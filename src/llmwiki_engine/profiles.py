@@ -35,9 +35,12 @@ def load_profile(name_or_path: str | Path) -> ProfileSpec:
 
 def _load_profile_file(path: Path) -> ProfileSpec:
     raw = read_yaml(path)
-    raw["page_types"] = {
-        key: PageTypeSpec(name=key, **value) for key, value in raw.get("page_types", {}).items()
-    }
+    page_types = {}
+    for key, value in raw.get("page_types", {}).items():
+        data = dict(value)
+        data.pop("name", None)
+        page_types[key] = PageTypeSpec(name=key, **data)
+    raw["page_types"] = page_types
     raw["template_root"] = path.parent / "templates"
     return ProfileSpec.model_validate(raw)
 

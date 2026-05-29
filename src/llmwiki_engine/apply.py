@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
-from .io import read_model, write_json
-from .models import OperationManifest, utc_now
+from .hash_utils import artifact_ref, sha256_file
+from .io import append_jsonl, read_json, read_model, write_json
+from .manifest import read_manifest, write_manifest
+from .models import AppliedReceipt, ApplyPreview, ArtifactVisibility, OperationStatus, utc_now
+from .verify import require_verified
+from .workspace import RunStore, run_lock
 
 
 class ApplyError(RuntimeError):
@@ -13,70 +16,85 @@ class ApplyError(RuntimeError):
 
 
 def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> list[Path]:
-    stage_dir = vault / "stage" / "ingest" / operation_id
-    draft_root = stage_dir / "draft_pages"
-    if not draft_root.exists():
-        raise ApplyError(f"Draft root not found: {draft_root}")
-    manifest = read_model(stage_dir / "manifest.json", OperationManifest)
-    if manifest.status not in {"drafted", "applied"}:
-        raise ApplyError(f"Operation is not apply-ready: {manifest.status}")
-    snapshot = snapshot_existing_pages(vault, draft_root, stage_dir)
-    preview = build_apply_preview(vault, draft_root)
-    write_json(stage_dir / "apply_preview.json", {"operation_id": operation_id, "writes": [str(path) for path in preview]})
-    written: list[Path] = []
-    for draft in draft_root.rglob("*.md"):
-        target = vault / "wiki" / draft.relative_to(draft_root)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(draft, target)
-        written.append(target)
-    manifest.status = "applied"
-    manifest.updated_at = utc_now()
-    write_json(stage_dir / "manifest.json", manifest)
-    append_markdown_audit(vault, operation_id, written, snapshot)
-    if commit:
-        commit_changes(vault, operation_id)
-    return written
+    store = RunStore(vault)
+    run_dir = store.run_dir(operation_id)
+    with run_lock(vault, operation_id):
+        manifest = read_manifest(store.manifest_path(operation_id))
+        if manifest.status == OperationStatus.applied:
+            raise ApplyError("Operation has already been applied.")
+        if manifest.status != OperationStatus.drafted:
+            raise ApplyError(f"Operation is not apply-ready: {manifest.status}")
+        if _receipt_exists(store.applied_log, operation_id):
+            raise ApplyError("Applied receipt already exists for this operation.")
+        require_verified(vault, manifest)
+        preview = read_model(run_dir / "apply_preview.json", ApplyPreview)
+        _verify_preimages(vault, preview)
+        written: list[Path] = []
+        for target in preview.targets:
+            draft = run_dir / target.draft_path
+            output = vault / target.target_path
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(draft.read_bytes())
+            written.append(output)
+        manifest.status = OperationStatus.applied
+        manifest.updated_at = utc_now()
+        write_manifest(store.manifest_path(operation_id), manifest)
+        receipt = AppliedReceipt(
+            operation_id=operation_id,
+            raw_bindings=manifest.raw_bindings,
+            written_pages=[
+                artifact_ref(
+                    base=vault,
+                    path=path,
+                    kind="markdown",
+                    producer_step="apply",
+                    required_for_resume=False,
+                    visibility=ArtifactVisibility.wiki_output,
+                )
+                for path in written
+            ],
+            profile_snapshot_hash=manifest.profile_snapshot_hash,
+            engine_version=manifest.engine_version,
+        )
+        append_jsonl(store.applied_log, [receipt])
+        if commit:
+            commit_changes(vault, operation_id)
+        return written
 
 
-def snapshot_existing_pages(vault: Path, draft_root: Path, stage_dir: Path) -> list[Path]:
-    snapshot_root = stage_dir / "pre_apply_snapshot"
-    copied: list[Path] = []
-    for draft in draft_root.rglob("*.md"):
-        target = vault / "wiki" / draft.relative_to(draft_root)
-        if target.exists():
-            out = snapshot_root / target.relative_to(vault / "wiki")
-            out.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(target, out)
-            copied.append(out)
-    write_json(stage_dir / "pre_apply_snapshot.json", {"files": [str(path) for path in copied]})
-    return copied
+def _verify_preimages(vault: Path, preview: ApplyPreview) -> None:
+    for target in preview.targets:
+        path = vault / target.target_path
+        if target.preimage_missing:
+            if path.exists():
+                raise ApplyError(f"Target appeared after preview: {target.target_path}")
+            continue
+        if not path.exists():
+            raise ApplyError(f"Target disappeared after preview: {target.target_path}")
+        if sha256_file(path) != target.preimage_sha256:
+            raise ApplyError(f"Target changed after preview: {target.target_path}")
 
 
-def build_apply_preview(vault: Path, draft_root: Path) -> list[Path]:
-    return [vault / "wiki" / draft.relative_to(draft_root) for draft in draft_root.rglob("*.md")]
+def _receipt_exists(path: Path, operation_id: str) -> bool:
+    if not path.exists():
+        return False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if read_json_line(line).get("operation_id") == operation_id:
+            return True
+    return False
 
 
-def append_markdown_audit(vault: Path, operation_id: str, written: list[Path], snapshot: list[Path]) -> None:
-    path = vault / "logs" / "audit.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        f"## {operation_id}",
-        "",
-        f"- status: applied",
-        f"- written: {len(written)}",
-        f"- snapshot_files: {len(snapshot)}",
-        "",
-    ]
-    for item in written:
-        lines.append(f"- {item.relative_to(vault)}")
-    lines.append("")
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
+def read_json_line(line: str) -> dict:
+    import json
+
+    return json.loads(line)
 
 
 def commit_changes(vault: Path, operation_id: str) -> None:
     if not (vault / ".git").exists():
         raise ApplyError("Cannot commit because vault is not a Git repository.")
-    subprocess.run(["git", "add", "wiki", "logs", "stage"], cwd=vault, check=True)
+    subprocess.run(["git", "add", "wiki", ".llmwiki/config.yaml", ".llmwiki/profiles", ".llmwiki/applied"], cwd=vault, check=True)
     subprocess.run(["git", "commit", "-m", f"apply ingest {operation_id}"], cwd=vault, check=True)
 

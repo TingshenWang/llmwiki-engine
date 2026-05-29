@@ -23,6 +23,41 @@ class EvidencePolicy(str, Enum):
     none = "none"
 
 
+class RunMode(str, Enum):
+    dev = "dev"
+    standard = "standard"
+
+
+class ArtifactVisibility(str, Enum):
+    run_cache = "run_cache"
+    committed_receipt = "committed_receipt"
+    wiki_output = "wiki_output"
+
+
+class StepStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    skipped = "skipped"
+
+
+class OperationStatus(str, Enum):
+    created = "created"
+    running = "running"
+    failed = "failed"
+    drafted = "drafted"
+    applied = "applied"
+
+
+class VerificationStatus(str, Enum):
+    ok = "ok"
+    drift = "drift"
+    missing = "missing"
+    raw_changed = "raw_changed"
+    invalid = "invalid"
+
+
 class PageTypeSpec(StrictModel):
     name: str
     directory: str
@@ -132,22 +167,57 @@ class PagePlanArtifact(StrictModel):
     pages: list[PagePlanItem]
 
 
+class ArtifactRef(StrictModel):
+    relative_path: str
+    sha256: str
+    size_bytes: int
+    kind: str
+    schema_version: str | None = None
+    producer_step: str
+    required_for_resume: bool = True
+    visibility: ArtifactVisibility = ArtifactVisibility.run_cache
+
+
+class RawBinding(StrictModel):
+    relative_path: str
+    sha256: str
+    size_bytes: int
+
+
+class StepAttempt(StrictModel):
+    attempt: int
+    started_at: str
+    completed_at: str | None = None
+    inputs: list[ArtifactRef] = Field(default_factory=list)
+    outputs: list[ArtifactRef] = Field(default_factory=list)
+    error: str | None = None
+
+
 class StepRecord(StrictModel):
     name: str
-    status: Literal["pending", "running", "completed", "failed", "skipped"] = "pending"
+    status: StepStatus = StepStatus.pending
     started_at: str | None = None
     completed_at: str | None = None
-    inputs: list[str] = Field(default_factory=list)
-    outputs: list[str] = Field(default_factory=list)
+    inputs: list[ArtifactRef] = Field(default_factory=list)
+    outputs: list[ArtifactRef] = Field(default_factory=list)
+    attempts: list[StepAttempt] = Field(default_factory=list)
     error: str | None = None
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v1"] = "operation_manifest.v1"
+    schema_version: Literal["operation_manifest.v2"] = "operation_manifest.v2"
     operation_id: str
     operation_type: str
+    run_mode: RunMode = RunMode.dev
+    engine_version: str
     profile: str
-    status: str = "created"
+    profile_version: str = "1"
+    workspace: str
+    raw_bindings: list[RawBinding] = Field(default_factory=list)
+    profile_snapshot_hash: str
+    template_hashes: dict[str, str] = Field(default_factory=dict)
+    provider_snapshot_hashes: dict[str, str] = Field(default_factory=dict)
+    status: OperationStatus = OperationStatus.created
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
     steps: list[StepRecord] = Field(default_factory=list)
@@ -211,3 +281,37 @@ class EvalRun(StrictModel):
         if not self.results:
             return 0.0
         return sum(1 for item in self.results if item.parse_success) / len(self.results)
+
+
+class VerifyIssue(StrictModel):
+    code: VerificationStatus
+    path: str
+    message: str
+
+
+class VerifyResult(StrictModel):
+    ok: bool
+    issues: list[VerifyIssue] = Field(default_factory=list)
+
+
+class ApplyTarget(StrictModel):
+    draft_path: str
+    target_path: str
+    preimage_sha256: str | None = None
+    preimage_missing: bool = False
+
+
+class ApplyPreview(StrictModel):
+    schema_version: Literal["apply_preview.v1"] = "apply_preview.v1"
+    operation_id: str
+    targets: list[ApplyTarget]
+
+
+class AppliedReceipt(StrictModel):
+    schema_version: Literal["applied_receipt.v1"] = "applied_receipt.v1"
+    operation_id: str
+    applied_at: str = Field(default_factory=utc_now)
+    raw_bindings: list[RawBinding]
+    written_pages: list[ArtifactRef]
+    profile_snapshot_hash: str
+    engine_version: str

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
 
@@ -17,6 +18,17 @@ def write_json(path: Path, model_or_data: BaseModel | dict[str, Any]) -> None:
     else:
         text = json.dumps(model_or_data, ensure_ascii=False, indent=2)
     path.write_text(text + "\n", encoding="utf-8")
+
+
+def write_json_atomic(path: Path, model_or_data: BaseModel | dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(model_or_data, BaseModel):
+        text = model_or_data.model_dump_json(indent=2)
+    else:
+        text = json.dumps(model_or_data, ensure_ascii=False, indent=2)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -49,4 +61,3 @@ def read_yaml(path: Path) -> dict[str, Any]:
 def write_yaml(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-

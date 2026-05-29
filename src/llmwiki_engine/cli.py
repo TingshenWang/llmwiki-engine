@@ -9,9 +9,11 @@ from rich.table import Table
 
 from .apply import apply_operation
 from .eval import load_eval_report, run_eval
-from .pipeline import init_vault, latest_operation, run_simplified_ingest, status as ingest_status
+from .models import OperationManifest, RunMode, VerificationStatus
+from .pipeline import init_vault, latest_operation, resume_ingest, run_simplified_ingest, status as ingest_status
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
+from .verify import verify_run
 
 app = typer.Typer(help="LLM-Wiki knowledge compilation engine.")
 ingest_app = typer.Typer(help="Run and manage simplified ingest operations.")
@@ -41,6 +43,7 @@ def ingest_run(
     fixture_dir: Path = typer.Option(..., "--fixture-dir", help="MockProvider fixture directory."),
     profile: str = "project_basic",
     slug: Optional[str] = None,
+    mode: RunMode = RunMode.dev,
 ) -> None:
     """Run simplified Ingest through draft generation."""
     manifest = run_simplified_ingest(
@@ -49,6 +52,7 @@ def ingest_run(
         fixture_dir=fixture_dir,
         profile_name=profile,
         slug=slug,
+        run_mode=mode,
         console=console,
     )
     console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
@@ -58,6 +62,7 @@ def ingest_run(
 def ingest_status_cmd(
     vault: Path,
     operation_id: Optional[str] = typer.Argument(None, help="Operation id. Defaults to the latest ingest operation."),
+    verify: bool = typer.Option(False, "--verify", help="Recompute raw and artifact hashes without writing files."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Show operation status."""
@@ -67,14 +72,71 @@ def ingest_status_cmd(
     manifest = ingest_status(vault, operation_id)
     if json_output:
         console.print(manifest.model_dump_json(indent=2))
+        if verify:
+            result = verify_run(vault, manifest)
+            raise typer.Exit(0 if result.ok else _verify_exit_code(result))
         return
+    _print_manifest_table(manifest)
+    if verify:
+        result = verify_run(vault, manifest)
+        if result.ok:
+            console.print("[green]verify: ok[/]")
+        else:
+            console.print("[red]verify: failed[/]")
+            for issue in result.issues:
+                console.print(f"- {issue.code.value}: {issue.path} - {issue.message}")
+            raise typer.Exit(_verify_exit_code(result))
+
+
+@ingest_app.command("resume")
+def ingest_resume(
+    vault: Path,
+    operation_id: str,
+    from_step: Optional[str] = typer.Option(None, "--from", help="Resume from this step, archiving this step and downstream outputs."),
+    mode: Optional[RunMode] = None,
+) -> None:
+    """Resume an ingest operation from the first failed/pending step or from a selected step."""
+    manifest = resume_ingest(vault=vault, operation_id=operation_id, from_step=from_step, run_mode=mode, console=console)
+    console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
+
+
+def _print_manifest_table(manifest: OperationManifest) -> None:
     table = Table(title=f"Ingest {manifest.operation_id}")
     table.add_column("Step")
     table.add_column("Status")
     for step in manifest.steps:
-        table.add_row(step.name, step.status)
+        table.add_row(step.name, step.status.value)
     console.print(table)
-    console.print(f"status: [bold]{manifest.status}[/]")
+    console.print(f"mode: [bold]{manifest.run_mode.value}[/]")
+    console.print(f"status: [bold]{manifest.status.value}[/]")
+    latest_error = next((step.error for step in reversed(manifest.steps) if step.error), None)
+    if latest_error:
+        console.print(f"[red]latest error:[/] {latest_error}")
+    console.print(f"next: {_next_action(manifest)}")
+
+
+def _next_action(manifest: OperationManifest) -> str:
+    if manifest.status.value == "applied":
+        return "operation already applied"
+    for step in manifest.steps:
+        if step.status.value in {"failed", "pending"}:
+            return f"run `llmwiki ingest resume <vault> {manifest.operation_id}`"
+    if manifest.status.value == "drafted":
+        return f"run `llmwiki ingest apply <vault> {manifest.operation_id}`"
+    return "inspect status"
+
+
+def _verify_exit_code(result) -> int:
+    codes = {issue.code for issue in result.issues}
+    if VerificationStatus.raw_changed in codes:
+        return 5
+    if VerificationStatus.missing in codes:
+        return 4
+    if VerificationStatus.invalid in codes:
+        return 6
+    if VerificationStatus.drift in codes:
+        return 3
+    return 3
 
 
 @ingest_app.command("apply")
