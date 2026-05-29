@@ -1,0 +1,9 @@
+{
+  "schema_version": "review_result.v1",
+  "reviewer": "mock",
+  "task": "semantic_aggregation",
+  "verdict": "pass",
+  "issues": [],
+  "confidence": "high"
+}
+

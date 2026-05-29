@@ -1,0 +1,19 @@
+{
+  "schema_version": "page_plan.v1",
+  "pages": [
+    {
+      "page_type": "source",
+      "title": "Source_raw_project_note",
+      "claim_ids": ["C001", "C002"],
+      "source_raw_path": "raw/raw_project_note.md",
+      "summary": "项目笔记来源页"
+    },
+    {
+      "page_type": "concept",
+      "title": "Concept_知识编译工程骨架",
+      "claim_ids": ["C001", "C002"],
+      "summary": "知识编译工程骨架强调先证明 CLI、状态机、artifact 和 validator。"
+    }
+  ]
+}
+

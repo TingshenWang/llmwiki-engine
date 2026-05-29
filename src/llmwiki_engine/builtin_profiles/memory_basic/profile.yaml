@@ -1,0 +1,25 @@
+name: memory_basic
+version: "1"
+description: Personal memory profile with light provenance.
+default_page_type: memory
+source_page_type: source
+page_types:
+  source:
+    directory: sources
+    title_prefix: "Source_"
+    template: source.md
+    required_sections: ["Summary", "Source Info"]
+    evidence_policy: light
+  memory:
+    directory: memories
+    title_prefix: "Memory_"
+    template: concept.md
+    required_sections: ["Summary", "Claims"]
+    evidence_policy: light
+  idea:
+    directory: ideas
+    title_prefix: "Idea_"
+    template: concept.md
+    required_sections: ["Summary", "Claims"]
+    evidence_policy: opinion
+

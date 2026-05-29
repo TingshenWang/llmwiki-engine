@@ -1,0 +1,18 @@
+{
+  "schema_version": "semantic_aggregation.v1",
+  "aggregations": [
+    {
+      "aggregation_id": "A001",
+      "source_span_ids": ["S002"],
+      "summary": "项目先证明 CLI、状态机、artifact 和 validator 的工程骨架",
+      "extract_policy": "extract"
+    },
+    {
+      "aggregation_id": "A002",
+      "source_span_ids": ["S003"],
+      "summary": "简化 Ingest 先生成 source 和 concept 草稿",
+      "extract_policy": "extract"
+    }
+  ]
+}
+

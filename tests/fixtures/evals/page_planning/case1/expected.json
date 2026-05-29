@@ -1,0 +1,12 @@
+{
+  "schema_version": "page_plan.v1",
+  "pages": [
+    {
+      "page_type": "source"
+    },
+    {
+      "page_type": "concept"
+    }
+  ]
+}
+

@@ -1,0 +1,26 @@
+{
+  "schema_version": "claims.v1",
+  "claims": [
+    {
+      "claim_id": "C001",
+      "aggregation_id": "A001",
+      "text": "第一阶段应先证明 CLI、状态机、artifact 和 validator 能跑通。",
+      "evidence_span_ids": ["S002"],
+      "evidence_quote": "第一阶段先证明 CLI、状态机、artifact 和 validator 能跑通",
+      "target_type": "concept",
+      "target_title": "Concept_知识编译工程骨架",
+      "confidence": "high"
+    },
+    {
+      "claim_id": "C002",
+      "aggregation_id": "A002",
+      "text": "简化 Ingest 应先生成 source 和 concept 草稿，而不是直接写入正式 wiki。",
+      "evidence_span_ids": ["S003"],
+      "evidence_quote": "简化 Ingest 不直接写入正式 wiki，而是先生成 source 和 concept 草稿",
+      "target_type": "concept",
+      "target_title": "Concept_知识编译工程骨架",
+      "confidence": "high"
+    }
+  ]
+}
+
