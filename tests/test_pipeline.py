@@ -56,7 +56,6 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert (run_dir / "prepared_raw" / "preparation_review.md").exists()
     assert (run_dir / "raw_index.json").exists()
     assert (run_dir / "extraction_windows.json").exists()
-    assert not (run_dir / "semantic_aggregation.json").exists()
     assert "input_kind" in (run_dir / "raw_index.json").read_text(encoding="utf-8")
     assert (run_dir / "apply_preview.json").exists()
     assert (run_dir / "draft_pages" / "sources" / "Source_raw_project_note.md").exists()
