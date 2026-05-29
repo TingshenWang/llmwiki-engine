@@ -1,18 +1,21 @@
 # Ingest Architecture Design Log
 
+English | [中文](2026-05-30-ingest-architecture.zh-CN.md)
+
 Date: 2026-05-30
 Status: Accepted for current MVP direction
 
 This note records the design decisions behind the current `llmwiki-engine`
 Ingest architecture. It is not a transcript. It is the durable project memory
 for why the engine moved from an agent-controlled skill flow toward a modular,
-auditable CLI workflow.
+auditable, and resumable CLI workflow.
 
 ## Context
 
-The engine is meant to support incremental knowledge compilation for a local
-wiki. Inputs may be noisy and inconsistent: Markdown notes, transcripts, PDF or
-DOCX exports, HTML clips, tables, diaries, and other user-authored material.
+`llmwiki-engine` is meant to support incremental knowledge compilation for a
+local wiki. Inputs may be noisy and inconsistent: Markdown notes, video
+transcripts, PDF or DOCX exports, HTML clips, tables, diaries, and other
+user-authored or user-studied material.
 
 The earlier skill-driven approach made the LLM repeatedly read procedural
 instructions and control the whole flow. That was expensive, hard to test, easy
@@ -24,10 +27,11 @@ model tasks with explicit inputs, schemas, validation, artifacts, and review.
 
 - Keep the core Ingest flow runnable from a CLI.
 - Give every step fixed inputs, outputs, logs, and artifacts.
-- Make each module independently testable and optimizable.
+- Make each module independently testable, evaluable, and optimizable.
 - Keep the formal wiki small and clean.
 - Keep local run cache separate from committed wiki output.
-- Make resume and apply safe against raw, artifact, config, and wiki drift.
+- Make `resume` and `apply` safe against raw, artifact, config, and wiki target
+  drift.
 - Allow providers to differ by module so cost and quality can be tuned locally.
 - Avoid making an agent the default runtime dependency.
 
@@ -69,8 +73,8 @@ original raw -> raw_prepare -> prepared_raw/prepared.md
 
 Downstream extraction and wiki compilation treat prepared raw as the factual
 input for the run. This is a deliberate trust boundary: the prepared raw must be
-auditable, but once accepted it is more valuable than forcing every downstream
-step to reason over the original noisy input.
+auditable, but once accepted it is usually more valuable than forcing every
+downstream step to reason over the original noisy input.
 
 The preparation step records:
 
@@ -179,7 +183,7 @@ than only end-to-end demos.
 
 Important checks include:
 
-- schema validity;
+- schema valid rate;
 - parse success rate;
 - repair success rate;
 - evidence quote validity;
@@ -205,4 +209,3 @@ It does not replace unit tests, regression tests, or module evals.
   more sophisticated?
 - Which modules deserve local-model defaults, and which should default to
   stronger hosted providers?
-
