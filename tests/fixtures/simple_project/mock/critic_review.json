@@ -1,9 +1,8 @@
 {
   "schema_version": "review_result.v1",
   "reviewer": "mock",
-  "task": "semantic_aggregation",
+  "task": "extraction_windows",
   "verdict": "pass",
   "issues": [],
   "confidence": "high"
 }
-

@@ -51,14 +51,22 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     loaded = status(vault, manifest.operation_id)
     assert loaded.operation_id == manifest.operation_id
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    assert (run_dir / "raw_preparation.json").exists()
+    assert (run_dir / "prepared_raw" / "prepared.md").exists()
+    assert (run_dir / "prepared_raw" / "preparation_review.md").exists()
     assert (run_dir / "raw_index.json").exists()
+    assert (run_dir / "extraction_windows.json").exists()
+    assert not (run_dir / "semantic_aggregation.json").exists()
+    assert "input_kind" in (run_dir / "raw_index.json").read_text(encoding="utf-8")
     assert (run_dir / "apply_preview.json").exists()
     assert (run_dir / "draft_pages" / "sources" / "Source_raw_project_note.md").exists()
     assert (run_dir / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md").exists()
     assert verify_run(vault, loaded).ok
     written = apply_operation(vault, manifest.operation_id)
     assert (vault / "wiki" / "sources" / "Source_raw_project_note.md") in written
-    assert (vault / ".llmwiki" / "applied" / "operations.jsonl").read_text(encoding="utf-8")
+    receipt_text = (vault / ".llmwiki" / "applied" / "operations.jsonl").read_text(encoding="utf-8")
+    assert receipt_text
+    assert "prepared_raw" in receipt_text
     assert status(vault, manifest.operation_id).status == OperationStatus.applied
 
 
@@ -66,7 +74,7 @@ def test_resume_after_failed_step(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     broken_fixture = tmp_path / "broken"
     broken_fixture.mkdir()
-    for name in ["semantic_aggregation.json", "claim_extraction.json"]:
+    for name in ["raw_prepare.json", "claim_extraction.json"]:
         (broken_fixture / name).write_text((FIXTURE_ROOT / "mock" / name).read_text(encoding="utf-8"), encoding="utf-8")
     with pytest.raises(Exception):
         run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=broken_fixture, slug="broken")
@@ -85,7 +93,7 @@ def test_resume_from_archives_downstream_outputs(tmp_path: Path) -> None:
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="rerun")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     assert (run_dir / "claims.json").exists()
-    resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="semantic_aggregation")
+    resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="extraction_windows")
     assert resumed.status == OperationStatus.drafted
     archives = list((run_dir / "archives").glob("*"))
     assert archives

@@ -11,8 +11,17 @@ class StepSpec:
 
 
 STEP_REGISTRY: tuple[StepSpec, ...] = (
+    StepSpec(
+        "raw_prepare",
+        (
+            "raw_preparation.json",
+            "prepared_raw/prepared.md",
+            "prepared_raw/preparation_review.md",
+            "model_calls/raw_prepare.provider_result.json",
+        ),
+    ),
     StepSpec("raw_index", ("raw_index.json",)),
-    StepSpec("semantic_aggregation", ("semantic_aggregation.json", "model_calls/semantic_aggregation.provider_result.json")),
+    StepSpec("extraction_windows", ("extraction_windows.json",)),
     StepSpec("claim_extraction", ("claims.json", "model_calls/claim_extraction.provider_result.json")),
     StepSpec("page_planning", ("page_plan.json", "model_calls/page_planning.provider_result.json")),
     StepSpec("draft_rendering", ("draft_pages",)),
@@ -33,4 +42,3 @@ def step_index(name: str) -> int:
 
 def downstream_steps(name: str) -> list[StepSpec]:
     return list(STEP_REGISTRY[step_index(name) :])
-

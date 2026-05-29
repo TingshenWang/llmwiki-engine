@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 from .hash_utils import artifact_ref, sha256_file
-from .io import append_jsonl, read_json, read_model, write_json
+from .io import append_jsonl, read_model
 from .manifest import read_manifest, write_manifest
-from .models import AppliedReceipt, ApplyPreview, ArtifactVisibility, OperationStatus, utc_now
+from .models import AppliedReceipt, ApplyPreview, ArtifactRef, ArtifactVisibility, OperationStatus, utc_now
 from .verify import require_verified
 from .workspace import RunStore, run_lock
 
@@ -42,6 +43,8 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
         receipt = AppliedReceipt(
             operation_id=operation_id,
             raw_bindings=manifest.raw_bindings,
+            prepared_raw=_optional_receipt_ref(vault, run_dir / "prepared_raw" / "prepared.md", "markdown", "raw_prepare"),
+            raw_preparation=_optional_receipt_ref(vault, run_dir / "raw_preparation.json", "json", "raw_prepare"),
             written_pages=[
                 artifact_ref(
                     base=vault,
@@ -60,6 +63,19 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
         if commit:
             commit_changes(vault, operation_id)
         return written
+
+
+def _optional_receipt_ref(vault: Path, path: Path, kind: str, producer_step: str) -> ArtifactRef | None:
+    if not path.exists():
+        return None
+    return artifact_ref(
+        base=vault,
+        path=path,
+        kind=kind,
+        producer_step=producer_step,
+        required_for_resume=False,
+        visibility=ArtifactVisibility.run_cache,
+    )
 
 
 def _verify_preimages(vault: Path, preview: ApplyPreview) -> None:
@@ -87,8 +103,6 @@ def _receipt_exists(path: Path, operation_id: str) -> bool:
 
 
 def read_json_line(line: str) -> dict:
-    import json
-
     return json.loads(line)
 
 
@@ -97,4 +111,3 @@ def commit_changes(vault: Path, operation_id: str) -> None:
         raise ApplyError("Cannot commit because vault is not a Git repository.")
     subprocess.run(["git", "add", "wiki", ".llmwiki/config.yaml", ".llmwiki/profiles", ".llmwiki/applied"], cwd=vault, check=True)
     subprocess.run(["git", "commit", "-m", f"apply ingest {operation_id}"], cwd=vault, check=True)
-

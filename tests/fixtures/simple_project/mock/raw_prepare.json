@@ -1,0 +1,14 @@
+{
+  "schema_version": "raw_preparation.v0",
+  "source_raw_path": "raw/raw_project_note.md",
+  "document_kind": "notes",
+  "prepared_markdown": "# 项目笔记\n\n这个项目的核心目标是把知识库维护流程拆成可测试的模块。第一阶段先证明 CLI、状态机、artifact 和 validator 能跑通。\n\n简化 Ingest 不直接写入正式 wiki，而是先生成 source 和 concept 草稿。这样可以先验证工程骨架，再逐步接入真实模型。\n",
+  "operations_applied": [
+    "kept_clean_markdown"
+  ],
+  "omission_policy": "non_content_noise_only",
+  "uncertain_items": [],
+  "risk_level": "low",
+  "requires_human_review": false,
+  "review_notes": "Fixture raw is already clean; prepared raw preserves the source content."
+}

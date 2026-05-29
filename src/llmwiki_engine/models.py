@@ -108,6 +108,25 @@ class ProviderResult(StrictModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class RawPreparationUncertainItem(StrictModel):
+    item: str
+    reason: str = ""
+    severity: Literal["low", "medium", "high"] = "medium"
+
+
+class RawPreparationArtifact(StrictModel):
+    schema_version: Literal["raw_preparation.v0"] = "raw_preparation.v0"
+    source_raw_path: str
+    document_kind: Literal["transcript", "article", "notes", "mixed", "unknown"] = "unknown"
+    prepared_markdown: str
+    operations_applied: list[str] = Field(default_factory=list)
+    omission_policy: str = "non_content_noise_only"
+    uncertain_items: list[RawPreparationUncertainItem] = Field(default_factory=list)
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    requires_human_review: bool = True
+    review_notes: str = ""
+
+
 class RawSpan(StrictModel):
     span_id: str
     raw_path: str
@@ -124,23 +143,32 @@ class RawIndexArtifact(StrictModel):
     raw_path: str
     raw_sha256: str
     spans: list[RawSpan]
+    input_kind: Literal["original_raw", "prepared_raw"] = "original_raw"
+    original_raw_path: str | None = None
 
 
-class SemanticAggregation(StrictModel):
-    aggregation_id: str
+class ExtractionWindow(StrictModel):
+    window_id: str
     source_span_ids: list[str]
-    summary: str
+    strategy: str = "deterministic"
+    reason: str = ""
+    text: str
     extract_policy: Literal["extract", "context_only", "skip"] = "extract"
 
 
-class SemanticAggregationArtifact(StrictModel):
-    schema_version: Literal["semantic_aggregation.v1"] = "semantic_aggregation.v1"
-    aggregations: list[SemanticAggregation]
+class ExtractionWindowsArtifact(StrictModel):
+    schema_version: Literal["extraction_windows.v0"] = "extraction_windows.v0"
+    raw_path: str
+    raw_sha256: str
+    strategy: str
+    max_chars: int
+    overlap_spans: int = 0
+    windows: list[ExtractionWindow]
 
 
 class Claim(StrictModel):
     claim_id: str
-    aggregation_id: str
+    source_window_id: str
     text: str
     evidence_span_ids: list[str]
     evidence_quote: str
@@ -312,6 +340,8 @@ class AppliedReceipt(StrictModel):
     operation_id: str
     applied_at: str = Field(default_factory=utc_now)
     raw_bindings: list[RawBinding]
+    prepared_raw: ArtifactRef | None = None
+    raw_preparation: ArtifactRef | None = None
     written_pages: list[ArtifactRef]
     profile_snapshot_hash: str
     engine_version: str

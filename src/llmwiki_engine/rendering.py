@@ -25,12 +25,13 @@ def render_drafts(
 
 
 def normalized_page_plan(raw_index: RawIndexArtifact, claims: ClaimsArtifact, plan: PagePlanArtifact) -> PagePlanArtifact:
-    source_title = source_title_for_raw(raw_index.raw_path)
+    source_identity = raw_index.original_raw_path or raw_index.raw_path
+    source_title = source_title_for_raw(source_identity)
     source_claim_ids = [claim.claim_id for claim in claims.claims]
     pages = [
         page
         for page in plan.pages
-        if not (page.page_type == "source" and page.source_raw_path in {None, raw_index.raw_path})
+        if not (page.page_type == "source" and page.source_raw_path in {None, raw_index.raw_path, source_identity})
     ]
     pages.insert(
         0,
@@ -62,8 +63,9 @@ def _render_page(profile: ProfileSpec, page: PagePlanItem, raw_index: RawIndexAr
     ) or "- No claims."
     source_line = "\n".join(
         [
-            f"- Raw: `{raw_index.raw_path}`",
-            f"- Raw SHA256: `{raw_index.raw_sha256}`",
+            f"- Prepared Raw: `{raw_index.raw_path}`",
+            f"- Prepared Raw SHA256: `{raw_index.raw_sha256}`",
+            f"- Original Raw: `{raw_index.original_raw_path}`" if raw_index.original_raw_path else "- Original Raw: same as prepared raw",
         ]
     )
     return (

@@ -8,7 +8,7 @@ from .models import EvalCaseResult, EvalRun
 
 
 SUPPORTED_MODULES = {
-    "semantic_aggregation",
+    "extraction_windows",
     "claim_extraction",
     "page_planning",
     "section_fill",
@@ -66,4 +66,3 @@ def _page_type_accuracy(actual: dict, expected: dict) -> float | None:
     expected_types = [item.get("page_type") for item in expected_pages if isinstance(item, dict)]
     matches = sum(1 for left, right in zip(actual_types, expected_types) if left == right)
     return matches / len(expected_types)
-

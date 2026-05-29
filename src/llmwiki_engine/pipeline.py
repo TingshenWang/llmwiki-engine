@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
@@ -26,16 +25,17 @@ from .models import (
     ApplyPreview,
     ApplyTarget,
     ArtifactRef,
-    ArtifactVisibility,
     ClaimsArtifact,
+    ExtractionWindow,
+    ExtractionWindowsArtifact,
     OperationManifest,
     OperationStatus,
     PagePlanArtifact,
     RawBinding,
     RawIndexArtifact,
+    RawPreparationArtifact,
     RawSpan,
     RunMode,
-    SemanticAggregationArtifact,
     StepStatus,
     utc_now,
 )
@@ -44,13 +44,29 @@ from .providers import ProviderRegistry
 from .rendering import normalized_page_plan, render_drafts
 from .steps import STEP_NAMES, downstream_steps
 from .structured import StructuredModelCall
-from .validators import validate_aggregation, validate_claims, validate_page_plan, validate_raw_index
+from .validators import validate_claims, validate_extraction_windows, validate_page_plan, validate_raw_index, validate_raw_preparation
 from .verify import require_verified
 from .workspace import RunStore, archive_paths, ensure_v2_layout, relative_to_vault, resolve_raw_path, run_lock
 
 
 class PipelineError(RuntimeError):
     pass
+
+
+RAW_PREPARE_CONTRACT = {
+    "goal": "Create a higher-quality canonical prepared raw for downstream knowledge compilation.",
+    "rules": [
+        "Do not add facts that are not supported by the original raw.",
+        "Remove or relocate non-content noise such as media timestamps, self-promotion, and obvious formatting artifacts.",
+        "Correct obvious ASR/OCR/formatting errors only when the context makes the correction clear.",
+        "Record uncertainty instead of guessing.",
+        "Return prepared_markdown as clean Markdown suitable for indexing and extraction windows.",
+    ],
+}
+
+EXTRACTION_WINDOW_STRATEGY = "deterministic_span_window"
+DEFAULT_EXTRACTION_WINDOW_MAX_CHARS = 2200
+DEFAULT_EXTRACTION_WINDOW_OVERLAP_SPANS = 1
 
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
@@ -73,7 +89,7 @@ def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
         {
             "profile": profile.name,
             "providers": {
-                "semantic_aggregation": "mock:fixture",
+                "raw_prepare": "mock:fixture",
                 "claim_extraction": "mock:fixture",
                 "page_planning": "mock:fixture",
                 "critic": "mock:fixture",
@@ -187,25 +203,50 @@ def _run_step(
     logger.emit(step_name, "started", status="running")
     begin_step(manifest, step_name)
     write_manifest(manifest_path, manifest)
-    if step_name == "raw_index":
-        raw_index = build_raw_index(vault, raw_path)
-        out = run_dir / "raw_index.json"
-        write_json(out, raw_index)
-        complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "raw_index.v1")])
-    elif step_name == "semantic_aggregation":
-        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
-        aggregation, _ = caller.run("semantic_aggregation", raw_index.model_dump(mode="json"), SemanticAggregationArtifact)
-        out = run_dir / "semantic_aggregation.json"
-        write_json(out, aggregation)
-        outputs = [_ref(run_dir, out, step_name, "json", "semantic_aggregation.v1")]
-        provider_result = run_dir / "model_calls" / "semantic_aggregation.provider_result.json"
+    if step_name == "raw_prepare":
+        raw_rel = relative_to_vault(vault, raw_path)
+        payload = {
+            "source_raw_path": raw_rel,
+            "source_raw_sha256": sha256_file(raw_path),
+            "original_markdown": raw_path.read_text(encoding="utf-8"),
+            "contract": RAW_PREPARE_CONTRACT,
+        }
+        preparation, _ = caller.run("raw_prepare", payload, RawPreparationArtifact)
+        validate_raw_preparation(preparation)
+        if preparation.source_raw_path != raw_rel:
+            raise PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
+        out = run_dir / "raw_preparation.json"
+        write_json(out, preparation)
+        prepared = run_dir / "prepared_raw" / "prepared.md"
+        prepared.parent.mkdir(parents=True, exist_ok=True)
+        prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
+        review = run_dir / "prepared_raw" / "preparation_review.md"
+        review.write_text(render_preparation_review(preparation), encoding="utf-8")
+        outputs = [
+            _ref(run_dir, out, step_name, "json", "raw_preparation.v0"),
+            _ref(run_dir, prepared, step_name, "markdown"),
+            _ref(run_dir, review, step_name, "markdown"),
+        ]
+        provider_result = run_dir / "model_calls" / "raw_prepare.provider_result.json"
         if provider_result.exists():
             outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
         complete_step(manifest, step_name, outputs=outputs)
+    elif step_name == "raw_index":
+        prepared_path = run_dir / "prepared_raw" / "prepared.md"
+        raw_index = build_raw_index(vault, prepared_path, original_raw_path=raw_path)
+        out = run_dir / "raw_index.json"
+        write_json(out, raw_index)
+        complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "raw_index.v1")])
+    elif step_name == "extraction_windows":
+        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
+        windows = build_extraction_windows(raw_index)
+        out = run_dir / "extraction_windows.json"
+        write_json(out, windows)
+        complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "extraction_windows.v0")])
     elif step_name == "claim_extraction":
         raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
-        aggregation = read_model(run_dir / "semantic_aggregation.json", SemanticAggregationArtifact)
-        payload = {"raw_index": raw_index.model_dump(mode="json"), "semantic_aggregation": aggregation.model_dump(mode="json")}
+        windows = read_model(run_dir / "extraction_windows.json", ExtractionWindowsArtifact)
+        payload = {"raw_index": raw_index.model_dump(mode="json"), "extraction_windows": windows.model_dump(mode="json")}
         claims, _ = caller.run("claim_extraction", payload, ClaimsArtifact)
         out = run_dir / "claims.json"
         write_json(out, claims)
@@ -234,13 +275,15 @@ def _run_step(
         outputs = render_drafts(draft_root=run_dir / "draft_pages", profile=profile, raw_index=raw_index, claims=claims, plan=plan)
         complete_step(manifest, step_name, outputs=[_ref(run_dir, path, step_name, "markdown") for path in outputs])
     elif step_name == "validation":
+        preparation = read_model(run_dir / "raw_preparation.json", RawPreparationArtifact)
         raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
-        aggregation = read_model(run_dir / "semantic_aggregation.json", SemanticAggregationArtifact)
+        windows = read_model(run_dir / "extraction_windows.json", ExtractionWindowsArtifact)
         claims = read_model(run_dir / "claims.json", ClaimsArtifact)
         plan = read_model(run_dir / "page_plan.json", PagePlanArtifact)
+        validate_raw_preparation(preparation)
         validate_raw_index(raw_index)
-        validate_aggregation(raw_index, aggregation)
-        validate_claims(raw_index, aggregation, claims)
+        validate_extraction_windows(raw_index, windows)
+        validate_claims(raw_index, windows, claims)
         validate_page_plan(profile, claims, plan)
         complete_step(manifest, step_name)
     elif step_name == "apply_preview":
@@ -253,12 +296,13 @@ def _run_step(
     logger.emit(step_name, "completed", status="completed")
 
 
-def build_raw_index(vault: Path, raw_path: Path) -> RawIndexArtifact:
+def build_raw_index(vault: Path, raw_path: Path, *, original_raw_path: Path | None = None) -> RawIndexArtifact:
     text = raw_path.read_text(encoding="utf-8")
     digest = sha256_bytes(text.encode("utf-8"))
     spans: list[RawSpan] = []
     cursor = 0
     raw_rel = relative_to_vault(vault, raw_path)
+    original_raw_rel = relative_to_vault(vault, original_raw_path) if original_raw_path is not None else None
     for part in [chunk.strip() for chunk in text.split("\n\n") if chunk.strip()]:
         start = text.find(part, cursor)
         end = start + len(part)
@@ -274,7 +318,74 @@ def build_raw_index(vault: Path, raw_path: Path) -> RawIndexArtifact:
                 text=part,
             )
         )
-    return RawIndexArtifact(raw_path=raw_rel, raw_sha256=digest, spans=spans)
+    return RawIndexArtifact(
+        raw_path=raw_rel,
+        raw_sha256=digest,
+        spans=spans,
+        input_kind="prepared_raw" if original_raw_rel is not None else "original_raw",
+        original_raw_path=original_raw_rel,
+    )
+
+
+def build_extraction_windows(
+    raw_index: RawIndexArtifact,
+    *,
+    max_chars: int = DEFAULT_EXTRACTION_WINDOW_MAX_CHARS,
+    overlap_spans: int = DEFAULT_EXTRACTION_WINDOW_OVERLAP_SPANS,
+) -> ExtractionWindowsArtifact:
+    windows: list[ExtractionWindow] = []
+    current: list[RawSpan] = []
+    current_chars = 0
+    for span in raw_index.spans:
+        span_len = len(span.text)
+        if current and current_chars + span_len > max_chars:
+            windows.append(_window_from_spans(current, len(windows) + 1))
+            current = current[-overlap_spans:] if overlap_spans else []
+            current_chars = sum(len(item.text) for item in current)
+        current.append(span)
+        current_chars += span_len
+    if current:
+        windows.append(_window_from_spans(current, len(windows) + 1))
+    return ExtractionWindowsArtifact(
+        raw_path=raw_index.raw_path,
+        raw_sha256=raw_index.raw_sha256,
+        strategy=EXTRACTION_WINDOW_STRATEGY,
+        max_chars=max_chars,
+        overlap_spans=overlap_spans,
+        windows=windows,
+    )
+
+
+def _window_from_spans(spans: list[RawSpan], index: int) -> ExtractionWindow:
+    return ExtractionWindow(
+        window_id=f"W{index:03d}",
+        source_span_ids=[span.span_id for span in spans],
+        strategy=EXTRACTION_WINDOW_STRATEGY,
+        reason="Generated for extraction context; not a knowledge-unit judgment.",
+        text="\n\n".join(span.text for span in spans),
+        extract_policy="extract",
+    )
+
+
+def render_preparation_review(preparation: RawPreparationArtifact) -> str:
+    operations = "\n".join(f"- {operation}" for operation in preparation.operations_applied) or "- none recorded"
+    uncertain = "\n".join(
+        f"- [{item.severity}] {item.item}: {item.reason}" for item in preparation.uncertain_items
+    ) or "- none recorded"
+    return (
+        "# Raw Preparation Review\n\n"
+        f"- Source raw: `{preparation.source_raw_path}`\n"
+        f"- Document kind: `{preparation.document_kind}`\n"
+        f"- Risk level: `{preparation.risk_level}`\n"
+        f"- Requires human review: `{str(preparation.requires_human_review).lower()}`\n"
+        f"- Omission policy: `{preparation.omission_policy}`\n\n"
+        "## Operations Applied\n\n"
+        f"{operations}\n\n"
+        "## Uncertain Items\n\n"
+        f"{uncertain}\n\n"
+        "## Review Notes\n\n"
+        f"{preparation.review_notes or 'No review notes.'}\n"
+    )
 
 
 def create_run_snapshots(run_dir: Path, profile, fixture_dir: Path) -> dict[str, dict | str]:

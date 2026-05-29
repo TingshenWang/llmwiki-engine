@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from llmwiki_engine.models import ReviewResult, SemanticAggregationArtifact
+from llmwiki_engine.models import ClaimsArtifact, RawPreparationArtifact, ReviewResult
 from llmwiki_engine.providers import ProviderRegistry
 from llmwiki_engine.structured import StructuredModelCall, StructuredOutputError
 
@@ -10,11 +10,19 @@ from llmwiki_engine.structured import StructuredModelCall, StructuredOutputError
 FIXTURE = Path(__file__).parent / "fixtures" / "simple_project" / "mock"
 
 
-def test_mock_provider_returns_schema_valid_result() -> None:
+def test_mock_provider_returns_claim_fixture() -> None:
     provider = ProviderRegistry().create("mock:fixture", fixture_dir=FIXTURE)
-    model, result = StructuredModelCall(provider).run("semantic_aggregation", {}, SemanticAggregationArtifact)
+    model, result = StructuredModelCall(provider).run("claim_extraction", {}, ClaimsArtifact)
     assert result.schema_valid
-    assert model.aggregations[0].aggregation_id == "A001"
+    assert model.claims[0].source_window_id == "W001"
+
+
+def test_raw_prepare_fixture_contract() -> None:
+    provider = ProviderRegistry().create("mock:fixture", fixture_dir=FIXTURE)
+    model, result = StructuredModelCall(provider).run("raw_prepare", {}, RawPreparationArtifact)
+    assert result.schema_valid
+    assert model.prepared_markdown.strip()
+    assert model.risk_level == "low"
 
 
 def test_critic_bad_format_is_blocked(tmp_path: Path) -> None:
@@ -28,4 +36,3 @@ def test_critic_bad_format_is_blocked(tmp_path: Path) -> None:
 
 def test_registry_lists_planned_provider_types() -> None:
     assert {"mock", "openai", "ollama", "local_http", "human"}.issubset(set(ProviderRegistry().names()))
-
