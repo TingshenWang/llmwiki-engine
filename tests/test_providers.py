@@ -36,3 +36,9 @@ def test_critic_bad_format_is_blocked(tmp_path: Path) -> None:
 
 def test_registry_lists_planned_provider_types() -> None:
     assert {"mock", "openai", "ollama", "local_http", "human"}.issubset(set(ProviderRegistry().names()))
+
+
+def test_openai_provider_uses_requested_api_key_env() -> None:
+    provider = ProviderRegistry().create("openai:gpt-test", api_key_env="LLMWIKI_TEST_OPENAI_KEY")
+    assert provider.name == "openai"
+    assert provider.api_key_env == "LLMWIKI_TEST_OPENAI_KEY"

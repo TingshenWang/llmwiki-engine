@@ -32,24 +32,10 @@ def verify_run(vault: Path, manifest: OperationManifest) -> VerifyResult:
                 issues.append(VerifyIssue(code=VerificationStatus.missing, path=ref.relative_path, message="required artifact is missing"))
             elif path.is_file() and sha256_file(path) != ref.sha256:
                 issues.append(VerifyIssue(code=VerificationStatus.drift, path=ref.relative_path, message="artifact hash changed"))
-    _verify_snapshot(run_dir, "snapshots/profile/profile.yaml", manifest.profile_snapshot_hash, issues)
-    for rel, expected in manifest.template_hashes.items():
-        _verify_snapshot(run_dir, rel, expected, issues)
-    for rel, expected in manifest.provider_snapshot_hashes.items():
-        _verify_snapshot(run_dir, rel, expected, issues)
     return VerifyResult(ok=not issues, issues=issues)
-
-
-def _verify_snapshot(run_dir: Path, rel: str, expected: str, issues: list[VerifyIssue]) -> None:
-    path = run_dir / rel
-    if not path.exists():
-        issues.append(VerifyIssue(code=VerificationStatus.missing, path=rel, message="snapshot artifact is missing"))
-    elif path.is_file() and sha256_file(path) != expected:
-        issues.append(VerifyIssue(code=VerificationStatus.drift, path=rel, message="snapshot artifact hash changed"))
 
 
 def require_verified(vault: Path, manifest: OperationManifest) -> None:
     result = verify_run(vault, manifest)
     if not result.ok:
         raise VerifyError(result)
-

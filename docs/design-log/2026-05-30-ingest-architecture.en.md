@@ -30,8 +30,8 @@ model tasks with explicit inputs, schemas, validation, artifacts, and review.
 - Make each module independently testable, evaluable, and optimizable.
 - Keep the formal wiki small and clean.
 - Keep local run cache separate from committed wiki output.
-- Make `resume` and `apply` safe against raw, artifact, config, and wiki target
-  drift.
+- Make `resume` and `apply` safe against raw, artifact, and wiki target drift;
+  provider config changes require an explicit refresh.
 - Allow providers to differ by module so cost and quality can be tuned locally.
 - Avoid making an agent the default runtime dependency.
 
@@ -52,7 +52,7 @@ state:
 ```
 
 `wiki/` is only for final pages. Run artifacts, drafts, previews, model calls,
-manifests, and snapshots stay under `.llmwiki/runs/`.
+and manifests stay under `.llmwiki/runs/`.
 
 `.llmwiki/runs/` is local cache. `.llmwiki/config.yaml`, profiles, and applied
 receipts can be committed because they are small, intentional, and useful for
@@ -68,7 +68,7 @@ The current design introduces `raw_prepare` as the first model-backed bounded
 step. It converts original raw material into canonical prepared raw:
 
 ```text
-original raw -> raw_prepare -> prepared_raw/prepared.md
+original raw -> raw_prepare -> raw_prepare/prepared.md
 ```
 
 Downstream extraction and wiki compilation treat prepared raw as the factual
@@ -136,6 +136,9 @@ validation
 apply_preview
 ```
 
+`validation` is an outputless gate step. It validates upstream artifacts and
+does not create a `validation/` module directory.
+
 `apply` remains an explicit command after preview. It verifies the run again,
 checks target preimage hashes, writes final wiki pages, and appends an applied
 receipt.
@@ -143,7 +146,7 @@ receipt.
 ## Manifest, Status, Resume, Apply
 
 The manifest is the local workflow contract. It records raw bindings, step
-attempts, artifact references, profile snapshots, provider snapshots, and run
+attempts, current artifact references, provider context records, and run
 status.
 
 `status` is for both humans and machines:
@@ -152,18 +155,21 @@ status.
 - `--json` should expose complete structured state;
 - `--verify` should recompute integrity checks without writing files.
 
-`resume` defaults to the first failed or pending step. `resume --from STEP`
-archives the chosen step and its downstream artifacts, marks them pending, and
-reruns from there.
+`resume` defaults to the first failed or pending step and reuses the provider
+context already recorded in the manifest. It does not reread the current
+`.llmwiki/config.yaml`. `resume --from STEP` deletes the chosen step's module
+directory and downstream module directories, marks those steps pending, and
+reruns from there. `resume --from STEP --refresh-providers` first resolves the
+current provider config and records a new provider context for the rerun range.
 
-Applied operations cannot be resumed. Raw drift, required artifact drift,
-snapshot drift, or apply preimage drift must block execution.
+Applied operations cannot be resumed. Raw drift, required artifact drift, or
+apply preimage drift must block execution.
 
 ## Provider Runtime Direction
 
 Providers should be selected per module, not globally. This enables cheap local
-models for preparation or critique and stronger API models for harder extraction
-or planning tasks.
+models for preparation, reserved future critique steps, and stronger API models
+for harder extraction or planning tasks.
 
 The intended provider direction is:
 
@@ -175,6 +181,9 @@ The intended provider direction is:
 
 Every model-backed step should use structured calls with schema validation,
 bounded repair, cost and latency capture, and failed-output diagnostics.
+Provider context records are the only provider execution snapshots. They store
+standard runtime fields such as `spec`, `endpoint`, `api_key_env`, and
+`fixture_dir`; plaintext API keys must not be recorded.
 
 ## Test And Evaluation Direction
 

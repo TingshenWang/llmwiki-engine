@@ -18,9 +18,17 @@ class StructuredOutputError(RuntimeError):
 
 
 class StructuredModelCall:
-    def __init__(self, provider: Provider, *, output_dir: Path | None = None, max_repair_attempts: int = 1):
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        output_dir: Path | None = None,
+        result_filename: str | None = None,
+        max_repair_attempts: int = 1,
+    ):
         self.provider = provider
         self.output_dir = output_dir
+        self.result_filename = result_filename
         self.max_repair_attempts = max_repair_attempts
 
     def run(self, task: str, payload: dict[str, Any], output_model: type[T]) -> tuple[T, ProviderResult]:
@@ -65,7 +73,8 @@ class StructuredModelCall:
     def _persist(self, task: str, result: ProviderResult) -> None:
         if self.output_dir is None:
             return
-        write_json(self.output_dir / f"{task}.provider_result.json", result)
+        filename = self.result_filename or f"{task}.provider_result.json"
+        write_json(self.output_dir / filename, result)
 
 
 def _parse_json(raw: str) -> dict[str, Any]:
@@ -81,4 +90,3 @@ def _parse_json(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Structured output root must be a JSON object.")
     return data
-

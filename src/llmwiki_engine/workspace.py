@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,11 +40,6 @@ class RunStore:
 
     def lock_path(self, operation_id: str) -> Path:
         return self.run_dir(operation_id) / ".lock"
-
-    def archive_dir(self, operation_id: str) -> Path:
-        stamp = utc_now().replace(":", "").replace("+00:00", "Z")
-        return self.run_dir(operation_id) / "archives" / stamp
-
 
 def ensure_v2_layout(vault: Path) -> None:
     if (vault / "stage" / "ingest").exists() and not (vault / ".llmwiki").exists():
@@ -101,18 +95,3 @@ def resolve_raw_path(vault: Path, raw_file: Path) -> tuple[Path, str]:
     if ".." in raw_rel.parts:
         raise WorkspaceError("Raw path traversal is not allowed.")
     return resolved, raw_rel.as_posix()
-
-
-def archive_paths(vault: Path, operation_id: str, paths: list[Path]) -> Path:
-    store = RunStore(vault)
-    archive = store.archive_dir(operation_id)
-    run_dir = store.run_dir(operation_id)
-    for path in paths:
-        if not path.exists():
-            continue
-        rel = path.relative_to(run_dir)
-        target = archive / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), str(target))
-    return archive
-

@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .hash_utils import artifact_ref, sha256_file
-from .io import read_model, write_json_atomic
+from .hash_utils import sha256_file
+from .io import read_json, write_json_atomic
 from .models import ArtifactRef, OperationManifest, OperationStatus, StepAttempt, StepRecord, StepStatus, utc_now
 from .steps import STEP_NAMES
 
 
 def read_manifest(path: Path) -> OperationManifest:
-    return read_model(path, OperationManifest)
+    data = read_json(path)
+    schema_version = data.get("schema_version")
+    if schema_version and schema_version != "operation_manifest.v3":
+        raise ValueError(f"Unsupported manifest schema_version: {schema_version}. Create a new operation.")
+    return OperationManifest.model_validate(data)
 
 
 def write_manifest(path: Path, manifest: OperationManifest) -> None:
@@ -28,11 +32,15 @@ def get_step(manifest: OperationManifest, name: str) -> StepRecord:
     raise KeyError(name)
 
 
-def set_operation_status(manifest: OperationManifest, status: OperationStatus) -> None:
-    manifest.status = status
-
-
-def begin_step(manifest: OperationManifest, name: str, inputs: list[ArtifactRef] | None = None) -> StepAttempt:
+def begin_step_attempt(
+    manifest: OperationManifest,
+    name: str,
+    inputs: list[ArtifactRef] | None = None,
+    *,
+    provider_record_id: str | None = None,
+    provider_spec: str | None = None,
+    provider_context_source: str | None = None,
+) -> StepAttempt:
     step = get_step(manifest, name)
     step.status = StepStatus.running
     step.started_at = utc_now()
@@ -42,6 +50,9 @@ def begin_step(manifest: OperationManifest, name: str, inputs: list[ArtifactRef]
         attempt=len(step.attempts) + 1,
         started_at=step.started_at,
         inputs=inputs or [],
+        provider_record_id=provider_record_id,
+        provider_spec=provider_spec,
+        provider_context_source=provider_context_source,
     )
     step.inputs = attempt.inputs
     step.attempts.append(attempt)
@@ -89,6 +100,8 @@ def mark_from_pending(manifest: OperationManifest, start: str) -> None:
             step.error = None
             step.inputs = []
             step.outputs = []
+            for attempt in step.attempts:
+                attempt.outputs = []
 
 
 def first_resumable_step(manifest: OperationManifest) -> str | None:
@@ -98,14 +111,5 @@ def first_resumable_step(manifest: OperationManifest) -> str | None:
     return None
 
 
-def refs_for_paths(base: Path, paths: list[Path], *, producer_step: str, kind: str, schema_version: str | None = None) -> list[ArtifactRef]:
-    return [
-        artifact_ref(base=base, path=path, kind=kind, producer_step=producer_step, schema_version=schema_version)
-        for path in paths
-        if path.exists() and path.is_file()
-    ]
-
-
 def raw_ref(path: Path) -> tuple[str, int]:
     return sha256_file(path), path.stat().st_size
-

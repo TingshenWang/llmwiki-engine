@@ -10,8 +10,6 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from .models import ProviderConfig, ProviderResult
-
 
 class ProviderError(RuntimeError):
     pass
@@ -152,14 +150,23 @@ class ProviderRegistry:
     def names(self) -> list[str]:
         return sorted(self._providers)
 
-    def create(self, spec: str, *, fixture_dir: Path | None = None, endpoint: str | None = None) -> Provider:
+    def create(
+        self,
+        spec: str,
+        *,
+        fixture_dir: Path | None = None,
+        endpoint: str | None = None,
+        api_key_env: str | None = None,
+    ) -> Provider:
         provider_name, _, model = spec.partition(":")
         if provider_name == "mock":
             if fixture_dir is None:
                 raise ProviderError("mock provider requires fixture_dir")
+            if not fixture_dir.is_dir():
+                raise ProviderError(f"mock fixture_dir does not exist: {fixture_dir}")
             return MockProvider(fixture_dir)
         if provider_name == "openai":
-            return OpenAIProvider(model or "gpt-4.1-mini")
+            return OpenAIProvider(model or "gpt-4.1-mini", api_key_env or "OPENAI_API_KEY")
         if provider_name == "ollama":
             return OllamaProvider(model or "llama3", endpoint or "http://localhost:11434/api/generate")
         if provider_name == "local_http":
@@ -169,11 +176,6 @@ class ProviderRegistry:
         if provider_name == "human":
             return HumanProvider()
         raise ProviderError(f"Unknown provider spec: {spec}")
-
-
-def provider_config_from_spec(task: str, spec: str, fixture_dir: Path | None = None) -> ProviderConfig:
-    provider, _, model = spec.partition(":")
-    return ProviderConfig(task=task, provider=provider, model=model or None, fixture_dir=fixture_dir)
 
 
 def _http_json_text(request: urllib.request.Request) -> str:

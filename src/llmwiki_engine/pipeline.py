@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
 from . import __version__
 from .events import EventLogger
 from .hash_utils import artifact_ref, sha256_bytes, sha256_file
-from .io import read_json, read_model, read_yaml, write_json, write_json_atomic, write_yaml
+from .io import read_model, read_yaml, write_json, write_yaml
 from .manifest import (
-    begin_step,
+    begin_step_attempt,
     complete_step,
     fail_step,
     first_resumable_step,
@@ -31,6 +32,8 @@ from .models import (
     OperationManifest,
     OperationStatus,
     PagePlanArtifact,
+    ProviderContextRecord,
+    ProviderRuntimeSpec,
     RawBinding,
     RawIndexArtifact,
     RawPreparationArtifact,
@@ -46,7 +49,7 @@ from .steps import STEP_NAMES, downstream_steps
 from .structured import StructuredModelCall
 from .validators import validate_claims, validate_extraction_windows, validate_page_plan, validate_raw_index, validate_raw_preparation
 from .verify import require_verified
-from .workspace import RunStore, archive_paths, ensure_v2_layout, relative_to_vault, resolve_raw_path, run_lock
+from .workspace import RunStore, ensure_v2_layout, relative_to_vault, resolve_raw_path, run_lock
 
 
 class PipelineError(RuntimeError):
@@ -67,6 +70,7 @@ RAW_PREPARE_CONTRACT = {
 EXTRACTION_WINDOW_STRATEGY = "deterministic_span_window"
 DEFAULT_EXTRACTION_WINDOW_MAX_CHARS = 2200
 DEFAULT_EXTRACTION_WINDOW_OVERLAP_SPANS = 1
+MODEL_STEPS = ("raw_prepare", "claim_extraction", "page_planning")
 
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
@@ -92,7 +96,6 @@ def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
                 "raw_prepare": "mock:fixture",
                 "claim_extraction": "mock:fixture",
                 "page_planning": "mock:fixture",
-                "critic": "mock:fixture",
             },
         },
     )
@@ -117,7 +120,15 @@ def run_simplified_ingest(
     run_dir.mkdir(parents=True, exist_ok=True)
     profile = load_profile(vault / ".llmwiki" / "profiles" / profile_name)
     provider_specs = load_provider_specs(vault)
-    snapshot_hashes = create_run_snapshots(run_dir, profile, fixture_dir, provider_specs)
+    provider_context = build_provider_context_record(
+        vault=vault,
+        manifest_contexts=[],
+        provider_specs=provider_specs,
+        fixture_dir=fixture_dir,
+        source="initial_run",
+        from_step=None,
+        affected_steps=list(MODEL_STEPS),
+    )
     manifest = OperationManifest(
         operation_id=operation_id,
         operation_type="ingest",
@@ -127,9 +138,7 @@ def run_simplified_ingest(
         profile_version=profile.version,
         workspace=relative_to_vault(vault, run_dir),
         raw_bindings=[RawBinding(relative_path=raw_rel, sha256=raw_hash, size_bytes=raw_size)],
-        profile_snapshot_hash=snapshot_hashes["profile"],
-        template_hashes=snapshot_hashes["templates"],
-        provider_snapshot_hashes=snapshot_hashes["providers"],
+        provider_contexts=[provider_context],
         steps=initial_steps(),
     )
     write_manifest(store.manifest_path(operation_id), manifest)
@@ -142,24 +151,48 @@ def resume_ingest(
     vault: Path,
     operation_id: str,
     from_step: str | None = None,
+    refresh_providers: bool = False,
     run_mode: RunMode | None = None,
     console: Console | None = None,
 ) -> OperationManifest:
     store = RunStore(vault)
-    manifest = read_manifest(store.manifest_path(operation_id))
-    if manifest.status == OperationStatus.applied:
-        raise PipelineError("Applied operations are immutable. Start a new operation instead.")
-    require_verified(vault, manifest)
-    start = from_step or first_resumable_step(manifest)
-    if start is None:
-        return manifest
-    if from_step is not None:
-        archive_downstream(vault, operation_id, from_step)
-        mark_from_pending(manifest, from_step)
-        if run_mode is not None:
-            manifest.run_mode = run_mode
-        write_manifest(store.manifest_path(operation_id), manifest)
     with run_lock(vault, operation_id):
+        manifest = read_manifest(store.manifest_path(operation_id))
+        if manifest.status == OperationStatus.applied:
+            raise PipelineError("Applied operations are immutable. Start a new operation instead.")
+        if refresh_providers and from_step is None:
+            raise PipelineError("--refresh-providers requires --from STEP.")
+        require_verified(vault, manifest)
+        start = from_step or first_resumable_step(manifest)
+        if start is None:
+            return manifest
+        if refresh_providers:
+            provider_specs = load_provider_specs(vault)
+            affected_steps = model_steps_from(start)
+            if not affected_steps:
+                raise PipelineError(f"--refresh-providers has no provider-backed steps from {start}.")
+            provider_context = build_provider_context_record(
+                vault=vault,
+                manifest_contexts=manifest.provider_contexts,
+                provider_specs=provider_specs,
+                fixture_dir=None,
+                source="resume_refresh",
+                from_step=start,
+                affected_steps=affected_steps,
+            )
+            validate_provider_context(provider_context)
+            manifest.provider_contexts.append(provider_context)
+            if console is not None:
+                console.print(
+                    f"[yellow]Refreshing providers[/] from [bold]{start}[/] "
+                    f"for model steps: {', '.join(affected_steps) or 'none'}"
+                )
+        if from_step is not None:
+            delete_downstream_step_dirs(vault, operation_id, from_step)
+            mark_from_pending(manifest, from_step)
+            if run_mode is not None:
+                manifest.run_mode = run_mode
+            write_manifest(store.manifest_path(operation_id), manifest)
         return execute_ingest(vault, operation_id, start_step=start, console=console)
 
 
@@ -168,9 +201,8 @@ def execute_ingest(vault: Path, operation_id: str, *, start_step: str, console: 
     run_dir = store.run_dir(operation_id)
     logger = EventLogger(operation_id, run_dir / "events.jsonl", console=console)
     manifest = read_manifest(store.manifest_path(operation_id))
-    profile = load_profile(run_dir / "snapshots" / "profile")
+    profile = load_profile(vault / ".llmwiki" / "profiles" / manifest.profile)
     raw_path = vault / manifest.raw_bindings[0].relative_path
-    provider_config = read_json(run_dir / "snapshots" / "provider_config.json")
     start_index = STEP_NAMES.index(start_step)
     for step_name in STEP_NAMES[start_index:]:
         if get_step(manifest, step_name).status == StepStatus.completed:
@@ -183,7 +215,6 @@ def execute_ingest(vault: Path, operation_id: str, *, start_step: str, console: 
                 run_dir,
                 raw_path,
                 profile,
-                provider_config,
                 manifest,
                 logger,
             )
@@ -205,14 +236,22 @@ def _run_step(
     run_dir: Path,
     raw_path: Path,
     profile,
-    provider_config: dict,
     manifest: OperationManifest,
     logger: EventLogger,
 ) -> None:
     logger.emit(step_name, "started", status="running")
-    begin_step(manifest, step_name)
+    provider_record = provider_context_for_step(manifest, step_name) if step_name in MODEL_STEPS else None
+    provider_runtime = provider_record.providers.get(step_name) if provider_record else None
+    begin_step_attempt(
+        manifest,
+        step_name,
+        provider_record_id=provider_record.record_id if provider_record else None,
+        provider_spec=provider_runtime.spec if provider_runtime else None,
+        provider_context_source=provider_record.source if provider_record else None,
+    )
     write_manifest(manifest_path, manifest)
     if step_name == "raw_prepare":
+        step_root = step_dir(run_dir, "raw_prepare")
         raw_rel = relative_to_vault(vault, raw_path)
         payload = {
             "source_raw_path": raw_rel,
@@ -220,7 +259,7 @@ def _run_step(
             "original_markdown": raw_path.read_text(encoding="utf-8"),
             "contract": RAW_PREPARE_CONTRACT,
         }
-        preparation, _ = _structured_call(run_dir, provider_config, "raw_prepare").run(
+        preparation, _ = _structured_call(run_dir, manifest, "raw_prepare").run(
             "raw_prepare",
             payload,
             RawPreparationArtifact,
@@ -228,79 +267,87 @@ def _run_step(
         validate_raw_preparation(preparation)
         if preparation.source_raw_path != raw_rel:
             raise PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
-        out = run_dir / "raw_preparation.json"
+        out = step_root / "raw_preparation.json"
         write_json(out, preparation)
-        prepared = run_dir / "prepared_raw" / "prepared.md"
+        prepared = step_root / "prepared.md"
         prepared.parent.mkdir(parents=True, exist_ok=True)
         prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
-        review = run_dir / "prepared_raw" / "preparation_review.md"
+        review = step_root / "preparation_review.md"
         review.write_text(render_preparation_review(preparation), encoding="utf-8")
         outputs = [
             _ref(run_dir, out, step_name, "json", "raw_preparation.v0"),
             _ref(run_dir, prepared, step_name, "markdown"),
             _ref(run_dir, review, step_name, "markdown"),
         ]
-        provider_result = run_dir / "model_calls" / "raw_prepare.provider_result.json"
+        provider_result = step_root / "provider_result.json"
         if provider_result.exists():
             outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
         complete_step(manifest, step_name, outputs=outputs)
     elif step_name == "raw_index":
-        prepared_path = run_dir / "prepared_raw" / "prepared.md"
+        prepared_path = step_dir(run_dir, "raw_prepare") / "prepared.md"
         raw_index = build_raw_index(vault, prepared_path, original_raw_path=raw_path)
-        out = run_dir / "raw_index.json"
+        out = step_dir(run_dir, "raw_index") / "raw_index.json"
         write_json(out, raw_index)
         complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "raw_index.v1")])
     elif step_name == "extraction_windows":
-        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
+        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
         windows = build_extraction_windows(raw_index)
-        out = run_dir / "extraction_windows.json"
+        out = step_dir(run_dir, "extraction_windows") / "extraction_windows.json"
         write_json(out, windows)
         complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "extraction_windows.v0")])
     elif step_name == "claim_extraction":
-        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
-        windows = read_model(run_dir / "extraction_windows.json", ExtractionWindowsArtifact)
+        step_root = step_dir(run_dir, "claim_extraction")
+        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+        windows = read_model(step_dir(run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
         payload = {"raw_index": raw_index.model_dump(mode="json"), "extraction_windows": windows.model_dump(mode="json")}
-        claims, _ = _structured_call(run_dir, provider_config, "claim_extraction").run(
+        claims, _ = _structured_call(run_dir, manifest, "claim_extraction").run(
             "claim_extraction",
             payload,
             ClaimsArtifact,
         )
-        out = run_dir / "claims.json"
+        out = step_root / "claims.json"
         write_json(out, claims)
         outputs = [_ref(run_dir, out, step_name, "json", "claims.v1")]
-        provider_result = run_dir / "model_calls" / "claim_extraction.provider_result.json"
+        provider_result = step_root / "provider_result.json"
         if provider_result.exists():
             outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
         complete_step(manifest, step_name, outputs=outputs)
     elif step_name == "page_planning":
-        claims = read_model(run_dir / "claims.json", ClaimsArtifact)
+        step_root = step_dir(run_dir, "page_planning")
+        claims = read_model(step_dir(run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
         payload = {"profile": profile.model_dump(mode="json"), "claims": claims.model_dump(mode="json")}
-        plan, _ = _structured_call(run_dir, provider_config, "page_planning").run(
+        plan, _ = _structured_call(run_dir, manifest, "page_planning").run(
             "page_planning",
             payload,
             PagePlanArtifact,
         )
-        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
+        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
         plan = normalized_page_plan(raw_index, claims, plan)
-        out = run_dir / "page_plan.json"
+        out = step_root / "page_plan.json"
         write_json(out, plan)
         outputs = [_ref(run_dir, out, step_name, "json", "page_plan.v1")]
-        provider_result = run_dir / "model_calls" / "page_planning.provider_result.json"
+        provider_result = step_root / "provider_result.json"
         if provider_result.exists():
             outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
         complete_step(manifest, step_name, outputs=outputs)
     elif step_name == "draft_rendering":
-        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
-        claims = read_model(run_dir / "claims.json", ClaimsArtifact)
-        plan = read_model(run_dir / "page_plan.json", PagePlanArtifact)
-        outputs = render_drafts(draft_root=run_dir / "draft_pages", profile=profile, raw_index=raw_index, claims=claims, plan=plan)
+        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+        claims = read_model(step_dir(run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+        plan = read_model(step_dir(run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
+        outputs = render_drafts(
+            draft_root=step_dir(run_dir, "draft_rendering") / "draft_pages",
+            profile=profile,
+            raw_index=raw_index,
+            claims=claims,
+            plan=plan,
+        )
         complete_step(manifest, step_name, outputs=[_ref(run_dir, path, step_name, "markdown") for path in outputs])
     elif step_name == "validation":
-        preparation = read_model(run_dir / "raw_preparation.json", RawPreparationArtifact)
-        raw_index = read_model(run_dir / "raw_index.json", RawIndexArtifact)
-        windows = read_model(run_dir / "extraction_windows.json", ExtractionWindowsArtifact)
-        claims = read_model(run_dir / "claims.json", ClaimsArtifact)
-        plan = read_model(run_dir / "page_plan.json", PagePlanArtifact)
+        preparation = read_model(step_dir(run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
+        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+        windows = read_model(step_dir(run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
+        claims = read_model(step_dir(run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+        plan = read_model(step_dir(run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
         validate_raw_preparation(preparation)
         validate_raw_index(raw_index)
         validate_extraction_windows(raw_index, windows)
@@ -309,7 +356,7 @@ def _run_step(
         complete_step(manifest, step_name)
     elif step_name == "apply_preview":
         preview = build_apply_preview(vault, run_dir)
-        out = run_dir / "apply_preview.json"
+        out = step_dir(run_dir, "apply_preview") / "apply_preview.json"
         write_json(out, preview)
         complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "apply_preview.v1")])
     else:
@@ -417,68 +464,158 @@ def load_provider_specs(vault: Path) -> dict[str, str | dict]:
     return dict(providers)
 
 
-def create_run_snapshots(
-    run_dir: Path,
-    profile,
-    fixture_dir: Path,
-    provider_specs: dict[str, str | dict],
-) -> dict[str, dict | str]:
-    snapshot_root = run_dir / "snapshots"
-    profile_root = snapshot_root / "profile"
-    fixture_root = snapshot_root / "mock_fixture"
-    profile_root.mkdir(parents=True, exist_ok=True)
-    fixture_root.mkdir(parents=True, exist_ok=True)
-    profile_file = profile_root / "profile.yaml"
-    write_yaml(profile_file, profile.model_dump(mode="json"))
-    template_hashes: dict[str, str] = {}
-    for spec in profile.page_types.values():
-        source = profile.template_root / spec.template if profile.template_root else None
-        if source and source.exists():
-            target = profile_root / "templates" / spec.template
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
-            template_hashes[target.relative_to(run_dir).as_posix()] = sha256_file(target)
-    provider_hashes: dict[str, str] = {}
-    for source in sorted(fixture_dir.glob("*.json")):
-        target = fixture_root / source.name
-        shutil.copyfile(source, target)
-        provider_hashes[target.relative_to(run_dir).as_posix()] = sha256_file(target)
-    provider_config = snapshot_root / "provider_config.json"
-    write_json_atomic(provider_config, {"providers": provider_specs, "fixture_files": sorted(provider_hashes)})
-    provider_hashes[provider_config.relative_to(run_dir).as_posix()] = sha256_file(provider_config)
-    return {
-        "profile": sha256_file(profile_file),
-        "templates": template_hashes,
-        "providers": provider_hashes,
-    }
+def build_provider_context_record(
+    *,
+    vault: Path,
+    manifest_contexts: list[ProviderContextRecord],
+    provider_specs: dict[str, Any],
+    fixture_dir: Path | None,
+    source: str,
+    from_step: str | None,
+    affected_steps: list[str],
+) -> ProviderContextRecord:
+    providers: dict[str, ProviderRuntimeSpec] = {}
+    for task in affected_steps:
+        config = provider_config_for_task(provider_specs, task)
+        providers[task] = provider_runtime_spec_for_task(
+            vault,
+            task,
+            config,
+            fixture_dir=fixture_dir,
+            previous=previous_provider_runtime(manifest_contexts, task),
+        )
+    return ProviderContextRecord(
+        record_id=f"provider-context-{len(manifest_contexts) + 1:03d}",
+        source=source,
+        from_step=from_step,
+        affected_steps=affected_steps,
+        providers=providers,
+    )
 
 
-def _structured_call(run_dir: Path, provider_config: dict, task: str) -> StructuredModelCall:
-    return StructuredModelCall(_provider_for_task(run_dir, provider_config, task), output_dir=run_dir / "model_calls")
+def provider_config_for_task(provider_specs: dict[str, Any], task: str) -> Any:
+    if task in provider_specs:
+        return provider_specs[task]
+    if "default" in provider_specs:
+        return provider_specs["default"]
+    return "mock:fixture"
 
 
-def _provider_for_task(run_dir: Path, provider_config: dict, task: str) -> Provider:
-    providers = provider_config.get("providers", {})
-    if not isinstance(providers, dict):
-        raise PipelineError("snapshot provider_config providers must be a mapping.")
-    spec_config = providers.get(task) or providers.get("default") or "mock:fixture"
+PROVIDER_RUNTIME_KEYS = {"spec", "endpoint", "api_key_env", "fixture_dir"}
+
+
+def provider_runtime_spec_for_task(
+    vault: Path,
+    task: str,
+    config: Any,
+    *,
+    fixture_dir: Path | None,
+    previous: ProviderRuntimeSpec | None,
+) -> ProviderRuntimeSpec:
     endpoint = None
-    if isinstance(spec_config, dict):
-        spec = spec_config.get("spec") or spec_config.get("provider")
-        endpoint = spec_config.get("endpoint")
+    api_key_env = None
+    config_fixture_dir = None
+    if isinstance(config, dict):
+        if "api_key" in config:
+            raise PipelineError(f"Provider config for {task} must use api_key_env, not api_key.")
+        unknown = set(config) - PROVIDER_RUNTIME_KEYS
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise PipelineError(f"Unsupported provider config field(s) for {task}: {names}")
+        spec = config.get("spec")
+        endpoint = config.get("endpoint")
+        api_key_env = config.get("api_key_env")
+        config_fixture_dir = config.get("fixture_dir")
     else:
-        spec = spec_config
+        spec = config
     if not isinstance(spec, str) or not spec:
         raise PipelineError(f"Invalid provider config for task: {task}")
-    fixture_dir = run_dir / "snapshots" / "mock_fixture" if spec.partition(":")[0] == "mock" else None
-    return ProviderRegistry().create(spec, fixture_dir=fixture_dir, endpoint=endpoint)
+    if endpoint is not None and not isinstance(endpoint, str):
+        raise PipelineError(f"Invalid provider endpoint for task: {task}")
+    if api_key_env is not None and not isinstance(api_key_env, str):
+        raise PipelineError(f"Invalid provider api_key_env for task: {task}")
+    if config_fixture_dir is not None and not isinstance(config_fixture_dir, str):
+        raise PipelineError(f"Invalid provider fixture_dir for task: {task}")
+    provider_name = spec.partition(":")[0]
+    resolved_fixture_dir = None
+    if provider_name == "mock":
+        if fixture_dir is not None:
+            resolved_fixture_dir = fixture_dir.resolve()
+        elif config_fixture_dir:
+            resolved_fixture_dir = resolve_config_path(vault, config_fixture_dir)
+        elif previous and previous.fixture_dir:
+            resolved_fixture_dir = Path(previous.fixture_dir)
+        else:
+            raise PipelineError(f"mock provider for {task} requires fixture_dir")
+    return ProviderRuntimeSpec(
+        spec=spec,
+        endpoint=endpoint,
+        api_key_env=api_key_env,
+        fixture_dir=resolved_fixture_dir.as_posix() if resolved_fixture_dir is not None else None,
+    )
+
+
+def previous_provider_runtime(manifest_contexts: list[ProviderContextRecord], task: str) -> ProviderRuntimeSpec | None:
+    for record in reversed(manifest_contexts):
+        runtime = record.providers.get(task)
+        if runtime is not None:
+            return runtime
+    return None
+
+
+def resolve_config_path(vault: Path, value: str) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (vault / path).resolve()
+
+
+def validate_provider_context(record: ProviderContextRecord) -> None:
+    for task in record.affected_steps:
+        provider_for_task(record, task)
+
+
+def provider_context_for_step(manifest: OperationManifest, step_name: str) -> ProviderContextRecord:
+    for record in reversed(manifest.provider_contexts):
+        if step_name in record.affected_steps:
+            return record
+    raise PipelineError(f"No provider context found for step: {step_name}")
+
+
+def model_steps_from(start_step: str) -> list[str]:
+    names = set(downstream_steps(start_step))
+    return [step for step in MODEL_STEPS if step in names]
+
+
+def _structured_call(run_dir: Path, manifest: OperationManifest, task: str) -> StructuredModelCall:
+    return StructuredModelCall(
+        provider_for_task(provider_context_for_step(manifest, task), task),
+        output_dir=step_dir(run_dir, task),
+        result_filename="provider_result.json",
+    )
+
+
+def provider_for_task(record: ProviderContextRecord, task: str) -> Provider:
+    if task not in record.providers:
+        raise PipelineError(f"Provider context {record.record_id} does not cover task: {task}")
+    runtime = record.providers[task]
+    fixture_dir = Path(runtime.fixture_dir) if runtime.fixture_dir else None
+    return ProviderRegistry().create(
+        runtime.spec,
+        fixture_dir=fixture_dir,
+        endpoint=runtime.endpoint,
+        api_key_env=runtime.api_key_env,
+    )
+
+
+def step_dir(run_dir: Path, step_name: str) -> Path:
+    return run_dir / step_name
 
 
 def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
     operation_id = run_dir.name
     targets: list[ApplyTarget] = []
-    for draft in sorted((run_dir / "draft_pages").rglob("*.md")):
-        target = vault / "wiki" / draft.relative_to(run_dir / "draft_pages")
+    draft_root = step_dir(run_dir, "draft_rendering") / "draft_pages"
+    for draft in sorted(draft_root.rglob("*.md")):
+        target = vault / "wiki" / draft.relative_to(draft_root)
         if target.exists():
             preimage = sha256_file(target)
             missing = False
@@ -496,18 +633,11 @@ def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
     return ApplyPreview(operation_id=operation_id, targets=targets)
 
 
-def archive_downstream(vault: Path, operation_id: str, start_step: str) -> None:
+def delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str) -> None:
     store = RunStore(vault)
-    manifest = read_manifest(store.manifest_path(operation_id))
     run_dir = store.run_dir(operation_id)
-    paths: list[Path] = []
-    names = {step.name for step in downstream_steps(start_step)}
-    for step in manifest.steps:
-        if step.name not in names:
-            continue
-        for ref in step.outputs:
-            paths.append(run_dir / ref.relative_path)
-    archive_paths(vault, operation_id, paths)
+    for step in downstream_steps(start_step):
+        shutil.rmtree(step_dir(run_dir, step), ignore_errors=True)
 
 
 def status(vault: Path, operation_id: str) -> OperationManifest:

@@ -10,10 +10,11 @@ from rich.table import Table
 from .apply import apply_operation
 from .eval import load_eval_report, run_eval
 from .models import OperationManifest, RunMode, VerificationStatus
-from .pipeline import init_vault, latest_operation, resume_ingest, run_simplified_ingest, status as ingest_status
+from .pipeline import PipelineError, init_vault, latest_operation, resume_ingest, run_simplified_ingest, status as ingest_status
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
 from .verify import verify_run
+from .workspace import WorkspaceError
 
 app = typer.Typer(help="LLM-Wiki knowledge compilation engine.")
 ingest_app = typer.Typer(help="Run and manage simplified ingest operations.")
@@ -46,15 +47,18 @@ def ingest_run(
     mode: RunMode = RunMode.dev,
 ) -> None:
     """Run simplified Ingest through draft generation."""
-    manifest = run_simplified_ingest(
-        vault=vault,
-        raw_file=raw,
-        fixture_dir=fixture_dir,
-        profile_name=profile,
-        slug=slug,
-        run_mode=mode,
-        console=console,
-    )
+    try:
+        manifest = run_simplified_ingest(
+            vault=vault,
+            raw_file=raw,
+            fixture_dir=fixture_dir,
+            profile_name=profile,
+            slug=slug,
+            run_mode=mode,
+            console=console,
+        )
+    except (PipelineError, WorkspaceError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
 
 
@@ -92,11 +96,31 @@ def ingest_status_cmd(
 def ingest_resume(
     vault: Path,
     operation_id: str,
-    from_step: Optional[str] = typer.Option(None, "--from", help="Resume from this step, archiving this step and downstream outputs."),
+    from_step: Optional[str] = typer.Option(
+        None,
+        "--from",
+        help="Resume from this step, deleting this step and downstream outputs. Valid steps: "
+        "raw_prepare, raw_index, extraction_windows, claim_extraction, page_planning, draft_rendering, validation, apply_preview.",
+    ),
+    refresh_providers: bool = typer.Option(
+        False,
+        "--refresh-providers",
+        help="With --from STEP, read the current provider config for provider-backed rerun steps. Plain resume reuses the manifest provider context.",
+    ),
     mode: Optional[RunMode] = None,
 ) -> None:
-    """Resume an ingest operation from the first failed/pending step or from a selected step."""
-    manifest = resume_ingest(vault=vault, operation_id=operation_id, from_step=from_step, run_mode=mode, console=console)
+    """Resume without rereading provider config unless --from STEP --refresh-providers is used."""
+    try:
+        manifest = resume_ingest(
+            vault=vault,
+            operation_id=operation_id,
+            from_step=from_step,
+            refresh_providers=refresh_providers,
+            run_mode=mode,
+            console=console,
+        )
+    except (PipelineError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
 
 
@@ -132,8 +156,6 @@ def _verify_exit_code(result) -> int:
         return 5
     if VerificationStatus.missing in codes:
         return 4
-    if VerificationStatus.invalid in codes:
-        return 6
     if VerificationStatus.drift in codes:
         return 3
     return 3

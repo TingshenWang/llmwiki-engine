@@ -1,36 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 
-
-@dataclass(frozen=True)
-class StepSpec:
-    name: str
-    outputs: tuple[str, ...]
-    required_for_resume: bool = True
-
-
-STEP_REGISTRY: tuple[StepSpec, ...] = (
-    StepSpec(
-        "raw_prepare",
-        (
-            "raw_preparation.json",
-            "prepared_raw/prepared.md",
-            "prepared_raw/preparation_review.md",
-            "model_calls/raw_prepare.provider_result.json",
-        ),
-    ),
-    StepSpec("raw_index", ("raw_index.json",)),
-    StepSpec("extraction_windows", ("extraction_windows.json",)),
-    StepSpec("claim_extraction", ("claims.json", "model_calls/claim_extraction.provider_result.json")),
-    StepSpec("page_planning", ("page_plan.json", "model_calls/page_planning.provider_result.json")),
-    StepSpec("draft_rendering", ("draft_pages",)),
-    StepSpec("validation", ()),
-    StepSpec("apply_preview", ("apply_preview.json",)),
+STEP_NAMES: tuple[str, ...] = (
+    "raw_prepare",
+    "raw_index",
+    "extraction_windows",
+    "claim_extraction",
+    "page_planning",
+    "draft_rendering",
+    "validation",
+    "apply_preview",
 )
-
-
-STEP_NAMES = [step.name for step in STEP_REGISTRY]
 
 
 def step_index(name: str) -> int:
@@ -40,5 +20,5 @@ def step_index(name: str) -> int:
         raise ValueError(f"Unknown step: {name}") from exc
 
 
-def downstream_steps(name: str) -> list[StepSpec]:
-    return list(STEP_REGISTRY[step_index(name) :])
+def downstream_steps(name: str) -> list[str]:
+    return list(STEP_NAMES[step_index(name) :])

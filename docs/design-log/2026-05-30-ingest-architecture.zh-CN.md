@@ -27,7 +27,8 @@ schema、校验、artifact 和 review。
 - 每个模块都可以独立测试、评估和优化。
 - 正式 wiki 保持小而干净。
 - 本地运行缓存与可提交的 wiki 输出分离。
-- `resume` 和 `apply` 必须能防止 raw、artifact、config、wiki target 漂移。
+- `resume` 和 `apply` 必须能防止 raw、artifact、wiki target 漂移；provider
+  配置变化必须通过显式 refresh 引入。
 - Provider 可以按模块配置，从而按步骤优化成本和质量。
 - Agent 不作为默认运行时依赖。
 
@@ -46,8 +47,8 @@ Vault 布局会区分原始材料、正式 wiki 页面和本地运行态：
     runs/ingest/<operation_id>/
 ```
 
-`wiki/` 只放正式页面。运行 artifacts、drafts、previews、model calls、manifests
-和 snapshots 都留在 `.llmwiki/runs/`。
+`wiki/` 只放正式页面。运行 artifacts、drafts、previews、model calls 和 manifests
+都留在 `.llmwiki/runs/`。
 
 `.llmwiki/runs/` 是本地缓存；`.llmwiki/config.yaml`、profiles 和 applied
 receipts 可以提交，因为它们足够小、足够明确，也对审计 workflow 决策有价值。
@@ -61,7 +62,7 @@ Original raw 不被自动视为干净事实。它可能包含视频转录噪声�
 整理成 canonical prepared raw：
 
 ```text
-original raw -> raw_prepare -> prepared_raw/prepared.md
+original raw -> raw_prepare -> raw_prepare/prepared.md
 ```
 
 下游抽取和 wiki 编译会把 prepared raw 当作该次运行的事实输入。这是一个刻意设计的
@@ -122,13 +123,16 @@ validation
 apply_preview
 ```
 
+`validation` 是不产出文件的 gate step。它只校验上游 artifacts，不创建
+`validation/` 模块目录。
+
 `apply` 仍然是 preview 之后的显式命令。它会再次 verify run，检查 target preimage
 hash，写入正式 wiki 页面，并追加 applied receipt。
 
 ## Manifest、Status、Resume、Apply
 
-Manifest 是本地 workflow contract。它记录 raw bindings、step attempts、artifact
-references、profile snapshots、provider snapshots 和运行状态。
+Manifest 是本地 workflow contract。它记录 raw bindings、step attempts、当前
+artifact references、provider context records 和运行状态。
 
 `status` 同时面向人类和机器：
 
@@ -136,16 +140,19 @@ references、profile snapshots、provider snapshots 和运行状态。
 - `--json` 暴露完整结构化状态；
 - `--verify` 重新计算完整性检查，但不写文件。
 
-`resume` 默认从第一个 failed 或 pending step 继续。`resume --from STEP` 会归档目标
-step 及其下游 artifacts，把它们标记为 pending，然后从那里重跑。
+`resume` 默认从第一个 failed 或 pending step 继续，并复用 manifest 中已经记录的
+provider context；默认不会重新读取当前 `.llmwiki/config.yaml`。`resume --from STEP`
+会删除目标 step 及其下游模块目录，把这些 step 标记为 pending，然后从那里重跑。
+`resume --from STEP --refresh-providers` 会先解析当前 provider 配置，并为这次重跑范围
+记录新的 provider context。
 
 已经 applied 的 operation 不能 resume。raw drift、required artifact drift、
-snapshot drift 或 apply preimage drift 都必须阻断执行。
+或 apply preimage drift 都必须阻断执行。
 
 ## Provider Runtime 方向
 
-Provider 应该按模块选择，而不是全局只选一个模型。这可以让准备、审查等模块使用便宜
-的本地模型，同时让更难的抽取或规划任务使用更强的 API 模型。
+Provider 应该按模块选择，而不是全局只选一个模型。这可以让准备、未来保留的审查等
+模块使用便宜的本地模型，同时让更难的抽取或规划任务使用更强的 API 模型。
 
 目标 provider 方向包括：
 
@@ -157,6 +164,8 @@ Provider 应该按模块选择，而不是全局只选一个模型。这可以�
 
 每个模型驱动步骤都应该使用 structured calls，并记录 schema validation、有限
 repair、cost、latency 和失败输出诊断。
+Provider context records 是唯一的 provider 执行快照，只记录 `spec`、`endpoint`、
+`api_key_env`、`fixture_dir` 等标准运行字段；明文 API key 不能进入 manifest。
 
 ## 测试与评估方向
 

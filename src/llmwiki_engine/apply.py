@@ -28,7 +28,7 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
         if _receipt_exists(store.applied_log, operation_id):
             raise ApplyError("Applied receipt already exists for this operation.")
         require_verified(vault, manifest)
-        preview = read_model(run_dir / "apply_preview.json", ApplyPreview)
+        preview = read_model(run_dir / "apply_preview" / "apply_preview.json", ApplyPreview)
         _verify_preimages(vault, preview)
         written: list[Path] = []
         for target in preview.targets:
@@ -43,8 +43,8 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
         receipt = AppliedReceipt(
             operation_id=operation_id,
             raw_bindings=manifest.raw_bindings,
-            prepared_raw=_optional_receipt_ref(vault, run_dir / "prepared_raw" / "prepared.md", "markdown", "raw_prepare"),
-            raw_preparation=_optional_receipt_ref(vault, run_dir / "raw_preparation.json", "json", "raw_prepare"),
+            prepared_raw=_optional_receipt_ref(vault, run_dir / "raw_prepare" / "prepared.md", "markdown", "raw_prepare"),
+            raw_preparation=_optional_receipt_ref(vault, run_dir / "raw_prepare" / "raw_preparation.json", "json", "raw_prepare"),
             written_pages=[
                 artifact_ref(
                     base=vault,
@@ -56,7 +56,8 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
                 )
                 for path in written
             ],
-            profile_snapshot_hash=manifest.profile_snapshot_hash,
+            profile=manifest.profile,
+            profile_version=manifest.profile_version,
             engine_version=manifest.engine_version,
         )
         append_jsonl(store.applied_log, [receipt])

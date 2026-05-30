@@ -55,7 +55,6 @@ class VerificationStatus(str, Enum):
     drift = "drift"
     missing = "missing"
     raw_changed = "raw_changed"
-    invalid = "invalid"
 
 
 class PageTypeSpec(StrictModel):
@@ -83,15 +82,6 @@ class ProfileSpec(StrictModel):
             if spec.name != key:
                 raise ValueError(f"page_types key {key!r} does not match spec name {spec.name!r}")
         return value
-
-
-class ProviderConfig(StrictModel):
-    task: str
-    provider: str
-    model: str | None = None
-    fixture_dir: Path | None = None
-    endpoint: str | None = None
-    api_key_env: str | None = None
 
 
 class ProviderResult(StrictModel):
@@ -212,12 +202,31 @@ class RawBinding(StrictModel):
     size_bytes: int
 
 
+class ProviderRuntimeSpec(StrictModel):
+    spec: str
+    endpoint: str | None = None
+    api_key_env: str | None = None
+    fixture_dir: str | None = None
+
+
+class ProviderContextRecord(StrictModel):
+    record_id: str
+    source: Literal["initial_run", "resume_refresh"]
+    from_step: str | None = None
+    affected_steps: list[str] = Field(default_factory=list)
+    providers: dict[str, ProviderRuntimeSpec] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now)
+
+
 class StepAttempt(StrictModel):
     attempt: int
     started_at: str
     completed_at: str | None = None
     inputs: list[ArtifactRef] = Field(default_factory=list)
     outputs: list[ArtifactRef] = Field(default_factory=list)
+    provider_record_id: str | None = None
+    provider_spec: str | None = None
+    provider_context_source: Literal["initial_run", "resume_refresh"] | None = None
     error: str | None = None
 
 
@@ -233,7 +242,7 @@ class StepRecord(StrictModel):
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v2"] = "operation_manifest.v2"
+    schema_version: Literal["operation_manifest.v3"] = "operation_manifest.v3"
     operation_id: str
     operation_type: str
     run_mode: RunMode = RunMode.dev
@@ -242,9 +251,7 @@ class OperationManifest(StrictModel):
     profile_version: str = "1"
     workspace: str
     raw_bindings: list[RawBinding] = Field(default_factory=list)
-    profile_snapshot_hash: str
-    template_hashes: dict[str, str] = Field(default_factory=dict)
-    provider_snapshot_hashes: dict[str, str] = Field(default_factory=dict)
+    provider_contexts: list[ProviderContextRecord] = Field(default_factory=list)
     status: OperationStatus = OperationStatus.created
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -343,5 +350,6 @@ class AppliedReceipt(StrictModel):
     prepared_raw: ArtifactRef | None = None
     raw_preparation: ArtifactRef | None = None
     written_pages: list[ArtifactRef]
-    profile_snapshot_hash: str
+    profile: str
+    profile_version: str
     engine_version: str
