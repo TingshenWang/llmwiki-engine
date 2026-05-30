@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from llmwiki_engine.apply import ApplyError, apply_operation
+from llmwiki_engine.io import read_yaml, write_yaml
 from llmwiki_engine.models import OperationStatus, StepStatus, VerificationStatus
 from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, resume_ingest, run_simplified_ingest, status
 from llmwiki_engine.verify import VerifyError, verify_run
@@ -85,6 +86,21 @@ def test_resume_after_failed_step(tmp_path: Path) -> None:
     snapshot_fixture.write_text((FIXTURE_ROOT / "mock" / "page_planning.json").read_text(encoding="utf-8"), encoding="utf-8")
     resumed = resume_ingest(vault=vault, operation_id=operation_id)
     assert resumed.status == OperationStatus.drafted
+
+
+def test_pipeline_uses_task_provider_config(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"]["page_planning"] = "human"
+    write_yaml(config_path, config)
+
+    with pytest.raises(Exception, match="HumanProvider"):
+        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="provider")
+    operation_id = next(RunStore(vault).runs_root.iterdir()).name
+    manifest = status(vault, operation_id)
+    assert manifest.status == OperationStatus.failed
+    assert [step for step in manifest.steps if step.status == StepStatus.failed][0].name == "page_planning"
 
 
 def test_resume_from_archives_downstream_outputs(tmp_path: Path) -> None:

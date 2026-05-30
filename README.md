@@ -32,3 +32,13 @@ and drafts can be tested before real models are introduced.
 - Human review and drafts are Markdown.
 - Providers are pluggable per module.
 - Validators are hard gates; LLM critics are optional semantic reviewers.
+
+Provider selection is configured per task in `.llmwiki/config.yaml` and
+snapshotted into each run before execution:
+
+```yaml
+providers:
+  raw_prepare: mock:fixture
+  claim_extraction: openai:gpt-4.1-mini
+  page_planning: ollama:llama3
+```

@@ -29,3 +29,13 @@ llmwiki ingest apply /path/to/vault <operation_id>
 - 人类 review 和 drafts 使用 Markdown。
 - Provider 可以按模块配置。
 - Validator 是硬门禁；LLM critic 是可选的语义审查者。
+
+Provider 在 `.llmwiki/config.yaml` 里按任务配置，并会在每次运行前写入
+run snapshot：
+
+```yaml
+providers:
+  raw_prepare: mock:fixture
+  claim_extraction: openai:gpt-4.1-mini
+  page_planning: ollama:llama3
+```
