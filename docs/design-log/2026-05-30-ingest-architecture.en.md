@@ -189,6 +189,11 @@ recorded in manifests, events, provider results, receipts, status JSON, or CLI
 output. Real provider execution uses an in-memory `ProviderExecutionContext`
 instead of reconstructing credentials from the manifest.
 
+If providers beyond `openai_compatible` later need live checks, the live-check
+interface should become explicit, for example with a shared protocol and result
+object. JSON mode fallback should remain specific to OpenAI-compatible probes so
+dynamic `check_live(...)` calls do not become brittle as provider types grow.
+
 ## Test And Evaluation Direction
 
 The engine should continue to grow through module-level tests and evals rather

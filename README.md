@@ -63,6 +63,10 @@ llmwiki providers check /path/to/vault
 llmwiki providers check /path/to/vault --live
 ```
 
+`--live` sends a small real-model probe. For thinking models it uses a
+`max_tokens=512` completion cap and prefers JSON mode, then falls back to a
+prompt-only JSON probe with a warning when JSON mode is clearly unsupported.
+
 Plain `llmwiki ingest resume` reads the current merged provider config for
 model-backed steps that still need to execute. Completed steps are not rerun just
 because config changed. To rerun from a step with the current config:

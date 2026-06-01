@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -139,12 +140,51 @@ def _run_live_checks(
             if check_live is None:
                 result.error(f"{spec} {label} live check is not supported for steps {', '.join(steps)}.")
                 continue
-            raw = check_live()
-            if raw.strip() != '{"ok": true}':
-                result.error(f"{spec} {label} live check returned unexpected content for steps {', '.join(steps)}.")
+            fallback_used = False
+            try:
+                raw = check_live()
+            except ProviderError as exc:
+                if not _is_json_mode_unsupported(exc):
+                    raise
+                raw = check_live(use_json_mode=False)
+                fallback_used = True
+            _validate_live_probe_content(raw)
+            if fallback_used:
+                result.warn(
+                    f"{spec} {label} does not support JSON mode; "
+                    f"used prompt-only JSON live check for steps {', '.join(steps)}."
+                )
         except (ProviderError, httpx.HTTPError) as exc:
             message = execution_context.redactor.redact_text(str(exc))
             result.error(f"{spec} {label} live check failed for steps {', '.join(steps)}: {message}")
         finally:
             if client is not None:
                 client.close()
+
+
+def _is_json_mode_unsupported(exc: ProviderError) -> bool:
+    if exc.status_code not in {400, 422}:
+        return False
+    message = str(exc).lower()
+    json_mode_terms = ("response_format", "json_object", "json mode")
+    unsupported_terms = (
+        "unsupported",
+        "not support",
+        "does not support",
+        "unrecognized",
+        "unknown parameter",
+        "invalid parameter",
+        "not allowed",
+    )
+    return any(term in message for term in json_mode_terms) and any(term in message for term in unsupported_terms)
+
+
+def _validate_live_probe_content(raw: str) -> None:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"live check returned invalid JSON: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise ProviderError("live check JSON root must be an object.")
+    if data.get("ok") is not True:
+        raise ProviderError("live check JSON must contain ok: true.")

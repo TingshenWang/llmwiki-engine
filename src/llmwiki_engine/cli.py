@@ -200,6 +200,8 @@ def providers_check(vault: Path, live: bool = typer.Option(False, "--live", help
         console.print(f"[red]error:[/] {error}")
     if not result.ok:
         raise typer.Exit(1)
+    if live:
+        console.print("[green]live check: ok[/]")
     console.print("[green]providers check: ok[/]")
 
 

@@ -234,7 +234,13 @@ With `--live`, openai-compatible providers receive a minimal connectivity probe:
 uv run llmwiki providers check "$VAULT" --live
 ```
 
-`--live` does not write the vault and does not create a run. Mock providers only check fixtures. Human providers do not make network requests.
+`--live` does not write the vault, does not create a run, and is not a full ingest. Mock providers only check fixtures. Human providers do not make network requests. Real providers receive a small Chat Completions probe:
+
+- `temperature=0`
+- `max_tokens=512`
+- preferred `response_format={"type": "json_object"}`
+
+`max_tokens=512` is a completion cap, not a fixed cost. Thinking models usually stop earlier, but may consume up to that limit. If JSON mode is unsupported, the check retries once with a prompt-only JSON probe and reports a warning if that succeeds. `temperature=0` does not promise deterministic behavior for every thinking model.
 
 ## `llmwiki ingest run`
 

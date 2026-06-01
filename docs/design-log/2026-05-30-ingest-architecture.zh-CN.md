@@ -169,6 +169,11 @@ Provider context records 是唯一的 provider 执行快照，只记录非 secre
 manifest、events、provider result、receipt、status JSON 或 CLI 输出。真实 provider
 执行使用内存中的 `ProviderExecutionContext`，不能从 manifest 反推出 credentials。
 
+未来如果 `openai_compatible` 之外的 provider 也需要 live check，应把 live-check
+接口显式化，例如定义统一的协议和返回对象；JSON mode fallback 仍应保持为
+OpenAI-compatible 探针的专属行为，避免动态 `check_live(...)` 调用在新增 provider
+类型后变脆。
+
 ## 测试与评估方向
 
 引擎后续应该通过模块级测试和 eval 增长，而不是只依靠端到端 demo。

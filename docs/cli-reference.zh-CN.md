@@ -234,7 +234,16 @@ mock provider ... has no fixture_dir; ingest will require --fixture-dir.
 uv run llmwiki providers check "$VAULT" --live
 ```
 
-`--live` 不会写 vault，不会创建 run。mock 只检查 fixture，human 不发请求。
+`--live` 不会写 vault，不会创建 run，也不等同于完整 ingest。mock 只检查 fixture，
+human 不发请求。真实 provider 会收到一次小型 Chat Completions 探针：
+
+- `temperature=0`
+- `max_tokens=512`
+- 优先使用 `response_format={"type": "json_object"}`
+
+`max_tokens=512` 是 completion 上限，不代表固定消耗；thinking 模型通常会提前停止，
+但最多可能用到这个上限。JSON mode 不支持时，会自动重试一次 prompt-only JSON probe，
+通过后仍会给 warning。`temperature=0` 也不承诺所有 thinking 模型都完全确定性。
 
 ## `llmwiki ingest run`
 

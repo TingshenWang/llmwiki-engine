@@ -10,7 +10,9 @@ from pydantic import BaseModel
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class Provider(Protocol):
@@ -75,7 +77,7 @@ class OpenAICompatibleProvider:
         }
         return _extract_openai_compatible_content(self._post_chat(body))
 
-    def check_live(self) -> str:
+    def check_live(self, *, use_json_mode: bool = True) -> str:
         body = {
             "model": self.model,
             "messages": [
@@ -83,9 +85,11 @@ class OpenAICompatibleProvider:
                 {"role": "user", "content": 'Return exactly {"ok": true}'},
             ],
             "temperature": 0,
-            "max_tokens": 16,
+            "max_tokens": 512,
         }
-        return _extract_openai_compatible_content(self._post_chat(body, timeout=10.0))
+        if use_json_mode:
+            body["response_format"] = {"type": "json_object"}
+        return _extract_openai_compatible_content(self._post_chat(body, timeout=20.0))
 
     def _post_chat(self, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -97,8 +101,16 @@ class OpenAICompatibleProvider:
                 with httpx.Client(timeout=request_timeout) as client:
                     response = client.post(self.endpoint, json=body, headers=headers)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = str(exc)
+            if exc.response.text:
+                message = f"HTTP {exc.response.status_code}: {exc.response.text}"
+            raise ProviderError(message, status_code=exc.response.status_code) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(str(exc)) from exc
+        try:
             data = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except ValueError as exc:
             raise ProviderError(str(exc)) from exc
         if not isinstance(data, dict):
             raise ProviderError("OpenAI-compatible response root must be a JSON object.")

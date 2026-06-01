@@ -60,6 +60,10 @@ llmwiki providers check /path/to/vault
 llmwiki providers check /path/to/vault --live
 ```
 
+`--live` 会发起一次小型真实模型探针。面向 thinking 模型时，它使用
+`max_tokens=512` 的 completion 上限，并优先使用 JSON mode；如果 API 明确不支持
+JSON mode，则 fallback 到 prompt-only JSON probe，并给出 warning。
+
 普通 `llmwiki ingest resume` 会为仍需执行的模型步骤读取当前合并后的 provider
 配置。已经完成的 step 不会因为 config 改变自动重跑。
 
