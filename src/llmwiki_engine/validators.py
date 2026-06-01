@@ -47,19 +47,18 @@ def validate_extraction_windows(raw_index: RawIndexArtifact, windows: Extraction
 
 def validate_claims(raw_index: RawIndexArtifact, windows: ExtractionWindowsArtifact, claims: ClaimsArtifact) -> None:
     span_by_id = {span.span_id: span for span in raw_index.spans}
-    span_ids_by_window = {window.window_id: set(window.source_span_ids) for window in windows.windows}
+    window_ids = {window.window_id for window in windows.windows}
     for claim in claims.claims:
-        window_span_ids = span_ids_by_window.get(claim.source_window_id)
-        if window_span_ids is None:
+        if claim.source_window_id not in window_ids:
             raise ValidationError(f"{claim.claim_id} references missing extraction window {claim.source_window_id}")
+        if not claim.evidence_span_ids:
+            raise ValidationError(f"{claim.claim_id} must reference at least one evidence span")
+        if not claim.evidence_quote.strip():
+            raise ValidationError(f"{claim.claim_id} evidence_quote must not be empty")
         for span_id in claim.evidence_span_ids:
-            if span_id not in window_span_ids:
-                raise ValidationError(f"{claim.claim_id} evidence span {span_id} is outside window {claim.source_window_id}")
             span = span_by_id.get(span_id)
             if span is None:
                 raise ValidationError(f"{claim.claim_id} references missing evidence span {span_id}")
-            if claim.evidence_quote not in span.text:
-                raise ValidationError(f"{claim.claim_id} evidence_quote is not inside span {span_id}")
 
 
 def validate_page_plan(profile: ProfileSpec, claims: ClaimsArtifact, plan: PagePlanArtifact) -> None:

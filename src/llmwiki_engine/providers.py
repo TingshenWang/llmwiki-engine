@@ -9,6 +9,9 @@ import httpx
 from pydantic import BaseModel
 
 
+DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 300.0
+
+
 class ProviderError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
@@ -44,7 +47,7 @@ class OpenAICompatibleProvider:
         endpoint: str,
         api_key: str,
         *,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
         http_client: httpx.Client | None = None,
     ):
         self.model = model

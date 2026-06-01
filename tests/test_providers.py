@@ -93,6 +93,34 @@ def test_openai_compatible_live_check_uses_twenty_second_timeout() -> None:
     assert seen["timeout"] == 20.0
 
 
+def test_openai_compatible_generate_raw_defaults_to_five_minute_timeout() -> None:
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": '{"claims": []}'}}]}
+
+    class FakeClient:
+        def post(self, endpoint, *, json, headers, timeout):
+            seen["timeout"] = timeout
+            return FakeResponse()
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        http_client=FakeClient(),
+    )
+
+    assert provider.generate_raw("claim_extraction", {}, ClaimsArtifact) == '{"claims": []}'
+    assert seen["timeout"] == 300.0
+
+
 def test_openai_compatible_live_check_can_skip_json_mode() -> None:
     seen: dict[str, object] = {}
 

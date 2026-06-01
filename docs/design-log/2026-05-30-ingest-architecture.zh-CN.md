@@ -106,8 +106,11 @@ extraction 足够的局部上下文，同时保留对 prepared raw spans 的可�
 prepared raw -> raw_index -> extraction_windows -> claim_extraction
 ```
 
-Claims 必须指向 `source_window_id`，并且 evidence 必须绑定回 prepared raw spans。
-这样抽取过程可以被测试，而不会假装窗口边界就是概念边界。
+Claims 必须指向 `source_window_id`，但它表示发现这个 claim 的上下文窗口或主窗口；
+evidence 必须绑定回 prepared raw spans，但 evidence span 可以来自全文其他位置，
+用于表达同一观点在文档中反复出现或被多处支持的情况。`evidence_span_ids`
+是权威溯源绑定；`evidence_quote` 是展示文本，可以概括或拼接多个被引用的 span。
+这样抽取过程可以被测试，而不会假装窗口边界就是概念边界或证据边界。
 
 ## 当前线性 Pipeline
 

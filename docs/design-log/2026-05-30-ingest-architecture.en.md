@@ -119,9 +119,13 @@ traceability back to prepared raw spans.
 prepared raw -> raw_index -> extraction_windows -> claim_extraction
 ```
 
-Claims must point to a `source_window_id`, and their evidence must bind back to
-prepared raw spans. This makes extraction testable without pretending that
-window boundaries are conceptual boundaries.
+Claims must point to a `source_window_id` as their discovery or primary context
+window, and their evidence must bind back to prepared raw spans. Evidence spans
+may come from elsewhere in the prepared raw when the same idea is repeated or
+supported across the document. `evidence_span_ids` are the authoritative
+provenance binding; `evidence_quote` is display text and may summarize or join
+multiple referenced spans. This makes extraction testable without pretending
+that window boundaries are conceptual or evidence boundaries.
 
 ## Current Linear Pipeline
 
