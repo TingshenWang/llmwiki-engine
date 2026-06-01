@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from .hash_utils import sha256_file
 from .io import read_json, write_json_atomic
@@ -11,7 +12,7 @@ from .steps import STEP_NAMES
 def read_manifest(path: Path) -> OperationManifest:
     data = read_json(path)
     schema_version = data.get("schema_version")
-    if schema_version and schema_version != "operation_manifest.v3":
+    if schema_version != "operation_manifest.v1":
         raise ValueError(f"Unsupported manifest schema_version: {schema_version}. Create a new operation.")
     return OperationManifest.model_validate(data)
 
@@ -36,10 +37,37 @@ def begin_step_attempt(
     manifest: OperationManifest,
     name: str,
     inputs: list[ArtifactRef] | None = None,
+) -> StepAttempt:
+    return _begin_step_attempt(manifest, name, inputs=inputs)
+
+
+def begin_model_step_attempt(
+    manifest: OperationManifest,
+    name: str,
+    *,
+    provider_record_id: str,
+    provider_spec: str,
+    provider_context_source: Literal["initial_run", "resume_current_config"],
+    inputs: list[ArtifactRef] | None = None,
+) -> StepAttempt:
+    return _begin_step_attempt(
+        manifest,
+        name,
+        inputs=inputs,
+        provider_record_id=provider_record_id,
+        provider_spec=provider_spec,
+        provider_context_source=provider_context_source,
+    )
+
+
+def _begin_step_attempt(
+    manifest: OperationManifest,
+    name: str,
+    inputs: list[ArtifactRef] | None = None,
     *,
     provider_record_id: str | None = None,
     provider_spec: str | None = None,
-    provider_context_source: str | None = None,
+    provider_context_source: Literal["initial_run", "resume_current_config"] | None = None,
 ) -> StepAttempt:
     step = get_step(manifest, name)
     step.status = StepStatus.running

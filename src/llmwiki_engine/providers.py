@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from pydantic import BaseModel
 
 
@@ -35,20 +33,28 @@ class MockProvider:
         return path.read_text(encoding="utf-8")
 
 
-class OpenAIProvider:
-    name = "openai"
+class OpenAICompatibleProvider:
+    name = "openai_compatible"
 
-    def __init__(self, model: str, api_key_env: str = "OPENAI_API_KEY"):
+    def __init__(
+        self,
+        model: str,
+        endpoint: str,
+        api_key: str,
+        *,
+        timeout: float = 60.0,
+        http_client: httpx.Client | None = None,
+    ):
         self.model = model
-        self.api_key_env = api_key_env
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.timeout = timeout
+        self.http_client = http_client
 
     def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
-        api_key = os.environ.get(self.api_key_env)
-        if not api_key:
-            raise ProviderError(f"Missing API key env var: {self.api_key_env}")
         body = {
             "model": self.model,
-            "input": [
+            "messages": [
                 {
                     "role": "system",
                     "content": "Return only JSON matching the requested schema.",
@@ -65,69 +71,38 @@ class OpenAIProvider:
                     ),
                 },
             ],
+            "temperature": 0,
         }
-        request = urllib.request.Request(
-            "https://api.openai.com/v1/responses",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        return _extract_text_from_response(_http_json_text(request))
+        return _extract_openai_compatible_content(self._post_chat(body))
 
-
-class OllamaProvider:
-    name = "ollama"
-
-    def __init__(self, model: str, endpoint: str = "http://localhost:11434/api/generate"):
-        self.model = model
-        self.endpoint = endpoint
-
-    def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
+    def check_live(self) -> str:
         body = {
             "model": self.model,
-            "stream": False,
-            "format": "json",
-            "prompt": json.dumps(
-                {
-                    "instruction": "Return only JSON matching schema.",
-                    "task": task,
-                    "payload": payload,
-                    "schema": output_model.model_json_schema(),
-                },
-                ensure_ascii=False,
-            ),
+            "messages": [
+                {"role": "system", "content": "Return only JSON."},
+                {"role": "user", "content": 'Return exactly {"ok": true}'},
+            ],
+            "temperature": 0,
+            "max_tokens": 16,
         }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        data = json.loads(_http_json_text(request))
-        return data.get("response", "")
+        return _extract_openai_compatible_content(self._post_chat(body, timeout=10.0))
 
-
-class LocalHTTPProvider:
-    name = "local_http"
-
-    def __init__(self, endpoint: str, model: str | None = None):
-        self.endpoint = endpoint
-        self.model = model
-
-    def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
-        body = {
-            "model": self.model,
-            "task": task,
-            "payload": payload,
-            "schema": output_model.model_json_schema(),
-        }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        return _extract_text_from_response(_http_json_text(request))
+    def _post_chat(self, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        request_timeout = timeout if timeout is not None else self.timeout
+        try:
+            if self.http_client is not None:
+                response = self.http_client.post(self.endpoint, json=body, headers=headers, timeout=request_timeout)
+            else:
+                with httpx.Client(timeout=request_timeout) as client:
+                    response = client.post(self.endpoint, json=body, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ProviderError(str(exc)) from exc
+        if not isinstance(data, dict):
+            raise ProviderError("OpenAI-compatible response root must be a JSON object.")
+        return data
 
 
 class HumanProvider:
@@ -141,9 +116,7 @@ class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, type | object] = {
             "mock": MockProvider,
-            "openai": OpenAIProvider,
-            "ollama": OllamaProvider,
-            "local_http": LocalHTTPProvider,
+            "openai_compatible": OpenAICompatibleProvider,
             "human": HumanProvider,
         }
 
@@ -156,7 +129,8 @@ class ProviderRegistry:
         *,
         fixture_dir: Path | None = None,
         endpoint: str | None = None,
-        api_key_env: str | None = None,
+        api_key: str | None = None,
+        http_client: httpx.Client | None = None,
     ) -> Provider:
         provider_name, _, model = spec.partition(":")
         if provider_name == "mock":
@@ -165,49 +139,40 @@ class ProviderRegistry:
             if not fixture_dir.is_dir():
                 raise ProviderError(f"mock fixture_dir does not exist: {fixture_dir}")
             return MockProvider(fixture_dir)
-        if provider_name == "openai":
-            return OpenAIProvider(model or "gpt-4.1-mini", api_key_env or "OPENAI_API_KEY")
-        if provider_name == "ollama":
-            return OllamaProvider(model or "llama3", endpoint or "http://localhost:11434/api/generate")
-        if provider_name == "local_http":
+        if provider_name == "openai_compatible":
+            if not model:
+                raise ProviderError("openai_compatible provider requires model in spec")
             if endpoint is None:
-                raise ProviderError("local_http provider requires endpoint")
-            return LocalHTTPProvider(endpoint, model or None)
+                raise ProviderError("openai_compatible provider requires endpoint")
+            if api_key is None:
+                raise ProviderError("openai_compatible provider requires api_key")
+            return OpenAICompatibleProvider(model, endpoint, api_key, http_client=http_client)
         if provider_name == "human":
             return HumanProvider()
         raise ProviderError(f"Unknown provider spec: {spec}")
 
 
-def _http_json_text(request: urllib.request.Request) -> str:
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        raise ProviderError(str(exc)) from exc
-
-
-def _extract_text_from_response(raw: str) -> str:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-    if isinstance(data, dict):
-        for key in ("output_text", "response", "text", "result"):
-            value = data.get(key)
-            if isinstance(value, str):
-                return value
-        output = data.get("output")
-        if isinstance(output, list):
-            chunks: list[str] = []
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-                for content in item.get("content", []):
-                    if isinstance(content, dict) and isinstance(content.get("text"), str):
-                        chunks.append(content["text"])
-            if chunks:
-                return "\n".join(chunks)
-    return raw
+def _extract_openai_compatible_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ProviderError("OpenAI-compatible response missing choices.")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise ProviderError("OpenAI-compatible choice must be an object.")
+    message = first.get("message")
+    if not isinstance(message, dict):
+        raise ProviderError("OpenAI-compatible choice missing message.")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                chunks.append(item["text"])
+        if chunks:
+            return "\n".join(chunks)
+    raise ProviderError("OpenAI-compatible message content must be text.")
 
 
 def timed_call(provider: Provider, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> tuple[str, int]:

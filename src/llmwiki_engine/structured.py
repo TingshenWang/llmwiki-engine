@@ -9,6 +9,7 @@ from pydantic import BaseModel, ValidationError
 from .io import write_json
 from .models import ProviderResult
 from .providers import Provider, ProviderError, timed_call
+from .redaction import NO_REDACTION, Redactor
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -24,11 +25,13 @@ class StructuredModelCall:
         *,
         output_dir: Path | None = None,
         result_filename: str | None = None,
+        redactor: Redactor = NO_REDACTION,
         max_repair_attempts: int = 1,
     ):
         self.provider = provider
         self.output_dir = output_dir
         self.result_filename = result_filename
+        self.redactor = redactor
         self.max_repair_attempts = max_repair_attempts
 
     def run(self, task: str, payload: dict[str, Any], output_model: type[T]) -> tuple[T, ProviderResult]:
@@ -37,15 +40,16 @@ class StructuredModelCall:
         try:
             raw, latency_ms = timed_call(self.provider, task, payload, output_model)
         except ProviderError as exc:
+            error = self.redactor.redact_text(str(exc))
             result = ProviderResult(
                 task=task,
                 provider=self.provider.name,
                 raw_output="",
                 latency_ms=latency_ms,
-                errors=[str(exc)],
+                errors=[error],
             )
             self._persist(task, result)
-            raise StructuredOutputError(str(exc)) from exc
+            raise StructuredOutputError(error) from exc
 
         parsed: dict[str, Any] | None = None
         model: T | None = None
@@ -53,13 +57,13 @@ class StructuredModelCall:
             parsed = _parse_json(raw)
             model = output_model.model_validate(parsed)
         except (ValueError, ValidationError) as exc:
-            errors.append(str(exc))
+            errors.append(self.redactor.redact_text(str(exc)))
 
         result = ProviderResult(
             task=task,
             provider=self.provider.name,
-            raw_output=raw,
-            parsed_output=parsed,
+            raw_output=self.redactor.redact_text(raw),
+            parsed_output=self.redactor.redact(parsed),
             parse_success=parsed is not None,
             schema_valid=model is not None,
             latency_ms=latency_ms,

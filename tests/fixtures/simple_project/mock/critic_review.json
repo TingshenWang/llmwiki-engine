@@ -1,8 +1,0 @@
-{
-  "schema_version": "review_result.v1",
-  "reviewer": "mock",
-  "task": "extraction_windows",
-  "verdict": "pass",
-  "issues": [],
-  "confidence": "high"
-}

@@ -31,7 +31,8 @@ model tasks with explicit inputs, schemas, validation, artifacts, and review.
 - Keep the formal wiki small and clean.
 - Keep local run cache separate from committed wiki output.
 - Make `resume` and `apply` safe against raw, artifact, and wiki target drift;
-  provider config changes require an explicit refresh.
+  model-backed resume steps read current provider config while completed steps
+  remain unchanged unless explicitly rerun with `--from`.
 - Allow providers to differ by module so cost and quality can be tuned locally.
 - Avoid making an agent the default runtime dependency.
 
@@ -54,9 +55,10 @@ state:
 `wiki/` is only for final pages. Run artifacts, drafts, previews, model calls,
 and manifests stay under `.llmwiki/runs/`.
 
-`.llmwiki/runs/` is local cache. `.llmwiki/config.yaml`, profiles, and applied
-receipts can be committed because they are small, intentional, and useful for
-auditing workflow decisions.
+`.llmwiki/` is local runtime, configuration, and audit state. It may contain
+plaintext provider credentials in config, so `init` ignores the whole directory
+with `.gitignore`. Git-backed review and rollback should focus on `wiki/` and
+source material, not run cache.
 
 ## Original Raw And Prepared Raw
 
@@ -155,12 +157,13 @@ status.
 - `--json` should expose complete structured state;
 - `--verify` should recompute integrity checks without writing files.
 
-`resume` defaults to the first failed or pending step and reuses the provider
-context already recorded in the manifest. It does not reread the current
-`.llmwiki/config.yaml`. `resume --from STEP` deletes the chosen step's module
-directory and downstream module directories, marks those steps pending, and
-reruns from there. `resume --from STEP --refresh-providers` first resolves the
-current provider config and records a new provider context for the rerun range.
+`resume` defaults to the first failed or pending step. For the current
+execution, it reads the merged provider config and records a new sanitized
+provider context. Step attempts remain the authority for which provider each
+step actually used. Completed steps are not rerun just
+because config changed. `resume --from STEP` first validates the current provider
+execution context, then deletes the chosen step's module directory and
+downstream module directories, marks those steps pending, and reruns from there.
 
 Applied operations cannot be resumed. Raw drift, required artifact drift, or
 apply preimage drift must block execution.
@@ -171,19 +174,20 @@ Providers should be selected per module, not globally. This enables cheap local
 models for preparation, reserved future critique steps, and stronger API models
 for harder extraction or planning tasks.
 
-The intended provider direction is:
+The MVP provider set is:
 
 - `MockProvider` for deterministic fixtures and tests;
-- `OpenAIProvider` for hosted model calls;
-- `OllamaProvider` for local models;
-- `LocalHTTPProvider` for custom local services;
+- `OpenAICompatibleProvider` for hosted or routed Chat Completions-compatible APIs;
 - `HumanProvider` for explicit manual handoff points.
 
 Every model-backed step should use structured calls with schema validation,
 bounded repair, cost and latency capture, and failed-output diagnostics.
 Provider context records are the only provider execution snapshots. They store
-standard runtime fields such as `spec`, `endpoint`, `api_key_env`, and
-`fixture_dir`; plaintext API keys must not be recorded.
+only non-secret runtime fields such as `spec`, `endpoint`, and `fixture_dir`.
+Plaintext API keys are allowed in local config files, but they must not be
+recorded in manifests, events, provider results, receipts, status JSON, or CLI
+output. Real provider execution uses an in-memory `ProviderExecutionContext`
+instead of reconstructing credentials from the manifest.
 
 ## Test And Evaluation Direction
 
@@ -208,6 +212,23 @@ init -> ingest run -> status -> status --verify -> apply
 ```
 
 It does not replace unit tests, regression tests, or module evals.
+
+## Known Follow-ups From Review
+
+The current MVP deliberately leaves these cleanup items for a later pass:
+
+- add an automated end-to-end regression test proving API keys do not spread
+  into manifests, events, provider results, status JSON, applied receipts, or
+  CLI output;
+- derive module directory reads and writes from `StepSpec.output_dir`, instead
+  of relying on `run_dir / step_name` matching the current directory names;
+- remove remaining hand-written step/module lists such as `resume --from` help
+  text and eval module declarations;
+- include global/vault config source information in provider config errors;
+- replace any remaining provider "snapshot" wording with provider execution
+  record wording, so it does not conflict with the removed `snapshots/` layout;
+- cover both legacy `operation_manifest.v3` and `operation_manifest.v4` at the
+  CLI layer, not only in lower-level manifest tests.
 
 ## Open Questions
 

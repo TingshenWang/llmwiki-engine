@@ -7,18 +7,20 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .apply import apply_operation
+from .apply import ApplyError, apply_operation
 from .eval import load_eval_report, run_eval
 from .models import OperationManifest, RunMode, VerificationStatus
 from .pipeline import PipelineError, init_vault, latest_operation, resume_ingest, run_simplified_ingest, status as ingest_status
+from .provider_checks import check_providers
+from .provider_config import ProviderConfigError
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
-from .verify import verify_run
+from .verify import VerifyError, verify_run
 from .workspace import WorkspaceError
 
 app = typer.Typer(help="LLM-Wiki knowledge compilation engine.")
 ingest_app = typer.Typer(help="Run and manage simplified ingest operations.")
-providers_app = typer.Typer(help="Inspect and test providers.")
+providers_app = typer.Typer(help="Inspect and check providers.")
 profile_app = typer.Typer(help="Inspect and validate profiles.")
 eval_app = typer.Typer(help="Run module evals.")
 
@@ -41,8 +43,8 @@ def init(vault: Path, profile: str = "project_basic") -> None:
 def ingest_run(
     vault: Path,
     raw: Path,
-    fixture_dir: Path = typer.Option(..., "--fixture-dir", help="MockProvider fixture directory."),
-    profile: str = "project_basic",
+    fixture_dir: Optional[Path] = typer.Option(None, "--fixture-dir", help="MockProvider fixture directory."),
+    profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
     mode: RunMode = RunMode.dev,
 ) -> None:
@@ -57,7 +59,7 @@ def ingest_run(
             run_mode=mode,
             console=console,
         )
-    except (PipelineError, WorkspaceError, ValueError) as exc:
+    except (PipelineError, ProviderConfigError, WorkspaceError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
 
@@ -73,9 +75,12 @@ def ingest_status_cmd(
     operation_id = operation_id or latest_operation(vault)
     if operation_id is None:
         raise typer.BadParameter("No ingest operation found.")
-    manifest = ingest_status(vault, operation_id)
+    try:
+        manifest = ingest_status(vault, operation_id)
+    except (WorkspaceError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if json_output:
-        console.print(manifest.model_dump_json(indent=2))
+        typer.echo(manifest.model_dump_json(indent=2))
         if verify:
             result = verify_run(vault, manifest)
             raise typer.Exit(0 if result.ok else _verify_exit_code(result))
@@ -102,24 +107,18 @@ def ingest_resume(
         help="Resume from this step, deleting this step and downstream outputs. Valid steps: "
         "raw_prepare, raw_index, extraction_windows, claim_extraction, page_planning, draft_rendering, validation, apply_preview.",
     ),
-    refresh_providers: bool = typer.Option(
-        False,
-        "--refresh-providers",
-        help="With --from STEP, read the current provider config for provider-backed rerun steps. Plain resume reuses the manifest provider context.",
-    ),
     mode: Optional[RunMode] = None,
 ) -> None:
-    """Resume without rereading provider config unless --from STEP --refresh-providers is used."""
+    """Resume using the current provider config for steps that will execute."""
     try:
         manifest = resume_ingest(
             vault=vault,
             operation_id=operation_id,
             from_step=from_step,
-            refresh_providers=refresh_providers,
             run_mode=mode,
             console=console,
         )
-    except (PipelineError, ValueError) as exc:
+    except (PipelineError, ProviderConfigError, VerifyError, WorkspaceError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
 
@@ -164,7 +163,10 @@ def _verify_exit_code(result) -> int:
 @ingest_app.command("apply")
 def ingest_apply(vault: Path, operation_id: str, commit: bool = typer.Option(False, "--commit")) -> None:
     """Apply draft pages into the vault wiki."""
-    written = apply_operation(vault, operation_id, commit=commit)
+    try:
+        written = apply_operation(vault, operation_id, commit=commit)
+    except (ApplyError, VerifyError, WorkspaceError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Applied[/] {len(written)} draft pages")
 
 
@@ -178,11 +180,27 @@ def providers_list() -> None:
     console.print(table)
 
 
-@providers_app.command("test")
-def providers_test(provider: str, fixture_dir: Optional[Path] = typer.Option(None, "--fixture-dir")) -> None:
-    """Create a provider and report whether it is locally constructible."""
-    created = ProviderRegistry().create(provider, fixture_dir=fixture_dir)
-    console.print(f"[green]Provider OK[/]: {created.name}")
+@providers_app.command("check")
+def providers_check(vault: Path, live: bool = typer.Option(False, "--live", help="Run minimal live checks.")) -> None:
+    """Check merged provider config without creating an ingest run."""
+    result = check_providers(vault, live=live)
+    table = Table(title="Provider Check")
+    table.add_column("Step")
+    table.add_column("Spec")
+    table.add_column("Endpoint")
+    table.add_column("Credential")
+    table.add_column("Fixture")
+    for row in result.rows:
+        table.add_row(row.task, row.spec, row.endpoint or "", row.credential_label or "", row.fixture_dir or "")
+    if result.rows:
+        console.print(table)
+    for warning in result.warnings:
+        console.print(f"[yellow]warning:[/] {warning}")
+    for error in result.errors:
+        console.print(f"[red]error:[/] {error}")
+    if not result.ok:
+        raise typer.Exit(1)
+    console.print("[green]providers check: ok[/]")
 
 
 @profile_app.command("list")

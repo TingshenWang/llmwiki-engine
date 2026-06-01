@@ -205,15 +205,13 @@ class RawBinding(StrictModel):
 class ProviderRuntimeSpec(StrictModel):
     spec: str
     endpoint: str | None = None
-    api_key_env: str | None = None
     fixture_dir: str | None = None
 
 
 class ProviderContextRecord(StrictModel):
     record_id: str
-    source: Literal["initial_run", "resume_refresh"]
+    source: Literal["initial_run", "resume_current_config"]
     from_step: str | None = None
-    affected_steps: list[str] = Field(default_factory=list)
     providers: dict[str, ProviderRuntimeSpec] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
 
@@ -226,7 +224,7 @@ class StepAttempt(StrictModel):
     outputs: list[ArtifactRef] = Field(default_factory=list)
     provider_record_id: str | None = None
     provider_spec: str | None = None
-    provider_context_source: Literal["initial_run", "resume_refresh"] | None = None
+    provider_context_source: Literal["initial_run", "resume_current_config"] | None = None
     error: str | None = None
 
 
@@ -242,7 +240,7 @@ class StepRecord(StrictModel):
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v3"] = "operation_manifest.v3"
+    schema_version: Literal["operation_manifest.v1"] = "operation_manifest.v1"
     operation_id: str
     operation_type: str
     run_mode: RunMode = RunMode.dev
@@ -267,23 +265,6 @@ class EventRecord(StrictModel):
     duration_ms: int | None = None
     message: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
-
-
-class ReviewIssue(StrictModel):
-    severity: Literal["blocking", "major", "minor", "note"]
-    artifact: str
-    pointer: str | None = None
-    problem: str
-    suggested_fix: str | None = None
-
-
-class ReviewResult(StrictModel):
-    schema_version: Literal["review_result.v1"] = "review_result.v1"
-    reviewer: str
-    task: str
-    verdict: Literal["pass", "fail", "needs_human"]
-    issues: list[ReviewIssue] = Field(default_factory=list)
-    confidence: Literal["high", "medium", "low"] = "medium"
 
 
 class EvalCaseResult(StrictModel):

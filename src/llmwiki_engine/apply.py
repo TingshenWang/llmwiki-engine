@@ -9,7 +9,7 @@ from .io import append_jsonl, read_model
 from .manifest import read_manifest, write_manifest
 from .models import AppliedReceipt, ApplyPreview, ArtifactRef, ArtifactVisibility, OperationStatus, utc_now
 from .verify import require_verified
-from .workspace import RunStore, run_lock
+from .workspace import RunStore, WorkspaceError, assert_llmwiki_not_tracked_or_staged, run_lock
 
 
 class ApplyError(RuntimeError):
@@ -27,6 +27,8 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
             raise ApplyError(f"Operation is not apply-ready: {manifest.status}")
         if _receipt_exists(store.applied_log, operation_id):
             raise ApplyError("Applied receipt already exists for this operation.")
+        if commit:
+            _preflight_commit(vault)
         require_verified(vault, manifest)
         preview = read_model(run_dir / "apply_preview" / "apply_preview.json", ApplyPreview)
         _verify_preimages(vault, preview)
@@ -108,7 +110,13 @@ def read_json_line(line: str) -> dict:
 
 
 def commit_changes(vault: Path, operation_id: str) -> None:
-    if not (vault / ".git").exists():
-        raise ApplyError("Cannot commit because vault is not a Git repository.")
-    subprocess.run(["git", "add", "wiki", ".llmwiki/config.yaml", ".llmwiki/profiles", ".llmwiki/applied"], cwd=vault, check=True)
-    subprocess.run(["git", "commit", "-m", f"apply ingest {operation_id}"], cwd=vault, check=True)
+    _preflight_commit(vault)
+    subprocess.run(["git", "add", "wiki"], cwd=vault, check=True)
+    subprocess.run(["git", "commit", "--only", "-m", f"apply ingest {operation_id}", "--", "wiki"], cwd=vault, check=True)
+
+
+def _preflight_commit(vault: Path) -> None:
+    try:
+        assert_llmwiki_not_tracked_or_staged(vault)
+    except WorkspaceError as exc:
+        raise ApplyError(str(exc)) from exc

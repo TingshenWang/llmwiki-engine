@@ -5,6 +5,7 @@ description = "A modular knowledge-compilation engine for LLM-Wiki style vaults.
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "httpx>=0.28",
   "pydantic>=2.7",
   "pyyaml>=6.0",
   "rich>=13.7",
@@ -29,4 +30,3 @@ packages = ["src/llmwiki_engine"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-

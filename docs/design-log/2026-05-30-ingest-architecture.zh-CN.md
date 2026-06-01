@@ -27,8 +27,8 @@ schema、校验、artifact 和 review。
 - 每个模块都可以独立测试、评估和优化。
 - 正式 wiki 保持小而干净。
 - 本地运行缓存与可提交的 wiki 输出分离。
-- `resume` 和 `apply` 必须能防止 raw、artifact、wiki target 漂移；provider
-  配置变化必须通过显式 refresh 引入。
+- `resume` 和 `apply` 必须能防止 raw、artifact、wiki target 漂移；需要执行的
+  模型步骤会读取当前 provider config，已完成步骤不会自动重跑，除非显式 `--from`。
 - Provider 可以按模块配置，从而按步骤优化成本和质量。
 - Agent 不作为默认运行时依赖。
 
@@ -50,8 +50,9 @@ Vault 布局会区分原始材料、正式 wiki 页面和本地运行态：
 `wiki/` 只放正式页面。运行 artifacts、drafts、previews、model calls 和 manifests
 都留在 `.llmwiki/runs/`。
 
-`.llmwiki/runs/` 是本地缓存；`.llmwiki/config.yaml`、profiles 和 applied
-receipts 可以提交，因为它们足够小、足够明确，也对审计 workflow 决策有价值。
+`.llmwiki/` 是本地运行状态、配置和审计状态。它可能在 config 中包含明文
+provider credentials，所以 `init` 会在 `.gitignore` 中忽略整个目录。Git 层面的
+review 和回退应该聚焦 `wiki/` 与 source material，而不是 run cache。
 
 ## Original Raw 与 Prepared Raw
 
@@ -140,11 +141,12 @@ artifact references、provider context records 和运行状态。
 - `--json` 暴露完整结构化状态；
 - `--verify` 重新计算完整性检查，但不写文件。
 
-`resume` 默认从第一个 failed 或 pending step 继续，并复用 manifest 中已经记录的
-provider context；默认不会重新读取当前 `.llmwiki/config.yaml`。`resume --from STEP`
-会删除目标 step 及其下游模块目录，把这些 step 标记为 pending，然后从那里重跑。
-`resume --from STEP --refresh-providers` 会先解析当前 provider 配置，并为这次重跑范围
-记录新的 provider context。
+`resume` 默认从第一个 failed 或 pending step 继续。对于本次执行，它会读取当前合并后
+的 provider config，并记录新的 sanitized provider context；每个 step 实际用了什么
+provider，以 step attempt 为准。已经完成的 step 不会仅因为 config 改变而自动重跑。
+`resume --from STEP` 会先验证
+当前 provider execution context，再删除目标 step 及其下游模块目录，把这些 step
+标记为 pending，然后从那里重跑。
 
 已经 applied 的 operation 不能 resume。raw drift、required artifact drift、
 或 apply preimage drift 都必须阻断执行。
@@ -154,18 +156,18 @@ provider context；默认不会重新读取当前 `.llmwiki/config.yaml`。`resu
 Provider 应该按模块选择，而不是全局只选一个模型。这可以让准备、未来保留的审查等
 模块使用便宜的本地模型，同时让更难的抽取或规划任务使用更强的 API 模型。
 
-目标 provider 方向包括：
+MVP provider 集合包括：
 
 - `MockProvider`：用于确定性 fixtures 和测试；
-- `OpenAIProvider`：用于线上模型调用；
-- `OllamaProvider`：用于本地模型；
-- `LocalHTTPProvider`：用于自定义本地服务；
+- `OpenAICompatibleProvider`：用于 hosted 或 API 中转站的 Chat Completions-compatible 接口；
 - `HumanProvider`：用于显式人工交接点。
 
 每个模型驱动步骤都应该使用 structured calls，并记录 schema validation、有限
 repair、cost、latency 和失败输出诊断。
-Provider context records 是唯一的 provider 执行快照，只记录 `spec`、`endpoint`、
-`api_key_env`、`fixture_dir` 等标准运行字段；明文 API key 不能进入 manifest。
+Provider context records 是唯一的 provider 执行快照，只记录非 secret 运行字段：
+`spec`、`endpoint`、`fixture_dir`。明文 API key 允许保存在本地 config，但不能进入
+manifest、events、provider result、receipt、status JSON 或 CLI 输出。真实 provider
+执行使用内存中的 `ProviderExecutionContext`，不能从 manifest 反推出 credentials。
 
 ## 测试与评估方向
 
@@ -189,6 +191,21 @@ init -> ingest run -> status -> status --verify -> apply
 ```
 
 但它不能替代 unit tests、regression tests 或 module evals。
+
+## Review 已知后续项
+
+当前 MVP 有意把下面这些清理项留到后续单独收口：
+
+- 增加一个端到端自动化回归测试，证明 API key 不会扩散到 manifest、events、
+  provider result、status JSON、applied receipt 或 CLI 输出；
+- 模块目录的读写也从 `StepSpec.output_dir` 派生，不再依赖
+  `run_dir / step_name` 恰好等于当前目录名；
+- 移除剩余手写 step/module 列表，例如 `resume --from` help 文案和 eval module 声明；
+- provider config 错误中补充 global/vault 配置来源信息，方便定位是哪份 config 出错；
+- 把剩余 provider “snapshot/快照” 表述改成 provider execution record / provider 执行记录，
+  避免和已经删除的 `snapshots/` 布局混淆；
+- CLI 层也同时覆盖旧 `operation_manifest.v3` 和 `operation_manifest.v4`，不只在底层
+  manifest 测试里覆盖。
 
 ## 开放问题
 

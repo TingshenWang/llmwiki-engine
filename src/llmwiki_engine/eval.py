@@ -11,8 +11,6 @@ SUPPORTED_MODULES = {
     "extraction_windows",
     "claim_extraction",
     "page_planning",
-    "section_fill",
-    "critic_review",
 }
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import subprocess
 from pathlib import Path
 from typing import Iterator
 
@@ -28,10 +29,6 @@ class RunStore:
     def applied_log(self) -> Path:
         return self.llmwiki / "applied" / "operations.jsonl"
 
-    @property
-    def config_path(self) -> Path:
-        return self.llmwiki / "config.yaml"
-
     def run_dir(self, operation_id: str) -> Path:
         return self.runs_root / operation_id
 
@@ -41,7 +38,7 @@ class RunStore:
     def lock_path(self, operation_id: str) -> Path:
         return self.run_dir(operation_id) / ".lock"
 
-def ensure_v2_layout(vault: Path) -> None:
+def ensure_workspace_layout(vault: Path) -> None:
     if (vault / "stage" / "ingest").exists() and not (vault / ".llmwiki").exists():
         raise WorkspaceError("Legacy stage/ingest layout detected. Re-run init and create a new operation.")
     store = RunStore(vault)
@@ -55,11 +52,60 @@ def ensure_v2_layout(vault: Path) -> None:
 
 def ensure_gitignore(vault: Path) -> None:
     path = vault / ".gitignore"
-    line = ".llmwiki/runs/"
+    line = ".llmwiki/"
     existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    existing = [item for item in existing if item != ".llmwiki/runs/"]
     if line not in existing:
         existing.append(line)
-        path.write_text("\n".join(existing).strip() + "\n", encoding="utf-8")
+    path.write_text("\n".join(existing).strip() + "\n", encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class LlmwikiGitState:
+    is_git_repo: bool
+    tracked: list[str]
+    staged: list[str]
+    root: Path | None = None
+
+
+def llmwiki_git_state(vault: Path) -> LlmwikiGitState:
+    root = _git_root(vault)
+    if root is None:
+        return LlmwikiGitState(is_git_repo=False, tracked=[], staged=[])
+    rel = _relative_git_path(root, vault / ".llmwiki")
+    tracked = _git_paths(root, ["git", "ls-files", "-z", "--", rel])
+    staged = _git_paths(root, ["git", "diff", "--cached", "--name-only", "-z", "--", rel])
+    return LlmwikiGitState(is_git_repo=True, tracked=tracked, staged=staged, root=root)
+
+
+def assert_llmwiki_not_tracked_or_staged(vault: Path) -> None:
+    state = llmwiki_git_state(vault)
+    if not state.is_git_repo:
+        raise WorkspaceError("Cannot commit because vault is not a Git repository.")
+    if state.tracked or state.staged:
+        paths = ", ".join(sorted(set(state.tracked + state.staged)))
+        raise WorkspaceError(f".llmwiki/ must not be tracked or staged by Git: {paths}")
+
+
+def _git_paths(vault: Path, args: list[str]) -> list[str]:
+    result = subprocess.run(args, cwd=vault, check=False, capture_output=True)
+    if result.returncode != 0:
+        raise WorkspaceError(result.stderr.decode("utf-8", errors="replace").strip() or "git command failed")
+    return [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+
+
+def _git_root(vault: Path) -> Path | None:
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=vault, check=False, capture_output=True)
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.decode("utf-8").strip()).resolve()
+
+
+def _relative_git_path(root: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(root).as_posix()
+    except ValueError as exc:
+        raise WorkspaceError(f"Vault path is outside Git root: {path}") from exc
 
 
 @contextmanager
@@ -94,4 +140,6 @@ def resolve_raw_path(vault: Path, raw_file: Path) -> tuple[Path, str]:
     raw_rel = Path("raw") / rel
     if ".." in raw_rel.parts:
         raise WorkspaceError("Raw path traversal is not allowed.")
+    if not resolved.is_file():
+        raise WorkspaceError(f"Raw input file does not exist: {raw_rel.as_posix()}")
     return resolved, raw_rel.as_posix()

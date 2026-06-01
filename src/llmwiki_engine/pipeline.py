@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from rich.console import Console
+from pydantic import BaseModel
 
 from . import __version__
 from .events import EventLogger
 from .hash_utils import artifact_ref, sha256_bytes, sha256_file
 from .io import read_model, read_yaml, write_json, write_yaml
 from .manifest import (
+    begin_model_step_attempt,
     begin_step_attempt,
     complete_step,
     fail_step,
@@ -32,8 +35,6 @@ from .models import (
     OperationManifest,
     OperationStatus,
     PagePlanArtifact,
-    ProviderContextRecord,
-    ProviderRuntimeSpec,
     RawBinding,
     RawIndexArtifact,
     RawPreparationArtifact,
@@ -42,14 +43,14 @@ from .models import (
     StepStatus,
     utc_now,
 )
+from .provider_config import ProviderExecutionContext, build_provider_execution_context
 from .profiles import load_profile
-from .providers import Provider, ProviderRegistry
 from .rendering import normalized_page_plan, render_drafts
-from .steps import STEP_NAMES, downstream_steps
+from .steps import MODEL_BACKED_STEPS, STEP_NAMES, STEP_SPECS, StepSpec, downstream_steps
 from .structured import StructuredModelCall
 from .validators import validate_claims, validate_extraction_windows, validate_page_plan, validate_raw_index, validate_raw_preparation
 from .verify import require_verified
-from .workspace import RunStore, ensure_v2_layout, relative_to_vault, resolve_raw_path, run_lock
+from .workspace import RunStore, ensure_workspace_layout, relative_to_vault, resolve_raw_path, run_lock
 
 
 class PipelineError(RuntimeError):
@@ -70,7 +71,6 @@ RAW_PREPARE_CONTRACT = {
 EXTRACTION_WINDOW_STRATEGY = "deterministic_span_window"
 DEFAULT_EXTRACTION_WINDOW_MAX_CHARS = 2200
 DEFAULT_EXTRACTION_WINDOW_OVERLAP_SPANS = 1
-MODEL_STEPS = ("raw_prepare", "claim_extraction", "page_planning")
 
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
@@ -78,7 +78,7 @@ def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
     (vault / "raw").mkdir(parents=True, exist_ok=True)
     for spec in profile.page_types.values():
         (vault / "wiki" / spec.directory).mkdir(parents=True, exist_ok=True)
-    ensure_v2_layout(vault)
+    ensure_workspace_layout(vault)
     profile_root = vault / ".llmwiki" / "profiles" / profile.name
     (profile_root / "templates").mkdir(parents=True, exist_ok=True)
     write_yaml(profile_root / "profile.yaml", profile.model_dump(mode="json"))
@@ -105,30 +105,29 @@ def run_simplified_ingest(
     *,
     vault: Path,
     raw_file: Path,
-    fixture_dir: Path,
-    profile_name: str = "project_basic",
+    fixture_dir: Path | None = None,
+    profile_name: str | None = None,
     slug: str | None = None,
     run_mode: RunMode = RunMode.dev,
     console: Console | None = None,
 ) -> OperationManifest:
-    ensure_v2_layout(vault)
+    ensure_workspace_layout(vault)
     raw_path, raw_rel = resolve_raw_path(vault, raw_file)
     raw_hash, raw_size = raw_ref(raw_path)
     operation_id = f"ING-{safe_timestamp()}-{slug or raw_path.stem}"
     store = RunStore(vault)
-    run_dir = store.run_dir(operation_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    profile = load_profile(vault / ".llmwiki" / "profiles" / profile_name)
-    provider_specs = load_provider_specs(vault)
-    provider_context = build_provider_context_record(
+    resolved_profile_name = resolve_vault_profile_name(vault, profile_name)
+    profile = load_profile(vault / ".llmwiki" / "profiles" / resolved_profile_name)
+    provider_execution_context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
-        provider_specs=provider_specs,
         fixture_dir=fixture_dir,
         source="initial_run",
         from_step=None,
-        affected_steps=list(MODEL_STEPS),
+        tasks=list(MODEL_BACKED_STEPS),
     )
+    run_dir = store.run_dir(operation_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
     manifest = OperationManifest(
         operation_id=operation_id,
         operation_type="ingest",
@@ -138,12 +137,18 @@ def run_simplified_ingest(
         profile_version=profile.version,
         workspace=relative_to_vault(vault, run_dir),
         raw_bindings=[RawBinding(relative_path=raw_rel, sha256=raw_hash, size_bytes=raw_size)],
-        provider_contexts=[provider_context],
+        provider_contexts=[provider_execution_context.record] if provider_execution_context.record else [],
         steps=initial_steps(),
     )
     write_manifest(store.manifest_path(operation_id), manifest)
     with run_lock(vault, operation_id):
-        return execute_ingest(vault, operation_id, start_step=STEP_NAMES[0], console=console)
+        return execute_ingest(
+            vault,
+            operation_id,
+            start_step=STEP_NAMES[0],
+            execution_context=provider_execution_context,
+            console=console,
+        )
 
 
 def resume_ingest(
@@ -151,7 +156,6 @@ def resume_ingest(
     vault: Path,
     operation_id: str,
     from_step: str | None = None,
-    refresh_providers: bool = False,
     run_mode: RunMode | None = None,
     console: Console | None = None,
 ) -> OperationManifest:
@@ -160,46 +164,50 @@ def resume_ingest(
         manifest = read_manifest(store.manifest_path(operation_id))
         if manifest.status == OperationStatus.applied:
             raise PipelineError("Applied operations are immutable. Start a new operation instead.")
-        if refresh_providers and from_step is None:
-            raise PipelineError("--refresh-providers requires --from STEP.")
         require_verified(vault, manifest)
         start = from_step or first_resumable_step(manifest)
         if start is None:
             return manifest
-        if refresh_providers:
-            provider_specs = load_provider_specs(vault)
-            affected_steps = model_steps_from(start)
-            if not affected_steps:
-                raise PipelineError(f"--refresh-providers has no provider-backed steps from {start}.")
-            provider_context = build_provider_context_record(
-                vault=vault,
-                manifest_contexts=manifest.provider_contexts,
-                provider_specs=provider_specs,
-                fixture_dir=None,
-                source="resume_refresh",
-                from_step=start,
-                affected_steps=affected_steps,
-            )
-            validate_provider_context(provider_context)
-            manifest.provider_contexts.append(provider_context)
-            if console is not None:
-                console.print(
-                    f"[yellow]Refreshing providers[/] from [bold]{start}[/] "
-                    f"for model steps: {', '.join(affected_steps) or 'none'}"
-                )
+        model_steps = model_steps_from(start)
+        provider_execution_context = build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=manifest.provider_contexts,
+            fixture_dir=None,
+            source="resume_current_config",
+            from_step=start,
+            tasks=model_steps,
+        )
+        if provider_execution_context.record is not None:
+            manifest.provider_contexts.append(provider_execution_context.record)
         if from_step is not None:
+            write_manifest(store.manifest_path(operation_id), manifest)
             delete_downstream_step_dirs(vault, operation_id, from_step)
             mark_from_pending(manifest, from_step)
             if run_mode is not None:
                 manifest.run_mode = run_mode
             write_manifest(store.manifest_path(operation_id), manifest)
-        return execute_ingest(vault, operation_id, start_step=start, console=console)
+        else:
+            write_manifest(store.manifest_path(operation_id), manifest)
+        return execute_ingest(
+            vault,
+            operation_id,
+            start_step=start,
+            execution_context=provider_execution_context,
+            console=console,
+        )
 
 
-def execute_ingest(vault: Path, operation_id: str, *, start_step: str, console: Console | None = None) -> OperationManifest:
+def execute_ingest(
+    vault: Path,
+    operation_id: str,
+    *,
+    start_step: str,
+    execution_context: ProviderExecutionContext,
+    console: Console | None = None,
+) -> OperationManifest:
     store = RunStore(vault)
     run_dir = store.run_dir(operation_id)
-    logger = EventLogger(operation_id, run_dir / "events.jsonl", console=console)
+    logger = EventLogger(operation_id, run_dir / "events.jsonl", console=console, redactor=execution_context.redactor)
     manifest = read_manifest(store.manifest_path(operation_id))
     profile = load_profile(vault / ".llmwiki" / "profiles" / manifest.profile)
     raw_path = vault / manifest.raw_bindings[0].relative_path
@@ -217,12 +225,14 @@ def execute_ingest(vault: Path, operation_id: str, *, start_step: str, console: 
                 profile,
                 manifest,
                 logger,
+                execution_context,
             )
         except Exception as exc:
-            fail_step(manifest, step_name, str(exc))
+            message = execution_context.redactor.redact_text(str(exc))
+            fail_step(manifest, step_name, message)
             write_manifest(store.manifest_path(operation_id), manifest)
-            logger.emit(step_name, "failed", status="failed", message=str(exc))
-            raise
+            logger.emit(step_name, "failed", status="failed", message=message)
+            raise PipelineError(message) from exc
         write_manifest(store.manifest_path(operation_id), manifest)
     manifest.status = OperationStatus.drafted
     write_manifest(store.manifest_path(operation_id), manifest)
@@ -238,130 +248,213 @@ def _run_step(
     profile,
     manifest: OperationManifest,
     logger: EventLogger,
+    execution_context: ProviderExecutionContext,
 ) -> None:
     logger.emit(step_name, "started", status="running")
-    provider_record = provider_context_for_step(manifest, step_name) if step_name in MODEL_STEPS else None
-    provider_runtime = provider_record.providers.get(step_name) if provider_record else None
-    begin_step_attempt(
-        manifest,
-        step_name,
-        provider_record_id=provider_record.record_id if provider_record else None,
-        provider_spec=provider_runtime.spec if provider_runtime else None,
-        provider_context_source=provider_record.source if provider_record else None,
-    )
-    write_manifest(manifest_path, manifest)
-    if step_name == "raw_prepare":
-        step_root = step_dir(run_dir, "raw_prepare")
-        raw_rel = relative_to_vault(vault, raw_path)
-        payload = {
-            "source_raw_path": raw_rel,
-            "source_raw_sha256": sha256_file(raw_path),
-            "original_markdown": raw_path.read_text(encoding="utf-8"),
-            "contract": RAW_PREPARE_CONTRACT,
-        }
-        preparation, _ = _structured_call(run_dir, manifest, "raw_prepare").run(
-            "raw_prepare",
-            payload,
-            RawPreparationArtifact,
-        )
-        validate_raw_preparation(preparation)
-        if preparation.source_raw_path != raw_rel:
-            raise PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
-        out = step_root / "raw_preparation.json"
-        write_json(out, preparation)
-        prepared = step_root / "prepared.md"
-        prepared.parent.mkdir(parents=True, exist_ok=True)
-        prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
-        review = step_root / "preparation_review.md"
-        review.write_text(render_preparation_review(preparation), encoding="utf-8")
-        outputs = [
-            _ref(run_dir, out, step_name, "json", "raw_preparation.v0"),
-            _ref(run_dir, prepared, step_name, "markdown"),
-            _ref(run_dir, review, step_name, "markdown"),
-        ]
-        provider_result = step_root / "provider_result.json"
-        if provider_result.exists():
-            outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
-        complete_step(manifest, step_name, outputs=outputs)
-    elif step_name == "raw_index":
-        prepared_path = step_dir(run_dir, "raw_prepare") / "prepared.md"
-        raw_index = build_raw_index(vault, prepared_path, original_raw_path=raw_path)
-        out = step_dir(run_dir, "raw_index") / "raw_index.json"
-        write_json(out, raw_index)
-        complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "raw_index.v1")])
-    elif step_name == "extraction_windows":
-        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-        windows = build_extraction_windows(raw_index)
-        out = step_dir(run_dir, "extraction_windows") / "extraction_windows.json"
-        write_json(out, windows)
-        complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "extraction_windows.v0")])
-    elif step_name == "claim_extraction":
-        step_root = step_dir(run_dir, "claim_extraction")
-        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-        windows = read_model(step_dir(run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
-        payload = {"raw_index": raw_index.model_dump(mode="json"), "extraction_windows": windows.model_dump(mode="json")}
-        claims, _ = _structured_call(run_dir, manifest, "claim_extraction").run(
-            "claim_extraction",
-            payload,
-            ClaimsArtifact,
-        )
-        out = step_root / "claims.json"
-        write_json(out, claims)
-        outputs = [_ref(run_dir, out, step_name, "json", "claims.v1")]
-        provider_result = step_root / "provider_result.json"
-        if provider_result.exists():
-            outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
-        complete_step(manifest, step_name, outputs=outputs)
-    elif step_name == "page_planning":
-        step_root = step_dir(run_dir, "page_planning")
-        claims = read_model(step_dir(run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
-        payload = {"profile": profile.model_dump(mode="json"), "claims": claims.model_dump(mode="json")}
-        plan, _ = _structured_call(run_dir, manifest, "page_planning").run(
-            "page_planning",
-            payload,
-            PagePlanArtifact,
-        )
-        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-        plan = normalized_page_plan(raw_index, claims, plan)
-        out = step_root / "page_plan.json"
-        write_json(out, plan)
-        outputs = [_ref(run_dir, out, step_name, "json", "page_plan.v1")]
-        provider_result = step_root / "provider_result.json"
-        if provider_result.exists():
-            outputs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
-        complete_step(manifest, step_name, outputs=outputs)
-    elif step_name == "draft_rendering":
-        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-        claims = read_model(step_dir(run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
-        plan = read_model(step_dir(run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
-        outputs = render_drafts(
-            draft_root=step_dir(run_dir, "draft_rendering") / "draft_pages",
-            profile=profile,
-            raw_index=raw_index,
-            claims=claims,
-            plan=plan,
-        )
-        complete_step(manifest, step_name, outputs=[_ref(run_dir, path, step_name, "markdown") for path in outputs])
-    elif step_name == "validation":
-        preparation = read_model(step_dir(run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
-        raw_index = read_model(step_dir(run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-        windows = read_model(step_dir(run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
-        claims = read_model(step_dir(run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
-        plan = read_model(step_dir(run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
-        validate_raw_preparation(preparation)
-        validate_raw_index(raw_index)
-        validate_extraction_windows(raw_index, windows)
-        validate_claims(raw_index, windows, claims)
-        validate_page_plan(profile, claims, plan)
-        complete_step(manifest, step_name)
-    elif step_name == "apply_preview":
-        preview = build_apply_preview(vault, run_dir)
-        out = step_dir(run_dir, "apply_preview") / "apply_preview.json"
-        write_json(out, preview)
-        complete_step(manifest, step_name, outputs=[_ref(run_dir, out, step_name, "json", "apply_preview.v1")])
-    else:
+    runner = STEP_RUNNERS.get(step_name)
+    if runner is None:
         raise PipelineError(f"Unknown step: {step_name}")
+    provider_record = execution_context.record if runner.spec.model_backed else None
+    provider_runtime = provider_record.providers.get(step_name) if provider_record else None
+    if runner.spec.model_backed:
+        if provider_record is None or provider_runtime is None:
+            raise PipelineError(f"No provider execution context found for model-backed step: {step_name}")
+        begin_model_step_attempt(
+            manifest,
+            step_name,
+            provider_record_id=provider_record.record_id,
+            provider_spec=provider_runtime.spec,
+            provider_context_source=provider_record.source,
+        )
+    else:
+        begin_step_attempt(manifest, step_name)
+    write_manifest(manifest_path, manifest)
+    ctx = StepRunContext(
+        vault=vault,
+        run_dir=run_dir,
+        raw_path=raw_path,
+        profile=profile,
+        manifest=manifest,
+        execution_context=execution_context,
+    )
+    runner.run(ctx)
     logger.emit(step_name, "completed", status="completed")
+
+
+@dataclass(frozen=True)
+class StepRunContext:
+    vault: Path
+    run_dir: Path
+    raw_path: Path
+    profile: Any
+    manifest: OperationManifest
+    execution_context: ProviderExecutionContext
+
+
+def _run_raw_prepare(ctx: StepRunContext) -> None:
+    step_name = "raw_prepare"
+    step_root = step_dir(ctx.run_dir, step_name)
+    raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
+    payload = {
+        "source_raw_path": raw_rel,
+        "source_raw_sha256": sha256_file(ctx.raw_path),
+        "original_markdown": ctx.raw_path.read_text(encoding="utf-8"),
+        "contract": RAW_PREPARE_CONTRACT,
+    }
+    preparation, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
+        step_name,
+        payload,
+        RawPreparationArtifact,
+    )
+    preparation = _redacted_model(ctx, preparation, RawPreparationArtifact)
+    validate_raw_preparation(preparation)
+    if preparation.source_raw_path != raw_rel:
+        raise PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
+    out = step_root / "raw_preparation.json"
+    write_json(out, preparation)
+    prepared = step_root / "prepared.md"
+    prepared.parent.mkdir(parents=True, exist_ok=True)
+    prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
+    review = step_root / "preparation_review.md"
+    review.write_text(render_preparation_review(preparation), encoding="utf-8")
+    outputs = [
+        _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v0"),
+        _ref(ctx.run_dir, prepared, step_name, "markdown"),
+        _ref(ctx.run_dir, review, step_name, "markdown"),
+    ]
+    provider_result = step_root / "provider_result.json"
+    if provider_result.exists():
+        outputs.append(_ref(ctx.run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
+    complete_step(ctx.manifest, step_name, outputs=outputs)
+
+
+def _run_raw_index(ctx: StepRunContext) -> None:
+    step_name = "raw_index"
+    prepared_path = step_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
+    raw_index = build_raw_index(ctx.vault, prepared_path, original_raw_path=ctx.raw_path)
+    out = step_dir(ctx.run_dir, step_name) / "raw_index.json"
+    write_json(out, raw_index)
+    complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "raw_index.v1")])
+
+
+def _run_extraction_windows(ctx: StepRunContext) -> None:
+    step_name = "extraction_windows"
+    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    windows = build_extraction_windows(raw_index)
+    out = step_dir(ctx.run_dir, step_name) / "extraction_windows.json"
+    write_json(out, windows)
+    complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "extraction_windows.v0")])
+
+
+def _run_claim_extraction(ctx: StepRunContext) -> None:
+    step_name = "claim_extraction"
+    step_root = step_dir(ctx.run_dir, step_name)
+    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    windows = read_model(step_dir(ctx.run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
+    payload = {"raw_index": raw_index.model_dump(mode="json"), "extraction_windows": windows.model_dump(mode="json")}
+    claims, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
+        step_name,
+        payload,
+        ClaimsArtifact,
+    )
+    claims = _redacted_model(ctx, claims, ClaimsArtifact)
+    out = step_root / "claims.json"
+    write_json(out, claims)
+    outputs = [_ref(ctx.run_dir, out, step_name, "json", "claims.v1")]
+    provider_result = step_root / "provider_result.json"
+    if provider_result.exists():
+        outputs.append(_ref(ctx.run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
+    complete_step(ctx.manifest, step_name, outputs=outputs)
+
+
+def _run_page_planning(ctx: StepRunContext) -> None:
+    step_name = "page_planning"
+    step_root = step_dir(ctx.run_dir, step_name)
+    claims = read_model(step_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+    payload = {"profile": ctx.profile.model_dump(mode="json"), "claims": claims.model_dump(mode="json")}
+    plan, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
+        step_name,
+        payload,
+        PagePlanArtifact,
+    )
+    plan = _redacted_model(ctx, plan, PagePlanArtifact)
+    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    plan = normalized_page_plan(raw_index, claims, plan)
+    out = step_root / "page_plan.json"
+    write_json(out, plan)
+    outputs = [_ref(ctx.run_dir, out, step_name, "json", "page_plan.v1")]
+    provider_result = step_root / "provider_result.json"
+    if provider_result.exists():
+        outputs.append(_ref(ctx.run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
+    complete_step(ctx.manifest, step_name, outputs=outputs)
+
+
+def _run_draft_rendering(ctx: StepRunContext) -> None:
+    step_name = "draft_rendering"
+    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    claims = read_model(step_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+    plan = read_model(step_dir(ctx.run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
+    outputs = render_drafts(
+        draft_root=step_dir(ctx.run_dir, step_name) / "draft_pages",
+        profile=ctx.profile,
+        raw_index=raw_index,
+        claims=claims,
+        plan=plan,
+    )
+    complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, path, step_name, "markdown") for path in outputs])
+
+
+def _run_validation(ctx: StepRunContext) -> None:
+    step_name = "validation"
+    preparation = read_model(step_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
+    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    windows = read_model(step_dir(ctx.run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
+    claims = read_model(step_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+    plan = read_model(step_dir(ctx.run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
+    validate_raw_preparation(preparation)
+    validate_raw_index(raw_index)
+    validate_extraction_windows(raw_index, windows)
+    validate_claims(raw_index, windows, claims)
+    validate_page_plan(ctx.profile, claims, plan)
+    complete_step(ctx.manifest, step_name)
+
+
+def _run_apply_preview(ctx: StepRunContext) -> None:
+    step_name = "apply_preview"
+    preview = build_apply_preview(ctx.vault, ctx.run_dir)
+    out = step_dir(ctx.run_dir, step_name) / "apply_preview.json"
+    write_json(out, preview)
+    complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "apply_preview.v1")])
+
+
+@dataclass(frozen=True)
+class StepRunner:
+    spec: StepSpec
+    run: Any
+
+
+_STEP_RUN_FUNCTIONS = {
+    "raw_prepare": _run_raw_prepare,
+    "raw_index": _run_raw_index,
+    "extraction_windows": _run_extraction_windows,
+    "claim_extraction": _run_claim_extraction,
+    "page_planning": _run_page_planning,
+    "draft_rendering": _run_draft_rendering,
+    "validation": _run_validation,
+    "apply_preview": _run_apply_preview,
+}
+
+STEP_RUNNERS: dict[str, StepRunner] = {
+    spec.name: StepRunner(spec, _STEP_RUN_FUNCTIONS[spec.name]) for spec in STEP_SPECS
+}
+
+
+TModel = TypeVar("TModel", bound=BaseModel)
+
+
+def _redacted_model(ctx: StepRunContext, model: TModel, model_type: type[TModel]) -> TModel:
+    data = ctx.execution_context.redactor.redact(model.model_dump(mode="json"))
+    return model_type.model_validate(data)
 
 
 def build_raw_index(vault: Path, raw_path: Path, *, original_raw_path: Path | None = None) -> RawIndexArtifact:
@@ -456,158 +549,41 @@ def render_preparation_review(preparation: RawPreparationArtifact) -> str:
     )
 
 
-def load_provider_specs(vault: Path) -> dict[str, str | dict]:
+def resolve_vault_profile_name(vault: Path, profile_name: str | None) -> str:
+    if profile_name:
+        return profile_name
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
-    providers = config.get("providers", {})
-    if not isinstance(providers, dict):
-        raise PipelineError(".llmwiki/config.yaml providers must be a mapping.")
-    return dict(providers)
-
-
-def build_provider_context_record(
-    *,
-    vault: Path,
-    manifest_contexts: list[ProviderContextRecord],
-    provider_specs: dict[str, Any],
-    fixture_dir: Path | None,
-    source: str,
-    from_step: str | None,
-    affected_steps: list[str],
-) -> ProviderContextRecord:
-    providers: dict[str, ProviderRuntimeSpec] = {}
-    for task in affected_steps:
-        config = provider_config_for_task(provider_specs, task)
-        providers[task] = provider_runtime_spec_for_task(
-            vault,
-            task,
-            config,
-            fixture_dir=fixture_dir,
-            previous=previous_provider_runtime(manifest_contexts, task),
-        )
-    return ProviderContextRecord(
-        record_id=f"provider-context-{len(manifest_contexts) + 1:03d}",
-        source=source,
-        from_step=from_step,
-        affected_steps=affected_steps,
-        providers=providers,
-    )
-
-
-def provider_config_for_task(provider_specs: dict[str, Any], task: str) -> Any:
-    if task in provider_specs:
-        return provider_specs[task]
-    if "default" in provider_specs:
-        return provider_specs["default"]
-    return "mock:fixture"
-
-
-PROVIDER_RUNTIME_KEYS = {"spec", "endpoint", "api_key_env", "fixture_dir"}
-
-
-def provider_runtime_spec_for_task(
-    vault: Path,
-    task: str,
-    config: Any,
-    *,
-    fixture_dir: Path | None,
-    previous: ProviderRuntimeSpec | None,
-) -> ProviderRuntimeSpec:
-    endpoint = None
-    api_key_env = None
-    config_fixture_dir = None
-    if isinstance(config, dict):
-        if "api_key" in config:
-            raise PipelineError(f"Provider config for {task} must use api_key_env, not api_key.")
-        unknown = set(config) - PROVIDER_RUNTIME_KEYS
-        if unknown:
-            names = ", ".join(sorted(unknown))
-            raise PipelineError(f"Unsupported provider config field(s) for {task}: {names}")
-        spec = config.get("spec")
-        endpoint = config.get("endpoint")
-        api_key_env = config.get("api_key_env")
-        config_fixture_dir = config.get("fixture_dir")
-    else:
-        spec = config
-    if not isinstance(spec, str) or not spec:
-        raise PipelineError(f"Invalid provider config for task: {task}")
-    if endpoint is not None and not isinstance(endpoint, str):
-        raise PipelineError(f"Invalid provider endpoint for task: {task}")
-    if api_key_env is not None and not isinstance(api_key_env, str):
-        raise PipelineError(f"Invalid provider api_key_env for task: {task}")
-    if config_fixture_dir is not None and not isinstance(config_fixture_dir, str):
-        raise PipelineError(f"Invalid provider fixture_dir for task: {task}")
-    provider_name = spec.partition(":")[0]
-    resolved_fixture_dir = None
-    if provider_name == "mock":
-        if fixture_dir is not None:
-            resolved_fixture_dir = fixture_dir.resolve()
-        elif config_fixture_dir:
-            resolved_fixture_dir = resolve_config_path(vault, config_fixture_dir)
-        elif previous and previous.fixture_dir:
-            resolved_fixture_dir = Path(previous.fixture_dir)
-        else:
-            raise PipelineError(f"mock provider for {task} requires fixture_dir")
-    return ProviderRuntimeSpec(
-        spec=spec,
-        endpoint=endpoint,
-        api_key_env=api_key_env,
-        fixture_dir=resolved_fixture_dir.as_posix() if resolved_fixture_dir is not None else None,
-    )
-
-
-def previous_provider_runtime(manifest_contexts: list[ProviderContextRecord], task: str) -> ProviderRuntimeSpec | None:
-    for record in reversed(manifest_contexts):
-        runtime = record.providers.get(task)
-        if runtime is not None:
-            return runtime
-    return None
-
-
-def resolve_config_path(vault: Path, value: str) -> Path:
-    path = Path(value)
-    return path.resolve() if path.is_absolute() else (vault / path).resolve()
-
-
-def validate_provider_context(record: ProviderContextRecord) -> None:
-    for task in record.affected_steps:
-        provider_for_task(record, task)
-
-
-def provider_context_for_step(manifest: OperationManifest, step_name: str) -> ProviderContextRecord:
-    for record in reversed(manifest.provider_contexts):
-        if step_name in record.affected_steps:
-            return record
-    raise PipelineError(f"No provider context found for step: {step_name}")
+    configured = config.get("profile")
+    if not isinstance(configured, str) or not configured:
+        raise PipelineError(".llmwiki/config.yaml profile must be a non-empty string.")
+    return configured
 
 
 def model_steps_from(start_step: str) -> list[str]:
     names = set(downstream_steps(start_step))
-    return [step for step in MODEL_STEPS if step in names]
+    return [step for step in MODEL_BACKED_STEPS if step in names]
 
 
-def _structured_call(run_dir: Path, manifest: OperationManifest, task: str) -> StructuredModelCall:
+def _structured_call(run_dir: Path, execution_context: ProviderExecutionContext, task: str) -> StructuredModelCall:
     return StructuredModelCall(
-        provider_for_task(provider_context_for_step(manifest, task), task),
-        output_dir=step_dir(run_dir, task),
+        execution_context.provider_for_task(task),
+        output_dir=step_output_dir(run_dir, task),
         result_filename="provider_result.json",
-    )
-
-
-def provider_for_task(record: ProviderContextRecord, task: str) -> Provider:
-    if task not in record.providers:
-        raise PipelineError(f"Provider context {record.record_id} does not cover task: {task}")
-    runtime = record.providers[task]
-    fixture_dir = Path(runtime.fixture_dir) if runtime.fixture_dir else None
-    return ProviderRegistry().create(
-        runtime.spec,
-        fixture_dir=fixture_dir,
-        endpoint=runtime.endpoint,
-        api_key_env=runtime.api_key_env,
+        redactor=execution_context.redactor,
     )
 
 
 def step_dir(run_dir: Path, step_name: str) -> Path:
     return run_dir / step_name
+
+
+def step_output_dir(run_dir: Path, step_name: str) -> Path | None:
+    runner = STEP_RUNNERS.get(step_name)
+    if runner is None:
+        raise PipelineError(f"Unknown step: {step_name}")
+    if runner.spec.output_dir is None:
+        return None
+    return run_dir / runner.spec.output_dir
 
 
 def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
@@ -637,7 +613,9 @@ def delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str)
     store = RunStore(vault)
     run_dir = store.run_dir(operation_id)
     for step in downstream_steps(start_step):
-        shutil.rmtree(step_dir(run_dir, step), ignore_errors=True)
+        output_dir = step_output_dir(run_dir, step)
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
 
 
 def status(vault: Path, operation_id: str) -> OperationManifest:
@@ -648,7 +626,7 @@ def latest_operation(vault: Path) -> str | None:
     root = RunStore(vault).runs_root
     if not root.exists():
         return None
-    candidates = sorted([path for path in root.iterdir() if path.is_dir()])
+    candidates = sorted([path for path in root.iterdir() if path.is_dir() and (path / "manifest.json").exists()])
     return candidates[-1].name if candidates else None
 
 
