@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import llmwiki_engine.steps as steps_module
 from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
 from llmwiki_engine.manifest import read_manifest
@@ -18,7 +19,14 @@ from llmwiki_engine.pipeline import (
     status,
 )
 from llmwiki_engine.providers import OpenAICompatibleProvider
-from llmwiki_engine.steps import MODEL_BACKED_STEPS, STEP_NAMES, STEP_SPECS
+from llmwiki_engine.steps import (
+    MODEL_BACKED_STEPS,
+    STEP_NAMES,
+    STEP_SPECS,
+    StepSpec,
+    require_step_output_dir,
+    step_output_dir,
+)
 from llmwiki_engine.verify import VerifyError, verify_run
 from llmwiki_engine.workspace import RunStore, WorkspaceError, ensure_workspace_layout
 
@@ -197,6 +205,24 @@ def test_step_metadata_and_runners_stay_in_sync() -> None:
     assert STEP_NAMES == tuple(spec.name for spec in STEP_SPECS)
     assert MODEL_BACKED_STEPS == tuple(spec.name for spec in STEP_SPECS if spec.model_backed)
     assert tuple(STEP_RUNNERS) == STEP_NAMES
+
+
+def test_step_output_dir_helpers_use_step_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = tmp_path / "run"
+    assert step_output_dir(run_dir, "raw_prepare") == run_dir / "raw_prepare"
+    assert require_step_output_dir(run_dir, "apply_preview") == run_dir / "apply_preview"
+    assert step_output_dir(run_dir, "validation") is None
+    monkeypatch.setattr(
+        steps_module,
+        "STEP_SPECS",
+        (*STEP_SPECS, StepSpec("renamed_step", False, "custom_output_dir")),
+    )
+    assert step_output_dir(run_dir, "renamed_step") == run_dir / "custom_output_dir"
+    assert step_output_dir(run_dir, "renamed_step") != run_dir / "renamed_step"
+    with pytest.raises(ValueError, match="Step has no output directory: validation"):
+        require_step_output_dir(run_dir, "validation")
+    with pytest.raises(ValueError, match="Unknown step: missing"):
+        step_output_dir(run_dir, "missing")
 
 
 def test_model_artifacts_are_redacted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -197,14 +197,17 @@ init -> ingest run -> status -> status --verify -> apply
 
 但它不能替代 unit tests、regression tests 或 module evals。
 
+## Review 已收口项
+
+- API key 不扩散已有端到端自动化回归测试覆盖，确认 key 不会进入 manifest、events、
+  provider result、status JSON、applied receipt 或 CLI 输出。
+- 模块目录读写已经从 `StepSpec.output_dir` 派生，生产代码不再依赖
+  `run_dir / step_name` 恰好等于当前目录名。
+
 ## Review 已知后续项
 
 当前 MVP 有意把下面这些清理项留到后续单独收口：
 
-- 增加一个端到端自动化回归测试，证明 API key 不会扩散到 manifest、events、
-  provider result、status JSON、applied receipt 或 CLI 输出；
-- 模块目录的读写也从 `StepSpec.output_dir` 派生，不再依赖
-  `run_dir / step_name` 恰好等于当前目录名；
 - 移除剩余手写 step/module 列表，例如 `resume --from` help 文案和 eval module 声明；
 - provider config 错误中补充 global/vault 配置来源信息，方便定位是哪份 config 出错；
 - 把剩余 provider “snapshot/快照” 表述改成 provider execution record / provider 执行记录，

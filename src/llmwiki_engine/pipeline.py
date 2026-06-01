@@ -46,7 +46,15 @@ from .models import (
 from .provider_config import ProviderExecutionContext, build_provider_execution_context
 from .profiles import load_profile
 from .rendering import normalized_page_plan, render_drafts
-from .steps import MODEL_BACKED_STEPS, STEP_NAMES, STEP_SPECS, StepSpec, downstream_steps
+from .steps import (
+    MODEL_BACKED_STEPS,
+    STEP_NAMES,
+    STEP_SPECS,
+    StepSpec,
+    downstream_steps,
+    require_step_output_dir,
+    step_output_dir,
+)
 from .structured import StructuredModelCall
 from .validators import validate_claims, validate_extraction_windows, validate_page_plan, validate_raw_index, validate_raw_preparation
 from .verify import require_verified
@@ -293,7 +301,7 @@ class StepRunContext:
 
 def _run_raw_prepare(ctx: StepRunContext) -> None:
     step_name = "raw_prepare"
-    step_root = step_dir(ctx.run_dir, step_name)
+    step_root = require_step_output_dir(ctx.run_dir, step_name)
     raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
     payload = {
         "source_raw_path": raw_rel,
@@ -330,27 +338,30 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
 
 def _run_raw_index(ctx: StepRunContext) -> None:
     step_name = "raw_index"
-    prepared_path = step_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
+    prepared_path = require_step_output_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
     raw_index = build_raw_index(ctx.vault, prepared_path, original_raw_path=ctx.raw_path)
-    out = step_dir(ctx.run_dir, step_name) / "raw_index.json"
+    out = require_step_output_dir(ctx.run_dir, step_name) / "raw_index.json"
     write_json(out, raw_index)
     complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "raw_index.v1")])
 
 
 def _run_extraction_windows(ctx: StepRunContext) -> None:
     step_name = "extraction_windows"
-    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    raw_index = read_model(require_step_output_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
     windows = build_extraction_windows(raw_index)
-    out = step_dir(ctx.run_dir, step_name) / "extraction_windows.json"
+    out = require_step_output_dir(ctx.run_dir, step_name) / "extraction_windows.json"
     write_json(out, windows)
     complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "extraction_windows.v0")])
 
 
 def _run_claim_extraction(ctx: StepRunContext) -> None:
     step_name = "claim_extraction"
-    step_root = step_dir(ctx.run_dir, step_name)
-    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-    windows = read_model(step_dir(ctx.run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
+    step_root = require_step_output_dir(ctx.run_dir, step_name)
+    raw_index = read_model(require_step_output_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    windows = read_model(
+        require_step_output_dir(ctx.run_dir, "extraction_windows") / "extraction_windows.json",
+        ExtractionWindowsArtifact,
+    )
     payload = {"raw_index": raw_index.model_dump(mode="json"), "extraction_windows": windows.model_dump(mode="json")}
     claims, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
         step_name,
@@ -369,8 +380,8 @@ def _run_claim_extraction(ctx: StepRunContext) -> None:
 
 def _run_page_planning(ctx: StepRunContext) -> None:
     step_name = "page_planning"
-    step_root = step_dir(ctx.run_dir, step_name)
-    claims = read_model(step_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+    step_root = require_step_output_dir(ctx.run_dir, step_name)
+    claims = read_model(require_step_output_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
     payload = {"profile": ctx.profile.model_dump(mode="json"), "claims": claims.model_dump(mode="json")}
     plan, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
         step_name,
@@ -378,7 +389,7 @@ def _run_page_planning(ctx: StepRunContext) -> None:
         PagePlanArtifact,
     )
     plan = _redacted_model(ctx, plan, PagePlanArtifact)
-    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    raw_index = read_model(require_step_output_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
     plan = normalized_page_plan(raw_index, claims, plan)
     out = step_root / "page_plan.json"
     write_json(out, plan)
@@ -391,11 +402,11 @@ def _run_page_planning(ctx: StepRunContext) -> None:
 
 def _run_draft_rendering(ctx: StepRunContext) -> None:
     step_name = "draft_rendering"
-    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-    claims = read_model(step_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
-    plan = read_model(step_dir(ctx.run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
+    raw_index = read_model(require_step_output_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    claims = read_model(require_step_output_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+    plan = read_model(require_step_output_dir(ctx.run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
     outputs = render_drafts(
-        draft_root=step_dir(ctx.run_dir, step_name) / "draft_pages",
+        draft_root=require_step_output_dir(ctx.run_dir, step_name) / "draft_pages",
         profile=ctx.profile,
         raw_index=raw_index,
         claims=claims,
@@ -406,11 +417,17 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
 
 def _run_validation(ctx: StepRunContext) -> None:
     step_name = "validation"
-    preparation = read_model(step_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
-    raw_index = read_model(step_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
-    windows = read_model(step_dir(ctx.run_dir, "extraction_windows") / "extraction_windows.json", ExtractionWindowsArtifact)
-    claims = read_model(step_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
-    plan = read_model(step_dir(ctx.run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
+    preparation = read_model(
+        require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json",
+        RawPreparationArtifact,
+    )
+    raw_index = read_model(require_step_output_dir(ctx.run_dir, "raw_index") / "raw_index.json", RawIndexArtifact)
+    windows = read_model(
+        require_step_output_dir(ctx.run_dir, "extraction_windows") / "extraction_windows.json",
+        ExtractionWindowsArtifact,
+    )
+    claims = read_model(require_step_output_dir(ctx.run_dir, "claim_extraction") / "claims.json", ClaimsArtifact)
+    plan = read_model(require_step_output_dir(ctx.run_dir, "page_planning") / "page_plan.json", PagePlanArtifact)
     validate_raw_preparation(preparation)
     validate_raw_index(raw_index)
     validate_extraction_windows(raw_index, windows)
@@ -422,7 +439,7 @@ def _run_validation(ctx: StepRunContext) -> None:
 def _run_apply_preview(ctx: StepRunContext) -> None:
     step_name = "apply_preview"
     preview = build_apply_preview(ctx.vault, ctx.run_dir)
-    out = step_dir(ctx.run_dir, step_name) / "apply_preview.json"
+    out = require_step_output_dir(ctx.run_dir, step_name) / "apply_preview.json"
     write_json(out, preview)
     complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "apply_preview.v1")])
 
@@ -573,23 +590,10 @@ def _structured_call(run_dir: Path, execution_context: ProviderExecutionContext,
     )
 
 
-def step_dir(run_dir: Path, step_name: str) -> Path:
-    return run_dir / step_name
-
-
-def step_output_dir(run_dir: Path, step_name: str) -> Path | None:
-    runner = STEP_RUNNERS.get(step_name)
-    if runner is None:
-        raise PipelineError(f"Unknown step: {step_name}")
-    if runner.spec.output_dir is None:
-        return None
-    return run_dir / runner.spec.output_dir
-
-
 def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
     operation_id = run_dir.name
     targets: list[ApplyTarget] = []
-    draft_root = step_dir(run_dir, "draft_rendering") / "draft_pages"
+    draft_root = require_step_output_dir(run_dir, "draft_rendering") / "draft_pages"
     for draft in sorted(draft_root.rglob("*.md")):
         target = vault / "wiki" / draft.relative_to(draft_root)
         if target.exists():

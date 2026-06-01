@@ -218,15 +218,18 @@ init -> ingest run -> status -> status --verify -> apply
 
 It does not replace unit tests, regression tests, or module evals.
 
+## Closed Follow-ups From Review
+
+- An automated end-to-end API key regression test now verifies that keys do not
+  spread into manifests, events, provider results, status JSON, applied receipts,
+  or CLI output.
+- Module directory reads and writes now derive from `StepSpec.output_dir`; production
+  code no longer relies on `run_dir / step_name` matching the current directory names.
+
 ## Known Follow-ups From Review
 
 The current MVP deliberately leaves these cleanup items for a later pass:
 
-- add an automated end-to-end regression test proving API keys do not spread
-  into manifests, events, provider results, status JSON, applied receipts, or
-  CLI output;
-- derive module directory reads and writes from `StepSpec.output_dir`, instead
-  of relying on `run_dir / step_name` matching the current directory names;
 - remove remaining hand-written step/module lists such as `resume --from` help
   text and eval module declarations;
 - include global/vault config source information in provider config errors;

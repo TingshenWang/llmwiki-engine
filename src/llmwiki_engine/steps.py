@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -42,3 +43,17 @@ def step_index(name: str) -> int:
 
 def downstream_steps(name: str) -> list[str]:
     return list(STEP_NAMES[step_index(name) :])
+
+
+def step_output_dir(run_dir: Path, step_name: str) -> Path | None:
+    output_dir = step_spec(step_name).output_dir
+    if output_dir is None:
+        return None
+    return run_dir / output_dir
+
+
+def require_step_output_dir(run_dir: Path, step_name: str) -> Path:
+    output_dir = step_output_dir(run_dir, step_name)
+    if output_dir is None:
+        raise ValueError(f"Step has no output directory: {step_name}")
+    return output_dir

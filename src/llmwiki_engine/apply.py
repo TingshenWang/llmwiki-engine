@@ -8,6 +8,7 @@ from .hash_utils import artifact_ref, sha256_file
 from .io import append_jsonl, read_model
 from .manifest import read_manifest, write_manifest
 from .models import AppliedReceipt, ApplyPreview, ArtifactRef, ArtifactVisibility, OperationStatus, utc_now
+from .steps import require_step_output_dir
 from .verify import require_verified
 from .workspace import RunStore, WorkspaceError, assert_llmwiki_not_tracked_or_staged, run_lock
 
@@ -30,7 +31,9 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
         if commit:
             _preflight_commit(vault)
         require_verified(vault, manifest)
-        preview = read_model(run_dir / "apply_preview" / "apply_preview.json", ApplyPreview)
+        apply_preview_dir = require_step_output_dir(run_dir, "apply_preview")
+        raw_prepare_dir = require_step_output_dir(run_dir, "raw_prepare")
+        preview = read_model(apply_preview_dir / "apply_preview.json", ApplyPreview)
         _verify_preimages(vault, preview)
         written: list[Path] = []
         for target in preview.targets:
@@ -45,8 +48,8 @@ def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> 
         receipt = AppliedReceipt(
             operation_id=operation_id,
             raw_bindings=manifest.raw_bindings,
-            prepared_raw=_optional_receipt_ref(vault, run_dir / "raw_prepare" / "prepared.md", "markdown", "raw_prepare"),
-            raw_preparation=_optional_receipt_ref(vault, run_dir / "raw_prepare" / "raw_preparation.json", "json", "raw_prepare"),
+            prepared_raw=_optional_receipt_ref(vault, raw_prepare_dir / "prepared.md", "markdown", "raw_prepare"),
+            raw_preparation=_optional_receipt_ref(vault, raw_prepare_dir / "raw_preparation.json", "json", "raw_prepare"),
             written_pages=[
                 artifact_ref(
                     base=vault,
