@@ -11,6 +11,7 @@ from llmwiki_engine.manifest import read_manifest
 from llmwiki_engine.models import OperationStatus, StepStatus, VerificationStatus
 from llmwiki_engine.pipeline import (
     STEP_RUNNERS,
+    _STEP_RUN_FUNCTIONS,
     copy_fixture_raw,
     init_vault,
     latest_operation,
@@ -20,6 +21,7 @@ from llmwiki_engine.pipeline import (
 )
 from llmwiki_engine.providers import OpenAICompatibleProvider
 from llmwiki_engine.steps import (
+    EVAL_MODULES,
     MODEL_BACKED_STEPS,
     STEP_NAMES,
     STEP_SPECS,
@@ -204,6 +206,9 @@ def test_model_step_attempts_record_provider_context(tmp_path: Path) -> None:
 def test_step_metadata_and_runners_stay_in_sync() -> None:
     assert STEP_NAMES == tuple(spec.name for spec in STEP_SPECS)
     assert MODEL_BACKED_STEPS == tuple(spec.name for spec in STEP_SPECS if spec.model_backed)
+    assert EVAL_MODULES == tuple(spec.name for spec in STEP_SPECS if spec.eval_supported)
+    assert set(EVAL_MODULES) <= set(STEP_NAMES)
+    assert set(_STEP_RUN_FUNCTIONS) == set(STEP_NAMES)
     assert tuple(STEP_RUNNERS) == STEP_NAMES
 
 
@@ -458,7 +463,7 @@ def test_apply_commit_does_not_include_unrelated_staged_files(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("schema_version", ["operation_manifest.v3", "operation_manifest.v4"])
-def test_old_manifest_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
+def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v2")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)

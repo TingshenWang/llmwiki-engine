@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 
+import yaml
+
 from .io import read_yaml
 from .models import ProviderContextRecord, ProviderRuntimeSpec
 from .providers import Provider, ProviderRegistry
@@ -20,6 +22,9 @@ class ProviderConfigError(RuntimeError):
 class ProviderConfigEntry:
     value: Any
     base_dir: Path
+    source_label: str
+    source_path: Path | None
+    provider_key: str
 
 
 @dataclass(frozen=True)
@@ -57,40 +62,82 @@ def load_provider_entries(vault: Path) -> dict[str, ProviderConfigEntry]:
     entries: dict[str, ProviderConfigEntry] = {}
     global_path = global_config_path()
     if global_path.exists():
-        global_config = _read_config(global_path)
+        global_config = _read_config(global_path, "global config")
         unknown_global = set(global_config) - {"providers"}
         if unknown_global:
             names = ", ".join(sorted(unknown_global))
-            raise ProviderConfigError(f"Global config only supports providers; unsupported top-level field(s): {names}")
-        entries.update(_provider_entries_from_config(global_config, base_dir=global_path.parent))
+            raise ProviderConfigError(
+                f"Global config only supports providers; unsupported top-level field(s): {names} "
+                f"(source: global config {global_path})"
+            )
+        entries.update(
+            _provider_entries_from_config(
+                global_config,
+                base_dir=global_path.parent,
+                source_label="global config",
+                source_path=global_path,
+            )
+        )
 
     vault_path = vault / ".llmwiki" / "config.yaml"
-    vault_config = _read_config(vault_path)
-    entries.update(_provider_entries_from_config(vault_config, base_dir=vault))
+    vault_config = _read_config(vault_path, "vault config")
+    entries.update(
+        _provider_entries_from_config(
+            vault_config,
+            base_dir=vault,
+            source_label="vault config",
+            source_path=vault_path,
+        )
+    )
     return entries
 
 
-def _read_config(path: Path) -> dict[str, Any]:
+def _read_config(path: Path, source_label: str) -> dict[str, Any]:
     try:
         data = read_yaml(path)
     except FileNotFoundError as exc:
-        raise ProviderConfigError(f"Config file not found: {path}") from exc
+        raise ProviderConfigError(f"Config file not found (source: {source_label} {path})") from exc
+    except yaml.YAMLError as exc:
+        location = _yaml_error_location(exc)
+        raise ProviderConfigError(f"Config YAML parse failed{location} (source: {source_label} {path})") from exc
     if not isinstance(data, dict):
-        raise ProviderConfigError(f"Config must be a mapping: {path}")
+        raise ProviderConfigError(f"Config must be a mapping (source: {source_label} {path})")
     return data
 
 
-def _provider_entries_from_config(config: dict[str, Any], *, base_dir: Path) -> dict[str, ProviderConfigEntry]:
+def _yaml_error_location(exc: yaml.YAMLError) -> str:
+    mark = getattr(exc, "problem_mark", None)
+    if mark is None:
+        return ""
+    return f" at line {mark.line + 1}, column {mark.column + 1}"
+
+
+def _provider_entries_from_config(
+    config: dict[str, Any],
+    *,
+    base_dir: Path,
+    source_label: str,
+    source_path: Path,
+) -> dict[str, ProviderConfigEntry]:
     providers = config.get("providers", {})
     if providers is None:
         providers = {}
     if not isinstance(providers, dict):
-        raise ProviderConfigError("providers must be a mapping.")
+        raise ProviderConfigError(f"providers must be a mapping (source: {source_label} {source_path}).")
     unknown = set(providers) - set(PROVIDER_CONFIG_KEYS)
     if unknown:
         names = ", ".join(sorted(unknown))
-        raise ProviderConfigError(f"Unknown provider key(s): {names}")
-    return {key: ProviderConfigEntry(value=value, base_dir=base_dir) for key, value in providers.items()}
+        raise ProviderConfigError(f"Unknown provider key(s): {names} (source: {source_label} {source_path}).")
+    return {
+        key: ProviderConfigEntry(
+            value=value,
+            base_dir=base_dir,
+            source_label=source_label,
+            source_path=source_path,
+            provider_key=key,
+        )
+        for key, value in providers.items()
+    }
 
 
 def provider_entry_for_task(entries: dict[str, ProviderConfigEntry], task: str) -> ProviderConfigEntry:
@@ -98,7 +145,13 @@ def provider_entry_for_task(entries: dict[str, ProviderConfigEntry], task: str) 
         return entries[task]
     if "default" in entries:
         return entries["default"]
-    return ProviderConfigEntry(value="mock:fixture", base_dir=Path.cwd())
+    return ProviderConfigEntry(
+        value="mock:fixture",
+        base_dir=Path.cwd(),
+        source_label="built-in default",
+        source_path=None,
+        provider_key="default",
+    )
 
 
 def build_provider_execution_context(
@@ -155,7 +208,7 @@ def provider_runtime_spec_for_task(
         unknown = set(value) - PROVIDER_RUNTIME_KEYS
         if unknown:
             names = ", ".join(sorted(unknown))
-            raise ProviderConfigError(f"Unsupported provider config field(s) for {task}: {names}")
+            raise _provider_error(entry, task, f"Unsupported provider config field(s) for {task}: {names}")
         spec = value.get("spec")
         endpoint = value.get("endpoint")
         api_key = value.get("api_key")
@@ -163,46 +216,50 @@ def provider_runtime_spec_for_task(
     else:
         spec = value
     if not isinstance(spec, str) or not spec:
-        raise ProviderConfigError(f"Invalid provider config for task: {task}")
+        raise _provider_error(entry, task, f"Invalid provider config for task: {task}")
     provider_name = spec.partition(":")[0]
     _, separator, model = spec.partition(":")
     if provider_name not in {"mock", "human", "openai_compatible"}:
-        raise ProviderConfigError(f"Unknown provider spec for {task}: {provider_name}")
+        raise _provider_error(entry, task, f"Unknown provider spec for {task}: {provider_name}")
 
-    _validate_optional_string(endpoint, f"Invalid provider endpoint for task: {task}")
-    _validate_optional_string(api_key, f"Invalid provider api_key for task: {task}")
-    _validate_optional_string(config_fixture_dir, f"Invalid provider fixture_dir for task: {task}")
+    _validate_optional_string(entry, task, endpoint, f"Invalid provider endpoint for task: {task}")
+    _validate_optional_string(entry, task, api_key, f"Invalid provider api_key for task: {task}")
+    _validate_optional_string(entry, task, config_fixture_dir, f"Invalid provider fixture_dir for task: {task}")
 
     if provider_name == "openai_compatible":
         if not separator or not model:
-            raise ProviderConfigError(f"openai_compatible provider for {task} requires model in spec.")
+            raise _provider_error(entry, task, f"openai_compatible provider for {task} requires model in spec.")
         if not isinstance(value, dict):
-            raise ProviderConfigError(f"openai_compatible provider for {task} must use mapping config.")
+            raise _provider_error(entry, task, f"openai_compatible provider for {task} must use mapping config.")
         if config_fixture_dir is not None:
-            raise ProviderConfigError(f"openai_compatible provider for {task} does not support fixture_dir.")
+            raise _provider_error(entry, task, f"openai_compatible provider for {task} does not support fixture_dir.")
         if not endpoint:
-            raise ProviderConfigError(f"openai_compatible provider for {task} requires endpoint.")
+            raise _provider_error(entry, task, f"openai_compatible provider for {task} requires endpoint.")
         if not api_key:
-            raise ProviderConfigError(f"openai_compatible provider for {task} requires api_key.")
-        validate_endpoint(endpoint, task)
+            raise _provider_error(entry, task, f"openai_compatible provider for {task} requires api_key.")
+        validate_endpoint(endpoint, task, entry=entry)
         return ProviderRuntimeSpec(spec=spec, endpoint=endpoint), api_key
 
     if provider_name == "human":
         if separator:
-            raise ProviderConfigError(f"human provider for {task} must use spec: human.")
+            raise _provider_error(entry, task, f"human provider for {task} must use spec: human.")
         if endpoint is not None or api_key is not None or config_fixture_dir is not None:
-            raise ProviderConfigError(f"human provider for {task} does not support endpoint, api_key, or fixture_dir.")
+            raise _provider_error(
+                entry,
+                task,
+                f"human provider for {task} does not support endpoint, api_key, or fixture_dir.",
+            )
         return ProviderRuntimeSpec(spec=spec), None
 
     if endpoint is not None or api_key is not None:
-        raise ProviderConfigError(f"mock provider for {task} does not support endpoint or api_key.")
+        raise _provider_error(entry, task, f"mock provider for {task} does not support endpoint or api_key.")
     resolved_fixture_dir = None
     if fixture_dir is not None:
         resolved_fixture_dir = fixture_dir.resolve()
     elif config_fixture_dir:
         resolved_fixture_dir = _resolve_config_path(entry.base_dir, config_fixture_dir)
     if resolved_fixture_dir is None and require_mock_fixture:
-        raise ProviderConfigError(f"mock provider for {task} requires fixture_dir")
+        raise _provider_error(entry, task, f"mock provider for {task} requires fixture_dir")
     return (
         ProviderRuntimeSpec(
             spec=spec,
@@ -212,18 +269,31 @@ def provider_runtime_spec_for_task(
     )
 
 
-def validate_endpoint(endpoint: str, task: str) -> None:
+def validate_endpoint(endpoint: str, task: str, *, entry: ProviderConfigEntry | None = None) -> None:
     parts = urlsplit(endpoint)
     if parts.username or parts.password:
-        raise ProviderConfigError(f"Provider endpoint for {task} must not include username or password.")
+        message = f"Provider endpoint for {task} must not include username or password."
+        if entry is not None:
+            raise _provider_error(entry, task, message)
+        raise ProviderConfigError(message)
     for key, _ in parse_qsl(parts.query, keep_blank_values=True):
         if key.lower() in SECRET_QUERY_KEYS:
-            raise ProviderConfigError(f"Provider endpoint for {task} must not include secret query parameter: {key}")
+            message = f"Provider endpoint for {task} must not include secret query parameter: {key}"
+            if entry is not None:
+                raise _provider_error(entry, task, message)
+            raise ProviderConfigError(message)
 
 
-def _validate_optional_string(value: Any, message: str) -> None:
+def _validate_optional_string(entry: ProviderConfigEntry, task: str, value: Any, message: str) -> None:
     if value is not None and not isinstance(value, str):
-        raise ProviderConfigError(message)
+        raise _provider_error(entry, task, message)
+
+
+def _provider_error(entry: ProviderConfigEntry, task: str, message: str) -> ProviderConfigError:
+    source = f"{entry.source_label}"
+    if entry.source_path is not None:
+        source = f"{source} {entry.source_path}"
+    return ProviderConfigError(f"{message} (source: {source}, provider key: {entry.provider_key}, task: {task})")
 
 
 def _resolve_config_path(base_dir: Path, value: str) -> Path:

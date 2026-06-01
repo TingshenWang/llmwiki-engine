@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 from typer.testing import CliRunner
 
 import llmwiki_engine.cli as cli_module
@@ -10,6 +11,7 @@ from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, writ
 from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, latest_operation, run_simplified_ingest
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
+from llmwiki_engine.steps import STEP_NAMES
 from llmwiki_engine.workspace import RunStore
 
 
@@ -57,21 +59,33 @@ def test_resume_invalid_from_step_reports_single_line_error(tmp_path: Path) -> N
     assert "Traceback" not in result.output
 
 
-def test_old_manifest_reports_single_line_error_for_user_commands(tmp_path: Path) -> None:
+def test_resume_help_lists_step_names_from_metadata() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "resume", "--help"])
+    assert result.exit_code == 0
+    for step_name in STEP_NAMES:
+        assert step_name in result.output
+
+
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v3", "operation_manifest.v4"])
+def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
+    tmp_path: Path,
+    schema_version: str,
+) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="old")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
-    data["schema_version"] = "operation_manifest.v4"
+    data["schema_version"] = schema_version
     write_json(manifest_path, data)
 
     runner = CliRunner()
     for command in ["status", "resume", "apply"]:
         result = runner.invoke(app, ["ingest", command, str(vault), manifest.operation_id])
         assert result.exit_code != 0
-        assert "Unsupported manifest schema_version: operation_manifest.v4" in result.output
+        assert f"Unsupported manifest schema_version: {schema_version}" in result.output
         assert "Traceback" not in result.output
 
 
@@ -184,6 +198,23 @@ def test_providers_check_config_error_does_not_print_empty_table(tmp_path: Path)
 
     assert result.exit_code == 1
     assert "Unknown provider key" in result.output
+    assert "Provider Check" not in result.output
+
+
+def test_providers_check_bad_yaml_reports_single_line_error(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config_path.write_text("providers:\n  default: [\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["providers", "check", str(vault)])
+
+    assert result.exit_code == 1
+    assert "Config YAML parse failed" in result.output
+    assert "vault config" in result.output
+    assert str(config_path) in result.output.replace("\n", "")
+    assert "Traceback" not in result.output
     assert "Provider Check" not in result.output
 
 

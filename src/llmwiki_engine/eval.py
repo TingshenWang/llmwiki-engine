@@ -5,18 +5,13 @@ from pathlib import Path
 
 from .io import read_json, write_json
 from .models import EvalCaseResult, EvalRun
-
-
-SUPPORTED_MODULES = {
-    "extraction_windows",
-    "claim_extraction",
-    "page_planning",
-}
+from .steps import EVAL_MODULES
 
 
 def run_eval(module: str, dataset: Path, output_root: Path) -> EvalRun:
-    if module not in SUPPORTED_MODULES:
-        raise ValueError(f"Unsupported eval module: {module}")
+    if module not in EVAL_MODULES:
+        supported = ", ".join(EVAL_MODULES)
+        raise ValueError(f"Unsupported eval module: {module}. Supported modules: {supported}")
     results: list[EvalCaseResult] = []
     for case_dir in sorted(path for path in dataset.iterdir() if path.is_dir()):
         actual_path = case_dir / "actual.json"

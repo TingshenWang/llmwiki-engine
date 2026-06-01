@@ -182,7 +182,7 @@ The MVP provider set is:
 
 Every model-backed step should use structured calls with schema validation,
 bounded repair, cost and latency capture, and failed-output diagnostics.
-Provider context records are the only provider execution snapshots. They store
+Provider context records are the only provider execution records. They store
 only non-secret runtime fields such as `spec`, `endpoint`, and `fixture_dir`.
 Plaintext API keys are allowed in local config files, but they must not be
 recorded in manifests, events, provider results, receipts, status JSON, or CLI
@@ -225,18 +225,20 @@ It does not replace unit tests, regression tests, or module evals.
   or CLI output.
 - Module directory reads and writes now derive from `StepSpec.output_dir`; production
   code no longer relies on `run_dir / step_name` matching the current directory names.
+- Step and eval support lists now derive from `StepSpec`, including `resume --from`
+  help text and eval module validation.
+- Provider config errors now include global/vault source information and the
+  provider key that produced the error.
+- CLI tests now verify that non-v1 manifest schemas such as `operation_manifest.v3`
+  and `operation_manifest.v4` are rejected clearly.
 
 ## Known Follow-ups From Review
 
-The current MVP deliberately leaves these cleanup items for a later pass:
-
-- remove remaining hand-written step/module lists such as `resume --from` help
-  text and eval module declarations;
-- include global/vault config source information in provider config errors;
-- replace any remaining provider "snapshot" wording with provider execution
-  record wording, so it does not conflict with the removed `snapshots/` layout;
-- cover both legacy `operation_manifest.v3` and `operation_manifest.v4` at the
-  CLI layer, not only in lower-level manifest tests.
+- `resume --help` tests can be tightened to fail if stale or unsupported step
+  names are accidentally mixed into the generated help text.
+- Provider config safety can later add stronger detection or redaction for
+  secrets mistakenly pasted into unknown provider keys, unsupported field names,
+  or endpoint fields beyond the current MVP endpoint guards.
 
 ## Open Questions
 

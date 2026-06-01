@@ -15,6 +15,7 @@ from .provider_checks import check_providers
 from .provider_config import ProviderConfigError
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
+from .steps import STEP_NAMES
 from .verify import VerifyError, verify_run
 from .workspace import WorkspaceError
 
@@ -30,6 +31,7 @@ app.add_typer(profile_app, name="profile")
 app.add_typer(eval_app, name="eval")
 
 console = Console()
+VALID_RESUME_STEPS_HELP = ", ".join(STEP_NAMES)
 
 
 @app.command()
@@ -104,8 +106,7 @@ def ingest_resume(
     from_step: Optional[str] = typer.Option(
         None,
         "--from",
-        help="Resume from this step, deleting this step and downstream outputs. Valid steps: "
-        "raw_prepare, raw_index, extraction_windows, claim_extraction, page_planning, draft_rendering, validation, apply_preview.",
+        help=f"Resume from this step, deleting this step and downstream outputs. Valid steps: {VALID_RESUME_STEPS_HELP}.",
     ),
     mode: Optional[RunMode] = None,
 ) -> None:

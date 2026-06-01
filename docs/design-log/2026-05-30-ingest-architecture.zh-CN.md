@@ -164,7 +164,7 @@ MVP provider 集合包括：
 
 每个模型驱动步骤都应该使用 structured calls，并记录 schema validation、有限
 repair、cost、latency 和失败输出诊断。
-Provider context records 是唯一的 provider 执行快照，只记录非 secret 运行字段：
+Provider context records 是唯一的 provider 执行记录，只记录非 secret 运行字段：
 `spec`、`endpoint`、`fixture_dir`。明文 API key 允许保存在本地 config，但不能进入
 manifest、events、provider result、receipt、status JSON 或 CLI 输出。真实 provider
 执行使用内存中的 `ProviderExecutionContext`，不能从 manifest 反推出 credentials。
@@ -203,17 +203,19 @@ init -> ingest run -> status -> status --verify -> apply
   provider result、status JSON、applied receipt 或 CLI 输出。
 - 模块目录读写已经从 `StepSpec.output_dir` 派生，生产代码不再依赖
   `run_dir / step_name` 恰好等于当前目录名。
+- Step 和 eval 支持列表现在都从 `StepSpec` 派生，包括 `resume --from` help 文案
+  和 eval module 校验。
+- provider config 错误现在会包含 global/vault 来源信息，以及触发错误的 provider key。
+- CLI 测试现在会确认 `operation_manifest.v3`、`operation_manifest.v4` 这类非 v1
+  manifest schema 被清晰拒绝。
 
 ## Review 已知后续项
 
-当前 MVP 有意把下面这些清理项留到后续单独收口：
-
-- 移除剩余手写 step/module 列表，例如 `resume --from` help 文案和 eval module 声明；
-- provider config 错误中补充 global/vault 配置来源信息，方便定位是哪份 config 出错；
-- 把剩余 provider “snapshot/快照” 表述改成 provider execution record / provider 执行记录，
-  避免和已经删除的 `snapshots/` 布局混淆；
-- CLI 层也同时覆盖旧 `operation_manifest.v3` 和 `operation_manifest.v4`，不只在底层
-  manifest 测试里覆盖。
+- `resume --help` 测试后续可以进一步收紧，确保生成的 help 中不会混入已废弃或
+  不支持的 step 名称。
+- provider config 安全后续可以补更强的检测或脱敏，覆盖用户误把 secret 粘到
+  unknown provider key、unsupported field name 或当前 MVP endpoint guard 之外的
+  endpoint 字段里的情况。
 
 ## 开放问题
 

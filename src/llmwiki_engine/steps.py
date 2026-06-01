@@ -9,14 +9,15 @@ class StepSpec:
     name: str
     model_backed: bool
     output_dir: str | None
+    eval_supported: bool = False
 
 
 STEP_SPECS: tuple[StepSpec, ...] = (
     StepSpec("raw_prepare", True, "raw_prepare"),
     StepSpec("raw_index", False, "raw_index"),
-    StepSpec("extraction_windows", False, "extraction_windows"),
-    StepSpec("claim_extraction", True, "claim_extraction"),
-    StepSpec("page_planning", True, "page_planning"),
+    StepSpec("extraction_windows", False, "extraction_windows", eval_supported=True),
+    StepSpec("claim_extraction", True, "claim_extraction", eval_supported=True),
+    StepSpec("page_planning", True, "page_planning", eval_supported=True),
     StepSpec("draft_rendering", False, "draft_rendering"),
     StepSpec("validation", False, None),
     StepSpec("apply_preview", False, "apply_preview"),
@@ -24,6 +25,7 @@ STEP_SPECS: tuple[StepSpec, ...] = (
 
 STEP_NAMES: tuple[str, ...] = tuple(spec.name for spec in STEP_SPECS)
 MODEL_BACKED_STEPS: tuple[str, ...] = tuple(spec.name for spec in STEP_SPECS if spec.model_backed)
+EVAL_MODULES: tuple[str, ...] = tuple(spec.name for spec in STEP_SPECS if spec.eval_supported)
 PROVIDER_CONFIG_KEYS: tuple[str, ...] = ("default", *MODEL_BACKED_STEPS)
 
 

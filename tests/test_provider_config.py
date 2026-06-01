@@ -52,10 +52,11 @@ def test_global_provider_default_and_vault_whole_step_override(tmp_path: Path) -
 
 def test_global_config_rejects_vault_only_fields(tmp_path: Path) -> None:
     (Path.home() / ".llmwiki").mkdir()
-    write_yaml(Path.home() / ".llmwiki" / "config.yaml", {"profile": "project_basic"})
+    global_config_path = Path.home() / ".llmwiki" / "config.yaml"
+    write_yaml(global_config_path, {"profile": "project_basic"})
     vault = tmp_path / "vault"
     init_vault(vault)
-    with pytest.raises(ProviderConfigError, match="Global config only supports providers"):
+    with pytest.raises(ProviderConfigError) as exc:
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
@@ -64,6 +65,154 @@ def test_global_config_rejects_vault_only_fields(tmp_path: Path) -> None:
             from_step=None,
             tasks=["raw_prepare"],
         )
+    message = str(exc.value)
+    assert "Global config only supports providers" in message
+    assert str(global_config_path) in message
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_label"),
+    [
+        ("global", "global config"),
+        ("vault", "vault config"),
+    ],
+)
+def test_config_yaml_parse_error_includes_source(tmp_path: Path, source: str, expected_label: str) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    if source == "global":
+        config_path = Path.home() / ".llmwiki" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+    else:
+        config_path = vault / ".llmwiki" / "config.yaml"
+    config_path.write_text("providers:\n  default: [\n", encoding="utf-8")
+
+    with pytest.raises(ProviderConfigError) as exc:
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=tmp_path,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
+    message = str(exc.value)
+    assert "Config YAML parse failed" in message
+    assert expected_label in message
+    assert str(config_path) in message
+    assert "Traceback" not in message
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_label"),
+    [
+        ("global", "global config"),
+        ("vault", "vault config"),
+    ],
+)
+def test_config_root_must_be_mapping_error_includes_source(tmp_path: Path, source: str, expected_label: str) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    if source == "global":
+        config_path = Path.home() / ".llmwiki" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+    else:
+        config_path = vault / ".llmwiki" / "config.yaml"
+    config_path.write_text("- providers\n", encoding="utf-8")
+
+    with pytest.raises(ProviderConfigError) as exc:
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=tmp_path,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
+    message = str(exc.value)
+    assert "Config must be a mapping" in message
+    assert expected_label in message
+    assert str(config_path) in message
+
+
+def test_vault_unknown_provider_key_error_includes_source(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {"unknown": "human"}
+    write_yaml(config_path, config)
+
+    with pytest.raises(ProviderConfigError) as exc:
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=tmp_path,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
+    message = str(exc.value)
+    assert "Unknown provider key(s)" in message
+    assert "unknown" in message
+    assert str(config_path) in message
+
+
+def test_provider_unknown_field_error_includes_source_and_key(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "page_planning": {
+            "spec": "mock:fixture",
+            "unexpected": "value",
+        }
+    }
+    write_yaml(config_path, config)
+
+    with pytest.raises(ProviderConfigError) as exc:
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=tmp_path,
+            source="initial_run",
+            from_step=None,
+            tasks=["page_planning"],
+        )
+    message = str(exc.value)
+    assert "Unsupported provider config field(s) for page_planning" in message
+    assert "unexpected" in message
+    assert str(config_path) in message
+    assert "provider key: page_planning" in message
+
+
+def test_openai_missing_required_field_error_includes_source_and_key(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+        }
+    }
+    write_yaml(config_path, config)
+
+    with pytest.raises(ProviderConfigError) as exc:
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=None,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
+    message = str(exc.value)
+    assert "openai_compatible provider for raw_prepare requires api_key" in message
+    assert str(config_path) in message
+    assert "provider key: default" in message
 
 
 def test_openai_compatible_context_omits_api_key(tmp_path: Path) -> None:
