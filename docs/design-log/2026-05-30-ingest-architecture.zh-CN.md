@@ -3,7 +3,7 @@
 [English](2026-05-30-ingest-architecture.en.md) | 中文
 
 日期：2026-05-30
-状态：已采纳为当前 MVP 方向
+状态：已被 2026-06-02 M1 ingest redesign 更新；模块化 CLI、artifact、resume/apply 边界仍然有效
 
 这篇文档记录当前 `llmwiki-engine` Ingest 架构背后的设计决策。它不是聊天记录，
 而是项目长期维护时需要保留的设计记忆：为什么这个引擎从 Agent 控制的 skill
@@ -90,27 +90,25 @@ PDF 中的内嵌图片在初始版本中可以直接丢弃。如果某张图片�
 
 这样可以避免在文本编译路径稳定之前，把 Ingest engine 过早扩展成 OCR 和视觉系统。
 
-## 用 Extraction Windows 替代 Semantic Aggregation
+## 用 Source Digest 替代 Semantic Aggregation
 
-早期的 `semantic_aggregation` 已经从主路径移除。
+早期的 `semantic_aggregation` 和强证据链窗口流程已经从主路径移除。
 
 原因是 aggregation 层可能会假装自己在定义知识单元，但实际上做出有损或错误的分组。
 例如，对话材料可能把一问一答切得过窄；视频转录稿也可能因为相邻而把无关片段合并。
 
-替代方案是 `extraction_windows`。
+当前替代方案是 `source_digest`。
 
-Extraction windows 是工程上下文窗口，不是语义知识单元。它们的作用是给 claim
-extraction 足够的局部上下文，同时保留对 prepared raw spans 的可追溯性。
+Source digest 是面向人工审核的单篇 raw 完整消化文件，不是最终 wiki 页面。它的作用是
+让模型先尽量完整地列出 entity、concept、design、comparison 和 open question 等候选
+知识，再由后续 resolution/merge 步骤判断哪些更新已有页面、哪些创建新页面。
 
 ```text
-prepared raw -> raw_index -> extraction_windows -> claim_extraction
+prepared raw -> source_digest -> candidate_resolution -> wiki_merge_planning
 ```
 
-Claims 必须指向 `source_window_id`，但它表示发现这个 claim 的上下文窗口或主窗口；
-evidence 必须绑定回 prepared raw spans，但 evidence span 可以来自全文其他位置，
-用于表达同一观点在文档中反复出现或被多处支持的情况。`evidence_span_ids`
-是权威溯源绑定；`evidence_quote` 是展示文本，可以概括或拼接多个被引用的 span。
-这样抽取过程可以被测试，而不会假装窗口边界就是概念边界或证据边界。
+证据链不再作为主路径硬合同。只要 source page 能回链 raw，必要时可以回到原文检查。
+MVP 的关键审核对象是 digest 是否完整、候选页面解析是否合理、最终草稿是否有用。
 
 ## 当前线性 Pipeline
 
@@ -118,10 +116,11 @@ evidence 必须绑定回 prepared raw spans，但 evidence span 可以来自全�
 
 ```text
 raw_prepare
-raw_index
-extraction_windows
-claim_extraction
-page_planning
+prepared_raw_review
+source_digest
+source_digest_review
+candidate_resolution
+wiki_merge_planning
 draft_rendering
 validation
 apply_preview
@@ -209,7 +208,7 @@ init -> ingest run -> status -> status --verify -> apply
 - Step 和 eval 支持列表现在都从 `StepSpec` 派生，包括 `resume --from` help 文案
   和 eval module 校验。
 - provider config 错误现在会包含 global/vault 来源信息，以及触发错误的 provider key。
-- CLI 测试现在会确认 `operation_manifest.v3`、`operation_manifest.v4` 这类非 v1
+- CLI 测试现在会确认 `operation_manifest.v3`、`operation_manifest.v5` 这类非当前
   manifest schema 被清晰拒绝。
 
 ## Review 已知后续项
@@ -225,5 +224,5 @@ init -> ingest run -> status -> status --verify -> apply
 - 当模型发现清洗存在不确定性时，`raw_prepare` 应该多严格？
 - prepared raw 是否需要可选的人类 approval gate？
 - 非 Markdown 格式应该如何归一化到同一个 prepared raw contract？
-- 在 deduplication 和 page planning 更复杂之前，claim schema 应该如何演进？
+- 在候选去重、candidate resolution 和 merge planning 更复杂之前，source digest candidate schema 应该如何演进？
 - 哪些模块适合默认本地模型，哪些模块应该默认使用更强的线上模型？

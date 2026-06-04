@@ -3,23 +3,30 @@ version: "1"
 description: Personal memory profile with light provenance.
 default_page_type: memory
 source_page_type: source
+# Template files are currently inactive in the current MVP. Rendering is hard-coded until
+# page contracts stabilize; templates are kept for future configuration.
 page_types:
   source:
     directory: sources
     title_prefix: "Source_"
     template: source.md
-    required_sections: ["Summary", "Source Info"]
+    required_sections: ["Summary", "Raw", "Key Takeaways", "Derived Wiki Pages"]
     evidence_policy: light
   memory:
     directory: memories
     title_prefix: "Memory_"
     template: concept.md
-    required_sections: ["Summary", "Claims"]
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
     evidence_policy: light
   idea:
     directory: ideas
     title_prefix: "Idea_"
     template: concept.md
-    required_sections: ["Summary", "Claims"]
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
     evidence_policy: opinion
-
+  open_question:
+    directory: open_questions
+    title_prefix: "Open_Question_"
+    template: concept.md
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
+    evidence_policy: light

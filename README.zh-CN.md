@@ -10,8 +10,11 @@
 [docs/cli-reference.zh-CN.md](docs/cli-reference.zh-CN.md)。英文版见
 [docs/cli-reference.en.md](docs/cli-reference.en.md)。
 
-当前第一个可运行路径是简化版 Ingest 流程。它会先把 noisy raw material
-整理成规范的 `raw_prepare/prepared.md`，再进入索引、抽取窗口和 wiki 草稿渲染：
+当前可运行路径是 M3 Ingest MVP。它会先把目标 `raw/` 文件里的 Obsidian 文本
+wikilink 原地规范化，再把 noisy raw material 整理成规范的
+`raw_prepare/prepared.md`，然后生成 `source_digest`、做来源重复检查、基于全文和
+digest 做候选页面规划、冻结 wiki context snapshot、用模型判断
+create/update/noop/needs-human-decision、生成可审核草稿和 apply preview：
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
@@ -28,8 +31,16 @@ llmwiki ingest apply /path/to/vault <operation_id>
 ## 设计原则
 
 - 规范 artifacts 使用 JSON/JSONL。
-- `raw_prepare` 将 original raw 转换为下游知识编译使用的 canonical prepared raw。
-- `extraction_windows` 是结构化抽取的工程上下文窗口，不是语义知识单元。
+- `raw/` 是规范化材料层。MVP 只展开 `[[Page]]`、`[[Page|Alias]]` 这类
+  Obsidian 文本 wikilink；网页链接、Markdown 链接、媒体 embed 和代码块保持不变。
+- `raw_prepare` 将规范化后的 raw 转换为下游知识编译使用的 canonical prepared raw。
+- `source_digest` 是单篇 raw 的完整消化文件，用于人工审核候选知识。
+- `candidate_resolution` 基于 approved prepared 全文和 digest 规划 wiki 选题；
+  `wiki_merge_planning` 基于冻结 snapshot 判断
+  create/update/noop/needs-human-decision。
+- dev 模式支持 update 整页草稿替换，但必须经过显式 draft review 才能
+  validation/apply。
+- 知识页使用确定性的 `Related` wikilink；source 页不进入 Obsidian 知识图谱。
 - 人类可编辑的 profile 使用 YAML。
 - 人类 review 和 drafts 使用 Markdown。
 - Provider 可以按模块配置。
@@ -48,7 +59,7 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
-  page_planning:
+  source_digest:
     spec: mock:fixture
     fixture_dir: tests/fixtures/simple_project/mock
 ```
@@ -70,5 +81,5 @@ JSON mode，则 fallback 到 prompt-only JSON probe，并给出 warning。
 如果需要从某一步开始，用当前配置重跑该 step 及下游：
 
 ```bash
-llmwiki ingest resume /path/to/vault <operation_id> --from claim_extraction
+llmwiki ingest resume /path/to/vault <operation_id> --from source_digest
 ```

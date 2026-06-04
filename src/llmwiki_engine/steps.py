@@ -13,12 +13,18 @@ class StepSpec:
 
 
 STEP_SPECS: tuple[StepSpec, ...] = (
+    StepSpec("raw_link_cleanup", False, "raw_link_cleanup"),
     StepSpec("raw_prepare", True, "raw_prepare"),
-    StepSpec("raw_index", False, "raw_index"),
-    StepSpec("extraction_windows", False, "extraction_windows", eval_supported=True),
-    StepSpec("claim_extraction", True, "claim_extraction", eval_supported=True),
-    StepSpec("page_planning", True, "page_planning", eval_supported=True),
-    StepSpec("draft_rendering", False, "draft_rendering"),
+    StepSpec("prepared_raw_review", False, "prepared_raw_review"),
+    StepSpec("source_digest", True, "source_digest", eval_supported=True),
+    StepSpec("source_digest_review", False, "source_digest_review"),
+    StepSpec("source_duplicate_guard", False, "source_duplicate_guard"),
+    StepSpec("candidate_resolution", True, "candidate_resolution"),
+    StepSpec("wiki_context_snapshot", False, "wiki_context_snapshot"),
+    StepSpec("wiki_merge_planning", True, "wiki_merge_planning"),
+    StepSpec("merge_plan_review", False, "merge_plan_review"),
+    StepSpec("draft_rendering", True, "draft_rendering"),
+    StepSpec("draft_review", False, "draft_review"),
     StepSpec("validation", False, None),
     StepSpec("apply_preview", False, "apply_preview"),
 )

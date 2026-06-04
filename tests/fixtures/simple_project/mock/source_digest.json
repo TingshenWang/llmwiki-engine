@@ -1,0 +1,48 @@
+{
+  "schema_version": "source_digest.v2",
+  "source_raw_path": "raw/raw_project_note.md",
+  "summary": "项目笔记说明 llmwiki-engine 要把知识库维护流程拆成可测试模块，并先验证 CLI、状态机、artifact 和 validator。",
+  "key_takeaways": [
+    "知识库维护流程需要拆成可测试模块。",
+    "第一阶段重点是验证 CLI、状态机、artifact 和 validator 能跑通。",
+    "简化 ingest 应先生成 source 和 concept 草稿，而不是直接写正式 wiki。"
+  ],
+  "entities": [],
+  "concepts": [
+    {
+      "candidate_id": "CAND001",
+      "name": "知识编译工程骨架",
+      "type": "concept",
+      "one_sentence_summary": "知识编译工程骨架强调先证明 CLI、状态机、artifact 和 validator 等基础设施可运行。",
+      "why_matters": "这是 llmwiki-engine MVP 的工程判断：先证明流程可测试、可恢复，再扩展真实模型能力。",
+      "wiki_value": "帮助后续判断 ingest 功能是否服务稳定工程骨架，而不是只追求生成内容。",
+      "source_locator": "项目笔记 / 第 2 段",
+      "suggested_page_title": "知识编译工程骨架",
+      "related_candidates": [],
+      "resolution_hint": "如果已有工程骨架或 CLI 状态机页面，应优先更新旧页。",
+      "duplicate_risk": "low",
+      "open_question_or_tension": ""
+    }
+  ],
+  "designs": [
+    {
+      "candidate_id": "CAND002",
+      "name": "简化 Ingest 草稿流程",
+      "type": "design",
+      "one_sentence_summary": "简化 ingest 先生成 source 和 concept 草稿，用于验证工程骨架。",
+      "why_matters": "它说明正式写入 wiki 前需要通过草稿阶段验证 pipeline 输出。",
+      "wiki_value": "为后续设计 apply preview、审核和安全写入提供基础方案。",
+      "source_locator": "项目笔记 / 第 3 段",
+      "suggested_page_title": "简化 Ingest 草稿流程",
+      "related_candidates": [
+        "CAND001"
+      ],
+      "resolution_hint": "如果已有 ingest 流程设计页，应合并进去。",
+      "duplicate_risk": "low",
+      "open_question_or_tension": "草稿阶段应该由人类审核到什么粒度？"
+    }
+  ],
+  "comparisons": [],
+  "open_questions": [],
+  "weak_or_noise_items": []
+}

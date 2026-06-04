@@ -10,9 +10,13 @@ For complete command usage, parameters, config rules, Git boundaries, and common
 errors, see [docs/cli-reference.en.md](docs/cli-reference.en.md). Chinese users
 can read [docs/cli-reference.zh-CN.md](docs/cli-reference.zh-CN.md).
 
-The first runnable path is a simplified Ingest pipeline. It prepares noisy raw
-material into a canonical `raw_prepare/prepared.md` artifact before indexing,
-extraction windows, and wiki draft rendering:
+The current runnable path is the M3 Ingest MVP. It first normalizes Obsidian
+text wikilinks in the target `raw/` file in place, then prepares noisy raw
+material into a canonical `raw_prepare/prepared.md` artifact, creates a
+`source_digest`, checks source duplicates, plans candidate pages from the
+approved prepared text, freezes a wiki context snapshot, model-plans
+create/update/noop decisions, renders reviewed drafts, and produces an apply
+preview:
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
@@ -29,10 +33,20 @@ and drafts can be tested before real models are introduced.
 ## Design Principles
 
 - Canonical artifacts are JSON/JSONL.
+- `raw/` is the normalized material layer. The MVP only unwraps Obsidian text
+  wikilinks such as `[[Page]]` and `[[Page|Alias]]`; web links, Markdown links,
+  media embeds, and code blocks are preserved.
 - `raw_prepare` turns original raw material into the canonical prepared raw used
   by downstream knowledge compilation.
-- `extraction_windows` are engineering context windows for structured
-  extraction; they are not semantic knowledge units.
+- `source_digest` is the complete single-source digestion artifact used for
+  human review of candidate knowledge.
+- `candidate_resolution` plans wiki topics from the approved prepared text and
+  digest; `wiki_merge_planning` uses a frozen snapshot to decide
+  create/update/noop/needs-human-decision.
+- Update writes are supported in dev mode as whole-page draft replacement, but
+  must pass explicit draft review before validation/apply.
+- Knowledge pages use deterministic `Related` wikilinks; source pages stay out
+  of the Obsidian knowledge graph.
 - Human-editable profiles are YAML.
 - Human review and drafts are Markdown.
 - Providers are pluggable per module.
@@ -51,7 +65,7 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
-  page_planning:
+  source_digest:
     spec: mock:fixture
     fixture_dir: tests/fixtures/simple_project/mock
 ```
@@ -72,5 +86,5 @@ model-backed steps that still need to execute. Completed steps are not rerun jus
 because config changed. To rerun from a step with the current config:
 
 ```bash
-llmwiki ingest resume /path/to/vault <operation_id> --from claim_extraction
+llmwiki ingest resume /path/to/vault <operation_id> --from source_digest
 ```

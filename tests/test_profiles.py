@@ -10,7 +10,8 @@ def test_builtin_profiles_load() -> None:
     names = builtin_profile_names()
     assert {"project_basic", "research_basic", "memory_basic"}.issubset(names)
     profile = load_profile("project_basic")
-    assert profile.page_types["source"].evidence_policy == EvidencePolicy.strict
+    assert profile.page_types["source"].evidence_policy == EvidencePolicy.light
+    assert profile.page_types["source"].required_sections == ["Summary", "Raw", "Key Takeaways", "Derived Wiki Pages"]
     assert "concept" in profile.page_types
 
 
@@ -44,4 +45,3 @@ page_types:
         encoding="utf-8",
     )
     assert load_profile(profile_path).name == "custom"
-

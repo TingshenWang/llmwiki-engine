@@ -38,6 +38,10 @@ class RunStore:
     def lock_path(self, operation_id: str) -> Path:
         return self.run_dir(operation_id) / ".lock"
 
+    @property
+    def apply_lock_path(self) -> Path:
+        return self.llmwiki / "apply.lock"
+
 def ensure_workspace_layout(vault: Path) -> None:
     if (vault / "stage" / "ingest").exists() and not (vault / ".llmwiki").exists():
         raise WorkspaceError("Legacy stage/ingest layout detected. Re-run init and create a new operation.")
@@ -117,6 +121,23 @@ def run_lock(vault: Path, operation_id: str) -> Iterator[None]:
         fd = lock.open("x", encoding="utf-8")
     except FileExistsError as exc:
         raise WorkspaceError(f"Run lock exists: {lock}") from exc
+    with fd:
+        fd.write(utc_now())
+    try:
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+@contextmanager
+def apply_lock(vault: Path) -> Iterator[None]:
+    store = RunStore(vault)
+    lock = store.apply_lock_path
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = lock.open("x", encoding="utf-8")
+    except FileExistsError as exc:
+        raise WorkspaceError(f"Apply lock exists: {lock}") from exc
     with fd:
         fd.write(utc_now())
     try:

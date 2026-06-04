@@ -1,0 +1,40 @@
+{
+  "schema_version": "candidate_resolution.v3",
+  "items": [
+    {
+      "page_plan_id": "",
+      "source_basis": {
+        "source_candidate_ids": ["CAND001"],
+        "prepared_discovered_candidates": [],
+        "source_locator": "项目笔记 / 第 2 段"
+      },
+      "page_type": "concept",
+      "display_title": "知识编译工程骨架",
+      "path_stem": "",
+      "candidate_target_path": "",
+      "topic_summary": "知识编译工程骨架强调先证明 CLI、状态机、artifact 和 validator 等基础设施可运行。",
+      "why_this_page": "这是独立的工程判断主题，后续可以复用来判断 ingest MVP 是否先稳住工程骨架。",
+      "initial_section_intent": "记录工程骨架的定义、例子和价值点。",
+      "coverage_notes": "覆盖 CAND001。",
+      "reason": "从 digest 候选和全文 coverage check 规划为概念页。"
+    },
+    {
+      "page_plan_id": "",
+      "source_basis": {
+        "source_candidate_ids": ["CAND002"],
+        "prepared_discovered_candidates": [],
+        "source_locator": "项目笔记 / 第 3 段"
+      },
+      "page_type": "design",
+      "display_title": "简化 Ingest 草稿流程",
+      "path_stem": "",
+      "candidate_target_path": "",
+      "topic_summary": "简化 Ingest 草稿流程先生成 source 和知识页草稿，用于验证工程骨架。",
+      "why_this_page": "这是一个流程设计主题，直接影响后续 apply preview、审核和安全写入。",
+      "initial_section_intent": "记录流程方案、适用边界和价值点。",
+      "coverage_notes": "覆盖 CAND002。",
+      "reason": "从 digest 候选和全文 coverage check 规划为设计页。"
+    }
+  ],
+  "missed_candidate_risks": []
+}

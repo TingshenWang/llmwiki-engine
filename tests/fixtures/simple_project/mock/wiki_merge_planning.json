@@ -1,0 +1,86 @@
+{
+  "schema_version": "wiki_merge_plan.v4",
+  "log_date": "2026-06-03",
+  "context_snapshot_ref": "",
+  "items": [
+    {
+      "page_plan_id": "",
+      "source_basis": {
+        "source_candidate_ids": ["CAND001"],
+        "prepared_discovered_candidates": [],
+        "source_locator": "项目笔记 / 第 2 段"
+      },
+      "action": "create",
+      "canonical_target_path": "",
+      "display_title": "知识编译工程骨架",
+      "page_type": "concept",
+      "matched_page": null,
+      "prior_knowledge_state": "当前 wiki 没有相关知识页。",
+      "new_understanding": "llmwiki-engine 的第一阶段应先证明 CLI、状态机、artifact 和 validator 这些工程骨架可运行。",
+      "changed_view": "将 MVP 重点从生成内容数量转向可测试、可恢复的流程骨架。",
+      "knowledge_delta": "新增了以工程骨架为优先级的 ingest 建设判断。",
+      "why_this_matters": "它能帮助后续判断功能扩展是否建立在稳定状态机之上。",
+      "reuse_scenarios": ["评审 ingest MVP 是否过早追求生成内容。"],
+      "value_points": ["先稳定工程骨架，再接入更复杂模型能力。"],
+      "section_plans": {
+        "summary": "一句话说明工程骨架判断。",
+        "detail": "解释 CLI、状态机、artifact、validator 的作用。",
+        "examples": "用简化 ingest 作为例子。",
+        "value_points": "说明该判断的工程价值。",
+        "open_questions": "记录后续需要验证的风险。"
+      },
+      "related_pages": [],
+      "related_unresolved": [],
+      "unresolved_related": [],
+      "conflicts": [],
+      "uncertainties": [],
+      "quality_risks": [],
+      "apply_eligibility": "applyable",
+      "blocked_reason": "",
+      "reason": "空 vault 中该主题不存在，应创建概念页。"
+    },
+    {
+      "page_plan_id": "",
+      "source_basis": {
+        "source_candidate_ids": ["CAND002"],
+        "prepared_discovered_candidates": [],
+        "source_locator": "项目笔记 / 第 3 段"
+      },
+      "action": "create",
+      "canonical_target_path": "",
+      "display_title": "简化 Ingest 草稿流程",
+      "page_type": "design",
+      "matched_page": null,
+      "prior_knowledge_state": "当前 wiki 没有相关设计页。",
+      "new_understanding": "简化 Ingest 先生成 source 和知识页草稿，再通过 review/apply 流程进入 wiki。",
+      "changed_view": "把正式写入前的草稿验证作为流程安全层。",
+      "knowledge_delta": "新增了草稿阶段用于验证 pipeline 输出的设计思路。",
+      "why_this_matters": "它为 apply preview、审核和安全写入提供基础方案。",
+      "reuse_scenarios": ["设计后续 ingest 审核和 apply preview 时复用。"],
+      "value_points": ["先看草稿再写 wiki，降低自动写入风险。"],
+      "section_plans": {
+        "summary": "一句话说明草稿流程。",
+        "detail": "解释 source、知识页草稿和 apply preview 的关系。",
+        "examples": "用项目笔记中的简化 ingest 做例子。",
+        "value_points": "说明该流程对安全写入的价值。",
+        "open_questions": "草稿阶段应该审核到什么粒度。"
+      },
+      "related_pages": [
+        {
+          "target_path": "concepts/Concept_知识编译工程骨架.md",
+          "display_title": "知识编译工程骨架",
+          "source": "source_digest",
+          "reason": "草稿流程依赖先稳定工程骨架。"
+        }
+      ],
+      "related_unresolved": [],
+      "unresolved_related": [],
+      "conflicts": [],
+      "uncertainties": [],
+      "quality_risks": [],
+      "apply_eligibility": "applyable",
+      "blocked_reason": "",
+      "reason": "空 vault 中该设计不存在，应创建设计页。"
+    }
+  ]
+}

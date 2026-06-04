@@ -34,12 +34,11 @@ def test_providers_check_live_uses_fake_http_without_printing_key(tmp_path: Path
             "endpoint": "https://example.test/v1/chat/completions",
             "api_key": "sk-live-secret-a",
         },
-        "claim_extraction": {
+        "source_digest": {
             "spec": "openai_compatible:test-model",
             "endpoint": "https://example.test/v1/chat/completions",
             "api_key": "sk-live-secret-b",
         },
-        "page_planning": "human",
     }
     write_yaml(config_path, config)
     seen: list[dict] = []

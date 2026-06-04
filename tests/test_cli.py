@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 import llmwiki_engine.cli as cli_module
 from llmwiki_engine.cli import app
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
+from llmwiki_engine.models import RunMode
 from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, latest_operation, run_simplified_ingest
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
@@ -27,10 +28,19 @@ def test_status_verify_exit_codes(tmp_path: Path) -> None:
     runner = CliRunner()
     ok = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--verify"])
     assert ok.exit_code == 0
+    assert "Review" in ok.output
+    assert "Attempts" in ok.output
+    assert "Last Duration" in ok.output
+    assert "Total Duration" in ok.output
+    assert "Provider" in ok.output
+    assert "prepared_raw_review" in ok.output
+    assert "source_digest_review" in ok.output
+    assert "raw cleanup" in ok.output
+    assert ok.output.count("auto_stub/approved (auto-approved)") >= 2
     raw_json = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--json"])
     assert json.loads(raw_json.output)["operation_id"] == manifest.operation_id
-    claims = RunStore(vault).run_dir(manifest.operation_id) / "claim_extraction" / "claims.json"
-    claims.write_text(claims.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    digest = RunStore(vault).run_dir(manifest.operation_id) / "source_digest" / "source_digest.json"
+    digest.write_text(digest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     drift = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--verify"])
     assert drift.exit_code == 3
 
@@ -67,7 +77,7 @@ def test_resume_help_lists_step_names_from_metadata() -> None:
         assert step_name in result.output
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v3", "operation_manifest.v4"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7"])
 def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
     tmp_path: Path,
     schema_version: str,
@@ -85,7 +95,36 @@ def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands
     for command in ["status", "resume", "apply"]:
         result = runner.invoke(app, ["ingest", command, str(vault), manifest.operation_id])
         assert result.exit_code != 0
-        assert f"Unsupported manifest schema_version: {schema_version}" in result.output
+        assert "operation is incompatible with current MVP pipeline; rerun ingest" in _compact_output(result.output)
+        assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda names: names[:-1],
+        lambda names: [*names, "extra_step"],
+        lambda names: [*names, names[-1]],
+        lambda names: [names[1], names[0], *names[2:]],
+    ],
+)
+def test_manifest_step_topology_reports_single_line_error_for_user_commands(tmp_path: Path, mutator) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="topology-cli")
+    manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
+    data = read_json(manifest_path)
+    steps_by_name = {step["name"]: step for step in data["steps"]}
+    mutated_names = mutator([step["name"] for step in data["steps"]])
+    data["steps"] = [dict(steps_by_name.get(name, data["steps"][0]), name=name) for name in mutated_names]
+    write_json(manifest_path, data)
+
+    runner = CliRunner()
+    for command in ["status", "resume", "apply"]:
+        result = runner.invoke(app, ["ingest", command, str(vault), manifest.operation_id])
+        assert result.exit_code != 0
+        assert "operation is incompatible with current MVP pipeline; rerun ingest" in _compact_output(result.output)
         assert "Traceback" not in result.output
 
 
@@ -102,6 +141,46 @@ def test_verify_drift_reports_single_line_error_for_resume_and_apply(tmp_path: P
         assert result.exit_code != 0
         assert "raw file hash changed" in result.output
         assert "Traceback" not in result.output
+
+
+def test_apply_wiki_context_drift_reports_fixed_chinese_message(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="wiki-drift-cli")
+    (vault / "wiki" / "index.md").write_text("changed after planning\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "apply", str(vault), manifest.operation_id])
+    assert result.exit_code != 0
+    assert "当前 operation 的 apply plan 已过期，因为 wiki 在 plan 生成后发生变化。请 resume 后再 apply。" in _compact_output(result.output)
+    assert "wiki context changed after planning" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_standard_status_does_not_prompt_manual_apply(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=FIXTURE_ROOT / "mock",
+        slug="standard-next",
+        run_mode=RunMode.standard,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])
+    assert result.exit_code == 0
+    assert "standard mode does not allow manual apply in this MVP" in result.output
+    assert "llmwiki ingest apply" not in result.output
+
+
+def _compact_output(output: str) -> str:
+    for char in "│╭╮╰╯─":
+        output = output.replace(char, " ")
+    return " ".join(output.split())
 
 
 def test_ingest_run_raw_outside_vault_reports_single_line_error(tmp_path: Path) -> None:
@@ -278,10 +357,9 @@ def test_api_key_does_not_spread_across_e2e_cli_boundaries(monkeypatch, tmp_path
         if task == "raw_prepare":
             data["prepared_markdown"] += f"\n{secret}\n"
             data["review_notes"] = f"review note {secret}"
-        if task == "claim_extraction":
-            data["claims"][0]["text"] += f" {secret}"
-        if task == "page_planning":
-            data["pages"][0]["summary"] += f" {secret}"
+        if task == "source_digest":
+            data["summary"] += f" {secret}"
+            data["concepts"][0]["why_matters"] += f" {secret}"
         return json.dumps(data, ensure_ascii=False)
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)

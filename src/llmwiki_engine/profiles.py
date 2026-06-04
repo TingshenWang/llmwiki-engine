@@ -45,17 +45,6 @@ def _load_profile_file(path: Path) -> ProfileSpec:
     return ProfileSpec.model_validate(raw)
 
 
-def profile_template_text(profile: ProfileSpec, page_type: str) -> str:
-    spec = profile.page_types.get(page_type)
-    if spec is None:
-        raise ProfileError(f"Profile {profile.name} does not define page type {page_type!r}")
-    template_root = profile.template_root or Path(str(BUILTIN_PROFILE_ROOT / profile.name / "templates"))
-    template_path = Path(str(template_root / spec.template))
-    if not template_path.exists():
-        raise ProfileError(f"Template not found for {profile.name}:{page_type}: {spec.template}")
-    return template_path.read_text(encoding="utf-8")
-
-
 def page_output_path(root: Path, profile: ProfileSpec, page_type: str, title: str) -> Path:
     spec = profile.page_types.get(page_type)
     if spec is None:

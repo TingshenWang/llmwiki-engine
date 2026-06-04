@@ -3,29 +3,36 @@ version: "1"
 description: Research-oriented wiki profile with stricter source provenance.
 default_page_type: concept
 source_page_type: source
+# Template files are currently inactive in the current MVP. Rendering is hard-coded until
+# page contracts stabilize; templates are kept for future configuration.
 page_types:
   source:
     directory: sources
     title_prefix: "Source_"
     template: source.md
-    required_sections: ["Summary", "Source Info", "Claims"]
-    evidence_policy: strict
+    required_sections: ["Summary", "Raw", "Key Takeaways", "Derived Wiki Pages"]
+    evidence_policy: light
   concept:
     directory: concepts
     title_prefix: "Concept_"
     template: concept.md
-    required_sections: ["Summary", "Claims"]
-    evidence_policy: strict
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
+    evidence_policy: light
   entity:
     directory: entities
     title_prefix: "Entity_"
     template: concept.md
-    required_sections: ["Summary", "Claims"]
-    evidence_policy: strict
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
+    evidence_policy: light
   overview:
     directory: overviews
     title_prefix: "Overview_"
     template: concept.md
-    required_sections: ["Summary", "Claims"]
-    evidence_policy: strict
-
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
+    evidence_policy: light
+  open_question:
+    directory: open_questions
+    title_prefix: "Open_Question_"
+    template: concept.md
+    required_sections: ["Summary", "Detail", "Related", "Tensions / Open Questions"]
+    evidence_policy: light

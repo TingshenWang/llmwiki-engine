@@ -10,7 +10,7 @@
 
 `raw`
 
-待入库的原始材料。`ingest run` 的 `RAW` 参数必须指向 `vault/raw/` 里面的文件。
+待入库的原始材料。`ingest run` 的 `RAW` 参数必须指向 `vault/raw/` 里面的文件。`raw_link_cleanup` 会把目标 raw 文件原地改写为规范化材料层。本轮 MVP 只展开 `[[Page]]`、`[[Page|Alias]]` 这类 Obsidian 文本 wikilink；网页链接、裸 URL、HTML 链接、reference-style Markdown 链接、普通相对 Markdown 链接、媒体 embed、fenced code block 和 inline code 都保持不变。
 
 `.llmwiki/`
 
@@ -36,8 +36,7 @@ mock provider 的测试答案目录。目录里通常有：
 
 ```text
 raw_prepare.json
-claim_extraction.json
-page_planning.json
+source_digest.json
 ```
 
 `provider`
@@ -54,7 +53,7 @@ page_planning.json
 
 `apply --commit`
 
-写入 `vault/wiki/` 后创建 Git commit。当前语义是只提交 `wiki/` 路径，不带入用户已经 staged 的无关文件。
+本轮 MVP 禁用。CLI 暂时保留这个 flag，但会在任何 verify 或 wiki 写入前失败。
 
 `staged`
 
@@ -84,11 +83,13 @@ global providers -> vault providers
 ```text
 default
 raw_prepare
-claim_extraction
-page_planning
+source_digest
+candidate_resolution
+wiki_merge_planning
+draft_rendering
 ```
 
-`default` 是默认 provider；具体 step 会覆盖 `default`。
+`default` 是默认 provider；通常只需要配置这一项。具体 step key 只在你想让某一步使用不同模型时覆盖 `default`。
 
 mock 配置示例：
 
@@ -100,6 +101,16 @@ providers:
     fixture_dir: /path/to/mock
 ```
 
+真实模型建议放在全局配置 `~/.llmwiki/config.yaml`，这样不同 vault 不用重复配置：
+
+```yaml
+providers:
+  default:
+    spec: openai_compatible:deepseek-chat
+    endpoint: https://api.deepseek.com/v1/chat/completions
+    api_key: sk-...
+```
+
 openai-compatible 配置示例：
 
 ```yaml
@@ -109,8 +120,8 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
-  page_planning:
-    spec: openai_compatible:stronger-planner
+  source_digest:
+    spec: openai_compatible:stronger-digest
     endpoint: https://example.test/v1/chat/completions
     api_key: sk-...
 ```
@@ -149,7 +160,7 @@ llmwiki providers check <vault> [--live]
 llmwiki ingest run <vault> <raw> [--fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mode dev|standard]
-llmwiki ingest apply <vault> <operation_id> [--commit]
+llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
 llmwiki profile validate <path_or_name>
 llmwiki eval run <module> <dataset> [--output-root PATH]
@@ -298,6 +309,10 @@ uv run llmwiki ingest status "$VAULT" "$OP" --verify
 uv run llmwiki ingest status "$VAULT" "$OP" --json
 ```
 
+状态表会展示每一步的 review 状态、attempt 次数、最近耗时、总耗时和 provider。
+如果对应 artifact 已存在，也会输出 raw cleanup 审计文件、review prompt、draft
+pages、diff 和 apply preview 等路径。
+
 ## `llmwiki ingest resume`
 
 继续一个失败或 pending 的 operation。
@@ -315,7 +330,7 @@ uv run llmwiki ingest resume "$VAULT" "$OP"
 从指定 step 及下游重跑：
 
 ```bash
-uv run llmwiki ingest resume "$VAULT" "$OP" --from claim_extraction
+uv run llmwiki ingest resume "$VAULT" "$OP" --from source_digest
 ```
 
 `--from STEP` 会：
@@ -330,14 +345,60 @@ uv run llmwiki ingest resume "$VAULT" "$OP" --from claim_extraction
 合法 step：
 
 ```text
+raw_link_cleanup
 raw_prepare
-raw_index
-extraction_windows
-claim_extraction
-page_planning
+prepared_raw_review
+source_digest
+source_digest_review
+source_duplicate_guard
+candidate_resolution
+wiki_context_snapshot
+wiki_merge_planning
+merge_plan_review
 draft_rendering
+draft_review
 validation
 apply_preview
+```
+
+## `llmwiki ingest review / approve / revise`
+
+查看并处理真实 review gate。当前 gate 有两个：
+
+- `merge_plan_review`：审核“写哪些页面、为什么写”。如果计划里有
+  `needs_human_decision`，pipeline 会停在这里。
+- `draft_review`：审核“具体写什么”。update 或 revise 后的草稿必须显式 approve。
+
+查看 review artifacts：
+
+```bash
+uv run llmwiki ingest review "$VAULT" "$OP" merge_plan_review
+uv run llmwiki ingest review "$VAULT" "$OP" draft_review
+```
+
+如果 `merge_plan_review` 停住，先编辑 operation 目录下的
+`merge_plan_review/pending_merge_plan.json`，把 `needs_human_decision` 改成
+`create`、`update` 或 `noop`，再 approve：
+
+```bash
+uv run llmwiki ingest approve "$VAULT" "$OP" merge_plan_review
+uv run llmwiki ingest resume "$VAULT" "$OP"
+```
+
+如果 `draft_review` 停住，先检查 `draft_review/review_prompt.md`、
+`draft_rendering/diffs/` 和 `draft_rendering/draft_pages/`，再 approve：
+
+```bash
+uv run llmwiki ingest approve "$VAULT" "$OP" draft_review
+uv run llmwiki ingest resume "$VAULT" "$OP"
+```
+
+要求模型重新生成当前 review 对应的上游内容：
+
+```bash
+uv run llmwiki ingest revise "$VAULT" "$OP" merge_plan_review
+uv run llmwiki ingest revise "$VAULT" "$OP" draft_review
+uv run llmwiki ingest resume "$VAULT" "$OP"
 ```
 
 ## `llmwiki ingest apply`
@@ -348,22 +409,15 @@ apply_preview
 uv run llmwiki ingest apply "$VAULT" "$OP"
 ```
 
-普通 `apply` 不碰 Git，不要求 vault 是 Git repo。
+普通 `apply` 目前只对 `dev` operation 可用。不碰 Git，不要求 vault 是 Git repo。
 
-加 `--commit`：
+`--commit` 在本轮 MVP 禁用：
 
 ```bash
 uv run llmwiki ingest apply "$VAULT" "$OP" --commit
 ```
 
-`apply --commit` 会：
-
-- 要求 vault 是 Git repo；
-- 写入前检查 `.llmwiki/` 没有被 tracked/staged；
-- 写入 `wiki/`；
-- 创建一个只包含 `wiki/` 路径的 commit。
-
-如果用户之前 staged 了无关文件，`apply --commit` 不会提交它们，但也不会自动清理 staged 状态。
+它会在 verify、preimage 校验、manifest 写入、receipt 写入、wiki 写入之前失败。target-scoped Git transaction 是后续计划。
 
 ## `profile` 命令
 
@@ -385,7 +439,7 @@ uv run llmwiki profile validate /path/to/profile
 运行模块 eval：
 
 ```bash
-uv run llmwiki eval run page_planning tests/fixtures/evals/page_planning
+uv run llmwiki eval run source_digest tests/fixtures/evals/source_digest
 ```
 
 参数：
@@ -443,23 +497,14 @@ run artifact 被修改过或损坏，resume/apply 会阻止继续。
 
 `.llmwiki/` 是本地运行和配置目录，不应该进入 Git。需要先从 Git tracked/staged 状态移除。
 
-`Unsupported manifest schema_version`
+`operation is incompatible with current MVP pipeline; rerun ingest`
 
-当前代码不支持旧 run manifest。这个阶段不迁移旧 in-flight operation，需要重新 run。
+当前 MVP pipeline 已变化。开发期旧 run 不做迁移，直接重新 ingest。
 
 ## Git 边界
 
 `.gitignore` 负责让 `.llmwiki/` 默认不进入 Git。
 
-`apply --commit` 负责只提交 `wiki/`。
-
-两者不是一回事：
-
-```text
-.gitignore       防止默认 git add
-apply --commit   限定本次 commit 的路径
-```
-
 普通 `apply` 不检查 Git repo，也不提交。
 
-`apply --commit` 要求 Git repo，并且会在写入前检查 `.llmwiki/` 没有 tracked/staged。
+`apply --commit` 在本轮 MVP 禁用，并且会在写入前失败。未来 auto-apply/commit 会采用 target-scoped Git transaction。

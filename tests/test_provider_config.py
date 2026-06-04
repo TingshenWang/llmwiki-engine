@@ -29,7 +29,7 @@ def test_global_provider_default_and_vault_whole_step_override(tmp_path: Path) -
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
     config["providers"] = {
-        "page_planning": {
+        "source_digest": {
             "spec": "mock:fixture",
             "fixture_dir": "vault_mock",
         }
@@ -42,12 +42,12 @@ def test_global_provider_default_and_vault_whole_step_override(tmp_path: Path) -
         fixture_dir=None,
         source="initial_run",
         from_step=None,
-        tasks=["raw_prepare", "page_planning"],
+        tasks=["raw_prepare", "source_digest"],
     )
 
     assert context.record is not None
     assert context.record.providers["raw_prepare"].fixture_dir == global_fixture.resolve().as_posix()
-    assert context.record.providers["page_planning"].fixture_dir == vault_fixture.resolve().as_posix()
+    assert context.record.providers["source_digest"].fixture_dir == vault_fixture.resolve().as_posix()
 
 
 def test_global_config_rejects_vault_only_fields(tmp_path: Path) -> None:
@@ -164,7 +164,7 @@ def test_provider_unknown_field_error_includes_source_and_key(tmp_path: Path) ->
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
     config["providers"] = {
-        "page_planning": {
+        "source_digest": {
             "spec": "mock:fixture",
             "unexpected": "value",
         }
@@ -175,16 +175,16 @@ def test_provider_unknown_field_error_includes_source_and_key(tmp_path: Path) ->
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=tmp_path,
-            source="initial_run",
-            from_step=None,
-            tasks=["page_planning"],
-        )
+        fixture_dir=tmp_path,
+        source="initial_run",
+        from_step=None,
+        tasks=["source_digest"],
+    )
     message = str(exc.value)
-    assert "Unsupported provider config field(s) for page_planning" in message
+    assert "Unsupported provider config field(s) for source_digest" in message
     assert "unexpected" in message
     assert str(config_path) in message
-    assert "provider key: page_planning" in message
+    assert "provider key: source_digest" in message
 
 
 def test_openai_missing_required_field_error_includes_source_and_key(tmp_path: Path) -> None:

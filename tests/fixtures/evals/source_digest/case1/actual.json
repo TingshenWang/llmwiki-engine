@@ -1,0 +1,27 @@
+{
+  "schema_version": "source_digest.v2",
+  "source_raw_path": "raw/demo.md",
+  "summary": "demo",
+  "key_takeaways": [],
+  "entities": [],
+  "concepts": [
+    {
+      "candidate_id": "CAND001",
+      "name": "Demo Concept",
+      "type": "concept",
+      "one_sentence_summary": "demo",
+      "why_matters": "demo",
+      "wiki_value": "demo",
+      "source_locator": "demo",
+      "suggested_page_title": "Demo Concept",
+      "related_candidates": [],
+      "resolution_hint": "",
+      "duplicate_risk": "low",
+      "open_question_or_tension": ""
+    }
+  ],
+  "designs": [],
+  "comparisons": [],
+  "open_questions": [],
+  "weak_or_noise_items": []
+}

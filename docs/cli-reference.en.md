@@ -10,7 +10,7 @@ A local knowledge base directory. `llmwiki init` creates `raw/`, `wiki/`, and `.
 
 `raw`
 
-Source material to ingest. The `RAW` argument for `ingest run` must point to a file under `vault/raw/`.
+Source material to ingest. The `RAW` argument for `ingest run` must point to a file under `vault/raw/`. During `raw_link_cleanup`, the engine rewrites the target raw file in place as the normalized material layer. This MVP only unwraps Obsidian text wikilinks such as `[[Page]]` and `[[Page|Alias]]`; URL links, bare URLs, HTML links, reference links, relative Markdown links, media embeds, fenced code blocks, and inline code are preserved.
 
 `.llmwiki/`
 
@@ -36,8 +36,7 @@ The mock provider answer directory. It usually contains:
 
 ```text
 raw_prepare.json
-claim_extraction.json
-page_planning.json
+source_digest.json
 ```
 
 `provider`
@@ -54,7 +53,7 @@ Write draft pages from a run into `vault/wiki/`.
 
 `apply --commit`
 
-Write `vault/wiki/` and create a Git commit. The commit only includes `wiki/`, not unrelated files the user already staged.
+Disabled in this MVP. The flag is retained for CLI compatibility and fails before any verify or wiki write.
 
 `staged`
 
@@ -84,11 +83,13 @@ Allowed provider keys:
 ```text
 default
 raw_prepare
-claim_extraction
-page_planning
+source_digest
+candidate_resolution
+wiki_merge_planning
+draft_rendering
 ```
 
-`default` is the fallback provider. A concrete step overrides `default`.
+`default` is the fallback provider. In normal real-model runs, configure only this key. A concrete step key is only needed when one step should use a different model.
 
 Mock config example:
 
@@ -100,6 +101,16 @@ providers:
     fixture_dir: /path/to/mock
 ```
 
+For real-model runs, prefer the global config at `~/.llmwiki/config.yaml` so vaults do not need repeated provider setup:
+
+```yaml
+providers:
+  default:
+    spec: openai_compatible:deepseek-chat
+    endpoint: https://api.deepseek.com/v1/chat/completions
+    api_key: sk-...
+```
+
 OpenAI-compatible config example:
 
 ```yaml
@@ -109,8 +120,8 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
-  page_planning:
-    spec: openai_compatible:stronger-planner
+  source_digest:
+    spec: openai_compatible:stronger-digest
     endpoint: https://example.test/v1/chat/completions
     api_key: sk-...
 ```
@@ -149,7 +160,7 @@ llmwiki providers check <vault> [--live]
 llmwiki ingest run <vault> <raw> [--fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mode dev|standard]
-llmwiki ingest apply <vault> <operation_id> [--commit]
+llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
 llmwiki profile validate <path_or_name>
 llmwiki eval run <module> <dataset> [--output-root PATH]
@@ -295,6 +306,11 @@ uv run llmwiki ingest status "$VAULT" "$OP" --verify
 uv run llmwiki ingest status "$VAULT" "$OP" --json
 ```
 
+The table shows each step's review state, attempt count, last duration, total
+duration, and provider. It also prints useful run artifact paths such as raw
+cleanup audit files, review prompts, draft pages, diffs, and apply preview when
+they exist.
+
 ## `llmwiki ingest resume`
 
 Continue a failed or pending operation.
@@ -312,7 +328,7 @@ Default behavior:
 Rerun from a step and downstream:
 
 ```bash
-uv run llmwiki ingest resume "$VAULT" "$OP" --from claim_extraction
+uv run llmwiki ingest resume "$VAULT" "$OP" --from source_digest
 ```
 
 `--from STEP` will:
@@ -327,14 +343,61 @@ uv run llmwiki ingest resume "$VAULT" "$OP" --from claim_extraction
 Valid steps:
 
 ```text
+raw_link_cleanup
 raw_prepare
-raw_index
-extraction_windows
-claim_extraction
-page_planning
+prepared_raw_review
+source_digest
+source_digest_review
+source_duplicate_guard
+candidate_resolution
+wiki_context_snapshot
+wiki_merge_planning
+merge_plan_review
 draft_rendering
+draft_review
 validation
 apply_preview
+```
+
+## `llmwiki ingest review / approve / revise`
+
+Inspect and resolve real review gates. The current gates are:
+
+- `merge_plan_review`: review which pages will be written and why. If the plan
+  contains `needs_human_decision`, the pipeline stops here.
+- `draft_review`: review the concrete page content. Update drafts and revised
+  drafts require explicit approval.
+
+Show review artifacts:
+
+```bash
+uv run llmwiki ingest review "$VAULT" "$OP" merge_plan_review
+uv run llmwiki ingest review "$VAULT" "$OP" draft_review
+```
+
+If `merge_plan_review` is waiting, edit
+`merge_plan_review/pending_merge_plan.json` in the operation directory and
+change `needs_human_decision` to `create`, `update`, or `noop`, then approve:
+
+```bash
+uv run llmwiki ingest approve "$VAULT" "$OP" merge_plan_review
+uv run llmwiki ingest resume "$VAULT" "$OP"
+```
+
+If `draft_review` is waiting, inspect `draft_review/review_prompt.md`,
+`draft_rendering/diffs/`, and `draft_rendering/draft_pages/`, then approve:
+
+```bash
+uv run llmwiki ingest approve "$VAULT" "$OP" draft_review
+uv run llmwiki ingest resume "$VAULT" "$OP"
+```
+
+Ask the model to regenerate the upstream content for a review gate:
+
+```bash
+uv run llmwiki ingest revise "$VAULT" "$OP" merge_plan_review
+uv run llmwiki ingest revise "$VAULT" "$OP" draft_review
+uv run llmwiki ingest resume "$VAULT" "$OP"
 ```
 
 ## `llmwiki ingest apply`
@@ -345,22 +408,15 @@ Write draft pages into `vault/wiki/`.
 uv run llmwiki ingest apply "$VAULT" "$OP"
 ```
 
-Plain `apply` does not touch Git and does not require the vault to be a Git repository.
+Plain `apply` is currently available only for `dev` operations. It does not touch Git and does not require the vault to be a Git repository.
 
-With `--commit`:
+`--commit` is disabled in this MVP:
 
 ```bash
 uv run llmwiki ingest apply "$VAULT" "$OP" --commit
 ```
 
-`apply --commit` will:
-
-- require the vault to be a Git repository;
-- check before writing that `.llmwiki/` is not tracked or staged;
-- write `wiki/`;
-- create a commit containing only the `wiki/` path.
-
-If unrelated files were already staged, `apply --commit` does not commit them and does not unstage them.
+It fails before verify, preimage checks, manifest writes, receipt writes, or wiki writes. Target-scoped Git transaction support is a later follow-up.
 
 ## `profile` Commands
 
@@ -382,7 +438,7 @@ uv run llmwiki profile validate /path/to/profile
 Run a module eval:
 
 ```bash
-uv run llmwiki eval run page_planning tests/fixtures/evals/page_planning
+uv run llmwiki eval run source_digest tests/fixtures/evals/source_digest
 ```
 
 Arguments and options:
@@ -440,23 +496,14 @@ An applied operation cannot be resumed. Start a new `ingest run`.
 
 `.llmwiki/` is local runtime/config state and should not be committed. Remove it from tracked/staged Git state first.
 
-`Unsupported manifest schema_version`
+`operation is incompatible with current MVP pipeline; rerun ingest`
 
-The current code does not support that old run manifest. This stage does not migrate old in-flight operations. Start a new run.
+The current MVP pipeline changed. Old development runs are not migrated; start a new ingest operation.
 
 ## Git Boundary
 
 `.gitignore` prevents `.llmwiki/` from being added by default.
 
-`apply --commit` limits this commit to `wiki/`.
-
-They are separate protections:
-
-```text
-.gitignore       prevents default git add
-apply --commit   limits this commit path
-```
-
 Plain `apply` does not check Git and does not commit.
 
-`apply --commit` requires a Git repository and checks before writing that `.llmwiki/` is not tracked or staged.
+`apply --commit` is disabled in this MVP and fails before writing. Future auto-apply/commit support will use a target-scoped Git transaction.

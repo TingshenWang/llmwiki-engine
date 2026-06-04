@@ -3,7 +3,7 @@
 English | [中文](2026-05-30-ingest-architecture.zh-CN.md)
 
 Date: 2026-05-30
-Status: Accepted for current MVP direction
+Status: Updated by the 2026-06-02 M1 ingest redesign; the modular CLI, artifact, resume, and apply boundaries still hold
 
 This note records the design decisions behind the current `llmwiki-engine`
 Ingest architecture. It is not a transcript. It is the durable project memory
@@ -100,32 +100,32 @@ separate raw note when an image carries important knowledge.
 This avoids turning the Ingest engine into an OCR and vision system before the
 text compilation path is stable.
 
-## Extraction Windows Instead Of Semantic Aggregation
+## Source Digest Instead Of Semantic Aggregation
 
-The earlier `semantic_aggregation` idea was removed from the main path.
+The earlier `semantic_aggregation` idea and strict evidence-window flow were
+removed from the main path.
 
 The concern was that an aggregation layer could pretend to define knowledge
 units while actually making lossy or mistaken grouping decisions. For example,
 a conversation might group one question and answer too narrowly, or a transcript
 might combine unrelated fragments because they are adjacent.
 
-The replacement is `extraction_windows`.
+The current replacement is `source_digest`.
 
-Extraction windows are engineering context windows, not semantic knowledge
-units. They exist to give claim extraction enough local context while preserving
-traceability back to prepared raw spans.
+Source digest is a single-raw digestion artifact for human review, not a final
+wiki page. It asks the model to list entity, concept, design, comparison, and
+open-question candidates as completely as possible before later
+resolution/merge steps decide which candidates update existing pages and which
+create new pages.
 
 ```text
-prepared raw -> raw_index -> extraction_windows -> claim_extraction
+prepared raw -> source_digest -> candidate_resolution -> wiki_merge_planning
 ```
 
-Claims must point to a `source_window_id` as their discovery or primary context
-window, and their evidence must bind back to prepared raw spans. Evidence spans
-may come from elsewhere in the prepared raw when the same idea is repeated or
-supported across the document. `evidence_span_ids` are the authoritative
-provenance binding; `evidence_quote` is display text and may summarize or join
-multiple referenced spans. This makes extraction testable without pretending
-that window boundaries are conceptual or evidence boundaries.
+Strict evidence chains are no longer a hard main-path contract. As long as the
+source page links back to raw, reviewers can return to the source when needed.
+The MVP review surface is whether the digest is complete, candidate resolution
+is reasonable, and the final drafts are useful.
 
 ## Current Linear Pipeline
 
@@ -133,10 +133,11 @@ The current MVP pipeline is:
 
 ```text
 raw_prepare
-raw_index
-extraction_windows
-claim_extraction
-page_planning
+prepared_raw_review
+source_digest
+source_digest_review
+candidate_resolution
+wiki_merge_planning
 draft_rendering
 validation
 apply_preview
@@ -233,8 +234,8 @@ It does not replace unit tests, regression tests, or module evals.
   help text and eval module validation.
 - Provider config errors now include global/vault source information and the
   provider key that produced the error.
-- CLI tests now verify that non-v1 manifest schemas such as `operation_manifest.v3`
-  and `operation_manifest.v4` are rejected clearly.
+- CLI tests now verify that old or future manifest schemas such as `operation_manifest.v3`
+  and `operation_manifest.v5` are rejected clearly.
 
 ## Known Follow-ups From Review
 
@@ -249,7 +250,7 @@ It does not replace unit tests, regression tests, or module evals.
 - How strict should `raw_prepare` be when the model detects uncertain cleanup?
 - Should prepared raw require an optional human approval gate before extraction?
 - How should non-Markdown formats normalize into the same prepared raw contract?
-- What is the right claim schema before deduplication and page planning become
-  more sophisticated?
+- How should the source digest candidate schema evolve before deduplication,
+  candidate resolution, and merge planning become more sophisticated?
 - Which modules deserve local-model defaults, and which should default to
   stronger hosted providers?

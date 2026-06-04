@@ -62,7 +62,11 @@ class OpenAICompatibleProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": "Return only JSON matching the requested schema.",
+                    "content": (
+                        "Return only one complete valid JSON object matching the requested schema. "
+                        "Do not use markdown. Arrays must contain JSON objects with braces and commas. "
+                        "Include every required field."
+                    ),
                 },
                 {
                     "role": "user",
@@ -77,8 +81,16 @@ class OpenAICompatibleProvider:
                 },
             ],
             "temperature": 0,
+            "response_format": {"type": "json_object"},
         }
-        return _extract_openai_compatible_content(self._post_chat(body))
+        try:
+            return _extract_openai_compatible_content(self._post_chat(body))
+        except ProviderError as exc:
+            if not _is_json_mode_unsupported(exc):
+                raise
+            body_without_json_mode = dict(body)
+            body_without_json_mode.pop("response_format", None)
+            return _extract_openai_compatible_content(self._post_chat(body_without_json_mode))
 
     def check_live(self, *, use_json_mode: bool = True) -> str:
         body = {
@@ -188,6 +200,23 @@ def _extract_openai_compatible_content(data: dict[str, Any]) -> str:
         if chunks:
             return "\n".join(chunks)
     raise ProviderError("OpenAI-compatible message content must be text.")
+
+
+def _is_json_mode_unsupported(exc: ProviderError) -> bool:
+    if exc.status_code not in {400, 422}:
+        return False
+    message = str(exc).lower()
+    json_mode_terms = ("response_format", "json_object", "json mode")
+    unsupported_terms = (
+        "unsupported",
+        "not support",
+        "does not support",
+        "unrecognized",
+        "unknown parameter",
+        "invalid parameter",
+        "not allowed",
+    )
+    return any(term in message for term in json_mode_terms) and any(term in message for term in unsupported_terms)
 
 
 def timed_call(provider: Provider, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> tuple[str, int]:

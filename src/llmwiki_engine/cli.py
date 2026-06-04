@@ -9,15 +9,26 @@ from rich.table import Table
 
 from .apply import ApplyError, apply_operation
 from .eval import load_eval_report, run_eval
-from .models import OperationManifest, RunMode, VerificationStatus
-from .pipeline import PipelineError, init_vault, latest_operation, resume_ingest, run_simplified_ingest, status as ingest_status
+from .events import format_duration
+from .io import read_model
+from .models import OperationManifest, ReviewDecision, RunMode, VerificationStatus
+from .pipeline import (
+    PipelineError,
+    approve_review,
+    init_vault,
+    latest_operation,
+    resume_ingest,
+    revise_review,
+    run_simplified_ingest,
+    status as ingest_status,
+)
 from .provider_checks import check_providers
 from .provider_config import ProviderConfigError
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
 from .steps import STEP_NAMES
 from .verify import VerifyError, verify_run
-from .workspace import WorkspaceError
+from .workspace import RunStore, WorkspaceError
 
 app = typer.Typer(help="LLM-Wiki knowledge compilation engine.")
 ingest_app = typer.Typer(help="Run and manage simplified ingest operations.")
@@ -87,7 +98,7 @@ def ingest_status_cmd(
             result = verify_run(vault, manifest)
             raise typer.Exit(0 if result.ok else _verify_exit_code(result))
         return
-    _print_manifest_table(manifest)
+    _print_manifest_table(vault, manifest)
     if verify:
         result = verify_run(vault, manifest)
         if result.ok:
@@ -124,30 +135,104 @@ def ingest_resume(
     console.print(f"[green]Operation ready[/]: {manifest.operation_id}")
 
 
-def _print_manifest_table(manifest: OperationManifest) -> None:
+def _print_manifest_table(vault: Path, manifest: OperationManifest) -> None:
     table = Table(title=f"Ingest {manifest.operation_id}")
-    table.add_column("Step")
-    table.add_column("Status")
+    table.add_column("Step", no_wrap=True, overflow="fold")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Review", overflow="fold")
+    table.add_column("Attempts", justify="right")
+    table.add_column("Last Duration", justify="right")
+    table.add_column("Total Duration", justify="right")
+    table.add_column("Provider")
     for step in manifest.steps:
-        table.add_row(step.name, step.status.value)
+        durations = [attempt.duration_ms for attempt in step.attempts if attempt.duration_ms is not None]
+        last_duration = durations[-1] if durations else None
+        total_duration = sum(durations) if durations else None
+        table.add_row(
+            step.name,
+            step.status.value,
+            _review_label(vault, manifest, step.name),
+            str(len(step.attempts)),
+            format_duration(last_duration),
+            format_duration(total_duration),
+            _provider_label(step.name, step.attempts[-1].provider_spec if step.attempts else None),
+        )
     console.print(table)
+    console.print("columns: Step | Status | Review | Attempts | Last Duration | Total Duration | Provider")
+    reviews = [
+        f"{step.name}={label}"
+        for step in manifest.steps
+        if (label := _review_label(vault, manifest, step.name))
+    ]
+    if reviews:
+        console.print("reviews: " + "; ".join(reviews))
     console.print(f"mode: [bold]{manifest.run_mode.value}[/]")
     console.print(f"status: [bold]{manifest.status.value}[/]")
     latest_error = next((step.error for step in reversed(manifest.steps) if step.error), None)
     if latest_error:
         console.print(f"[red]latest error:[/] {latest_error}")
+    _print_artifact_hints(vault, manifest)
     console.print(f"next: {_next_action(manifest)}")
+
+
+def _review_label(vault: Path, manifest: OperationManifest, step_name: str) -> str:
+    if not step_name.endswith("_review"):
+        return ""
+    path = RunStore(vault).run_dir(manifest.operation_id) / step_name / "review_decision.json"
+    if not path.exists():
+        return ""
+    try:
+        decision = read_model(path, ReviewDecision)
+    except Exception:
+        return "decision unreadable"
+    label = f"{decision.review_mode}/{decision.decision}"
+    if decision.auto_approved:
+        label += " (auto-approved)"
+    return label
 
 
 def _next_action(manifest: OperationManifest) -> str:
     if manifest.status.value == "applied":
         return "operation already applied"
+    if manifest.status.value == "source_recorded":
+        return "来源已记录，没有知识页变化"
+    if manifest.status.value == "apply_failed":
+        return "inspect apply_failed.json and written targets before retrying"
+    for step in manifest.steps:
+        if step.status.value == "awaiting_review":
+            return f"review `{step.name}` then run `llmwiki ingest approve <vault> {manifest.operation_id} {step.name}`"
     for step in manifest.steps:
         if step.status.value in {"failed", "pending"}:
             return f"run `llmwiki ingest resume <vault> {manifest.operation_id}`"
     if manifest.status.value == "drafted":
+        if manifest.run_mode == RunMode.standard:
+            return "standard mode does not allow manual apply in this MVP"
         return f"run `llmwiki ingest apply <vault> {manifest.operation_id}`"
     return "inspect status"
+
+
+def _print_artifact_hints(vault: Path, manifest: OperationManifest) -> None:
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    hints = [
+        ("raw cleanup", run_dir / "raw_link_cleanup" / "raw_link_cleanup.md"),
+        ("raw cleanup diff", run_dir / "raw_link_cleanup" / "cleanup.diff"),
+        ("merge review", run_dir / "merge_plan_review" / "review_prompt.md"),
+        ("draft review", run_dir / "draft_review" / "review_prompt.md"),
+        ("draft root", run_dir / "draft_rendering" / "draft_pages"),
+        ("diffs", run_dir / "draft_rendering" / "diffs"),
+        ("apply preview", run_dir / "apply_preview" / "apply_preview.json"),
+    ]
+    for label, path in hints:
+        if path.exists():
+            console.print(f"{label}: `{path}`")
+
+
+def _provider_label(step_name: str, provider_spec: str | None) -> str:
+    if provider_spec:
+        return provider_spec
+    if step_name.endswith("_review"):
+        return "local:auto_review"
+    return "local"
 
 
 def _verify_exit_code(result) -> int:
@@ -162,13 +247,48 @@ def _verify_exit_code(result) -> int:
 
 
 @ingest_app.command("apply")
-def ingest_apply(vault: Path, operation_id: str, commit: bool = typer.Option(False, "--commit")) -> None:
+def ingest_apply(
+    vault: Path,
+    operation_id: str,
+    commit: bool = typer.Option(False, "--commit", help="Disabled in this MVP."),
+) -> None:
     """Apply draft pages into the vault wiki."""
     try:
         written = apply_operation(vault, operation_id, commit=commit)
     except (ApplyError, VerifyError, WorkspaceError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Applied[/] {len(written)} draft pages")
+
+
+@ingest_app.command("review")
+def ingest_review(vault: Path, operation_id: str, review_step: str) -> None:
+    """Show review artifact paths for a review step."""
+    run_dir = RunStore(vault).run_dir(operation_id)
+    root = run_dir / review_step
+    if not root.exists():
+        raise typer.BadParameter(f"Review step artifact not found: {review_step}")
+    for path in sorted(root.iterdir()):
+        console.print(path)
+
+
+@ingest_app.command("approve")
+def ingest_approve(vault: Path, operation_id: str, review_step: str) -> None:
+    """Approve a pending review gate after manual inspection."""
+    try:
+        manifest = approve_review(vault, operation_id, review_step)
+    except (PipelineError, WorkspaceError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"[green]Approved[/] {review_step} for {manifest.operation_id}")
+
+
+@ingest_app.command("revise")
+def ingest_revise(vault: Path, operation_id: str, review_step: str) -> None:
+    """Invalidate a review step and downstream artifacts before revising."""
+    try:
+        manifest = revise_review(vault, operation_id, review_step)
+    except (PipelineError, WorkspaceError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"[yellow]Revision reset[/] {review_step} for {manifest.operation_id}")
 
 
 @providers_app.command("list")
