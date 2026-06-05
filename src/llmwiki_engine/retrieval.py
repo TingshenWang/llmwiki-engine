@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from .models import (
 WIKI_EXCLUDED_ROOTS = {"sources", "logs"}
 SYSTEM_WIKI_FILES = {"index.md", "log.md"}
 TYPE_PREFIXES = ("concept_", "entity_", "design_", "comparison_", "overview_", "event_", "memory_", "idea_", "open_question_")
+SCORE_BUCKET_EPSILON = 0.01
 
 
 class RetrievalError(RuntimeError):
@@ -83,7 +85,7 @@ def build_candidate_contexts(
     candidate_pool_sha = candidate_pool_sha256(knowledge_pool)
     items: list[CandidateContextItem] = []
     embeddings = None
-    model_revision = ""
+    model_revision = "unknown"
     if backend == "sentence_transformers" and knowledge_pool:
         try:
             embeddings, model_revision = SentenceTransformerRanker(config).rank_inputs(resolution.items, knowledge_pool, vault)
@@ -152,8 +154,56 @@ def rank_candidates(
                 truncated=truncated,
             )
         )
-    hits.sort(key=lambda hit: (-strength_rank(hit.strength), -hit.score, hit.path))
+    entry_by_path = {entry.path: entry for entry in knowledge_pool}
+    hits.sort(key=lambda hit: retrieval_sort_key(hit, item, entry_by_path))
     return hits
+
+
+def retrieval_sort_key(
+    hit: CandidateContextHit,
+    item: CandidateResolutionItem,
+    entry_by_path: dict[str, WikiKnowledgePoolEntry],
+) -> tuple[int, int, int, int, int, int, str]:
+    entry = entry_by_path.get(hit.path)
+    score_bucket = math.floor(hit.score / SCORE_BUCKET_EPSILON)
+    return (
+        -strength_rank(hit.strength),
+        -score_bucket,
+        -basis_rank(hit.match_basis),
+        0 if entry is not None and entry.llmwiki_type == item.page_type else 1,
+        0 if same_target_directory(item.candidate_target_path, hit.path) else 1,
+        title_distance(item, entry),
+        hit.path,
+    )
+
+
+def basis_rank(value: str) -> int:
+    return {
+        "exact_path": 5,
+        "exact_title_or_alias": 4,
+        "normalized_path_stem": 3,
+        "normalized_title": 2,
+        "embedding": 1,
+        "lexical": 1,
+    }.get(value, 0)
+
+
+def same_target_directory(candidate_target_path: str, hit_path: str) -> bool:
+    candidate_parts = Path(candidate_target_path).parts
+    hit_parts = Path(hit_path).parts
+    return bool(candidate_parts and hit_parts and candidate_parts[0] == hit_parts[0])
+
+
+def title_distance(item: CandidateResolutionItem, entry: WikiKnowledgePoolEntry | None) -> int:
+    if entry is None:
+        return 3
+    item_title = normalize_key(item.display_title)
+    titles = [normalize_key(entry.display_title), *(normalize_key(alias) for alias in entry.aliases)]
+    if item_title and item_title in titles:
+        return 0
+    if item_title and any(item_title in title or title in item_title for title in titles if title):
+        return 1
+    return 2
 
 
 def deterministic_signal(item: CandidateResolutionItem, entry: WikiKnowledgePoolEntry) -> tuple[str, float]:
@@ -339,6 +389,7 @@ class SentenceTransformerRanker:
         knowledge_pool: list[WikiKnowledgePoolEntry],
         vault: Path,
     ) -> tuple[dict[str, dict[str, float]], str]:
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
         except Exception as exc:
@@ -350,16 +401,15 @@ class SentenceTransformerRanker:
         )
         candidate_texts = [candidate_text(vault, entry) for entry in knowledge_pool]
         query_texts = [query_for_item(item) for item in items]
-        candidate_vectors = model.encode(candidate_texts, normalize_embeddings=True)
-        query_vectors = model.encode(query_texts, normalize_embeddings=True)
+        candidate_vectors = model.encode(candidate_texts, normalize_embeddings=True, show_progress_bar=False)
+        query_vectors = model.encode(query_texts, normalize_embeddings=True, show_progress_bar=False)
         scores: dict[str, dict[str, float]] = {}
         for item, query_vector in zip(items, query_vectors, strict=True):
             item_scores: dict[str, float] = {}
             for entry, candidate_vector in zip(knowledge_pool, candidate_vectors, strict=True):
                 item_scores[entry.path] = float(dot(query_vector, candidate_vector))
             scores[item.page_plan_id] = item_scores
-        revision = getattr(model, "model_card_data", None)
-        return scores, str(revision) if revision is not None else ""
+        return scores, model_revision(model)
 
 
 def dot(left: Any, right: Any) -> float:
@@ -367,6 +417,30 @@ def dot(left: Any, right: Any) -> float:
         return float(left @ right)
     except Exception:
         return float(sum(a * b for a, b in zip(left, right, strict=True)) / max(1e-9, math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))))
+
+
+def model_revision(model: Any) -> str:
+    candidates: list[Any] = []
+    try:
+        first_module = model._first_module()
+        candidates.extend(
+            [
+                getattr(getattr(getattr(first_module, "auto_model", None), "config", None), "_commit_hash", None),
+                getattr(getattr(getattr(first_module, "tokenizer", None), "init_kwargs", {}), "_commit_hash", None),
+            ]
+        )
+    except Exception:
+        pass
+    candidates.extend(
+        [
+            getattr(model, "revision", None),
+            getattr(model, "_model_revision", None),
+        ]
+    )
+    for value in candidates:
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{7,40}", value):
+            return value
+    return "unknown"
 
 
 def resolve_cache_dir(vault: Path, cache_dir: str) -> Path:

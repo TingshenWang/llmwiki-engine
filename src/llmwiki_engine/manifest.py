@@ -23,7 +23,7 @@ def read_manifest(path: Path) -> OperationManifest:
     if not isinstance(data, dict):
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
     schema_version = data.get("schema_version")
-    if schema_version != "operation_manifest.v7":
+    if schema_version != "operation_manifest.v8":
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
     if REQUIRED_MANIFEST_KEYS - set(data):
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
@@ -93,6 +93,11 @@ def _begin_step_attempt(
     step.started_at = utc_now()
     step.completed_at = None
     step.error = None
+    step.review_reason = None
+    step.review_state = "none"
+    step.awaiting_since = None
+    step.resolved_at = None
+    step.review_decision_ref = None
     attempt = StepAttempt(
         attempt=len(step.attempts) + 1,
         started_at=step.started_at,
@@ -130,18 +135,24 @@ def mark_step_awaiting_review(
     name: str,
     *,
     outputs: list[ArtifactRef] | None = None,
-    error: str | None = None,
+    reason: str | None = None,
+    review_decision_ref: str | None = None,
 ) -> None:
     step = get_step(manifest, name)
     step.status = StepStatus.awaiting_review
     step.completed_at = utc_now()
-    step.error = error
+    step.error = None
+    step.review_reason = reason
+    step.review_state = "awaiting"
+    step.awaiting_since = step.completed_at
+    step.resolved_at = None
+    step.review_decision_ref = review_decision_ref
     step.outputs = outputs or []
     if step.attempts:
         step.attempts[-1].completed_at = step.completed_at
         step.attempts[-1].duration_ms = _duration_ms(step.attempts[-1].started_at, step.completed_at)
         step.attempts[-1].outputs = step.outputs
-        step.attempts[-1].error = error
+        step.attempts[-1].error = None
     manifest.status = OperationStatus.awaiting_review
 
 
@@ -155,11 +166,16 @@ def mark_step_approved(
     step.status = StepStatus.approved
     step.completed_at = utc_now()
     step.error = None
+    step.review_reason = None
+    step.review_state = "approved"
+    step.resolved_at = utc_now()
     step.outputs = outputs or step.outputs
     if step.attempts:
-        step.attempts[-1].completed_at = step.completed_at
-        step.attempts[-1].duration_ms = _duration_ms(step.attempts[-1].started_at, step.completed_at)
+        if step.attempts[-1].completed_at is None:
+            step.attempts[-1].completed_at = step.completed_at
+            step.attempts[-1].duration_ms = _duration_ms(step.attempts[-1].started_at, step.completed_at)
         step.attempts[-1].outputs = step.outputs
+        step.attempts[-1].error = None
     manifest.status = OperationStatus.running
 
 
@@ -187,11 +203,11 @@ def mark_from_pending(manifest: OperationManifest, start: str) -> None:
             step.error = None
             step.inputs = []
             step.outputs = []
-            for attempt in step.attempts:
-                attempt.completed_at = None
-                attempt.duration_ms = None
-                attempt.error = None
-                attempt.outputs = []
+            step.review_reason = None
+            step.review_state = "none"
+            step.awaiting_since = None
+            step.resolved_at = None
+            step.review_decision_ref = None
 
 
 def first_resumable_step(manifest: OperationManifest) -> str | None:

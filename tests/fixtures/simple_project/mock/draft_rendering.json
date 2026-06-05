@@ -1,5 +1,5 @@
 {
-  "schema_version": "draft_rendering.v2",
+  "schema_version": "draft_rendering.v3",
   "pages": [
     {
       "page_plan_id": "PP-46a89c05043b",
@@ -13,7 +13,7 @@
         "value_points": "- 避免一开始只追求生成内容，而忽略流程是否可恢复。\n- 为后续 update apply、review gate 和 drift 校验提供基础。",
         "open_questions": "暂无矛盾与未决问题记录。"
       },
-      "change_summary": "创建知识编译工程骨架概念页。",
+      "change_summary": "创建或更新知识编译工程骨架页面，补充并澄清源材料中的 MVP 编译重点。",
       "source_coverage_notes": "覆盖项目笔记中关于 CLI、状态机、artifact、validator 的内容。",
       "quality_risks": []
     },

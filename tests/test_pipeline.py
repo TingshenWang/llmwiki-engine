@@ -23,6 +23,7 @@ from llmwiki_engine.models import (
     SourceDigestCandidate,
     StepStatus,
     VerificationStatus,
+    WikiKnowledgePoolEntry,
 )
 from llmwiki_engine.pipeline import (
     PipelineError,
@@ -317,14 +318,17 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "## 派生知识页" in source_text
     assert "`concepts/Concept_知识编译工程骨架.md`" in source_text
     assert "[[concepts/" not in source_text
-    assert loaded.schema_version == "operation_manifest.v7"
+    assert loaded.schema_version == "operation_manifest.v8"
     assert [ref.schema_version for ref in loaded.steps[0].outputs if ref.kind == "json"] == ["raw_link_cleanup.v1"]
-    assert [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"] == ["raw_preparation.v1"]
-    assert [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"] == ["source_digest.v2"]
+    assert "raw_preparation.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
+    assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
+    assert "source_digest.v2" in [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"]
+    assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"]
     assert [ref.schema_version for ref in loaded.steps[4].outputs if ref.relative_path.endswith("approved_digest.json")] == [
         "source_digest.v2"
     ]
-    assert [ref.schema_version for ref in loaded.steps[6].outputs if ref.kind == "json"] == ["candidate_resolution.v3"]
+    assert "candidate_resolution.v3" in [ref.schema_version for ref in loaded.steps[6].outputs if ref.kind == "json"]
+    assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[6].outputs if ref.kind == "json"]
     assert [ref.schema_version for ref in loaded.steps[7].outputs if ref.relative_path.endswith("wiki_context_snapshot.json")] == [
         "wiki_context_snapshot.v2"
     ]
@@ -334,10 +338,22 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert [ref.schema_version for ref in loaded.steps[8].outputs if ref.relative_path.endswith("wiki_merge_plan.json")] == [
         "wiki_merge_plan.v5"
     ]
+    assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[8].outputs if ref.kind == "json"]
+    for review_name in ["prepared_raw_review", "source_digest_review", "merge_plan_review", "draft_review"]:
+        review_step = [step for step in loaded.steps if step.name == review_name][0]
+        assert review_step.review_state == "approved"
+        assert review_step.review_decision_ref
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
     assert plan["schema_version"] == "wiki_merge_plan.v5"
     assert (run_dir / "wiki_context_snapshot" / "candidate_contexts.json").exists()
     assert (run_dir / "wiki_context_snapshot" / "candidate_contexts.md").exists()
+    assert (run_dir / "draft_rendering" / "update_merge_report.json").exists()
+    assert (run_dir / "draft_rendering" / "draft_grounding_review.json").exists()
+    assert (run_dir / "draft_rendering" / "related_merge_report.json").exists()
+    contexts_markdown = (run_dir / "wiki_context_snapshot" / "candidate_contexts.md").read_text(encoding="utf-8")
+    assert "resolved cache path" in contexts_markdown
+    assert "query count" in contexts_markdown
+    assert "编码页面数" in contexts_markdown
     assert (run_dir / "wiki_merge_planning" / "merge_decision_report.md").exists()
     snapshot = read_json(run_dir / "wiki_context_snapshot" / "wiki_context_snapshot.json")
     assert snapshot["schema_version"] == "wiki_context_snapshot.v2"
@@ -384,6 +400,8 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert receipts[-1]["raw_cleanup_changed"] is False
     assert receipts[-1]["raw_cleanup_cleaned_link_count"] == 0
     assert status(vault, manifest.operation_id).status == OperationStatus.applied
+    metrics_after_apply = read_json(run_dir / "run_metrics.json")
+    assert metrics_after_apply["status"] == "applied"
 
 
 def test_ingest_run_uses_vault_config_profile_by_default(tmp_path: Path) -> None:
@@ -682,7 +700,10 @@ def test_resume_from_deletes_downstream_step_dirs(tmp_path: Path) -> None:
     assert (run_dir / "draft_rendering" / "draft_pages").exists()
     assert (run_dir / "prepared_raw_review" / "approved_prepared.md").exists()
     digest_step = [step for step in resumed.steps if step.name == "source_digest"][0]
-    assert digest_step.attempts[0].outputs == []
+    assert digest_step.attempts[0].outputs
+    assert digest_step.attempts[0].completed_at is not None
+    assert digest_step.attempts[0].duration_ms is not None
+    assert list((run_dir / "attempt_archive" / "source_digest").glob("*"))
     assert digest_step.attempts[-1].outputs
 
 
@@ -826,6 +847,15 @@ def test_raw_and_artifact_drift_block_resume(tmp_path: Path) -> None:
     with pytest.raises(VerifyError):
         resume_ingest(vault=vault2, operation_id=manifest2.operation_id)
 
+    vault3, raw3 = make_vault(tmp_path / "third")
+    manifest3 = run_simplified_ingest(vault=vault3, raw_file=raw3, fixture_dir=FIXTURE_ROOT / "mock", slug="artifact-dir")
+    digest_dir = RunStore(vault3).run_dir(manifest3.operation_id) / "source_digest" / "source_digest.json"
+    digest_dir.unlink()
+    digest_dir.mkdir()
+    result = verify_run(vault3, status(vault3, manifest3.operation_id))
+    assert not result.ok
+    assert any(issue.path == "source_digest/source_digest.json" and "not a file" in issue.message for issue in result.issues)
+
 
 def test_apply_preimage_repeat_and_applied_resume_block(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
@@ -906,6 +936,84 @@ def test_model_related_pages_are_deterministically_resolved_before_rendering(tmp
     assert "[[designs/Design_简化 Ingest 草稿流程|简化 Ingest 草稿流程]]" in concept_text
     assert "[[sources/" not in concept_text
     assert "Concept_Missing" not in concept_text
+
+
+def test_related_renderer_filters_and_caps_candidates() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CAND001",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Current.md",
+        display_title="Current",
+        page_type="concept",
+        new_understanding="当前主题。",
+        section_plans={"summary": "Summary"},
+        related_pages=[
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_A.md",
+                display_title="A",
+                source="wiki_context",
+                reason="A 与当前主题最相关。",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_A.md",
+                display_title="A duplicate",
+                source="wiki_context",
+                reason="重复链接。",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_B.md",
+                display_title="B",
+                source="source_digest",
+                reason="B 是同源互补主题。",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_C.md",
+                display_title="C",
+                source="wiki_context",
+                reason="C 是召回到的补充背景。",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_D.md",
+                display_title="D",
+                source="wiki_context",
+                reason="D 会因为 cap 被截断。",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="sources/Source_Bad.md",
+                display_title="Source",
+                source="wiki_context",
+                reason="source page 不应进入 Related。",
+            ),
+        ],
+        reason="test",
+    )
+    report: list[pipeline_module.RelatedCandidateReport] = []
+    rendered = pipeline_module.render_related_pages(
+        item,
+        existing_entry=pipeline_module.WikiContextEntry(
+            path="wiki/concepts/Concept_Current.md",
+            expected_state="present",
+            preimage_sha256="old",
+            content="## 相关页面\n\n- [[concepts/Concept_Old|旧链接]]：旧页中仍强相关的链接。\n",
+        ),
+        report_list=report,
+        known_paths={
+            "concepts/Concept_Old.md",
+            "concepts/Concept_A.md",
+            "concepts/Concept_B.md",
+            "concepts/Concept_C.md",
+            "concepts/Concept_D.md",
+        },
+    )
+
+    assert rendered.count("[[") == 3
+    assert "[[concepts/Concept_Old|旧链接]]" in rendered
+    assert "Concept_D" not in rendered
+    assert "sources/" not in rendered
+    assert any(row.decision == "cutoff" and row.target_path == "concepts/Concept_D.md" for row in report)
+    assert any(row.decision == "filtered" and row.reject_reason == "duplicate" for row in report)
+    assert any(row.decision == "filtered" and row.reject_reason == "unknown_path" for row in report)
 
 
 def test_draft_rendering_normalizes_model_section_keys(tmp_path: Path) -> None:
@@ -1027,6 +1135,425 @@ def test_m3_update_target_stops_at_draft_review_without_apply_preview(tmp_path: 
     assert (run_dir / "draft_rendering" / "draft_write_manifest.json").exists()
     assert (run_dir / "draft_review" / "pending_write_manifest.json").exists()
     assert not (run_dir / "apply_preview").exists()
+    draft_step = [step for step in manifest.steps if step.name == "draft_rendering"][0]
+    diff_refs = [ref for ref in draft_step.outputs if ref.relative_path.endswith(".diff")]
+    assert diff_refs
+    assert {ref.kind for ref in diff_refs} == {"diff"}
+
+
+def test_update_preserves_and_reports_existing_summary_detail_and_index_title(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: 旧工程骨架标题\n"
+        "aliases: []\n"
+        "summary: 旧摘要用于索引。\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# 旧工程骨架标题\n\n"
+        "## 摘要\n\n"
+        "旧摘要正文应该参与 update 审计。\n\n"
+        "## 详情\n\n"
+        "旧详情正文应该参与 update 审计。\n\n"
+        "## 相关页面\n\n"
+        "- [[concepts/Concept_旧相关|旧相关]]：旧链接仍然重要。\n\n"
+        "## 矛盾与未决问题\n\n"
+        "暂无矛盾与未决问题记录。\n",
+        encoding="utf-8",
+    )
+    related = vault / "wiki" / "concepts" / "Concept_旧相关.md"
+    related.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: 旧相关\n"
+        "aliases: []\n"
+        "summary: 旧相关摘要。\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# 旧相关\n",
+        encoding="utf-8",
+    )
+    fixture_dir = tmp_path / "update-core-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "wiki_merge_planning.json":
+            data["items"][0]["action"] = "update"
+            data["items"][0]["matched_page"] = "concepts/Concept_知识编译工程骨架.md"
+            data["items"][0]["canonical_target_path"] = "concepts/Concept_知识编译工程骨架.md"
+        if name == "draft_rendering.json":
+            data["pages"][0]["change_summary"] = "补充并澄清旧工程骨架页面，将新材料中的 MVP 编译重点整合进完整替换草稿。"
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="update-core")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    draft_path = run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md"
+    draft_text = draft_path.read_text(encoding="utf-8")
+    update_report = read_json(run_dir / "draft_rendering" / "update_merge_report.json")
+    report_markdown = (run_dir / "draft_rendering" / "update_merge_report.md").read_text(encoding="utf-8")
+    index_text = (run_dir / "draft_rendering" / "draft_pages" / "index.md").read_text(encoding="utf-8")
+
+    assert "# 旧工程骨架标题" in draft_text
+    assert "旧摘要正文应该参与 update 审计。" not in draft_text
+    assert "知识编译工程骨架强调" in draft_text
+    assert "旧详情正文应该参与 update 审计。" not in draft_text
+    assert "这个判断把 MVP 的重点" in draft_text
+    sections = {section["section_key"]: section for section in update_report["pages"][0]["sections"]}
+    assert "旧摘要正文应该参与 update 审计。" in sections["summary"]["removed"]
+    assert any("知识编译工程骨架强调" in item for item in sections["summary"]["added"])
+    assert "旧详情正文应该参与 update 审计。" in sections["detail"]["removed"]
+    assert any("这个判断把 MVP 的重点" in item for item in sections["detail"]["added"])
+    assert "| 段落 | 保留 | 新增 | 删除 | 删除原因 |" in report_markdown
+    assert "Removal Reason" not in report_markdown
+    assert "| 旧工程骨架标题 | [[concepts/Concept_知识编译工程骨架]] |" in index_text
+
+
+def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
+    metadata = pipeline_module.WikiPageMetadata(
+        path="concepts/Concept_X.md",
+        llmwiki_type="concept",
+        title="旧标题",
+        summary="旧摘要。",
+        created="2026-01-01",
+        updated="2026-01-02",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-05",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_X.md",
+                expected_state="present",
+                preimage_sha256="old",
+                metadata=metadata,
+                content=(
+                    "---\n"
+                    "llmwiki_type: concept\n"
+                    "title: 旧标题\n"
+                    "summary: 旧摘要。\n"
+                    "updated: 2026-01-02\n"
+                    "---\n\n"
+                    "# 旧标题\n\n"
+                    "## 摘要\n\n"
+                    "旧摘要正文。\n"
+                ),
+            )
+        ],
+        knowledge_metadata_pool=[
+            WikiKnowledgePoolEntry(
+                path="wiki/concepts/Concept_X.md",
+                rel_path="concepts/Concept_X.md",
+                preimage_sha256="old",
+                metadata=metadata,
+                display_title="旧标题",
+                summary="旧摘要。",
+                llmwiki_type="concept",
+            )
+        ],
+    )
+    plan = pipeline_module.WikiMergePlanArtifact(
+        log_date="2026-06-05",
+        context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-X",
+                source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                action="update",
+                canonical_target_path="concepts/Concept_X.md",
+                display_title="模型新标题",
+                page_type="concept",
+                matched_page="concepts/Concept_X.md",
+                new_understanding="模型新摘要。",
+                section_plans={"summary": "摘要"},
+                reason="测试 update 索引标题。",
+            )
+        ],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-X",
+                action="update",
+                canonical_target_path="concepts/Concept_X.md",
+                preimage_sha256="old",
+                section_bodies={"summary": "模型新摘要。", "detail": "模型新详情。"},
+                change_summary="更新页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    profile = type("ProfileStub", (), {"page_types": {"concept": object()}})()
+
+    rows = build_index_rows(profile, plan, draft, snapshot)
+
+    assert rows[0]["title"] == "旧标题"
+    assert rows[0]["summary"] == "模型新摘要。"
+
+
+def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> None:
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Product_Taste.md",
+                expected_state="present",
+                preimage_sha256="a",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_Product_Taste.md",
+                    llmwiki_type="concept",
+                    title="Product Taste",
+                    summary="产品品味摘要。",
+                    updated="2026-06-05",
+                ),
+                content="# Product Taste\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n- 待补来源：MIT报告的具体引用。\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/designs/Design_AI_PM.md",
+                expected_state="present",
+                preimage_sha256="b",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="designs/Design_AI_PM.md",
+                    llmwiki_type="design",
+                    title="AI PM",
+                    summary="AI PM 摘要。",
+                    updated="2026-06-06",
+                ),
+                content="# AI PM\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_PM角色.md",
+                expected_state="present",
+                preimage_sha256="c",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="open_questions/Open_Question_PM角色.md",
+                    llmwiki_type="open_question",
+                    title="PM角色如何演变",
+                    summary="PM角色问题。",
+                    updated="2026-06-04",
+                ),
+                content="# PM角色如何演变\n\n## 矛盾与未决问题\n\n- PM 角色在 AI 时代如何演变？\n",
+            ),
+        ],
+    )
+    plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[])
+    draft = pipeline_module.DraftRenderingArtifact(pages=[])
+
+    rows, report = pipeline_module.build_open_question_rows_with_report(plan, draft, snapshot)
+    questions = [row["question"] for row in rows]
+
+    assert questions.count("产品品味能否通过系统化训练提升？") == 1
+    assert "PM 角色在 AI 时代如何演变？" in questions
+    assert all("待补来源" not in question for question in questions)
+    filtered = [item for item in report["items"] if item["decision"] == "filtered"]
+    assert any("MIT报告" in item["question"] for item in filtered)
+
+
+def test_source_page_empty_unwritten_section_does_not_repeat_touched_pages() -> None:
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="这是一篇用于测试 source 页空态的材料。",
+        key_takeaways=["关键收获。"],
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/sample.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    markdown = pipeline_module.render_source_page(
+        title="Source sample",
+        digest=digest,
+        operation_id="ING-TEST",
+        linked_pages=["concepts/Concept_A.md"],
+        touched_pages=["concepts/Concept_A.md"],
+        no_change_pages=[],
+        log_date="2026-06-06",
+        raw_hash="raw-hash",
+        prepared_hash="prepared-hash",
+        cleanup=cleanup,
+    )
+
+    section = markdown.split("## 未写入说明", 1)[1]
+    assert "暂无未写入页面。" in section
+    assert "触达页面" not in section
+    assert "concepts/Concept_A.md" not in section
+
+
+def test_embedding_model_revision_falls_back_to_unknown() -> None:
+    class FakeModel:
+        model_card_data = "tags:\n- sentence-transformers\nvery long model card"
+
+    assert retrieval_module.model_revision(FakeModel()) == "unknown"
+
+
+def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "grounding-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "draft_rendering.json":
+            data["pages"][0]["section_bodies"]["detail"] += "\n\n该方案被多个社区引用。"
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="grounding")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    grounding = read_json(run_dir / "draft_rendering" / "draft_grounding_review.json")
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
+    grounding_markdown = (run_dir / "draft_rendering" / "draft_grounding_review.md").read_text(encoding="utf-8")
+
+    assert grounding["requires_review"] is True
+    assert grounding["unsupported_new_facts"]
+    assert "# 草稿来源支撑审查" in grounding_markdown
+    assert "unsupported new_fact" not in grounding_markdown
+    assert "Draft Grounding Review" not in grounding_markdown
+    assert repair_report["repair_count"] == 2
+    assert repair_report["attempts"][1]["repair_prompt_ref"] == "repair_prompts/attempt-2.json"
+    assert (run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json").exists()
+    manifest = status(vault, manifest.operation_id)
+    assert manifest.status == OperationStatus.awaiting_review
+    awaiting_step = [step for step in manifest.steps if step.status == StepStatus.awaiting_review][0]
+    assert awaiting_step.name == "draft_review"
+    assert "Grounding review" in (awaiting_step.review_reason or "")
+    assert not (run_dir / "apply_preview").exists()
+
+    approve_review(vault, manifest.operation_id, "draft_review")
+    resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="validation")
+    preview = read_json(run_dir / "apply_preview" / "apply_preview.json")
+    assert resumed.status == OperationStatus.drafted
+    assert preview["requires_draft_review"] is True
+
+
+def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-X",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_X.md",
+        display_title="示例提示",
+        page_type="concept",
+        new_understanding="示例提示帮助说明 Agent 使用边界。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-X",
+                action="create",
+                canonical_target_path="concepts/Concept_X.md",
+                section_bodies={
+                    "summary": "示例提示。",
+                    "detail": "这个页面说明如何处理通用问题。",
+                    "examples": "- “公司报销政策是什么？”\n- “你是一位客服代表，用礼貌的语气回答。”",
+                },
+                change_summary="创建示例提示页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_X.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]), snapshot, "")
+
+    assert review.requires_review is False
+    assert {claim.claim_type for claim in review.claims} == {"inference"}
+
+
+def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "draft-repair-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json"]:
+        write_json(fixture_dir / name, read_json(FIXTURE_ROOT / "mock" / name))
+    bad_draft = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")
+    bad_draft["pages"][0]["section_bodies"].pop("summary")
+    write_json(fixture_dir / "draft_rendering.1.json", bad_draft)
+    write_json(fixture_dir / "draft_rendering.2.json", read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json"))
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-repair")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
+    manifest_after = status(vault, manifest.operation_id)
+    draft_step = [step for step in manifest_after.steps if step.name == "draft_rendering"][0]
+
+    assert manifest_after.status == OperationStatus.drafted
+    assert repair_report["repair_count"] == 1
+    assert repair_report["attempts"][0]["issues"][0]["issue_code"] == "missing_field"
+    assert repair_report["attempts"][1]["repair_prompt_ref"] == "repair_prompts/attempt-2.json"
+    assert (run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json").exists()
+    assert any(ref.relative_path.endswith("repair_prompts/attempt-2.json") for ref in draft_step.outputs)
+
+
+def test_candidate_resolution_repairs_weak_noise_formal_item(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "candidate-noise-repair"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "source_digest.json":
+            data["weak_or_noise_items"] = [
+                {
+                    "candidate_id": "noise-1",
+                    "name": "噪声片段",
+                    "type": "noise",
+                    "one_sentence_summary": "这只是口播噪声，不应该成为页面。",
+                    "why_matters": "用于确认噪声不会泄漏进正式页面规划。",
+                    "wiki_value": "不入库。",
+                    "suggested_action": "ignore",
+                }
+            ]
+        write_json(fixture_dir / name, data)
+    bad_resolution = read_json(FIXTURE_ROOT / "mock" / "candidate_resolution.json")
+    bad_resolution["items"].append(
+        {
+            "page_plan_id": "",
+            "source_basis": {"source_candidate_ids": ["noise-1"], "prepared_discovered_candidates": [], "source_locator": "noise"},
+            "page_type": "noise",
+            "display_title": "噪声片段",
+            "path_stem": "",
+            "candidate_target_path": "",
+            "topic_summary": "这只是噪声。",
+            "why_this_page": "ignore",
+            "initial_section_intent": "ignore",
+            "coverage_notes": "ignore",
+            "reason": "ignore",
+        }
+    )
+    write_json(fixture_dir / "candidate_resolution.1.json", bad_resolution)
+    write_json(fixture_dir / "candidate_resolution.2.json", read_json(FIXTURE_ROOT / "mock" / "candidate_resolution.json"))
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="candidate-noise")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    repair_report = read_json(run_dir / "candidate_resolution" / "structured_repair_report.json")
+    resolution = read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
+
+    assert repair_report["repair_count"] == 1
+    issue_codes = {issue["issue_code"] for issue in repair_report["attempts"][0]["issues"]}
+    assert {"unknown_page_type", "weak_noise_candidate_reference", "ignore_as_formal_item"} & issue_codes
+    assert all(item["page_type"] != "noise" for item in resolution["items"])
+    assert "noise-1" not in {
+        candidate_id
+        for item in resolution["items"]
+        for candidate_id in item["source_basis"]["source_candidate_ids"]
+    }
 
 
 def test_wiki_merge_planning_normalizes_model_wiki_prefix_on_update_target(tmp_path: Path) -> None:
@@ -1054,6 +1581,167 @@ def test_wiki_merge_planning_normalizes_model_wiki_prefix_on_update_target(tmp_p
     assert first["matched_page"] == "concepts/Concept_知识编译工程骨架.md"
     assert manifest.status == OperationStatus.awaiting_review
     assert [step for step in manifest.steps if step.status == StepStatus.awaiting_review][0].name == "draft_review"
+
+
+def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    existing = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: 知识编译工程骨架\n"
+        "aliases: []\n"
+        "summary: 已有知识编译工程骨架。\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# 知识编译工程骨架\n",
+        encoding="utf-8",
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_知识编译工程骨架.md",
+                display_title="知识编译工程骨架",
+            ),
+            resolution_item(
+                "CAND002",
+                page_type="concept",
+                target_path="concepts/Concept_知识编译工程骨架.md",
+                display_title="知识编译工程骨架",
+            ),
+        ]
+    )
+    snapshot = build_wiki_context_snapshot(
+        vault,
+        resolution,
+        log_date="2026-06-03",
+        source_target_path="sources/Source_Test.md",
+    )
+    plan = pipeline_module.finalize_wiki_merge_plan(
+        pipeline_module.WikiMergePlanArtifact(
+            log_date="",
+            context_snapshot_ref="",
+            items=[
+                pipeline_module.WikiMergePlanItem(
+                    page_plan_id="PP-CAND001",
+                    source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                    action="update",
+                    canonical_target_path="concepts/Concept_知识编译工程骨架.md",
+                    display_title="知识编译工程骨架",
+                    page_type="concept",
+                    matched_page="concepts/Concept_知识编译工程骨架.md",
+                    new_understanding="新增工程骨架理解。",
+                    section_plans={"summary": "Summary"},
+                    reason="更新已有页。",
+                ),
+                pipeline_module.WikiMergePlanItem(
+                    page_plan_id="PP-CAND002",
+                    source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
+                    action="noop",
+                    canonical_target_path="concepts/Concept_知识编译工程骨架.md",
+                    display_title="知识编译工程骨架",
+                    page_type="concept",
+                    matched_page="concepts/Concept_知识编译工程骨架.md",
+                    new_understanding="已有页已覆盖。",
+                    section_plans={},
+                    reason="已被已有页覆盖。",
+                ),
+            ],
+        ),
+        resolution,
+        snapshot,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+    )
+
+    assert len(plan.items) == 1
+    assert plan.items[0].action == "update"
+    assert set(plan.items[0].source_basis.source_candidate_ids) == {"CAND001", "CAND002"}
+    assert set(plan.items[0].merged_page_plan_ids) == {"PP-CAND001", "PP-CAND002"}
+    assert plan.items[0].noop_covered_by_update is True
+
+
+def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    resolution = CandidateResolutionArtifact(
+        items=[
+            resolution_item("CAND001", page_type="concept", target_path="concepts/Concept_Agent 与 Workflow 对比.md", display_title="Agent 与 Workflow 对比"),
+            resolution_item("CAND002", page_type="comparison", target_path="comparisons/Comparison_Workflow vs Agent.md", display_title="Workflow vs Agent"),
+            resolution_item("CAND003", page_type="concept", target_path="concepts/Concept_RAG 概念.md", display_title="RAG 概念"),
+            resolution_item("CAND004", page_type="design", target_path="designs/Design_RAG 系统设计.md", display_title="RAG 系统设计"),
+        ]
+    )
+    snapshot = build_wiki_context_snapshot(vault, resolution, log_date="2026-06-06", source_target_path="sources/Source_Test.md")
+
+    def plan_item(page_plan_id: str, candidate_id: str, page_type: str, target_path: str, title: str) -> pipeline_module.WikiMergePlanItem:
+        return pipeline_module.WikiMergePlanItem(
+            page_plan_id=page_plan_id,
+            source_basis=SourceBasis(source_candidate_ids=[candidate_id]),
+            action="create",
+            canonical_target_path=target_path,
+            display_title=title,
+            page_type=page_type,
+            new_understanding=f"{title} 说明 Agent 与 Workflow 的执行边界、适用场景和判断价值。",
+            knowledge_delta=f"{title} 补充 Agent 与 Workflow 的边界差异。",
+            why_this_matters="帮助判断什么时候用稳定流程，什么时候用智能体。",
+            value_points=["帮助判断方案边界。"],
+            section_plans={"summary": f"{title} 摘要。", "detail": f"{title} 讨论 Agent 与 Workflow 的差异。"},
+            reason=f"{title} 值得沉淀。",
+        )
+
+    plan = pipeline_module.finalize_wiki_merge_plan(
+        pipeline_module.WikiMergePlanArtifact(
+            log_date="2026-06-06",
+            context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
+                items=[
+                    plan_item("PP-CAND001", "CAND001", "concept", "concepts/Concept_Agent 与 Workflow 对比.md", "Agent 与 Workflow 对比"),
+                    plan_item("PP-CAND002", "CAND002", "comparison", "comparisons/Comparison_Workflow vs Agent.md", "Workflow vs Agent"),
+                    pipeline_module.WikiMergePlanItem(
+                        page_plan_id="PP-CAND003",
+                        source_basis=SourceBasis(source_candidate_ids=["CAND003"]),
+                        action="create",
+                        canonical_target_path="concepts/Concept_RAG 概念.md",
+                        display_title="RAG 概念",
+                        page_type="concept",
+                        new_understanding="RAG 概念解释检索增强生成如何把外部材料带入模型回答。",
+                        knowledge_delta="补充 RAG 作为概念的定义和适用边界。",
+                        why_this_matters="帮助区分 RAG 概念和具体系统设计。",
+                        value_points=["帮助判断什么时候需要检索增强。"],
+                        section_plans={"summary": "RAG 概念摘要。", "detail": "RAG 概念讨论检索增强生成的定义和边界。"},
+                        reason="RAG 概念值得沉淀。",
+                    ),
+                pipeline_module.WikiMergePlanItem(
+                    page_plan_id="PP-CAND004",
+                    source_basis=SourceBasis(source_candidate_ids=["CAND004"]),
+                    action="create",
+                    canonical_target_path="designs/Design_RAG 系统设计.md",
+                    display_title="RAG 系统设计",
+                    page_type="design",
+                    new_understanding="RAG 系统设计关注检索、编排、评估和工具实现。",
+                    knowledge_delta="补充 RAG 方案实现路径。",
+                    why_this_matters="帮助判断 RAG 什么时候是系统方案而非单一概念。",
+                    value_points=["帮助设计检索增强生成方案。"],
+                    section_plans={"summary": "RAG 系统设计摘要。", "detail": "RAG 系统设计讨论检索、编排和评估。"},
+                    reason="RAG 系统设计值得沉淀。",
+                ),
+            ],
+        ),
+        resolution,
+        snapshot,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+    )
+
+    paths = {item.canonical_target_path for item in plan.items}
+    assert "comparisons/Comparison_Workflow vs Agent.md" in paths
+    assert "concepts/Concept_Agent 与 Workflow 对比.md" not in paths
+    assert "concepts/Concept_RAG 概念.md" in paths
+    assert "designs/Design_RAG 系统设计.md" in paths
+    agent_item = next(item for item in plan.items if item.canonical_target_path == "comparisons/Comparison_Workflow vs Agent.md")
+    assert set(agent_item.source_basis.source_candidate_ids) == {"CAND001", "CAND002"}
+    assert {"PP-CAND001", "PP-CAND002"} <= set(agent_item.merged_page_plan_ids)
+    assert "合并自" in "\n".join(agent_item.section_plans.values())
 
 
 def test_source_recorded_operation_cannot_resume(tmp_path: Path) -> None:
@@ -1188,10 +1876,26 @@ def test_merge_plan_review_pending_can_be_approved_after_manual_edit(tmp_path: P
     pending["items"][0]["apply_eligibility"] = "applyable"
     pending["items"][0]["blocked_reason"] = ""
     write_json(pending_path, pending)
+    before_approve = status(vault, manifest.operation_id)
+    before_step = [step for step in before_approve.steps if step.name == "merge_plan_review"][0]
+    before_duration = before_step.attempts[-1].duration_ms
 
     approved = approve_review(vault, manifest.operation_id, "merge_plan_review")
     assert approved.status == OperationStatus.running
     assert (run_dir / "merge_plan_review" / "approved_merge_plan.json").exists()
+    assert pending_path.exists()
+    approved_step = [step for step in approved.steps if step.name == "merge_plan_review"][0]
+    assert approved_step.status == StepStatus.approved
+    assert approved_step.error is None
+    assert approved_step.attempts[-1].error is None
+    assert approved_step.attempts[-1].duration_ms == before_duration
+    assert any(ref.relative_path.endswith("pending_merge_plan.json") for ref in approved_step.outputs)
+    decision = read_json(run_dir / "merge_plan_review" / "review_decision.json")
+    assert "取代" in decision["notes"]
+    metrics = read_json(run_dir / "run_metrics.json")
+    assert metrics["status"] == "running"
+    metric_step = [step for step in metrics["steps"] if step["name"] == "merge_plan_review"][0]
+    assert metric_step["status"] == "approved"
 
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
     config["providers"]["default"] = {
@@ -1202,6 +1906,55 @@ def test_merge_plan_review_pending_can_be_approved_after_manual_edit(tmp_path: P
     resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id)
     assert resumed.status == OperationStatus.drafted
     assert (run_dir / "apply_preview" / "apply_preview.json").exists()
+
+
+def test_review_approval_rejects_upstream_artifact_replaced_by_directory(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "needs-human-dir-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "wiki_merge_planning.json":
+            data["items"][0]["action"] = "needs_human_decision"
+            data["items"][0]["apply_eligibility"] = "blocked"
+            data["items"][0]["blocked_reason"] = "需要人工决定是否创建。"
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="review-artifact-dir")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    plan_path = run_dir / "wiki_merge_planning" / "wiki_merge_plan.json"
+    plan_path.unlink()
+    plan_path.mkdir()
+
+    with pytest.raises(PipelineError, match="wiki_merge_planning/wiki_merge_plan.json is not a file"):
+        approve_review(vault, manifest.operation_id, "merge_plan_review")
+
+
+def test_revise_review_archives_pending_artifacts_before_reset(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "needs-human-archive-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "wiki_merge_planning.json":
+            data["items"][0]["action"] = "needs_human_decision"
+            data["items"][0]["apply_eligibility"] = "blocked"
+            data["items"][0]["blocked_reason"] = "需要人工决定是否创建。"
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="review-archive")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    revised = revise_review(vault, manifest.operation_id, "merge_plan_review")
+    archives = list((run_dir / "review_archive" / "merge_plan_review").glob("*"))
+
+    assert revised.status == OperationStatus.running
+    assert archives
+    assert (archives[0] / "pending_merge_plan.json").exists()
+    superseded = read_json(archives[0] / "superseded.json")
+    assert superseded["schema_version"] == "review_superseded.v1"
+    assert not (run_dir / "merge_plan_review").exists()
+    assert not (run_dir / "wiki_merge_planning").exists()
 
 
 def test_apply_rejects_incomplete_steps_even_if_manifest_is_marked_drafted(tmp_path: Path) -> None:
@@ -1267,6 +2020,26 @@ def test_source_digest_v2_strips_formal_candidate_suggested_action(tmp_path: Pat
     assert "Suggested" not in digest_markdown
     assert "action" not in resolution["items"][0]
     assert plan["items"][0]["action"] == "create"
+
+
+def test_source_digest_english_user_text_fails_for_zh_cn_vault(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "english-digest-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "source_digest.json":
+            data["summary"] = (
+                "This source explains how product managers should work with agents, workflows, evaluation loops, and career strategy."
+            )
+        write_json(fixture_dir / name, data)
+
+    with pytest.raises(PipelineError, match="must be Chinese"):
+        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="english-digest")
+
+    manifest = status(vault, latest_operation(vault) or "")
+    failed_step = [step for step in manifest.steps if step.status == StepStatus.failed][0]
+    assert failed_step.name == "source_digest"
 
 
 def test_source_page_neutralizes_model_generated_graph_links(tmp_path: Path) -> None:
@@ -1658,7 +2431,7 @@ def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path:
     assert plan.items[0].strongest_overlap.strength == "medium"
     assert plan.items[0].action == "needs_human_decision"
     assert plan.items[0].apply_eligibility == "blocked"
-    assert "没有解释为什么不 update" in plan.items[0].blocked_reason
+    assert "理由不充分" in plan.items[0].blocked_reason
 
 
 def test_wiki_merge_planning_repairs_missing_why_not_update_with_model(tmp_path: Path) -> None:
@@ -1691,7 +2464,9 @@ def test_wiki_merge_planning_repairs_missing_why_not_update_with_model(tmp_path:
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
 
-    assert (run_dir / "wiki_merge_planning" / "provider_result.repair.json").exists()
+    repair_report = read_json(run_dir / "wiki_merge_planning" / "structured_repair_report.json")
+    assert repair_report["repair_count"] == 1
+    assert len(list((run_dir / "wiki_merge_planning" / "provider_results").glob("attempt-*.json"))) == 2
     assert plan["items"][0]["why_not_update"] == "已有页只覆盖知识编译概念本身；本页聚焦 llmwiki-engine 的工程骨架，边界不同。"
     assert read_manifest(RunStore(vault).manifest_path(manifest.operation_id)).steps[8].status == StepStatus.completed
     assert manifest.status == OperationStatus.awaiting_review
@@ -1839,7 +2614,9 @@ def test_index_rebuilds_from_snapshot_metadata_and_drops_stale_rows(tmp_path: Pa
         "created: 2026-01-01\n"
         "updated: 2026-01-01\n"
         "---\n\n"
-        "# Old Concept\n",
+        "# Old Concept\n\n"
+        "## 矛盾与未决问题\n\n"
+        "- 旧概念是否还适用于新的 Agent 工作流？\n",
         encoding="utf-8",
     )
     misplaced_source = vault / "wiki" / "misc" / "Source_Misplaced.md"
@@ -1886,6 +2663,8 @@ def test_index_rebuilds_from_snapshot_metadata_and_drops_stale_rows(tmp_path: Pa
     assert "Misplaced Source" not in index_text
     assert "Source Pages" not in index_text
     assert "[[sources/" not in index_text
+    assert "旧概念是否还适用于新的 Agent 工作流？" in index_text
+    assert "暂无未决问题记录" not in index_text
     log_text = (vault / "wiki" / "log.md").read_text(encoding="utf-8")
     assert f"| [[logs/{today}]] | 2 | `raw/old.md`, `raw/raw_project_note.md` |" in log_text
     daily_text = daily.read_text(encoding="utf-8")
@@ -2020,6 +2799,28 @@ def test_apply_rejects_preview_paths_outside_expected_roots(tmp_path: Path) -> N
     assert not (vault.parent / "outside.md").exists()
 
 
+def test_apply_rejects_old_v8_draft_missing_m42_sidecar(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-sidecar")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    missing = run_dir / "draft_rendering" / "draft_grounding_review.json"
+    missing.unlink()
+    manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
+    manifest_data = read_json(manifest_path)
+    for step in manifest_data["steps"]:
+        if step["name"] != "draft_rendering":
+            continue
+        step["outputs"] = [ref for ref in step["outputs"] if ref["relative_path"] != "draft_rendering/draft_grounding_review.json"]
+        for attempt in step["attempts"]:
+            attempt["outputs"] = [
+                ref for ref in attempt["outputs"] if ref["relative_path"] != "draft_rendering/draft_grounding_review.json"
+            ]
+    write_json(manifest_path, manifest_data)
+
+    with pytest.raises(ApplyError, match="M4.2 draft sidecar artifacts are missing"):
+        apply_operation(vault, manifest.operation_id)
+
+
 def test_apply_commit_is_disabled_before_verify_or_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="commit")
@@ -2105,7 +2906,7 @@ def test_standard_apply_and_commit_are_rejected_before_writing(tmp_path: Path) -
     assert not target.exists()
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v8"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v9"])
 def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v2")

@@ -123,6 +123,39 @@ class ProviderResult(StrictModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class StructuredIssue(StrictModel):
+    issue_code: str
+    field_path: str = ""
+    validator_id: str = ""
+    message: str
+    repairability: Literal["repairable", "non_repairable"] = "non_repairable"
+
+
+class StructuredAttemptRef(StrictModel):
+    attempt: int
+    provider_result_ref: str
+    issues: list[StructuredIssue] = Field(default_factory=list)
+    repair_prompt_ref: str | None = None
+    parse_success: bool = False
+    schema_valid: bool = False
+    duration_ms: int = 0
+
+
+class StructuredRepairReport(StrictModel):
+    schema_version: Literal["structured_repair_report.v1"] = "structured_repair_report.v1"
+    task: str
+    provider: str
+    final_outcome: Literal["success", "failed"] = "success"
+    repair_attempted: bool = False
+    max_repair_attempts: int = 0
+    attempt_count: int = 0
+    repair_count: int = 0
+    duration_ms: int = 0
+    attempts: list[StructuredAttemptRef] = Field(default_factory=list)
+    final_provider_result_ref: str = ""
+    non_repairable_issues: list[StructuredIssue] = Field(default_factory=list)
+
+
 class RawPreparationUncertainItem(StrictModel):
     item: str
     reason: str = ""
@@ -328,6 +361,9 @@ class WikiMergePlanItem(StrictModel):
     apply_eligibility: Literal["applyable", "blocked", "source_only"] = "applyable"
     blocked_reason: str = ""
     reason: str
+    merged_page_plan_ids: list[str] = Field(default_factory=list)
+    noop_covered_by_update: bool = False
+    merge_reason: str = ""
 
 
 class CandidateResolutionArtifact(StrictModel):
@@ -496,8 +532,66 @@ def _coerce_section_body_scalar(value: Any) -> str:
 
 
 class DraftRenderingArtifact(StrictModel):
-    schema_version: Literal["draft_rendering.v2"] = "draft_rendering.v2"
+    schema_version: Literal["draft_rendering.v3"] = "draft_rendering.v3"
     pages: list[DraftPageItem] = Field(default_factory=list)
+
+
+class SectionMergeChange(StrictModel):
+    section_key: str
+    retained: list[str] = Field(default_factory=list)
+    added: list[str] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    removal_reason: str = ""
+
+
+class UpdatePageMergeReport(StrictModel):
+    page_plan_id: str
+    target_path: str
+    old_title: str = ""
+    final_title: str = ""
+    model_title: str = ""
+    retained_title: bool = True
+    merged_page_plan_ids: list[str] = Field(default_factory=list)
+    noop_covered_by_update: bool = False
+    sections: list[SectionMergeChange] = Field(default_factory=list)
+
+
+class UpdateMergeReport(StrictModel):
+    schema_version: Literal["update_merge_report.v1"] = "update_merge_report.v1"
+    pages: list[UpdatePageMergeReport] = Field(default_factory=list)
+
+
+class GroundingClaim(StrictModel):
+    page_plan_id: str
+    target_path: str
+    section_key: str = ""
+    claim_type: Literal["new_fact", "retained_fact", "inference", "needs_source"]
+    text: str
+    support: Literal["raw", "wiki_context", "existing_wiki", "inference", "unsupported"] = "unsupported"
+    action: Literal["kept", "moved_to_open_questions", "removed", "needs_review"] = "kept"
+    reason: str = ""
+
+
+class DraftGroundingReview(StrictModel):
+    schema_version: Literal["draft_grounding_review.v1"] = "draft_grounding_review.v1"
+    unsupported_new_facts: list[GroundingClaim] = Field(default_factory=list)
+    claims: list[GroundingClaim] = Field(default_factory=list)
+    requires_review: bool = False
+
+
+class RelatedCandidateReport(StrictModel):
+    page_plan_id: str
+    target_path: str
+    display_title: str
+    reason: str = ""
+    source: str = ""
+    decision: Literal["kept", "filtered", "cutoff"] = "kept"
+    reject_reason: str = ""
+
+
+class RelatedMergeReport(StrictModel):
+    schema_version: Literal["related_merge_report.v1"] = "related_merge_report.v1"
+    candidates: list[RelatedCandidateReport] = Field(default_factory=list)
 
 
 class DraftWriteTarget(StrictModel):
@@ -515,6 +609,7 @@ class DraftWriteManifest(StrictModel):
     has_updates: bool = False
     has_noops: bool = False
     source_only_noop: bool = False
+    requires_grounding_review: bool = False
 
 
 class DraftApproval(StrictModel):
@@ -581,10 +676,15 @@ class StepRecord(StrictModel):
     outputs: list[ArtifactRef] = Field(default_factory=list)
     attempts: list[StepAttempt] = Field(default_factory=list)
     error: str | None = None
+    review_reason: str | None = None
+    review_state: Literal["none", "awaiting", "approved", "rejected"] = "none"
+    awaiting_since: str | None = None
+    resolved_at: str | None = None
+    review_decision_ref: str | None = None
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v7"] = "operation_manifest.v7"
+    schema_version: Literal["operation_manifest.v8"] = "operation_manifest.v8"
     operation_id: str
     operation_type: str
     run_mode: RunMode = RunMode.dev

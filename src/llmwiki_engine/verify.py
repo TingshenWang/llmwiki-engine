@@ -30,7 +30,10 @@ def verify_run(vault: Path, manifest: OperationManifest) -> VerifyResult:
             path = run_dir / ref.relative_path
             if not path.exists():
                 issues.append(VerifyIssue(code=VerificationStatus.missing, path=ref.relative_path, message="required artifact is missing"))
-            elif path.is_file() and sha256_file(path) != ref.sha256:
+                continue
+            if not path.is_file():
+                issues.append(VerifyIssue(code=VerificationStatus.drift, path=ref.relative_path, message="required artifact is not a file"))
+            elif sha256_file(path) != ref.sha256:
                 issues.append(VerifyIssue(code=VerificationStatus.drift, path=ref.relative_path, message="artifact hash changed"))
     return VerifyResult(ok=not issues, issues=issues)
 

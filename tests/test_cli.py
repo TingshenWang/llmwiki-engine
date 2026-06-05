@@ -77,7 +77,7 @@ def test_resume_help_lists_step_names_from_metadata() -> None:
         assert step_name in result.output
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v8"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v9"])
 def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
     tmp_path: Path,
     schema_version: str,
@@ -407,6 +407,20 @@ def test_api_key_does_not_spread_across_e2e_cli_boundaries(monkeypatch, tmp_path
     boundaries.extend(
         (f"provider result {path}", path.read_text(encoding="utf-8"))
         for path in sorted(run_dir.rglob("provider_result.json"))
+    )
+    boundaries.extend(
+        (f"provider attempt {path}", path.read_text(encoding="utf-8"))
+        for path in sorted(run_dir.rglob("provider_results/attempt-*.json"))
+    )
+    boundaries.extend(
+        (f"report {path}", path.read_text(encoding="utf-8"))
+        for pattern in [
+            "structured_repair_report.*",
+            "draft_grounding_review.*",
+            "update_merge_report.*",
+            "related_merge_report.*",
+        ]
+        for path in sorted(run_dir.rglob(pattern))
     )
     boundaries.extend((f"wiki output {path}", path.read_text(encoding="utf-8")) for path in sorted((vault / "wiki").rglob("*.md")))
 

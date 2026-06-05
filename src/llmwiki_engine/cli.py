@@ -10,7 +10,7 @@ from rich.table import Table
 from .apply import ApplyError, apply_operation
 from .eval import load_eval_report, run_eval
 from .events import format_duration
-from .io import read_model
+from .io import read_json, read_model
 from .models import OperationManifest, ReviewDecision, RunMode, VerificationStatus
 from .pipeline import (
     PipelineError,
@@ -166,11 +166,19 @@ def _print_manifest_table(vault: Path, manifest: OperationManifest) -> None:
     ]
     if reviews:
         console.print("reviews: " + "; ".join(reviews))
+    review_reasons = [
+        f"{step.name}: {step.review_reason}"
+        for step in manifest.steps
+        if step.status.value == "awaiting_review" and step.review_reason
+    ]
+    if review_reasons:
+        console.print("[yellow]awaiting review:[/] " + "; ".join(review_reasons))
     console.print(f"mode: [bold]{manifest.run_mode.value}[/]")
     console.print(f"status: [bold]{manifest.status.value}[/]")
     latest_error = next((step.error for step in reversed(manifest.steps) if step.error), None)
     if latest_error:
         console.print(f"[red]latest error:[/] {latest_error}")
+    _print_metrics_summary(vault, manifest)
     _print_artifact_hints(vault, manifest)
     console.print(f"next: {_next_action(manifest)}")
 
@@ -217,7 +225,13 @@ def _print_artifact_hints(vault: Path, manifest: OperationManifest) -> None:
         ("raw cleanup", run_dir / "raw_link_cleanup" / "raw_link_cleanup.md"),
         ("raw cleanup diff", run_dir / "raw_link_cleanup" / "cleanup.diff"),
         ("merge review", run_dir / "merge_plan_review" / "review_prompt.md"),
+        ("merge decision report", run_dir / "wiki_merge_planning" / "merge_decision_report.md"),
+        ("candidate contexts", run_dir / "wiki_context_snapshot" / "candidate_contexts.md"),
         ("draft review", run_dir / "draft_review" / "review_prompt.md"),
+        ("structured repair", run_dir / "draft_rendering" / "structured_repair_report.md"),
+        ("update merge report", run_dir / "draft_rendering" / "update_merge_report.md"),
+        ("grounding review", run_dir / "draft_rendering" / "draft_grounding_review.md"),
+        ("related merge report", run_dir / "draft_rendering" / "related_merge_report.md"),
         ("draft root", run_dir / "draft_rendering" / "draft_pages"),
         ("diffs", run_dir / "draft_rendering" / "diffs"),
         ("apply preview", run_dir / "apply_preview" / "apply_preview.json"),
@@ -225,6 +239,22 @@ def _print_artifact_hints(vault: Path, manifest: OperationManifest) -> None:
     for label, path in hints:
         if path.exists():
             console.print(f"{label}: `{path}`")
+
+
+def _print_metrics_summary(vault: Path, manifest: OperationManifest) -> None:
+    metrics_path = RunStore(vault).run_dir(manifest.operation_id) / "run_metrics.json"
+    if not metrics_path.exists():
+        return
+    try:
+        metrics = read_json(metrics_path)
+    except Exception:
+        return
+    console.print(
+        "metrics: "
+        f"model_calls={metrics.get('internal_model_call_count', 0)}; "
+        f"repairs={metrics.get('repair_count', 0)}; "
+        f"provider_results={metrics.get('provider_result_count', 0)}"
+    )
 
 
 def _provider_label(step_name: str, provider_spec: str | None) -> str:

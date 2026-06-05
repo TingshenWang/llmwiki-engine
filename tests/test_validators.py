@@ -54,6 +54,24 @@ def test_source_digest_rejects_formal_source_candidate_type() -> None:
         validate_source_digest(digest)
 
 
+def test_source_digest_rejects_whole_english_user_text_for_zh_cn() -> None:
+    digest = _digest()
+    digest.summary = "This source explains how product managers should work with agents, workflows, evaluation loops, and career strategy."
+
+    with pytest.raises(ValidationError, match="must be Chinese"):
+        validate_source_digest(digest, language="zh-CN")
+
+
+def test_source_digest_allows_domain_terms_inside_chinese_for_zh_cn() -> None:
+    digest = _digest()
+    digest.summary = "这篇材料讨论 AI PM 如何理解 Workflow、Agent 和 RAG，并把它们转成可复用知识。"
+    digest.concepts[0].one_sentence_summary = "Workflow 和 Agent 的差异会影响产品方案、执行边界和评估方式。"
+    digest.concepts[0].why_matters = "它能帮助 PM 判断什么时候用流程自动化，什么时候需要智能体。"
+    digest.concepts[0].wiki_value = "适合沉淀为对比型知识，并连接到 Agent 产品设计。"
+
+    validate_source_digest(digest, language="zh-CN")
+
+
 def test_source_digest_accepts_weak_noise_without_suggested_page_title() -> None:
     digest = _digest()
     digest.weak_or_noise_items.append(
@@ -258,6 +276,28 @@ def test_wiki_merge_plan_rejects_source_graph_links() -> None:
 
     with pytest.raises(ValidationError, match="related_pages must not point to source pages"):
         validate_wiki_merge_plan(digest, plan)
+
+
+def test_wiki_merge_plan_rejects_english_related_reason_for_zh_cn() -> None:
+    digest = _digest()
+    plan = _merge_plan(
+        [
+            _plan_item(
+                "CAND001",
+                related_pages=[
+                    RelatedPageRef(
+                        target_path="concepts/Concept_Other.md",
+                        display_title="Other",
+                        source="source_digest",
+                        reason="This page is related because both discuss reusable product knowledge and agent workflows.",
+                    )
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="must be Chinese"):
+        validate_wiki_merge_plan(digest, plan, language="zh-CN")
 
 
 def test_wiki_merge_plan_must_cover_resolution_page_plans() -> None:
