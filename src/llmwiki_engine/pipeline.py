@@ -2407,14 +2407,14 @@ def finalize_wiki_merge_plan(
             resolution_item = (typed_matches or title_matches or [None])[0] if len(typed_matches or title_matches) == 1 else None
         if resolution_item is None:
             raise PipelineError(f"wiki_merge_plan references unknown page_plan_id: {item.page_plan_id}")
-        canonical = item.canonical_target_path or resolution_item.candidate_target_path
-        matched_page = item.matched_page
+        canonical = normalize_model_wiki_target_path(item.canonical_target_path or resolution_item.candidate_target_path)
+        matched_page = normalize_model_wiki_target_path(item.matched_page) if item.matched_page else None
         action = item.action
         if item.action == "update":
             matched_page = matched_page or canonical
             canonical = matched_page
         if item.action == "create":
-            canonical = resolution_item.candidate_target_path
+            canonical = normalize_model_wiki_target_path(resolution_item.candidate_target_path)
             matched_page = None
         if f"wiki/{canonical}" not in snapshot_paths:
             raise PipelineError(f"wiki_merge_plan target is outside wiki_context_snapshot: wiki/{canonical}")
@@ -2462,6 +2462,17 @@ def finalize_wiki_merge_plan(
             )
         )
     return WikiMergePlanArtifact(log_date=snapshot.log_date, items=items, context_snapshot_ref=snapshot_ref)
+
+
+def normalize_model_wiki_target_path(value: str) -> str:
+    path = value.strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    if path.startswith("/"):
+        path = path[1:]
+    if path.startswith("wiki/"):
+        path = path.removeprefix("wiki/")
+    return path
 
 
 def ensure_wiki_context_current(vault: Path, snapshot: WikiContextSnapshot) -> None:

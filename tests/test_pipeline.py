@@ -1002,6 +1002,33 @@ def test_m3_update_target_stops_at_draft_review_without_apply_preview(tmp_path: 
     assert not (run_dir / "apply_preview").exists()
 
 
+def test_wiki_merge_planning_normalizes_model_wiki_prefix_on_update_target(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("existing knowledge\n", encoding="utf-8")
+    fixture_dir = tmp_path / "wiki-prefixed-target-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "wiki_merge_planning.json":
+            data["items"][0]["action"] = "update"
+            data["items"][0]["canonical_target_path"] = "concepts/Concept_知识编译工程骨架.md"
+            data["items"][0]["matched_page"] = "wiki/concepts/Concept_知识编译工程骨架.md"
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="wiki-prefixed-target")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
+    first = plan["items"][0]
+
+    assert first["action"] == "update"
+    assert first["canonical_target_path"] == "concepts/Concept_知识编译工程骨架.md"
+    assert first["matched_page"] == "concepts/Concept_知识编译工程骨架.md"
+    assert manifest.status == OperationStatus.awaiting_review
+    assert [step for step in manifest.steps if step.status == StepStatus.awaiting_review][0].name == "draft_review"
+
+
 def test_source_recorded_operation_cannot_resume(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     for rel, title in [
