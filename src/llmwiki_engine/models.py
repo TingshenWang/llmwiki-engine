@@ -67,6 +67,19 @@ class VerificationStatus(str, Enum):
 class VaultConfig(StrictModel):
     wiki_language: Literal["zh-CN"] = "zh-CN"
     max_context_chars: int = 800_000
+    embedding_retrieval: "EmbeddingRetrievalConfig" = Field(default_factory=lambda: EmbeddingRetrievalConfig())
+
+
+class EmbeddingRetrievalConfig(StrictModel):
+    enabled: bool = True
+    backend: Literal["sentence_transformers", "exact"] = "sentence_transformers"
+    model: str = "Qwen/Qwen3-Embedding-0.6B"
+    device: str = "cpu"
+    top_k: int = 5
+    cache_dir: str = "~/.llmwiki/cache/embeddings"
+    strong_score: float = 0.78
+    medium_score: float = 0.62
+    max_excerpt_chars: int = 1200
 
 
 class PageTypeSpec(StrictModel):
@@ -269,14 +282,35 @@ class RelatedPageRef(StrictModel):
     reason: str
 
 
+class ContextOverlapSignal(StrictModel):
+    strength: Literal["none", "weak", "medium", "strong"] = "none"
+    match_basis: str = ""
+    path: str = ""
+    score: float = 0.0
+    reason: str = ""
+
+
 class WikiMergePlanItem(StrictModel):
     page_plan_id: str
     source_basis: SourceBasis
     action: Literal["create", "update", "noop", "needs_human_decision"]
+    model_action: Literal["create", "update", "noop", "needs_human_decision"] | None = None
+    finalization_reason: str = ""
     canonical_target_path: str
     display_title: str
     page_type: str
     matched_page: str | None = None
+    inspected_context_paths: list[str] = Field(default_factory=list)
+    strongest_overlap: ContextOverlapSignal = Field(default_factory=ContextOverlapSignal)
+    why_not_update: str = ""
+    why_create_or_update: str = ""
+    related_absence_reason: Literal[
+        "no_candidate",
+        "only_source_or_system",
+        "self_link_only",
+        "low_confidence",
+        "cap_cutoff",
+    ] | None = None
     prior_knowledge_state: str = ""
     new_understanding: str
     changed_view: str = ""
@@ -316,6 +350,19 @@ class WikiPageMetadata(StrictModel):
     source_operation_ids: list[str] = Field(default_factory=list)
 
 
+class WikiKnowledgePoolEntry(StrictModel):
+    path: str
+    rel_path: str
+    preimage_sha256: str
+    metadata: WikiPageMetadata | None = None
+    display_title: str
+    summary: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    llmwiki_type: str = "unknown"
+    indexable: bool = True
+    unindexable_reason: str = ""
+
+
 class WikiContextEntry(StrictModel):
     path: str
     expected_state: Literal["present", "missing"]
@@ -333,14 +380,53 @@ class WikiContextEntry(StrictModel):
 
 
 class WikiContextSnapshot(StrictModel):
-    schema_version: Literal["wiki_context_snapshot.v1"] = "wiki_context_snapshot.v1"
+    schema_version: Literal["wiki_context_snapshot.v2"] = "wiki_context_snapshot.v2"
     log_date: str
     source_target_path: str
+    candidate_contexts_ref: str = ""
+    candidate_pool_sha256: str = ""
+    knowledge_metadata_pool: list[WikiKnowledgePoolEntry] = Field(default_factory=list)
+    candidate_contexts: "CandidateContextsArtifact" = Field(default_factory=lambda: CandidateContextsArtifact(retrieval_backend="exact"))
     entries: list[WikiContextEntry] = Field(default_factory=list)
 
 
+class CandidateContextHit(StrictModel):
+    page_plan_id: str
+    rank: int
+    path: str
+    display_title: str
+    score: float = 0.0
+    strength: Literal["weak", "medium", "strong"] = "weak"
+    match_basis: str = ""
+    forced: bool = False
+    page_sha256: str
+    excerpt: str = ""
+    truncated: bool = False
+
+
+class CandidateContextItem(StrictModel):
+    page_plan_id: str
+    query: str
+    hits: list[CandidateContextHit] = Field(default_factory=list)
+    unindexable_pages: list[str] = Field(default_factory=list)
+
+
+class CandidateContextsArtifact(StrictModel):
+    schema_version: Literal["candidate_contexts.v1"] = "candidate_contexts.v1"
+    retrieval_backend: str
+    model: str = ""
+    model_revision: str = ""
+    cache_dir: str = ""
+    top_k: int = 5
+    candidate_pool_size: int = 0
+    candidate_pool_sha256: str = ""
+    skipped_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    items: list[CandidateContextItem] = Field(default_factory=list)
+
+
 class WikiMergePlanArtifact(StrictModel):
-    schema_version: Literal["wiki_merge_plan.v4"] = "wiki_merge_plan.v4"
+    schema_version: Literal["wiki_merge_plan.v5"] = "wiki_merge_plan.v5"
     log_date: str
     items: list[WikiMergePlanItem]
     context_snapshot_ref: str = ""
@@ -375,6 +461,10 @@ class DraftPageItem(StrictModel):
     def coerce_section_body_values(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+        data = dict(data)
+        coverage_checks = data.pop("source_coverage_checks", None)
+        if coverage_checks is not None and not data.get("source_coverage_notes"):
+            data["source_coverage_notes"] = _coerce_section_body_scalar(coverage_checks)
         section_bodies = data.get("section_bodies")
         if not isinstance(section_bodies, dict):
             return data
@@ -494,7 +584,7 @@ class StepRecord(StrictModel):
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v6"] = "operation_manifest.v6"
+    schema_version: Literal["operation_manifest.v7"] = "operation_manifest.v7"
     operation_id: str
     operation_type: str
     run_mode: RunMode = RunMode.dev

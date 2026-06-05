@@ -364,7 +364,10 @@ apply_preview
 Inspect and resolve real review gates. The current gates are:
 
 - `merge_plan_review`: review which pages will be written and why. If the plan
-  contains `needs_human_decision`, the pipeline stops here.
+  contains `needs_human_decision`, or embedding retrieval finds medium/strong
+  overlap while the plan still creates everything, the pipeline stops here.
+  Inspect `wiki_context_snapshot/candidate_contexts.md` and
+  `wiki_merge_planning/merge_decision_report.md`.
 - `draft_review`: review the concrete page content. Update drafts and revised
   drafts require explicit approval.
 

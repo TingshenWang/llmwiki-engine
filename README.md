@@ -10,13 +10,13 @@ For complete command usage, parameters, config rules, Git boundaries, and common
 errors, see [docs/cli-reference.en.md](docs/cli-reference.en.md). Chinese users
 can read [docs/cli-reference.zh-CN.md](docs/cli-reference.zh-CN.md).
 
-The current runnable path is the M3 Ingest MVP. It first normalizes Obsidian
+The current runnable path is the M4 Ingest MVP. It first normalizes Obsidian
 text wikilinks in the target `raw/` file in place, then prepares noisy raw
 material into a canonical `raw_prepare/prepared.md` artifact, creates a
 `source_digest`, checks source duplicates, plans candidate pages from the
-approved prepared text, freezes a wiki context snapshot, model-plans
-create/update/noop decisions, renders reviewed drafts, and produces an apply
-preview:
+approved prepared text, freezes a wiki context snapshot with local embedding
+retrieval evidence, model-plans create/update/noop decisions, renders reviewed
+drafts, and produces an apply preview:
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
@@ -41,12 +41,13 @@ and drafts can be tested before real models are introduced.
 - `source_digest` is the complete single-source digestion artifact used for
   human review of candidate knowledge.
 - `candidate_resolution` plans wiki topics from the approved prepared text and
-  digest; `wiki_merge_planning` uses a frozen snapshot to decide
-  create/update/noop/needs-human-decision.
+  digest; `wiki_context_snapshot` retrieves the most relevant existing wiki
+  pages per planned topic; `wiki_merge_planning` uses that frozen evidence to
+  decide create/update/noop/needs-human-decision.
 - Update writes are supported in dev mode as whole-page draft replacement, but
   must pass explicit draft review before validation/apply.
-- Knowledge pages use deterministic `Related` wikilinks; source pages stay out
-  of the Obsidian knowledge graph.
+- Knowledge pages use sparse deterministic `Related` wikilinks; source pages
+  stay out of the Obsidian knowledge graph.
 - Human-editable profiles are YAML.
 - Human review and drafts are Markdown.
 - Providers are pluggable per module.
@@ -80,6 +81,13 @@ llmwiki providers check /path/to/vault --live
 `--live` sends a small real-model probe. For thinking models it uses a
 `max_tokens=512` completion cap and prefers JSON mode, then falls back to a
 prompt-only JSON probe with a warning when JSON mode is clearly unsupported.
+
+Embedding retrieval is configured in `.llmwiki/config.json`, not provider YAML.
+New vaults default to local CPU `sentence_transformers` with
+`Qwen/Qwen3-Embedding-0.6B`; install it with `uv sync --extra embedding`.
+Model files are cached globally under `~/.llmwiki/cache/embeddings` so multiple
+vaults can share the same download. Mock/fixture runs use an exact lexical
+retriever and do not download embedding models.
 
 Plain `llmwiki ingest resume` reads the current merged provider config for
 model-backed steps that still need to execute. Completed steps are not rerun just

@@ -30,7 +30,7 @@ class RunStore:
         return self.llmwiki / "applied" / "operations.jsonl"
 
     def run_dir(self, operation_id: str) -> Path:
-        return self.runs_root / operation_id
+        return self.runs_root / require_operation_id(operation_id)
 
     def manifest_path(self, operation_id: str) -> Path:
         return self.run_dir(operation_id) / "manifest.json"
@@ -41,6 +41,16 @@ class RunStore:
     @property
     def apply_lock_path(self) -> Path:
         return self.llmwiki / "apply.lock"
+
+
+def require_operation_id(operation_id: str) -> str:
+    value = operation_id.strip()
+    if not value:
+        raise WorkspaceError("Operation id is empty. Check that your OP/OP2 shell variable is set.")
+    path = Path(value)
+    if path.is_absolute() or len(path.parts) != 1 or value in {".", ".."}:
+        raise WorkspaceError(f"Invalid operation id: {operation_id}")
+    return value
 
 def ensure_workspace_layout(vault: Path) -> None:
     if (vault / "stage" / "ingest").exists() and not (vault / ".llmwiki").exists():

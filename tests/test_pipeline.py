@@ -7,6 +7,7 @@ import yaml
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.steps as steps_module
+from llmwiki_engine import retrieval as retrieval_module
 from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
@@ -138,10 +139,22 @@ def test_init_creates_workspace_layout_and_gitignore(tmp_path: Path) -> None:
     assert (vault / "wiki" / "index.md").exists()
     assert (vault / "wiki" / "log.md").exists()
     assert (vault / "wiki" / "logs").is_dir()
+    config_json = read_json(vault / ".llmwiki" / "config.json")
+    assert config_json["embedding_retrieval"]["backend"] == "sentence_transformers"
+    assert config_json["embedding_retrieval"]["model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert config_json["embedding_retrieval"]["cache_dir"] == "~/.llmwiki/cache/embeddings"
     gitignore_lines = (vault / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".llmwiki/" in gitignore_lines
     assert ".llmwiki/runs/" not in gitignore_lines
     assert not (vault / ".git").exists()
+
+
+def test_embedding_cache_dir_expands_user_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", home.as_posix())
+    resolved = retrieval_module.resolve_cache_dir(tmp_path / "vault", "~/.llmwiki/cache/embeddings")
+    assert resolved == home / ".llmwiki" / "cache" / "embeddings"
+    assert resolved.is_dir()
 
 
 def test_raw_link_cleanup_normalizes_only_obsidian_text_wikilinks(tmp_path: Path) -> None:
@@ -304,7 +317,7 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "## 派生知识页" in source_text
     assert "`concepts/Concept_知识编译工程骨架.md`" in source_text
     assert "[[concepts/" not in source_text
-    assert loaded.schema_version == "operation_manifest.v6"
+    assert loaded.schema_version == "operation_manifest.v7"
     assert [ref.schema_version for ref in loaded.steps[0].outputs if ref.kind == "json"] == ["raw_link_cleanup.v1"]
     assert [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"] == ["raw_preparation.v1"]
     assert [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"] == ["source_digest.v2"]
@@ -312,12 +325,23 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
         "source_digest.v2"
     ]
     assert [ref.schema_version for ref in loaded.steps[6].outputs if ref.kind == "json"] == ["candidate_resolution.v3"]
+    assert [ref.schema_version for ref in loaded.steps[7].outputs if ref.relative_path.endswith("wiki_context_snapshot.json")] == [
+        "wiki_context_snapshot.v2"
+    ]
+    assert [ref.schema_version for ref in loaded.steps[7].outputs if ref.relative_path.endswith("candidate_contexts.json")] == [
+        "candidate_contexts.v1"
+    ]
     assert [ref.schema_version for ref in loaded.steps[8].outputs if ref.relative_path.endswith("wiki_merge_plan.json")] == [
-        "wiki_merge_plan.v4"
+        "wiki_merge_plan.v5"
     ]
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
-    assert plan["schema_version"] == "wiki_merge_plan.v4"
+    assert plan["schema_version"] == "wiki_merge_plan.v5"
+    assert (run_dir / "wiki_context_snapshot" / "candidate_contexts.json").exists()
+    assert (run_dir / "wiki_context_snapshot" / "candidate_contexts.md").exists()
+    assert (run_dir / "wiki_merge_planning" / "merge_decision_report.md").exists()
     snapshot = read_json(run_dir / "wiki_context_snapshot" / "wiki_context_snapshot.json")
+    assert snapshot["schema_version"] == "wiki_context_snapshot.v2"
+    assert snapshot["candidate_contexts"]["schema_version"] == "candidate_contexts.v1"
     snapshot_paths = {entry["path"] for entry in snapshot["entries"]}
     assert {
         "wiki/index.md",
@@ -900,6 +924,8 @@ def test_draft_rendering_normalizes_model_section_keys(tmp_path: Path) -> None:
                 "Additional Notes": "这是模型明确放进自由发挥区的观察。",
                 "Open Questions": "这个主题还有一个未决问题。",
             }
+            data["pages"][0].pop("source_coverage_notes", None)
+            data["pages"][0]["source_coverage_checks"] = "严格按照源内容，无额外添加。"
         write_json(fixture_dir / name, data)
 
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-sections")
@@ -918,6 +944,7 @@ def test_draft_rendering_normalizes_model_section_keys(tmp_path: Path) -> None:
     assert "### Product Philosophy" in first_page["section_bodies"]["detail"]
     assert first_page["section_bodies"]["value_points"] == "- PM 应该把建议写到价值点中。\n- 数组也要转成 Markdown 字符串。"
     assert first_page["section_bodies"]["additional_notes"] == "这是模型明确放进自由发挥区的观察。"
+    assert first_page["source_coverage_notes"] == "严格按照源内容，无额外添加。"
 
     concept_text = (run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md").read_text(
         encoding="utf-8"
@@ -1478,6 +1505,198 @@ def test_related_pages_resolve_deterministically_from_candidates_and_snapshot(tm
     assert all(item.target_path != first.canonical_target_path for item in first.related_pages)
 
 
+def test_wiki_context_snapshot_writes_candidate_contexts_and_metadata_poor_fallback(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    hand_written = vault / "wiki" / "concepts" / "Concept_Handwritten_Agent.md"
+    hand_written.parent.mkdir(parents=True, exist_ok=True)
+    hand_written.write_text(
+        "# Handwritten Agent Page\n\n"
+        "Workflow and agent execution differ in autonomy, feedback loops, and tool use.\n",
+        encoding="utf-8",
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_Workflow vs Agent.md",
+                display_title="Workflow vs Agent",
+                summary="Workflow and agent execution comparison.",
+            )
+        ]
+    )
+
+    snapshot = build_wiki_context_snapshot(
+        vault,
+        resolution,
+        log_date="2026-06-03",
+        source_target_path="sources/Source_Test.md",
+    )
+
+    pool_entry = [entry for entry in snapshot.knowledge_metadata_pool if entry.path == "concepts/Concept_Handwritten_Agent.md"][0]
+    assert pool_entry.metadata is None
+    assert pool_entry.indexable is False
+    context_item = snapshot.candidate_contexts.items[0]
+    assert "concepts/Concept_Handwritten_Agent.md" in context_item.unindexable_pages
+    assert any(hit.path == "concepts/Concept_Handwritten_Agent.md" for hit in context_item.hits)
+    assert "wiki/concepts/Concept_Handwritten_Agent.md" in {entry.path for entry in snapshot.entries}
+
+
+def test_strong_context_create_is_finalized_to_needs_human_decision(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    existing = vault / "wiki" / "concepts" / "Concept_Knowledge digestion.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Knowledge digestion\n"
+        "aliases: []\n"
+        "summary: Existing summary.\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# Knowledge digestion\n",
+        encoding="utf-8",
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_New Knowledge digestion.md",
+                display_title="Knowledge digestion",
+            )
+        ]
+    )
+    snapshot = build_wiki_context_snapshot(
+        vault,
+        resolution,
+        log_date="2026-06-03",
+        source_target_path="sources/Source_Test.md",
+    )
+    plan = pipeline_module.finalize_wiki_merge_plan(
+        pipeline_module.WikiMergePlanArtifact(
+            log_date="",
+            context_snapshot_ref="",
+            items=[
+                pipeline_module.WikiMergePlanItem(
+                    page_plan_id="PP-CAND001",
+                    source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                    action="create",
+                    canonical_target_path="concepts/Concept_New Knowledge digestion.md",
+                    display_title="Knowledge digestion",
+                    page_type="concept",
+                    new_understanding="New material.",
+                    section_plans={"summary": "Summary"},
+                    reason="Model tried to create.",
+                )
+            ],
+        ),
+        resolution,
+        snapshot,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+    )
+
+    assert plan.items[0].action == "needs_human_decision"
+    assert plan.items[0].apply_eligibility == "blocked"
+    assert plan.items[0].strongest_overlap.strength == "strong"
+
+
+def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    existing = vault / "wiki" / "concepts" / "Concept_AI_PM_Career.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: AI PM Career Skills\n"
+        "aliases: []\n"
+        "summary: Existing AI PM career skill summary.\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# AI PM Career Skills\n",
+        encoding="utf-8",
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_AI PM Interview.md",
+                display_title="AI PM",
+            )
+        ]
+    )
+    snapshot = build_wiki_context_snapshot(
+        vault,
+        resolution,
+        log_date="2026-06-03",
+        source_target_path="sources/Source_Test.md",
+    )
+    plan = pipeline_module.finalize_wiki_merge_plan(
+        pipeline_module.WikiMergePlanArtifact(
+            log_date="",
+            context_snapshot_ref="",
+            items=[
+                pipeline_module.WikiMergePlanItem(
+                    page_plan_id="PP-CAND001",
+                    source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                    action="create",
+                    canonical_target_path="concepts/Concept_AI PM Interview.md",
+                    display_title="AI PM",
+                    page_type="concept",
+                    new_understanding="New AI PM material.",
+                    section_plans={"summary": "Summary"},
+                    reason="Model tried to create without explaining why not update.",
+                )
+            ],
+        ),
+        resolution,
+        snapshot,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+    )
+
+    assert plan.items[0].strongest_overlap.strength == "medium"
+    assert plan.items[0].action == "needs_human_decision"
+    assert plan.items[0].apply_eligibility == "blocked"
+    assert "没有解释为什么不 update" in plan.items[0].blocked_reason
+
+
+def test_wiki_merge_planning_repairs_missing_why_not_update_with_model(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    existing = vault / "wiki" / "concepts" / "Concept_知识编译.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: 知识编译\n"
+        "aliases: []\n"
+        "summary: 已有知识编译概念。\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# 知识编译\n",
+        encoding="utf-8",
+    )
+    fixture_dir = tmp_path / "repair-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "draft_rendering.json"]:
+        write_json(fixture_dir / name, read_json(FIXTURE_ROOT / "mock" / name))
+    initial_plan = read_json(FIXTURE_ROOT / "mock" / "wiki_merge_planning.json")
+    initial_plan["items"][0].pop("why_not_update", None)
+    write_json(fixture_dir / "wiki_merge_planning.json", initial_plan)
+    repaired_plan = read_json(FIXTURE_ROOT / "mock" / "wiki_merge_planning.json")
+    repaired_plan["items"][0]["why_not_update"] = "已有页只覆盖知识编译概念本身；本页聚焦 llmwiki-engine 的工程骨架，边界不同。"
+    write_json(fixture_dir / "wiki_merge_planning.repair.json", repaired_plan)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="repair-why")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
+
+    assert (run_dir / "wiki_merge_planning" / "provider_result.repair.json").exists()
+    assert plan["items"][0]["why_not_update"] == "已有页只覆盖知识编译概念本身；本页聚焦 llmwiki-engine 的工程骨架，边界不同。"
+    assert read_manifest(RunStore(vault).manifest_path(manifest.operation_id)).steps[8].status == StepStatus.completed
+    assert manifest.status == OperationStatus.awaiting_review
+
+
 def test_source_type_plan_items_are_defensively_excluded_from_index_and_related(tmp_path: Path) -> None:
     vault, _ = make_vault(tmp_path)
     digest = SourceDigestArtifact(
@@ -1703,6 +1922,10 @@ def test_multiple_drafts_apply_requires_latest_wiki_context(tmp_path: Path) -> N
     }
     write_yaml(vault / ".llmwiki" / "config.yaml", config)
     resumed = resume_ingest(vault=vault, operation_id=second.operation_id)
+    assert resumed.status == OperationStatus.awaiting_review
+    assert read_manifest(RunStore(vault).manifest_path(second.operation_id)).steps[9].status == StepStatus.awaiting_review
+    approve_review(vault, second.operation_id, "merge_plan_review")
+    resumed = resume_ingest(vault=vault, operation_id=second.operation_id)
     assert resumed.status == OperationStatus.drafted
     written = apply_operation(vault, second.operation_id)
     assert vault / "wiki" / "sources" / "Source_second_project_note.md" in written
@@ -1882,7 +2105,7 @@ def test_standard_apply_and_commit_are_rejected_before_writing(tmp_path: Path) -
     assert not target.exists()
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v8"])
 def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v2")

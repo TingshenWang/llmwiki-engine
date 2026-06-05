@@ -32,6 +32,10 @@ class MockProvider:
         self.fixture_dir = fixture_dir
 
     def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
+        if isinstance(payload, dict) and payload.get("repair_contract"):
+            repair_path = self.fixture_dir / f"{task}.repair.json"
+            if repair_path.exists():
+                return repair_path.read_text(encoding="utf-8")
         path = self.fixture_dir / f"{task}.json"
         if not path.exists():
             raise ProviderError(f"Mock fixture missing: {path}")

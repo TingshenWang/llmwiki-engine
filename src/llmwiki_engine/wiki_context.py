@@ -4,10 +4,15 @@ from pathlib import Path
 
 from .hash_utils import sha256_file
 from .models import WikiContextSnapshot
+from .retrieval import build_knowledge_pool, candidate_pool_sha256
 
 
 def wiki_context_drift_messages(vault: Path, snapshot: WikiContextSnapshot) -> list[str]:
     messages: list[str] = []
+    if snapshot.candidate_pool_sha256:
+        current_pool_hash = candidate_pool_sha256(build_knowledge_pool(vault))
+        if current_pool_hash != snapshot.candidate_pool_sha256:
+            messages.append("wiki knowledge candidate pool changed after planning")
     for entry in snapshot.entries:
         path = vault / entry.path
         if entry.expected_state == "missing":

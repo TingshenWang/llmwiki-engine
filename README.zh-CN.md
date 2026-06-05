@@ -10,11 +10,11 @@
 [docs/cli-reference.zh-CN.md](docs/cli-reference.zh-CN.md)。英文版见
 [docs/cli-reference.en.md](docs/cli-reference.en.md)。
 
-当前可运行路径是 M3 Ingest MVP。它会先把目标 `raw/` 文件里的 Obsidian 文本
+当前可运行路径是 M4 Ingest MVP。它会先把目标 `raw/` 文件里的 Obsidian 文本
 wikilink 原地规范化，再把 noisy raw material 整理成规范的
 `raw_prepare/prepared.md`，然后生成 `source_digest`、做来源重复检查、基于全文和
-digest 做候选页面规划、冻结 wiki context snapshot、用模型判断
-create/update/noop/needs-human-decision、生成可审核草稿和 apply preview：
+digest 做候选页面规划、冻结带本地 embedding 召回证据的 wiki context snapshot、
+用模型判断 create/update/noop/needs-human-decision、生成可审核草稿和 apply preview：
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
@@ -36,11 +36,11 @@ llmwiki ingest apply /path/to/vault <operation_id>
 - `raw_prepare` 将规范化后的 raw 转换为下游知识编译使用的 canonical prepared raw。
 - `source_digest` 是单篇 raw 的完整消化文件，用于人工审核候选知识。
 - `candidate_resolution` 基于 approved prepared 全文和 digest 规划 wiki 选题；
-  `wiki_merge_planning` 基于冻结 snapshot 判断
-  create/update/noop/needs-human-decision。
+  `wiki_context_snapshot` 会为每个计划页召回最相关的已有 wiki 页面；
+  `wiki_merge_planning` 基于这些冻结证据判断 create/update/noop/needs-human-decision。
 - dev 模式支持 update 整页草稿替换，但必须经过显式 draft review 才能
   validation/apply。
-- 知识页使用确定性的 `Related` wikilink；source 页不进入 Obsidian 知识图谱。
+- 知识页使用少而准的确定性 `Related` wikilink；source 页不进入 Obsidian 知识图谱。
 - 人类可编辑的 profile 使用 YAML。
 - 人类 review 和 drafts 使用 Markdown。
 - Provider 可以按模块配置。
@@ -74,6 +74,12 @@ llmwiki providers check /path/to/vault --live
 `--live` 会发起一次小型真实模型探针。面向 thinking 模型时，它使用
 `max_tokens=512` 的 completion 上限，并优先使用 JSON mode；如果 API 明确不支持
 JSON mode，则 fallback 到 prompt-only JSON probe，并给出 warning。
+
+Embedding 召回配置写在 `.llmwiki/config.json`，不写在 provider YAML 里。新 vault
+默认使用本地 CPU `sentence_transformers` + `Qwen/Qwen3-Embedding-0.6B`；安装方式是
+`uv sync --extra embedding`。模型文件默认缓存在 `~/.llmwiki/cache/embeddings`，
+多个 vault 共用同一份下载。Mock/fixture run 会使用 exact lexical retriever，不会下载
+embedding 模型。
 
 普通 `llmwiki ingest resume` 会为仍需执行的模型步骤读取当前合并后的 provider
 配置。已经完成的 step 不会因为 config 改变自动重跑。

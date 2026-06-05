@@ -16,11 +16,14 @@ REQUIRED_MANIFEST_KEYS = frozenset(OperationManifest.model_fields)
 
 
 def read_manifest(path: Path) -> OperationManifest:
-    data = read_json(path)
+    try:
+        data = read_json(path)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Operation manifest not found: {path}") from exc
     if not isinstance(data, dict):
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
     schema_version = data.get("schema_version")
-    if schema_version != "operation_manifest.v6":
+    if schema_version != "operation_manifest.v7":
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
     if REQUIRED_MANIFEST_KEYS - set(data):
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)

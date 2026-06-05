@@ -62,6 +62,9 @@ from .models import (
     StepStatus,
     VaultConfig,
     WeakOrNoiseItem,
+    CandidateContextsArtifact,
+    ContextOverlapSignal,
+    EmbeddingRetrievalConfig,
     WikiContextEntry,
     WikiContextSnapshot,
     WikiMergePlanArtifact,
@@ -72,6 +75,13 @@ from .models import (
 from .provider_config import ProviderExecutionContext, build_provider_execution_context
 from .profiles import load_profile, page_output_path, safe_filename
 from .rendering import source_title_for_raw
+from .retrieval import (
+    RetrievalError,
+    build_candidate_contexts,
+    build_knowledge_pool,
+    candidate_pool_sha256,
+    metadata_from_text,
+)
 from .steps import (
     MODEL_BACKED_STEPS,
     STEP_NAMES,
@@ -119,6 +129,9 @@ RAW_PREPARE_CONTRACT = {
         "Return prepared_markdown as clean Markdown suitable for source_digest and downstream knowledge digestion.",
     ],
 }
+
+MODEL_RELATED_SUGGESTION_LIMIT = 2
+FINAL_RELATED_LIMIT = 3
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
     profile = load_profile(profile_name)
@@ -899,6 +912,7 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
 
 def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
     step_name = "wiki_context_snapshot"
+    step_root = require_step_output_dir(ctx.run_dir, step_name)
     resolution = read_model(
         require_step_output_dir(ctx.run_dir, "candidate_resolution") / "candidate_resolution.json",
         CandidateResolutionArtifact,
@@ -911,15 +925,118 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
         resolution,
         log_date=log_date,
         source_target_path=f"sources/{safe_filename(source_title)}.md",
+        retrieval_config=effective_retrieval_config(ctx),
+        force_exact_backend=uses_mock_provider_context(ctx.execution_context),
     )
     ensure_snapshot_within_limit(snapshot, ctx.manifest.vault_config_snapshot.max_context_chars)
-    snapshot_path = require_step_output_dir(ctx.run_dir, step_name) / "wiki_context_snapshot.json"
+    contexts_path = step_root / "candidate_contexts.json"
+    write_json(contexts_path, snapshot.candidate_contexts)
+    contexts_md = step_root / "candidate_contexts.md"
+    contexts_md.write_text(render_candidate_contexts_markdown(snapshot.candidate_contexts), encoding="utf-8")
+    snapshot = snapshot.model_copy(update={"candidate_contexts_ref": contexts_path.relative_to(ctx.run_dir).as_posix()})
+    snapshot_path = step_root / "wiki_context_snapshot.json"
     write_json(snapshot_path, snapshot)
     complete_step(
         ctx.manifest,
         step_name,
-        outputs=[_ref(ctx.run_dir, snapshot_path, step_name, "json", "wiki_context_snapshot.v1")],
+        outputs=[
+            _ref(ctx.run_dir, snapshot_path, step_name, "json", "wiki_context_snapshot.v2"),
+            _ref(ctx.run_dir, contexts_path, step_name, "json", "candidate_contexts.v1"),
+            _ref(ctx.run_dir, contexts_md, step_name, "markdown"),
+        ],
     )
+
+
+def effective_retrieval_config(ctx: StepRunContext) -> EmbeddingRetrievalConfig:
+    return ctx.manifest.vault_config_snapshot.embedding_retrieval
+
+
+def uses_mock_provider_context(execution_context: ProviderExecutionContext) -> bool:
+    if execution_context.record is None:
+        return False
+    providers = list(execution_context.record.providers.values())
+    return bool(providers) and all(provider.spec.startswith("mock:") for provider in providers)
+
+
+def medium_create_missing_why_not_update_items(plan: WikiMergePlanArtifact) -> list[WikiMergePlanItem]:
+    return [
+        item
+        for item in plan.items
+        if item.action == "create"
+        and item.strongest_overlap.strength == "medium"
+        and item.strongest_overlap.path
+        and not item.why_not_update.strip()
+    ]
+
+
+def repair_merge_plan_why_not_update(
+    *,
+    ctx: StepRunContext,
+    base_payload: dict[str, Any],
+    plan: WikiMergePlanArtifact,
+    repair_targets: list[WikiMergePlanItem],
+) -> WikiMergePlanArtifact:
+    step_name = "wiki_merge_planning"
+    repair_payload = {
+        **base_payload,
+        "current_merge_plan": plan.model_dump(mode="json"),
+        "repair_contract": {
+            "goal": "Repair missing why_not_update explanations for create actions with medium overlap.",
+            "rules": [
+                "Return a complete wiki_merge_plan.v5 JSON object.",
+                "Preserve page_plan_id, source_basis, action, canonical_target_path, display_title, page_type, matched_page, and section_plans unless they are clearly invalid.",
+                "For each repair target, fill why_not_update with a specific explanation comparing the new source topic against the strongest inspected old page.",
+                "If the old page should actually be updated, change action to update and set matched_page to that inspected path.",
+                "Do not leave why_not_update empty for create actions listed in repair_targets.",
+                "Keep all user-visible fields in Chinese unless retaining a stable domain term.",
+            ],
+        },
+        "repair_targets": [
+            {
+                "page_plan_id": item.page_plan_id,
+                "display_title": item.display_title,
+                "canonical_target_path": item.canonical_target_path,
+                "strongest_overlap": item.strongest_overlap.model_dump(mode="json"),
+                "inspected_context_paths": item.inspected_context_paths,
+            }
+            for item in repair_targets
+        ],
+    }
+    repaired, _ = _structured_call(
+        ctx.run_dir,
+        ctx.execution_context,
+        step_name,
+        result_filename="provider_result.repair.json",
+    ).run(step_name, repair_payload, WikiMergePlanArtifact)
+    return repaired
+
+
+def block_unrepaired_medium_missing_why_not_update(plan: WikiMergePlanArtifact) -> WikiMergePlanArtifact:
+    items: list[WikiMergePlanItem] = []
+    for item in plan.items:
+        if (
+            item.action == "create"
+            and item.strongest_overlap.strength == "medium"
+            and item.strongest_overlap.path
+            and not item.why_not_update.strip()
+        ):
+            items.append(
+                item.model_copy(
+                    update={
+                        "action": "needs_human_decision",
+                        "apply_eligibility": "blocked",
+                        "blocked_reason": item.blocked_reason
+                        or f"召回到中等相关旧页 `{item.strongest_overlap.path}`，但模型选择 create 且没有解释为什么不 update；需要人工确认。",
+                        "finalization_reason": merge_markdown_blocks(
+                            item.finalization_reason,
+                            "模型 repair 后仍缺少 why_not_update，已转为 needs_human_decision。",
+                        ),
+                    }
+                )
+            )
+            continue
+        items.append(item)
+    return plan.model_copy(update={"items": items})
 
 
 def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
@@ -932,17 +1049,24 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
     snapshot_path = require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json"
     snapshot = read_model(snapshot_path, WikiContextSnapshot)
+    candidate_contexts = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "candidate_contexts.json", CandidateContextsArtifact)
     payload = {
         "approved_prepared_markdown": (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8"),
         "approved_digest": digest.model_dump(mode="json"),
         "candidate_resolution": resolution.model_dump(mode="json"),
         "wiki_context_snapshot": snapshot.model_dump(mode="json"),
+        "candidate_contexts": candidate_contexts.model_dump(mode="json"),
         "profile": ctx.profile.model_dump(mode="json"),
         "language_contract": ctx.manifest.vault_config_snapshot.model_dump(mode="json"),
         "contract": {
             "goal": "Read the frozen wiki context and decide create/update/noop/needs_human_decision for planned pages.",
             "actions": ["create", "update", "noop", "needs_human_decision"],
             "rules": [
+                "For each page_plan_id, inspect candidate_contexts Top5 before choosing create/update/noop/needs_human_decision.",
+                "Write inspected_context_paths using wiki-root-relative paths from candidate_contexts hits.",
+                "For create, explain why_not_update against the strongest inspected context instead of only saying the target page is missing.",
+                "If an exact path/title/alias inspected context strongly overlaps but you still want create, use needs_human_decision.",
+                "Suggest at most two related_pages; they must come from source sibling pages, inspected context pages, or exact title/alias matches.",
                 "Use canonical_target_path for final writes; for update use the matched existing page path.",
                 "needs_human_decision is not writeable and must be resolved before drafting.",
                 "noop only when existing wiki already fully covers the source without new examples, expressions, links, or value points.",
@@ -958,19 +1082,37 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
         WikiMergePlanArtifact,
     )
     plan = _redacted_model(ctx, plan, WikiMergePlanArtifact)
-    plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_path.relative_to(ctx.run_dir).as_posix())
-    validate_wiki_merge_plan(digest, plan, resolution)
+    snapshot_ref = snapshot_path.relative_to(ctx.run_dir).as_posix()
+    plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_ref, medium_missing_policy="preserve")
+    repair_targets = medium_create_missing_why_not_update_items(plan)
+    if repair_targets:
+        plan = repair_merge_plan_why_not_update(
+            ctx=ctx,
+            base_payload=payload,
+            plan=plan,
+            repair_targets=repair_targets,
+        )
+        plan = _redacted_model(ctx, plan, WikiMergePlanArtifact)
+        plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_ref, medium_missing_policy="preserve")
+    plan = block_unrepaired_medium_missing_why_not_update(plan)
+    validate_wiki_merge_plan(digest, plan, resolution, snapshot)
     out = step_root / "wiki_merge_plan.json"
     write_json(out, plan)
     table = step_root / "wiki_merge_plan.md"
     table.write_text(render_merge_plan_markdown(plan), encoding="utf-8")
+    report = step_root / "merge_decision_report.md"
+    report.write_text(render_merge_decision_report(plan, snapshot), encoding="utf-8")
     outputs = [
-        _ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v4"),
+        _ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
         _ref(ctx.run_dir, table, step_name, "markdown"),
+        _ref(ctx.run_dir, report, step_name, "markdown"),
     ]
     provider_result = step_root / "provider_result.json"
     if provider_result.exists():
         outputs.append(_ref(ctx.run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
+    repair_provider_result = step_root / "provider_result.repair.json"
+    if repair_provider_result.exists():
+        outputs.append(_ref(ctx.run_dir, repair_provider_result, step_name, "provider_result", "provider_result.v1"))
     complete_step(
         ctx.manifest,
         step_name,
@@ -989,7 +1131,8 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     feedback_path.write_text("", encoding="utf-8")
     prompt_path.write_text(render_merge_plan_review_prompt(plan), encoding="utf-8")
     has_needs_human = any(item.action == "needs_human_decision" or item.apply_eligibility == "blocked" for item in plan.items)
-    if has_needs_human:
+    all_create_risk = merge_plan_all_create_review_reason(plan)
+    if has_needs_human or all_create_risk:
         pending_path = step_root / "pending_merge_plan.json"
         pending_path.write_text(plan_path.read_text(encoding="utf-8"), encoding="utf-8")
         decision = ReviewDecision(
@@ -997,7 +1140,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
             decision="pending",
             review_mode="manual",
             auto_approved=False,
-            notes="merge plan contains needs_human_decision; revise to create/update/noop before continuing.",
+            notes=all_create_risk or "merge plan contains needs_human_decision; revise to create/update/noop before continuing.",
         )
         decision_path = step_root / "review_decision.json"
         write_json(decision_path, decision)
@@ -1007,10 +1150,10 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
             outputs=[
                 _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
                 _ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
-                _ref(ctx.run_dir, pending_path, step_name, "json", "wiki_merge_plan.v4"),
+                _ref(ctx.run_dir, pending_path, step_name, "json", "wiki_merge_plan.v5"),
                 _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v1"),
             ],
-            error="merge plan requires human decision; run merge-level revise.",
+            error=all_create_risk or "merge plan requires human decision; run merge-level revise.",
         )
         return
     approved_path.write_text(plan_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -1030,7 +1173,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
             _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
             _ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
             _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v1"),
-            _ref(ctx.run_dir, approved_path, step_name, "json", "wiki_merge_plan.v4"),
+            _ref(ctx.run_dir, approved_path, step_name, "json", "wiki_merge_plan.v5"),
         ],
     )
 
@@ -1046,7 +1189,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     merge_plan = read_model(require_step_output_dir(ctx.run_dir, "merge_plan_review") / "approved_merge_plan.json", WikiMergePlanArtifact)
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
     validate_source_digest(digest)
-    validate_wiki_merge_plan(digest, merge_plan, resolution)
+    validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot)
     ensure_wiki_context_current(ctx.vault, snapshot)
     payload = {
         "approved_prepared_markdown": (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8"),
@@ -1269,7 +1412,7 @@ def _run_validation(ctx: StepRunContext) -> None:
     draft_write_manifest = read_model(require_step_output_dir(ctx.run_dir, "draft_review") / "approved_write_manifest.json", DraftWriteManifest)
     validate_raw_preparation(preparation)
     validate_source_digest(digest)
-    validate_wiki_merge_plan(digest, merge_plan, resolution)
+    validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot)
     ensure_wiki_context_current(ctx.vault, snapshot)
     if any(item.action == "needs_human_decision" for item in merge_plan.items):
         raise PipelineError("needs_human_decision must be revised to create/update/noop before validation.")
@@ -1440,6 +1583,20 @@ def build_wiki_merge_plan(
         matched_page = None
         if action == "update":
             matched_page = item.candidate_target_path
+        context_item = next((context for context in snapshot.candidate_contexts.items if context.page_plan_id == item.page_plan_id), None)
+        inspected_paths = [hit.path for hit in context_item.hits] if context_item is not None else []
+        strongest_hit = context_item.hits[0] if context_item is not None and context_item.hits else None
+        strongest_overlap = (
+            ContextOverlapSignal(
+                strength=strongest_hit.strength,
+                match_basis=strongest_hit.match_basis,
+                path=strongest_hit.path,
+                score=strongest_hit.score,
+                reason=f"Top inspected context: {strongest_hit.display_title}",
+            )
+            if strongest_hit is not None
+            else ContextOverlapSignal()
+        )
         source_candidate_id = item.source_basis.source_candidate_ids[0] if item.source_basis.source_candidate_ids else ""
         candidate = candidates[source_candidate_id]
         related_pages, related_unresolved = resolve_related_pages(item, candidate, resolution, snapshot)
@@ -1448,10 +1605,16 @@ def build_wiki_merge_plan(
                 page_plan_id=item.page_plan_id,
                 source_basis=item.source_basis,
                 action=action,
+                model_action=action,
+                finalization_reason="Deterministic local merge plan.",
                 canonical_target_path=item.candidate_target_path,
                 display_title=item.display_title,
                 page_type=item.page_type,
                 matched_page=matched_page,
+                inspected_context_paths=inspected_paths,
+                strongest_overlap=strongest_overlap,
+                why_not_update="" if action == "update" else "未发现需要合并的已存在目标页。",
+                why_create_or_update=item.reason,
                 prior_knowledge_state="已有页面。" if exists else "当前 wiki 没有相关知识页。",
                 new_understanding=item.topic_summary,
                 changed_view="",
@@ -1463,6 +1626,7 @@ def build_wiki_merge_plan(
                 related_pages=related_pages,
                 related_unresolved=related_unresolved,
                 unresolved_related=related_unresolved,
+                related_absence_reason=None if related_pages else ("no_candidate" if not inspected_paths else "low_confidence"),
                 apply_eligibility="applyable",
                 blocked_reason="",
                 reason=item.reason,
@@ -1472,21 +1636,7 @@ def build_wiki_merge_plan(
 
 
 def existing_knowledge_page_paths(vault: Path) -> set[str]:
-    wiki = vault / "wiki"
-    if not wiki.exists():
-        return set()
-    paths: set[str] = set()
-    for path in wiki.rglob("*.md"):
-        rel = path.relative_to(vault).as_posix()
-        if rel in {"wiki/index.md", "wiki/log.md"}:
-            continue
-        parts = Path(rel).parts
-        if len(parts) > 1 and parts[1] in {"sources", "logs"}:
-            continue
-        metadata = read_wiki_page_metadata(vault, rel)
-        if metadata is not None and metadata.llmwiki_type.lower() != "source":
-            paths.add(rel)
-    return paths
+    return {entry.rel_path for entry in build_knowledge_pool(vault)}
 
 
 def parse_frontmatter(text: str) -> dict[str, Any] | None:
@@ -1519,18 +1669,19 @@ def resolve_related_pages(
             continue
         by_current_title.setdefault(normalize_related_key(other.display_title), []).append(other)
     metadata_lookup: dict[str, list[WikiPageMetadata]] = {}
-    for entry in snapshot.entries:
-        if entry.metadata is None:
+    for pool_entry in snapshot.knowledge_metadata_pool:
+        metadata = pool_entry.metadata
+        if metadata is None:
             continue
-        if entry.metadata.llmwiki_type.lower() == "source":
+        if metadata.llmwiki_type.lower() == "source":
             continue
-        for key in [entry.metadata.title, *entry.metadata.aliases]:
-            metadata_lookup.setdefault(normalize_related_key(key), []).append(entry.metadata)
+        for key in [metadata.title, *metadata.aliases]:
+            metadata_lookup.setdefault(normalize_related_key(key), []).append(metadata)
     related: list[RelatedPageRef] = []
     unresolved: list[str] = []
     seen_paths: set[str] = set()
     for raw in candidate.related_candidates:
-        if len(related) >= 8:
+        if len(related) >= FINAL_RELATED_LIMIT:
             unresolved.append(raw)
             continue
         resolved: RelatedPageRef | None = None
@@ -1640,11 +1791,17 @@ def model_steps_from(start_step: str) -> list[str]:
     return [step for step in MODEL_BACKED_STEPS if step in names]
 
 
-def _structured_call(run_dir: Path, execution_context: ProviderExecutionContext, task: str) -> StructuredModelCall:
+def _structured_call(
+    run_dir: Path,
+    execution_context: ProviderExecutionContext,
+    task: str,
+    *,
+    result_filename: str = "provider_result.json",
+) -> StructuredModelCall:
     return StructuredModelCall(
         execution_context.provider_for_task(task),
         output_dir=step_output_dir(run_dir, task),
-        result_filename="provider_result.json",
+        result_filename=result_filename,
         redactor=execution_context.redactor,
     )
 
@@ -1817,7 +1974,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             snapshot = read_model(snapshot_path, WikiContextSnapshot)
             plan = read_model(pending, WikiMergePlanArtifact)
             plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_path.relative_to(run_dir).as_posix())
-            validate_wiki_merge_plan(digest, plan, resolution)
+            validate_wiki_merge_plan(digest, plan, resolution, snapshot)
             if any(item.action == "needs_human_decision" for item in plan.items):
                 raise PipelineError("needs_human_decision must be revised to create/update/noop before approval.")
             approved = step_root / "approved_merge_plan.json"
@@ -1829,7 +1986,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                 manifest,
                 review_step,
                 outputs=[
-                    _ref(run_dir, approved, review_step, "json", "wiki_merge_plan.v4"),
+                    _ref(run_dir, approved, review_step, "json", "wiki_merge_plan.v5"),
                     _ref(run_dir, decision_path, review_step, "json", "review_decision.v1"),
                 ],
             )
@@ -2182,7 +2339,21 @@ def build_wiki_context_snapshot(
     *,
     log_date: str,
     source_target_path: str,
+    retrieval_config: EmbeddingRetrievalConfig | None = None,
+    force_exact_backend: bool = False,
 ) -> WikiContextSnapshot:
+    retrieval_config = retrieval_config or EmbeddingRetrievalConfig(backend="exact")
+    knowledge_pool = build_knowledge_pool(vault)
+    try:
+        candidate_contexts = build_candidate_contexts(
+            resolution=resolution,
+            knowledge_pool=knowledge_pool,
+            config=retrieval_config,
+            vault=vault,
+            force_exact_backend=force_exact_backend,
+        )
+    except RetrievalError as exc:
+        raise PipelineError(str(exc)) from exc
     paths = {
         "wiki/index.md",
         "wiki/log.md",
@@ -2191,23 +2362,33 @@ def build_wiki_context_snapshot(
     }
     for item in resolution.items:
         paths.add(f"wiki/{item.candidate_target_path}")
-    paths.update(existing_knowledge_page_paths(vault))
+    for context_item in candidate_contexts.items:
+        for hit in context_item.hits:
+            paths.add(f"wiki/{hit.path}")
     entries: list[WikiContextEntry] = []
     for rel in sorted(paths):
         path = vault / rel
         if path.exists():
+            text = path.read_text(encoding="utf-8")
             entries.append(
                 WikiContextEntry(
                     path=rel,
                     expected_state="present",
                     preimage_sha256=sha256_file(path),
-                    content=path.read_text(encoding="utf-8"),
-                    metadata=read_wiki_page_metadata(vault, rel),
+                    content=text,
+                    metadata=metadata_from_text(text, rel),
                 )
             )
         else:
             entries.append(WikiContextEntry(path=rel, expected_state="missing", preimage_sha256=None, content=""))
-    return WikiContextSnapshot(log_date=log_date, source_target_path=source_target_path, entries=entries)
+    return WikiContextSnapshot(
+        log_date=log_date,
+        source_target_path=source_target_path,
+        candidate_pool_sha256=candidate_pool_sha256(knowledge_pool),
+        knowledge_metadata_pool=knowledge_pool,
+        candidate_contexts=candidate_contexts,
+        entries=entries,
+    )
 
 
 def ensure_snapshot_within_limit(snapshot: WikiContextSnapshot, max_context_chars: int) -> None:
@@ -2272,22 +2453,27 @@ def resolve_model_related_pages(
                 current_by_path[path] = other
         current_by_title.setdefault(normalize_related_key(other.display_title), []).append(other)
 
+    inspected_paths = set(item.inspected_context_paths)
     metadata_by_path: dict[str, WikiPageMetadata] = {}
     metadata_by_title: dict[str, list[WikiPageMetadata]] = {}
-    for entry in snapshot.entries:
-        if entry.metadata is None:
+    for pool_entry in snapshot.knowledge_metadata_pool:
+        metadata = pool_entry.metadata
+        if metadata is None:
             continue
-        if entry.metadata.llmwiki_type.lower() == "source":
+        if metadata.llmwiki_type.lower() == "source":
             continue
-        metadata_by_path[entry.metadata.path] = entry.metadata
-        for key in [entry.metadata.title, *entry.metadata.aliases]:
-            metadata_by_title.setdefault(normalize_related_key(key), []).append(entry.metadata)
+        metadata_by_path[metadata.path] = metadata
+        for key in [metadata.title, *metadata.aliases]:
+            metadata_by_title.setdefault(normalize_related_key(key), []).append(metadata)
 
     related: list[RelatedPageRef] = []
     unresolved: list[str] = []
     seen_paths: set[str] = set()
-    for suggestion in item.related_pages:
-        if len(related) >= 8:
+    for index, suggestion in enumerate(item.related_pages):
+        if index >= MODEL_RELATED_SUGGESTION_LIMIT:
+            unresolved.append(_related_debug_label(suggestion))
+            continue
+        if len(related) >= FINAL_RELATED_LIMIT:
             unresolved.append(_related_debug_label(suggestion))
             continue
         resolved = _resolve_single_model_related(
@@ -2302,6 +2488,11 @@ def resolve_model_related_pages(
         if resolved is None:
             unresolved.append(_related_debug_label(suggestion))
             continue
+        if resolved.source == "wiki_context" and resolved.target_path not in inspected_paths:
+            exact_key = normalize_related_key(resolved.display_title)
+            if exact_key not in metadata_by_title:
+                unresolved.append(_related_debug_label(suggestion))
+                continue
         if resolved.target_path in seen_paths:
             continue
         seen_paths.add(resolved.target_path)
@@ -2391,9 +2582,12 @@ def finalize_wiki_merge_plan(
     resolution: CandidateResolutionArtifact,
     snapshot: WikiContextSnapshot,
     snapshot_ref: str,
+    *,
+    medium_missing_policy: Literal["preserve", "block"] = "block",
 ) -> WikiMergePlanArtifact:
     resolution_by_id = {item.page_plan_id: item for item in resolution.items}
     snapshot_paths = {entry.path for entry in snapshot.entries}
+    context_by_id = {item.page_plan_id: item for item in snapshot.candidate_contexts.items}
     preliminary: list[WikiMergePlanItem] = []
     for item in plan.items:
         resolution_item = resolution_by_id.get(item.page_plan_id)
@@ -2407,9 +2601,25 @@ def finalize_wiki_merge_plan(
             resolution_item = (typed_matches or title_matches or [None])[0] if len(typed_matches or title_matches) == 1 else None
         if resolution_item is None:
             raise PipelineError(f"wiki_merge_plan references unknown page_plan_id: {item.page_plan_id}")
+        context_item = context_by_id.get(resolution_item.page_plan_id)
+        inspected_paths = [hit.path for hit in context_item.hits] if context_item is not None else []
+        strongest_hit = context_item.hits[0] if context_item is not None and context_item.hits else None
+        strongest_overlap = (
+            ContextOverlapSignal(
+                strength=strongest_hit.strength,
+                match_basis=strongest_hit.match_basis,
+                path=strongest_hit.path,
+                score=strongest_hit.score,
+                reason=f"Top inspected context: {strongest_hit.display_title}",
+            )
+            if strongest_hit is not None
+            else ContextOverlapSignal()
+        )
         canonical = normalize_model_wiki_target_path(item.canonical_target_path or resolution_item.candidate_target_path)
         matched_page = normalize_model_wiki_target_path(item.matched_page) if item.matched_page else None
         action = item.action
+        model_action = item.model_action or item.action
+        finalization_notes: list[str] = []
         if item.action == "update":
             matched_page = matched_page or canonical
             canonical = matched_page
@@ -2424,20 +2634,62 @@ def finalize_wiki_merge_plan(
         elif entry.expected_state == "present":
             action = "update" if action != "noop" else "noop"
             matched_page = canonical if action == "update" else matched_page
+            if action != model_action:
+                finalization_notes.append("目标页已存在，最终动作改为 update/noop。")
         else:
             action = "create"
             matched_page = None
+            if action != model_action:
+                finalization_notes.append("目标页缺失，最终动作改为 create。")
         apply_eligibility = item.apply_eligibility
         blocked_reason = item.blocked_reason
+        if (
+            action == "create"
+            and strongest_overlap.strength == "strong"
+            and strongest_overlap.path
+            and strongest_overlap.path != canonical
+        ):
+            action = "needs_human_decision"
+            apply_eligibility = "blocked"
+            blocked_reason = blocked_reason or (
+                f"召回到强相关旧页 `{strongest_overlap.path}`，但模型仍选择 create；需要人工确认是否应 update。"
+            )
+            finalization_notes.append("strong overlap create 被转为 needs_human_decision。")
+        if (
+            action == "create"
+            and strongest_overlap.strength == "medium"
+            and strongest_overlap.path
+            and not item.why_not_update.strip()
+        ):
+            if medium_missing_policy == "block":
+                action = "needs_human_decision"
+                apply_eligibility = "blocked"
+                blocked_reason = blocked_reason or (
+                    f"召回到中等相关旧页 `{strongest_overlap.path}`，但模型选择 create 且没有解释为什么不 update；需要人工确认。"
+                )
+                finalization_notes.append("medium overlap create 缺少 why_not_update，被转为 needs_human_decision。")
+            else:
+                finalization_notes.append("medium overlap create 缺少 why_not_update，已请求模型补充。")
         if apply_eligibility == "blocked" and action != "needs_human_decision":
             action = "needs_human_decision"
             blocked_reason = blocked_reason or "模型将该项标记为 blocked，需要人工决策。"
+            finalization_notes.append("blocked item 被转为 needs_human_decision。")
+        related_absence_reason = item.related_absence_reason
+        if not item.related_pages and related_absence_reason is None:
+            related_absence_reason = "no_candidate" if not inspected_paths else "low_confidence"
         preliminary.append(
             item.model_copy(
                 update={
                     "action": action,
+                    "model_action": model_action,
+                    "finalization_reason": "；".join(_dedupe_strings([*finalization_notes, item.finalization_reason])) or "模型动作已按冻结 wiki context 校验。",
                     "canonical_target_path": canonical,
                     "matched_page": matched_page,
+                    "inspected_context_paths": _dedupe_strings([*item.inspected_context_paths, *inspected_paths]),
+                    "strongest_overlap": strongest_overlap,
+                    "why_not_update": item.why_not_update,
+                    "why_create_or_update": item.why_create_or_update or item.reason,
+                    "related_absence_reason": related_absence_reason,
                     "page_plan_id": resolution_item.page_plan_id,
                     "source_basis": resolution_item.source_basis,
                     "page_type": resolution_item.page_type,
@@ -2452,12 +2704,16 @@ def finalize_wiki_merge_plan(
         resolution_item = resolution_by_id[item.page_plan_id]
         related_pages, related_unresolved = resolve_model_related_pages(item, resolution_item, preliminary, resolution_by_id, snapshot)
         unresolved = _dedupe_strings([*item.related_unresolved, *item.unresolved_related, *related_unresolved])
+        related_absence_reason = item.related_absence_reason
+        if not related_pages and related_absence_reason is None:
+            related_absence_reason = "cap_cutoff" if related_unresolved else ("no_candidate" if not item.inspected_context_paths else "low_confidence")
         items.append(
             item.model_copy(
                 update={
                     "related_pages": related_pages,
                     "related_unresolved": unresolved,
                     "unresolved_related": unresolved,
+                    "related_absence_reason": related_absence_reason,
                 }
             )
         )
@@ -2487,17 +2743,19 @@ def render_merge_plan_markdown(plan: WikiMergePlanArtifact) -> str:
         rows.append(
             [
                 item.page_plan_id,
+                item.model_action or item.action,
                 item.action,
                 item.display_title,
                 f"`{item.canonical_target_path}`",
+                f"{item.strongest_overlap.strength} `{item.strongest_overlap.path}`".strip(),
+                item.why_not_update,
                 item.new_understanding,
-                item.why_this_matters,
                 item.apply_eligibility,
                 item.blocked_reason,
             ]
         )
     return "# Wiki 合并计划\n\n" + format_markdown_table(
-        ["页面计划", "动作", "标题", "目标", "新增理解", "价值点", "Apply", "阻断原因"],
+        ["页面计划", "模型动作", "最终动作", "标题", "目标", "最强召回", "为什么不更新旧页", "新增理解", "Apply", "阻断原因"],
         rows,
     ) + "\n"
 
@@ -2508,6 +2766,98 @@ def render_merge_plan_review_prompt(plan: WikiMergePlanArtifact) -> str:
         "审查这一步回答：写哪些页面、为什么写。\n\n"
         f"{render_merge_plan_markdown(plan)}"
     )
+
+
+def merge_plan_all_create_review_reason(plan: WikiMergePlanArtifact) -> str:
+    if not plan.items or any(item.action != "create" for item in plan.items):
+        return ""
+    risky = [
+        item
+        for item in plan.items
+        if item.strongest_overlap.strength in {"medium", "strong"}
+    ]
+    if not risky:
+        return ""
+    names = ", ".join(f"{item.page_plan_id}:{item.strongest_overlap.strength or 'none'}" for item in risky[:8])
+    return f"merge plan is all-create but has retrieval risk ({names}); review why these pages should not update existing knowledge."
+
+
+def render_candidate_contexts_markdown(artifact: CandidateContextsArtifact) -> str:
+    sections = [
+        "# 候选页召回上下文",
+        "",
+        f"- 后端：`{artifact.retrieval_backend}`",
+        f"- 模型：`{artifact.model}`",
+        f"- TopK：{artifact.top_k}",
+        f"- 候选池页面数：{artifact.candidate_pool_size}",
+        f"- 不完整 frontmatter 页面数：{artifact.skipped_count}",
+        f"- 候选池 Hash：`{artifact.candidate_pool_sha256}`",
+    ]
+    if artifact.warnings:
+        sections.extend(["", "## Warnings", "", *[f"- {warning}" for warning in artifact.warnings]])
+    for item in artifact.items:
+        rows = [
+            [
+                str(hit.rank),
+                hit.strength,
+                hit.match_basis,
+                f"{hit.score:.4f}",
+                "`forced`" if hit.forced else "",
+                f"`{hit.path}`",
+                hit.display_title,
+                "`truncated`" if hit.truncated else "",
+                hit.excerpt[:180].replace("\n", " "),
+            ]
+            for hit in item.hits
+        ]
+        sections.extend(
+            [
+                "",
+                f"## {item.page_plan_id}",
+                "",
+                f"Query: {item.query[:500]}",
+                "",
+                format_markdown_table(["Rank", "Strength", "Basis", "Score", "Forced", "Path", "Title", "Truncated", "Excerpt"], rows)
+                if rows
+                else "未召回到候选旧页。",
+            ]
+        )
+        if item.unindexable_pages:
+            sections.extend(["", "Frontmatter 不完整但已进入低置信候选池：", "", *[f"- `{path}`" for path in item.unindexable_pages[:20]]])
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def render_merge_decision_report(plan: WikiMergePlanArtifact, snapshot: WikiContextSnapshot) -> str:
+    context_by_id = {item.page_plan_id: item for item in snapshot.candidate_contexts.items}
+    sections = ["# Merge Decision Report", ""]
+    for item in plan.items:
+        context = context_by_id.get(item.page_plan_id)
+        inspected = item.inspected_context_paths or ([hit.path for hit in context.hits] if context else [])
+        related_text = (
+            ", ".join(f"`{related.target_path}`" for related in item.related_pages)
+            if item.related_pages
+            else f"无（{item.related_absence_reason or 'no_candidate'}）"
+        )
+        sections.extend(
+            [
+                f"## {item.display_title}",
+                "",
+                f"- 页面计划：`{item.page_plan_id}`",
+                f"- 模型动作：`{item.model_action or item.action}`",
+                f"- 最终动作：`{item.action}`",
+                f"- 目标：`{item.canonical_target_path}`",
+                f"- 最像旧页：`{item.strongest_overlap.path or '无'}` ({item.strongest_overlap.strength}, {item.strongest_overlap.match_basis})",
+                f"- 看过的旧页：{', '.join(f'`{path}`' for path in inspected) if inspected else '无'}",
+                f"- 为什么不 update：{item.why_not_update or '未提供'}",
+                f"- 为什么 create/update/noop：{item.why_create_or_update or item.reason}",
+                f"- Related：{related_text}",
+                f"- Finalizer：{item.finalization_reason}",
+            ]
+        )
+        if item.blocked_reason:
+            sections.append(f"- 阻断原因：{item.blocked_reason}")
+        sections.append("")
+    return "\n".join(sections).rstrip() + "\n"
 
 
 def finalize_draft_rendering(
@@ -2813,15 +3163,16 @@ def neutralize_markdown_links(text: str) -> str:
 
 def build_index_rows(profile: Any, plan: WikiMergePlanArtifact, draft: DraftRenderingArtifact, snapshot: WikiContextSnapshot) -> list[dict[str, str]]:
     rows_by_path: dict[str, dict[str, str]] = {}
-    for entry in snapshot.entries:
-        if entry.metadata is None or entry.metadata.llmwiki_type.lower() == "source":
+    for pool_entry in snapshot.knowledge_metadata_pool:
+        metadata = pool_entry.metadata
+        if metadata is None or metadata.llmwiki_type.lower() == "source":
             continue
-        rows_by_path[entry.metadata.path] = {
-            "title": clean_display_title(entry.metadata.title),
-            "page": obsidian_link(entry.metadata.path),
-            "type": entry.metadata.llmwiki_type,
-            "summary": entry.metadata.summary,
-            "updated": entry.metadata.updated,
+        rows_by_path[metadata.path] = {
+            "title": clean_display_title(metadata.title),
+            "page": obsidian_link(metadata.path),
+            "type": metadata.llmwiki_type,
+            "summary": metadata.summary,
+            "updated": metadata.updated,
         }
     page_by_id = {page.page_plan_id: page for page in draft.pages}
     for item in plan.items:
@@ -2850,7 +3201,7 @@ def render_related_pages(item: WikiMergePlanItem) -> str:
     if not item.related_pages:
         return "- 暂无相关页面记录。"
     rows = []
-    for related in item.related_pages[:8]:
+    for related in item.related_pages[:FINAL_RELATED_LIMIT]:
         rows.append(f"- {obsidian_alias_link(related.target_path, related.display_title)}：{related.reason}")
     return "\n".join(rows)
 

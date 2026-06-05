@@ -1,5 +1,5 @@
 {
-  "schema_version": "wiki_merge_plan.v4",
+  "schema_version": "wiki_merge_plan.v5",
   "log_date": "2026-06-03",
   "context_snapshot_ref": "",
   "items": [
@@ -15,6 +15,8 @@
       "display_title": "知识编译工程骨架",
       "page_type": "concept",
       "matched_page": null,
+      "why_not_update": "召回旧页若存在，也只会作为工程背景；该候选聚焦知识编译工程骨架本身，边界独立。",
+      "why_create_or_update": "空 vault 中该主题不存在，应创建概念页。",
       "prior_knowledge_state": "当前 wiki 没有相关知识页。",
       "new_understanding": "llmwiki-engine 的第一阶段应先证明 CLI、状态机、artifact 和 validator 这些工程骨架可运行。",
       "changed_view": "将 MVP 重点从生成内容数量转向可测试、可恢复的流程骨架。",
@@ -51,6 +53,8 @@
       "display_title": "简化 Ingest 草稿流程",
       "page_type": "design",
       "matched_page": null,
+      "why_not_update": "召回旧页若存在，也只会作为相关背景；该候选聚焦简化 Ingest 草稿流程，边界独立。",
+      "why_create_or_update": "空 vault 中该设计不存在，应创建设计页。",
       "prior_knowledge_state": "当前 wiki 没有相关设计页。",
       "new_understanding": "简化 Ingest 先生成 source 和知识页草稿，再通过 review/apply 流程进入 wiki。",
       "changed_view": "把正式写入前的草稿验证作为流程安全层。",

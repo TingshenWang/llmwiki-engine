@@ -13,7 +13,7 @@ from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, latest_operati
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
 from llmwiki_engine.steps import STEP_NAMES
-from llmwiki_engine.workspace import RunStore
+from llmwiki_engine.workspace import RunStore, WorkspaceError
 
 
 ROOT = Path(__file__).parent
@@ -77,7 +77,7 @@ def test_resume_help_lists_step_names_from_metadata() -> None:
         assert step_name in result.output
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v8"])
 def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
     tmp_path: Path,
     schema_version: str,
@@ -155,6 +155,27 @@ def test_apply_wiki_context_drift_reports_fixed_chinese_message(tmp_path: Path) 
     assert result.exit_code != 0
     assert "当前 operation 的 apply plan 已过期，因为 wiki 在 plan 生成后发生变化。请 resume 后再 apply。" in _compact_output(result.output)
     assert "wiki context changed after planning" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_blank_operation_id_is_rejected_before_building_run_path(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+
+    with pytest.raises(WorkspaceError, match="Operation id is empty"):
+        RunStore(vault).run_dir(" ")
+
+
+@pytest.mark.parametrize("command", ["status", "resume", "apply"])
+def test_missing_operation_manifest_reports_single_line_error(tmp_path: Path, command: str) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", command, str(vault), "ING-missing"])
+
+    assert result.exit_code != 0
+    assert "Operation manifest not found:" in result.output
     assert "Traceback" not in result.output
 
 

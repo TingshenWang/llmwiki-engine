@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
-from .models import CandidateResolutionArtifact, RawPreparationArtifact, SourceDigestArtifact, WikiMergePlanArtifact
+from .models import CandidateResolutionArtifact, RawPreparationArtifact, SourceDigestArtifact, WikiContextSnapshot, WikiMergePlanArtifact
 
 
 class ValidationError(RuntimeError):
@@ -88,6 +88,7 @@ def validate_wiki_merge_plan(
     digest: SourceDigestArtifact,
     plan: WikiMergePlanArtifact,
     resolution: CandidateResolutionArtifact | None = None,
+    snapshot: WikiContextSnapshot | None = None,
 ) -> None:
     candidate_ids = {candidate.candidate_id for candidate in digest.ingest_candidates()}
     page_plan_ids = [item.page_plan_id for item in plan.items]
@@ -118,8 +119,16 @@ def validate_wiki_merge_plan(
         raise ValidationError("wiki_merge_plan log_date must not be empty")
     if not plan.context_snapshot_ref.strip():
         raise ValidationError("wiki_merge_plan context_snapshot_ref must not be empty")
+    inspected_by_id = {}
+    if snapshot is not None:
+        inspected_by_id = {
+            context.page_plan_id: {hit.path for hit in context.hits}
+            for context in snapshot.candidate_contexts.items
+        }
     for item in plan.items:
         validate_wiki_relative_markdown_path(item.page_plan_id, item.canonical_target_path, "canonical_target_path")
+        for inspected_path in item.inspected_context_paths:
+            validate_wiki_relative_markdown_path(item.page_plan_id, inspected_path, "inspected_context_paths")
         if item.page_type.strip().lower() == "source":
             raise ValidationError(f"{item.page_plan_id} wiki_merge_plan items must not use source page type")
         if not item.source_basis.source_candidate_ids and not item.source_basis.prepared_discovered_candidates:
@@ -130,6 +139,19 @@ def validate_wiki_merge_plan(
             validate_wiki_relative_markdown_path(item.page_plan_id, item.matched_page, "matched_page")
         if item.action == "update" and not item.matched_page:
             raise ValidationError(f"{item.page_plan_id} update action must include matched_page")
+        if snapshot is not None:
+            inspected_paths = inspected_by_id.get(item.page_plan_id, set())
+            if snapshot.knowledge_metadata_pool and not item.inspected_context_paths:
+                raise ValidationError(f"{item.page_plan_id} must include inspected_context_paths from candidate_contexts")
+            unknown_inspected = set(item.inspected_context_paths) - inspected_paths
+            if unknown_inspected:
+                raise ValidationError(f"{item.page_plan_id} inspected_context_paths must come from candidate_contexts: {sorted(unknown_inspected)}")
+            if item.action in {"update", "noop"} and item.matched_page and item.matched_page not in inspected_paths:
+                raise ValidationError(f"{item.page_plan_id} matched_page must come from inspected_context_paths")
+            if item.action == "create" and item.strongest_overlap.strength == "medium" and not item.why_not_update.strip():
+                raise ValidationError(f"{item.page_plan_id} create action with medium overlap must explain why_not_update")
+            if item.action == "create" and item.strongest_overlap.strength == "strong":
+                raise ValidationError(f"{item.page_plan_id} strong overlap create must use needs_human_decision")
         if item.action == "needs_human_decision" and item.apply_eligibility != "blocked":
             raise ValidationError(f"{item.page_plan_id} needs_human_decision must be blocked")
         if item.action != "needs_human_decision" and item.apply_eligibility == "blocked":
@@ -138,10 +160,17 @@ def validate_wiki_merge_plan(
             raise ValidationError(f"{item.page_plan_id} section_plans must not be empty")
         if not item.new_understanding.strip():
             raise ValidationError(f"{item.page_plan_id} new_understanding must not be empty")
+        if len(item.related_pages) > 3:
+            raise ValidationError(f"{item.page_plan_id} related_pages must contain at most 3 items")
+        if not item.related_pages and item.related_absence_reason is None:
+            raise ValidationError(f"{item.page_plan_id} must include related_absence_reason when related_pages is empty")
         _validate_no_source_graph_links(
             item.page_plan_id,
             [
                 item.display_title,
+                item.finalization_reason,
+                item.why_not_update,
+                item.why_create_or_update,
                 item.prior_knowledge_state,
                 item.new_understanding,
                 item.changed_view,

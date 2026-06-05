@@ -366,7 +366,9 @@ apply_preview
 查看并处理真实 review gate。当前 gate 有两个：
 
 - `merge_plan_review`：审核“写哪些页面、为什么写”。如果计划里有
-  `needs_human_decision`，pipeline 会停在这里。
+  `needs_human_decision`，或 embedding 召回发现中/强相关旧页但计划仍全部 create，
+  pipeline 会停在这里。相关证据见 `wiki_context_snapshot/candidate_contexts.md`
+  和 `wiki_merge_planning/merge_decision_report.md`。
 - `draft_review`：审核“具体写什么”。update 或 revise 后的草稿必须显式 approve。
 
 查看 review artifacts：

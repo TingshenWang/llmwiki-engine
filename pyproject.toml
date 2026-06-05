@@ -16,6 +16,9 @@ dependencies = [
 dev = [
   "pytest>=8.2",
 ]
+embedding = [
+  "sentence-transformers>=3.0",
+]
 
 [project.scripts]
 llmwiki = "llmwiki_engine.cli:app"
