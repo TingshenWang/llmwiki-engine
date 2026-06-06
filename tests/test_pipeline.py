@@ -4839,6 +4839,18 @@ def test_merge_update_section_additional_notes_does_not_reintroduce_superseded_n
     assert change.removed == [old]
 
 
+def test_merge_update_section_additional_notes_user_confirmation_deprecated_is_superseded() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "用户确认机制已废弃，系统改为自动校验。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert "旧页补充观察" not in merged
+    assert change.preserved_old == []
+    assert change.removed == [old]
+
+
 def test_merge_update_section_additional_notes_strips_legacy_label_before_preserving() -> None:
     note = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
     old = f"旧页补充观察：旧页补充观察：{note}"
@@ -4886,6 +4898,17 @@ def test_merge_update_section_additional_notes_generic_new_version_does_not_supe
 def test_merge_update_section_additional_notes_unrelated_replacement_does_not_supersede_note() -> None:
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "新版 API 已改为支持记忆元数据。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
+def test_merge_update_section_additional_notes_unrelated_replacement_with_anchor_preserves_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "新版 API 已改为支持用户记忆元数据。重要决定仍需要用户确认。"
 
     merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
 

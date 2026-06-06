@@ -11355,17 +11355,17 @@ def old_additional_note_absorbed(note: str, target: str) -> bool:
 def old_additional_note_superseded(note: str, target: str) -> bool:
     if not note.strip() or not target.strip():
         return False
-    normalized_target = re.sub(r"\s+", "", unicodedata.normalize("NFKC", target.lower()))
-    supersession_markers = ("不再需要", "已改为", "改为", "替代", "不适用", "deprecated", "废弃", "已废弃")
-    if not any(marker in normalized_target for marker in supersession_markers):
-        return False
-    note_terms = source_digest_non_generic_terms(source_digest_similarity_terms(note))
-    target_terms = source_digest_non_generic_terms(source_digest_similarity_terms(target))
-    shared_terms = note_terms & target_terms
     anchors = old_additional_note_supersession_anchors(note)
-    if any(anchor in normalized_target for anchor in anchors):
-        return True
-    return len(shared_terms) >= 2
+    if not anchors:
+        return False
+    for sentence in old_additional_note_supersession_sentences(target):
+        if not any(anchor in sentence for anchor in anchors):
+            continue
+        if old_additional_note_sentence_preserves_anchor(sentence, anchors):
+            continue
+        if old_additional_note_sentence_supersedes_anchor(sentence, anchors):
+            return True
+    return False
 
 
 def old_additional_note_supersession_anchors(note: str) -> list[str]:
@@ -11385,6 +11385,33 @@ def old_additional_note_supersession_anchors(note: str) -> list[str]:
         "成本约束",
     ]
     return [anchor for anchor in anchors if anchor in normalized]
+
+
+def old_additional_note_supersession_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text.lower()))
+    return [sentence for sentence in re.split(r"[。！？!?；;\n]+", normalized) if sentence]
+
+
+def old_additional_note_sentence_preserves_anchor(sentence: str, anchors: list[str]) -> bool:
+    preservation_markers = ("仍", "仍然", "继续", "依然", "还是")
+    for anchor in anchors:
+        for marker in preservation_markers:
+            if re.search(rf"{marker}.{{0,8}}{re.escape(anchor)}|{re.escape(anchor)}.{{0,8}}{marker}", sentence):
+                return True
+    return False
+
+
+def old_additional_note_sentence_supersedes_anchor(sentence: str, anchors: list[str]) -> bool:
+    strong_markers = ("不再需要", "不适用", "deprecated", "废弃", "已废弃")
+    for anchor in anchors:
+        escaped = re.escape(anchor)
+        if any(marker in sentence for marker in strong_markers):
+            return True
+        if re.search(rf"{escaped}.{{0,12}}(?:已)?改为|(?:已)?改为.{{0,12}}{escaped}", sentence):
+            return True
+        if re.search(rf"{escaped}.{{0,12}}替代|替代.{{0,12}}{escaped}", sentence):
+            return True
+    return False
 
 
 def preserved_old_additional_notes_block(notes: list[str]) -> str:
