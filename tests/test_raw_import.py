@@ -134,6 +134,38 @@ def test_import_raw_url_rejects_unsupported_binary_content(tmp_path: Path) -> No
             import_raw_url(vault, "https://example.com/paper.pdf", client=client)
 
 
+def test_import_raw_url_aborts_stream_when_max_bytes_exceeded(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+
+    class ChunkStream(httpx.SyncByteStream):
+        def __init__(self, chunks: list[bytes]):
+            self.chunks = chunks
+            self.yielded = 0
+
+        def __iter__(self):
+            for chunk in self.chunks:
+                self.yielded += 1
+                yield chunk
+
+    stream = ChunkStream([b"a" * 1024, b"b" * 1024, b"c" * 1024, b"d" * 1024])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=stream,
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RawUrlImportError, match="Fetched content is too large"):
+            import_raw_url(vault, "https://example.com/large.txt", client=client, max_bytes=2500)
+
+    assert stream.yielded == 3
+    assert list((vault / "raw").glob("*.md")) == []
+
+
 def test_import_arxiv_search_imports_top_result_via_html(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")

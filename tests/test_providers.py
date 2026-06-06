@@ -165,6 +165,7 @@ def test_openai_compatible_generate_raw_falls_back_when_json_mode_is_unsupported
 
     assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
     assert len(seen) == 2
+    assert provider.last_http_attempt_count == 2
     assert seen[0]["response_format"] == {"type": "json_object"}
     assert "response_format" not in seen[1]
 
@@ -196,6 +197,10 @@ def test_openai_compatible_generate_raw_shares_retry_budget_with_json_mode_fallb
 
     assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
     assert len(seen) == 3
+    assert provider.last_http_attempt_count == 3
+    assert "response_format" in seen[0]
+    assert "response_format" in seen[1]
+    assert "response_format" not in seen[2]
     assert "response_format" in seen[0]
     assert "response_format" in seen[1]
     assert "response_format" not in seen[2]
@@ -228,9 +233,66 @@ def test_openai_compatible_generate_raw_allows_fallback_to_use_remaining_retry_b
 
     assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
     assert len(seen) == 3
-    assert "response_format" in seen[0]
-    assert "response_format" not in seen[1]
-    assert "response_format" not in seen[2]
+    assert provider.last_http_attempt_count == 3
+
+
+def test_openai_compatible_generate_raw_resets_http_attempt_count_between_calls() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, text="temporary overload", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert provider.last_http_attempt_count == 2
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert provider.last_http_attempt_count == 1
+
+
+def test_structured_model_call_persists_http_attempt_count_for_provider_retry(tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"value_points": "ok", "quote": "fine"}'}}]},
+            request=request,
+        )
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    _model, result = StructuredModelCall(
+        provider,
+        output_dir=tmp_path,
+        result_filename="provider_result.json",
+    ).run("draft_rendering", {}, JsonLikeArtifact)
+
+    attempt = json.loads((tmp_path / "provider_results" / "attempt-1.json").read_text(encoding="utf-8"))
+    assert result.http_attempt_count == 2
+    assert attempt["http_attempt_count"] == 2
 
 
 def test_openai_compatible_generate_raw_does_not_fallback_after_transient_retry_exhaustion() -> None:

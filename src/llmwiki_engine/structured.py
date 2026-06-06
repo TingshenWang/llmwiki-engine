@@ -65,8 +65,10 @@ class StructuredModelCall:
             parsed: dict[str, Any] | None = None
             json_repair_applied = False
             model: T | None = None
+            http_attempt_count = 1
             try:
                 raw, latency_ms = timed_call(self.provider, task, attempt_payload, output_model)
+                http_attempt_count = _provider_http_attempt_count(self.provider)
                 try:
                     parsed, json_repair_applied = parse_structured_json_object(raw)
                     model = output_model.model_validate(parsed)
@@ -98,6 +100,7 @@ class StructuredModelCall:
                         model = None
             except ProviderError as exc:
                 provider_error = exc
+                http_attempt_count = max(exc.attempt_count, _provider_http_attempt_count(self.provider))
                 error = self.redactor.redact_text(str(exc))
                 issues = [_issue(_provider_issue_code(exc), error, repairable=False)]
                 errors = [error]
@@ -113,6 +116,7 @@ class StructuredModelCall:
                 repair_attempted=attempt_index > 1,
                 latency_ms=latency_ms,
                 payload_char_count=_payload_char_count(attempt_payload),
+                http_attempt_count=http_attempt_count,
                 errors=errors,
             )
             attempt_ref = self._persist_attempt(task, attempt_index, result, issues, repair_prompt_ref=repair_prompt_ref)
@@ -393,6 +397,13 @@ def _payload_char_count(payload: dict[str, Any]) -> int:
         return len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
     except TypeError:
         return len(str(payload))
+
+
+def _provider_http_attempt_count(provider: Provider) -> int:
+    try:
+        return max(1, int(getattr(provider, "last_http_attempt_count", 1)))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _issue(code: str, message: str, *, repairable: bool) -> StructuredIssue:

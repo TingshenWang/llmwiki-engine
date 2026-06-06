@@ -133,6 +133,7 @@ class ProviderResult(StrictModel):
     repair_attempted: bool = False
     latency_ms: int = 0
     payload_char_count: int = 0
+    http_attempt_count: int = 1
     cost_usd: float | None = None
     errors: list[str] = Field(default_factory=list)
 

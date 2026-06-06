@@ -4657,6 +4657,9 @@ def run_draft_rendering_model(
         batch_payload_char_count = provider_results_payload_char_count(
             [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
         )
+        batch_http_attempt_count = provider_results_http_attempt_count(
+            [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
+        )
         batch_items = job["batch_items"]
         batch_id = job["batch_id"]
         return {
@@ -4668,6 +4671,7 @@ def run_draft_rendering_model(
                 "target_paths": [item.canonical_target_path for item in batch_items],
                 "source_excerpt_chars": job["source_excerpt_pack"].get("included_char_count", 0),
                 "payload_char_count": batch_payload_char_count,
+                "http_attempt_count": batch_http_attempt_count,
                 "attempt_count": report.attempt_count,
                 "repair_count": report.repair_count,
                 "duration_ms": report.duration_ms,
@@ -5462,6 +5466,7 @@ def write_draft_rendering_batch_reports(
         "page_count": len(draft_artifact.pages),
         "attempt_count": sum(int(batch["attempt_count"]) for batch in batch_summaries),
         "repair_count": sum(int(batch["repair_count"]) for batch in batch_summaries),
+        "http_attempt_count": sum(int(batch.get("http_attempt_count", 0)) for batch in batch_summaries),
         "duration_ms": model_duration_ms,
         "model_duration_ms": model_duration_ms,
         "wall_duration_ms": wall_duration_ms if wall_duration_ms is not None else model_duration_ms,
@@ -5485,6 +5490,7 @@ def write_draft_rendering_batch_reports(
             repair_attempted=batch_report["repair_count"] > 0,
             latency_ms=batch_report["duration_ms"],
             payload_char_count=batch_report["payload_char_count"],
+            http_attempt_count=batch_report["http_attempt_count"],
         ),
     )
     attempts: list[StructuredAttemptRef] = []
@@ -5533,6 +5539,7 @@ def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
             batch["batch_id"],
             ", ".join(f"`{page_id}`" for page_id in batch["page_plan_ids"]),
             str(batch["attempt_count"]),
+            str(batch.get("http_attempt_count", 0)),
             str(batch["repair_count"]),
             format_duration(batch["duration_ms"]),
             str(batch["source_excerpt_chars"]),
@@ -5556,6 +5563,7 @@ def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
                 "Batch",
                 "页面计划",
                 "Attempts",
+                "HTTP Attempts",
                 "Repairs",
                 "Duration",
                 "Source Excerpt Chars",
@@ -7542,12 +7550,14 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
     local_json_repair_count = 0
     repair_duration_ms = 0
     provider_result_count = 0
+    http_attempt_count = 0
     model_payload_char_count = 0
     archived_internal_model_call_count = 0
     archived_repair_count = 0
     archived_local_json_repair_count = 0
     archived_repair_duration_ms = 0
     archived_provider_result_count = 0
+    archived_http_attempt_count = 0
     archived_model_payload_char_count = 0
     for step in manifest.steps:
         durations = [attempt.duration_ms for attempt in step.attempts if attempt.duration_ms is not None]
@@ -7562,12 +7572,14 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
         local_json_repair_count += repair_metrics["json_repair_count"]
         repair_duration_ms += repair_metrics["duration_ms"]
         provider_result_count += repair_metrics["provider_result_count"]
+        http_attempt_count += repair_metrics["http_attempt_count"]
         model_payload_char_count += repair_metrics["payload_char_count"]
         archived_internal_model_call_count += archived_repair_metrics["attempt_count"]
         archived_repair_count += archived_repair_metrics["repair_count"]
         archived_local_json_repair_count += archived_repair_metrics["json_repair_count"]
         archived_repair_duration_ms += archived_repair_metrics["duration_ms"]
         archived_provider_result_count += archived_repair_metrics["provider_result_count"]
+        archived_http_attempt_count += archived_repair_metrics["http_attempt_count"]
         archived_model_payload_char_count += archived_repair_metrics["payload_char_count"]
         row = {
             "name": step.name,
@@ -7583,6 +7595,7 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
             row["local_json_repair_count"] = repair_metrics["json_repair_count"]
             row["repair_duration_ms"] = repair_metrics["duration_ms"]
             row["provider_result_count"] = repair_metrics["provider_result_count"]
+            row["http_attempt_count"] = repair_metrics["http_attempt_count"]
             row["payload_char_count"] = repair_metrics["payload_char_count"]
         if archived_repair_metrics["attempt_count"]:
             row["archived_internal_model_call_count"] = archived_repair_metrics["attempt_count"]
@@ -7590,12 +7603,14 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
             row["archived_local_json_repair_count"] = archived_repair_metrics["json_repair_count"]
             row["archived_repair_duration_ms"] = archived_repair_metrics["duration_ms"]
             row["archived_provider_result_count"] = archived_repair_metrics["provider_result_count"]
+            row["archived_http_attempt_count"] = archived_repair_metrics["http_attempt_count"]
             row["archived_payload_char_count"] = archived_repair_metrics["payload_char_count"]
             row["total_internal_model_call_count"] = total_repair_metrics["attempt_count"]
             row["total_repair_count"] = total_repair_metrics["repair_count"]
             row["total_local_json_repair_count"] = total_repair_metrics["json_repair_count"]
             row["total_repair_duration_ms"] = total_repair_metrics["duration_ms"]
             row["total_provider_result_count"] = total_repair_metrics["provider_result_count"]
+            row["total_http_attempt_count"] = total_repair_metrics["http_attempt_count"]
             row["total_payload_char_count"] = total_repair_metrics["payload_char_count"]
         fast_path_report = run_dir / step.name / "raw_prepare_fast_path.json"
         if fast_path_report.exists():
@@ -7626,6 +7641,7 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
             "name": str(row["name"]),
             "payload_char_count": int(row.get("payload_char_count", 0) or 0),
             "provider_result_count": int(row.get("provider_result_count", 0) or 0),
+            "http_attempt_count": int(row.get("http_attempt_count", 0) or 0),
             "repair_count": int(row.get("repair_count", 0) or 0),
             "local_json_repair_count": int(row.get("local_json_repair_count", 0) or 0),
             "duration_ms": int(row.get("repair_duration_ms", 0) or 0),
@@ -7676,6 +7692,7 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
         "local_json_repair_count": local_json_repair_count,
         "repair_duration_ms": repair_duration_ms,
         "provider_result_count": provider_result_count,
+        "http_attempt_count": http_attempt_count,
         "internal_model_payload_char_count": model_payload_char_count,
         "payload_by_step": payload_steps,
         "largest_payload_step": largest_payload["name"] if largest_payload else "",
@@ -7685,12 +7702,14 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
         "archived_local_json_repair_count": archived_local_json_repair_count,
         "archived_repair_duration_ms": archived_repair_duration_ms,
         "archived_provider_result_count": archived_provider_result_count,
+        "archived_http_attempt_count": archived_http_attempt_count,
         "archived_internal_model_payload_char_count": archived_model_payload_char_count,
         "total_internal_model_call_count": internal_model_call_count + archived_internal_model_call_count,
         "total_repair_count": repair_count + archived_repair_count,
         "total_local_json_repair_count": local_json_repair_count + archived_local_json_repair_count,
         "total_repair_duration_ms": repair_duration_ms + archived_repair_duration_ms,
         "total_provider_result_count": provider_result_count + archived_provider_result_count,
+        "total_http_attempt_count": http_attempt_count + archived_http_attempt_count,
         "total_internal_model_payload_char_count": model_payload_char_count + archived_model_payload_char_count,
         "created_count": created,
         "updated_count": updated,
@@ -7708,6 +7727,7 @@ def render_run_metrics_markdown(metrics: dict[str, Any]) -> str:
             str(row.get("name", "")),
             f"{int(row.get('payload_char_count', 0) or 0):,}",
             str(row.get("provider_result_count", 0)),
+            str(row.get("http_attempt_count", 0)),
             str(row.get("repair_count", 0)),
             str(row.get("local_json_repair_count", 0)),
             format_duration(row.get("duration_ms")),
@@ -7730,12 +7750,13 @@ def render_run_metrics_markdown(metrics: dict[str, Any]) -> str:
         f"- Operation: `{metrics.get('operation_id', '')}`\n"
         f"- Status: `{metrics.get('status', '')}`\n"
         f"- Current model calls: `{metrics.get('internal_model_call_count', 0)}`\n"
+        f"- Current HTTP attempts: `{metrics.get('http_attempt_count', 0)}`\n"
         f"- Local JSON repairs: `{metrics.get('local_json_repair_count', 0)}`\n"
         f"- Current payload chars: `{int(metrics.get('internal_model_payload_char_count', 0) or 0):,}`\n"
         f"- Largest payload step: `{metrics.get('largest_payload_step', '') or 'none'}` "
         f"({int(metrics.get('largest_payload_char_count', 0) or 0):,} chars)\n\n"
         "## Payload By Step\n\n"
-        f"{format_markdown_table(['Step', 'Payload Chars', 'Provider Results', 'Model Repairs', 'Local JSON Repairs', 'Model Duration'], payload_rows) if payload_rows else '_No model payloads recorded._'}\n\n"
+        f"{format_markdown_table(['Step', 'Payload Chars', 'Provider Results', 'HTTP Attempts', 'Model Repairs', 'Local JSON Repairs', 'Model Duration'], payload_rows) if payload_rows else '_No model payloads recorded._'}\n\n"
         "## Steps\n\n"
         f"{format_markdown_table(['Step', 'Status', 'Attempts', 'Last Duration', 'Attempt Total', 'Payload Chars'], step_rows)}\n"
     )
@@ -7763,7 +7784,15 @@ def source_digest_budget_metrics(run_dir: Path) -> dict[str, Any]:
 def subtract_repair_metrics(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
     return {
         key: max(0, left.get(key, 0) - right.get(key, 0))
-        for key in ["attempt_count", "repair_count", "json_repair_count", "duration_ms", "provider_result_count", "payload_char_count"]
+        for key in [
+            "attempt_count",
+            "repair_count",
+            "json_repair_count",
+            "duration_ms",
+            "provider_result_count",
+            "http_attempt_count",
+            "payload_char_count",
+        ]
     }
 
 
@@ -7779,6 +7808,7 @@ def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool
     json_repair_count = 0
     duration_ms = 0
     provider_result_count = 0
+    http_attempt_count = 0
     payload_char_count = 0
     for step_dir in step_dirs:
         step_attempt_count = 0
@@ -7797,6 +7827,7 @@ def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool
         existing_attempt_result_paths = [path for path in attempt_result_paths if path.exists()]
         if existing_attempt_result_paths:
             provider_result_count += len(existing_attempt_result_paths)
+            http_attempt_count += provider_results_http_attempt_count(existing_attempt_result_paths)
             payload_char_count += provider_results_payload_char_count(existing_attempt_result_paths)
             json_repair_count += provider_results_json_repair_count(existing_attempt_result_paths)
             continue
@@ -7804,16 +7835,19 @@ def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool
         if provider_results_dir.exists():
             provider_result_paths = list(provider_results_dir.glob("attempt-*.json"))
             provider_result_count += len(provider_result_paths)
+            http_attempt_count += provider_results_http_attempt_count(provider_result_paths)
             payload_char_count += provider_results_payload_char_count(provider_result_paths)
             json_repair_count += provider_results_json_repair_count(provider_result_paths)
         elif step_attempt_count:
             provider_result_count += step_attempt_count
             result_paths = [step_dir / "provider_result.json"]
+            http_attempt_count += provider_results_http_attempt_count(result_paths)
             payload_char_count += provider_results_payload_char_count(result_paths)
             json_repair_count += provider_results_json_repair_count(result_paths)
         elif (step_dir / "provider_result.json").exists():
             provider_result_count += 1
             result_paths = [step_dir / "provider_result.json"]
+            http_attempt_count += provider_results_http_attempt_count(result_paths)
             payload_char_count += provider_results_payload_char_count(result_paths)
             json_repair_count += provider_results_json_repair_count(result_paths)
     if attempt_count == 0:
@@ -7824,6 +7858,7 @@ def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool
         "json_repair_count": json_repair_count,
         "duration_ms": duration_ms,
         "provider_result_count": provider_result_count,
+        "http_attempt_count": http_attempt_count,
         "payload_char_count": payload_char_count,
     }
 
@@ -7840,6 +7875,23 @@ def provider_results_payload_char_count(paths: list[Path]) -> int:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 total += int(data.get("payload_char_count", 0) or 0)
+            except Exception:
+                continue
+    return total
+
+
+def provider_results_http_attempt_count(paths: list[Path]) -> int:
+    total = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            result = read_model(path, ProviderResult)
+            total += max(1, int(result.http_attempt_count or 1))
+        except Exception:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                total += max(1, int(data.get("http_attempt_count", 1) or 1))
             except Exception:
                 continue
     return total

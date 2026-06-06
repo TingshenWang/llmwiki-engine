@@ -3327,6 +3327,7 @@ def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts
                     "task": "draft_rendering",
                     "payload_char_count": index * 100,
                     "json_repair_applied": index % 2 == 0,
+                    "http_attempt_count": index + 1,
                 },
             )
         write_json(
@@ -3362,10 +3363,12 @@ def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts
 
     assert current["attempt_count"] == 2
     assert current["provider_result_count"] == 2
+    assert current["http_attempt_count"] == 5
     assert current["payload_char_count"] == 300
     assert current["json_repair_count"] == 1
     assert total["attempt_count"] == 9
     assert total["provider_result_count"] == 9
+    assert total["http_attempt_count"] == 28
     assert total["payload_char_count"] == 1900
     assert total["json_repair_count"] == 4
 
@@ -8994,7 +8997,9 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     assert batch_report["batch_count"] == 2
     assert batch_report["page_count"] == 7
     assert [batch["attempt_count"] for batch in batch_report["batches"]] == [1, 2]
+    assert [batch["http_attempt_count"] for batch in batch_report["batches"]] == [1, 2]
     assert [batch["repair_count"] for batch in batch_report["batches"]] == [0, 1]
+    assert batch_report["http_attempt_count"] == 3
     assert batch_report["model_duration_ms"] == batch_report["duration_ms"]
     assert batch_report["wall_duration_ms"] >= 0
     assert batch_report["payload_char_count"] > 0
@@ -9012,12 +9017,15 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     assert second_batch_source_pack["full_source_in_payload"] is False
     batch_report_markdown = (run_dir / "draft_rendering" / "draft_rendering_batch_report.md").read_text(encoding="utf-8")
     assert "Payload Chars" in batch_report_markdown
+    assert "HTTP Attempts" in batch_report_markdown
     assert "墙钟耗时" in batch_report_markdown
     assert "最大单批 payload" in batch_report_markdown
     assert len(draft_artifact["pages"]) == 7
     assert (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "provider_result.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "provider_result.json").exists()
+    aggregate_provider_result = read_json(run_dir / "draft_rendering" / "provider_result.json")
+    assert aggregate_provider_result["http_attempt_count"] == 3
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json").exists()
@@ -9051,6 +9059,7 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     assert draft_metrics["internal_model_call_count"] == 3
     assert draft_metrics["repair_count"] == 1
     assert draft_metrics["provider_result_count"] == 3
+    assert draft_metrics["http_attempt_count"] == 3
     assert draft_metrics["payload_char_count"] > 0
 
 

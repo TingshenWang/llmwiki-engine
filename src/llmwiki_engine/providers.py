@@ -92,8 +92,12 @@ class OpenAICompatibleProvider:
         self.max_retries = max(0, int(max_retries))
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.http_client = http_client
+        self.last_http_attempt_count = 1
+        self._last_post_chat_attempt_count = 1
 
     def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
+        self.last_http_attempt_count = 1
+        self._last_post_chat_attempt_count = 1
         body = {
             "model": self.model,
             "messages": [
@@ -121,20 +125,27 @@ class OpenAICompatibleProvider:
             "response_format": {"type": "json_object"},
         }
         try:
-            return _extract_openai_compatible_content(self._post_chat(body))
+            data = self._post_chat(body)
+            self.last_http_attempt_count = max(1, self._last_post_chat_attempt_count)
+            return _extract_openai_compatible_content(data)
         except ProviderError as exc:
+            primary_attempts = max(1, exc.attempt_count, self._last_post_chat_attempt_count)
+            self.last_http_attempt_count = primary_attempts
             if not _is_json_mode_unsupported(exc):
                 raise
             body_without_json_mode = dict(body)
             body_without_json_mode.pop("response_format", None)
-            consumed_retry_budget = max(0, exc.attempt_count - 1)
+            consumed_retry_budget = max(0, primary_attempts - 1)
             fallback_retries = max(0, self.max_retries - consumed_retry_budget)
             try:
-                return _extract_openai_compatible_content(
-                    self._post_chat(body_without_json_mode, max_retries=fallback_retries)
-                )
+                data = self._post_chat(body_without_json_mode, max_retries=fallback_retries)
+                fallback_attempts = max(1, self._last_post_chat_attempt_count)
+                self.last_http_attempt_count = primary_attempts + fallback_attempts
+                return _extract_openai_compatible_content(data)
             except ProviderError as fallback_exc:
-                combined_attempts = exc.attempt_count + fallback_exc.attempt_count
+                fallback_attempts = max(1, fallback_exc.attempt_count, self._last_post_chat_attempt_count)
+                combined_attempts = primary_attempts + fallback_attempts
+                self.last_http_attempt_count = combined_attempts
                 message = _retry_exhausted_message(_strip_retry_attempt_suffix(str(fallback_exc)), combined_attempts)
                 raise ProviderError(
                     message,
@@ -175,6 +186,7 @@ class OpenAICompatibleProvider:
                     with httpx.Client(timeout=request_timeout) as client:
                         response = client.post(self.endpoint, json=body, headers=headers)
                 response.raise_for_status()
+                self._last_post_chat_attempt_count = attempt
                 break
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
@@ -185,18 +197,21 @@ class OpenAICompatibleProvider:
                 message = str(exc)
                 if exc.response.text:
                     message = f"HTTP {status_code}: {exc.response.text}"
+                self._last_post_chat_attempt_count = attempt
                 raise ProviderError(
                     _retry_exhausted_message(message, attempt if retryable else 1),
                     status_code=status_code,
                     attempt_count=attempt,
                 ) from exc
             except httpx.InvalidURL as exc:
+                self._last_post_chat_attempt_count = attempt
                 raise ProviderError(str(exc), attempt_count=attempt) from exc
             except httpx.HTTPError as exc:
                 retryable = _is_transient_httpx_error(exc)
                 if retryable and attempt < total_attempts:
                     self._sleep_before_retry(attempt)
                     continue
+                self._last_post_chat_attempt_count = attempt
                 raise ProviderError(
                     _retry_exhausted_message(str(exc), attempt if retryable else 1),
                     attempt_count=attempt,
@@ -206,7 +221,7 @@ class OpenAICompatibleProvider:
         try:
             data = response.json()
         except ValueError as exc:
-            raise ProviderError(str(exc)) from exc
+            raise ProviderError(str(exc), attempt_count=max(1, self._last_post_chat_attempt_count)) from exc
         if not isinstance(data, dict):
             raise ProviderError("OpenAI-compatible response root must be a JSON object.")
         return data

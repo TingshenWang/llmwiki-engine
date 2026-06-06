@@ -149,9 +149,7 @@ def import_raw_url(
         if existing is not None:
             return _existing_url_result(vault, url, fetch_url, existing)
 
-    response = _fetch_url(fetch_url, timeout=timeout, client=client)
-    if len(response.content) > max_bytes:
-        raise RawUrlImportError(f"Fetched content is too large: {len(response.content)} bytes > {max_bytes} max_bytes")
+    response = _fetch_url(fetch_url, timeout=timeout, max_bytes=max_bytes, client=client)
     if dedupe_url and not overwrite:
         existing = _find_existing_url_import(raw_root, [url, fetch_url, str(response.url)])
         if existing is not None:
@@ -562,23 +560,48 @@ def _read_text_prefix(path: Path, limit: int = 8192) -> str:
         return handle.read(limit)
 
 
-def _fetch_url(url: str, *, timeout: float, client: httpx.Client | None) -> httpx.Response:
+def _fetch_url(url: str, *, timeout: float, max_bytes: int, client: httpx.Client | None) -> httpx.Response:
     headers = {
         "User-Agent": "llmwiki-engine/0.1 raw-import-url",
         "Accept": "text/html,text/markdown,text/plain;q=0.9,*/*;q=0.1",
     }
     try:
         if client is not None:
-            response = client.get(url, headers=headers, follow_redirects=True, timeout=timeout)
+            with client.stream("GET", url, headers=headers, follow_redirects=True, timeout=timeout) as response:
+                return _read_limited_response(url, response, max_bytes=max_bytes)
         else:
             with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout) as owned_client:
-                response = owned_client.get(url)
-        response.raise_for_status()
-        return response
+                with owned_client.stream("GET", url) as response:
+                    return _read_limited_response(url, response, max_bytes=max_bytes)
     except httpx.HTTPStatusError as exc:
         raise RawUrlImportError(f"Fetch failed with HTTP {exc.response.status_code} for {url}") from exc
     except httpx.HTTPError as exc:
         raise RawUrlImportError(f"Fetch failed for {url}: {exc}") from exc
+
+
+def _read_limited_response(url: str, response: httpx.Response, *, max_bytes: int) -> httpx.Response:
+    response.raise_for_status()
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError:
+            declared_bytes = 0
+        if declared_bytes > max_bytes:
+            raise RawUrlImportError(f"Fetched content is too large: {declared_bytes} bytes > {max_bytes} max_bytes")
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise RawUrlImportError(f"Fetched content is too large: {total} bytes > {max_bytes} max_bytes")
+        chunks.append(chunk)
+    return httpx.Response(
+        response.status_code,
+        headers=response.headers,
+        content=b"".join(chunks),
+        request=response.request,
+    )
 
 
 def _content_type(response: httpx.Response) -> str:
