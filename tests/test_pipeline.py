@@ -2286,6 +2286,87 @@ def test_raw_prepare_fast_path_allows_structured_web_article_with_colon_labels(t
     assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
 
 
+def test_raw_prepare_fast_path_allows_code_heavy_official_docs_chrome(tmp_path: Path) -> None:
+    raw = tmp_path / "cloudflare-agent-memory.md"
+    tab_links = "\n".join(
+        [
+            "[  JavaScript ](#tab-panel-4670)",
+            "[  TypeScript ](#tab-panel-4671)",
+            "[  wrangler.jsonc ](#tab-panel-4662)",
+            "[  wrangler.toml ](#tab-panel-4663)",
+            "[  JavaScript ](#tab-panel-4666)",
+            "[  TypeScript ](#tab-panel-4667)",
+            "[  JavaScript ](#tab-panel-4664)",
+            "[  TypeScript ](#tab-panel-4665)",
+            "[  JavaScript ](#tab-panel-4672)",
+            "[  TypeScript ](#tab-panel-4673)",
+        ]
+    )
+    sections = []
+    for heading in [
+        "How agent memory works",
+        "Create a project",
+        "Create a namespace",
+        "Configure bindings",
+        "Add memory tools",
+        "Run locally",
+    ]:
+        sections.append(
+            f"## {heading}\n\n"
+            + "\n".join(
+                f"This official docs paragraph {index} explains durable memory setup, recall, ingest, and agent integration."
+                for index in range(1, 6)
+            )
+        )
+    raw.write_text(
+        "# Cloudflare Agent Memory: Get started\n\n"
+        "Source URL: https://developers.cloudflare.com/agent-memory/get-started/\n"
+        "Language: English\n"
+        "Category: web tutorial / docs\n\n"
+        "---\n"
+        "---\n"
+        "title: Get started\n"
+        "description: Add durable memory recall and ingestion to an agent.\n"
+        "image: https://developers.cloudflare.com/dev-products-preview.png\n"
+        "---\n\n"
+        "> Documentation Index\n"
+        "> Fetch the complete documentation index at: https://developers.cloudflare.com/agent-memory/llms.txt\n\n"
+        "[Skip to content](#%5Ftop)\n\n"
+        "npm  yarn  pnpm\n\n"
+        "Terminal window\n\n"
+        f"{tab_links}\n\n"
+        + "\n\n".join(sections)
+        + "\n\n```jsonc\n"
+        "{\n"
+        '  "name": "memory-agent",\n'
+        '  "agent_memory": [{"binding": "MEMORY", "namespace": "my-agent"}]\n'
+        "}\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/cloudflare-agent-memory.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/cloudflare-agent-memory.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert report["eligible"] is True
+    assert report["noise_profile"]["long_unpunctuated_body_line_count"] >= 8
+    assert report["noise_profile"]["structured_markdown_quality_risk"] is False
+    assert preparation.document_kind == "article"
+    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
+
+
 def test_raw_prepare_skip_prepare_records_local_provider(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
 

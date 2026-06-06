@@ -1754,7 +1754,12 @@ def raw_prepare_structured_markdown_quality_risk(noise: dict[str, Any]) -> bool:
         and noise.get("missing_sentence_terminal_ratio", 0.0) >= 0.35
     ):
         return True
-    return noise.get("long_unpunctuated_body_line_count", 0) >= 8
+    if noise.get("long_unpunctuated_body_line_count", 0) >= 8:
+        return (
+            noise.get("low_punctuation_body_line_ratio", 0.0) >= 0.25
+            or noise.get("missing_sentence_terminal_ratio", 0.0) >= 0.65
+        )
+    return False
 
 
 def infer_passthrough_document_kind(text: str, noise: dict[str, Any]) -> Literal["transcript", "article", "notes", "mixed", "unknown"]:
