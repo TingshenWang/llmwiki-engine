@@ -278,6 +278,38 @@ def test_run_passes_skip_prepare_policy(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert seen["raw_prepare_policy"] == RawPreparePolicy.skip_model
 
 
+@pytest.mark.parametrize(
+    ("prepare", "expected"),
+    [
+        ("auto", RawPreparePolicy.auto),
+        ("skip", RawPreparePolicy.skip_model),
+        ("force", RawPreparePolicy.force_model),
+    ],
+)
+def test_run_passes_prepare_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    prepare: str,
+    expected: RawPreparePolicy,
+) -> None:
+    vault = tmp_path / "vault"
+    raw = tmp_path / "raw.md"
+    raw.write_text("# Raw\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def fake_run_simplified_ingest(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "run_simplified_ingest", fake_run_simplified_ingest)
+    monkeypatch.setattr(cli_module, "_print_operation_outcome", lambda manifest: None)
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), "--prepare", prepare])
+
+    assert result.exit_code == 0
+    assert seen["raw_prepare_policy"] == expected
+
+
 def test_status_labels_skip_prepare_as_local_provider(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -307,6 +339,43 @@ def test_run_rejects_skip_prepare_and_force_prepare_together(tmp_path: Path) -> 
 
     assert result.exit_code != 0
     assert "Use either --skip-prepare or --force-prepare" in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--prepare", "auto", "--skip-prepare"],
+        ["--prepare", "skip", "--skip-prepare"],
+        ["--prepare", "force", "--force-prepare"],
+        ["--prepare", "skip", "--force-prepare"],
+    ],
+)
+def test_run_rejects_prepare_mixed_with_legacy_flags(tmp_path: Path, args: list[str]) -> None:
+    vault = tmp_path / "vault"
+    raw = tmp_path / "raw.md"
+    raw.write_text("# Raw\n", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), *args])
+
+    assert result.exit_code != 0
+    assert "Use either --prepare or --skip-prepare/--force-prepare" in result.output
+
+
+def test_resume_passes_prepare_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    seen: dict[str, object] = {}
+
+    def fake_resume_ingest(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "resume_ingest", fake_resume_ingest)
+    monkeypatch.setattr(cli_module, "_print_operation_outcome", lambda manifest: None)
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "resume", str(vault), "ING-demo", "--prepare", "force"])
+
+    assert result.exit_code == 0
+    assert seen["raw_prepare_policy"] == RawPreparePolicy.force_model
 
 
 def test_resume_invalid_from_step_reports_single_line_error(tmp_path: Path) -> None:
@@ -753,6 +822,26 @@ def test_raw_prepare_check_skip_unavailable_omits_skip_next_command(tmp_path: Pa
     assert "--skip-prepare`" not in table_result.output
 
 
+def test_raw_prepare_check_preserves_prepare_choice_in_next_command(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    configure_openai_provider(vault)
+    raw = vault / "raw" / "clean.md"
+    raw.write_text("# Clean\n\n这是一份已经整理好的 Markdown。\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--prepare", "skip", "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--prepare", "skip"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["selected_policy"] == RawPreparePolicy.skip_model.value
+    assert payload["prepare_cli_suffix"] == " --prepare skip"
+    assert table_result.exit_code == 0
+    assert "llmwiki ingest run" in table_result.output
+    assert "--prepare skip" in table_result.output
+
+
 def test_raw_candidates_all_includes_processed_and_table_gives_next_command(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -847,6 +936,26 @@ def test_run_next_dry_run_selects_unprocessed_raw(tmp_path: Path) -> None:
     assert "llmwiki ingest run" in result.output
 
 
+def test_run_next_dry_run_preserves_prepare_choice_in_next_command(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = vault / "raw" / "next.md"
+    raw.write_text("# Next\n\ncandidate\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--prepare", "skip"])
+    json_result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--prepare", "auto", "--json"])
+    legacy_result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--skip-prepare"])
+
+    assert result.exit_code == 0
+    assert "llmwiki ingest run" in result.output
+    assert "--prepare skip" in result.output
+    assert json_result.exit_code == 0
+    assert json.loads(json_result.output)["next_command"].endswith("--prepare auto")
+    assert legacy_result.exit_code == 0
+    assert "--skip-prepare" in legacy_result.output
+
+
 def test_run_next_dry_run_outputs_json(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -927,6 +1036,8 @@ def test_run_next_invokes_ingest_with_selected_raw(monkeypatch: pytest.MonkeyPat
             str(mock_fixture_dir),
             "--slug",
             "next-run",
+            "--prepare",
+            "force",
         ],
     )
 
@@ -936,6 +1047,7 @@ def test_run_next_invokes_ingest_with_selected_raw(monkeypatch: pytest.MonkeyPat
     assert seen["mock_fixture_dir"] == mock_fixture_dir
     assert seen["slug"] == "next-run"
     assert seen["run_mode"] == RunMode.dev
+    assert seen["raw_prepare_policy"] == RawPreparePolicy.force_model
 
 
 def test_run_next_outputs_json_after_ingest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

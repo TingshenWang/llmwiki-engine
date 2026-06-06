@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 import io
 import json
 from pathlib import Path
@@ -50,7 +51,27 @@ console = Console()
 VALID_RESUME_STEPS_HELP = ", ".join(STEP_NAMES)
 
 
-def _raw_prepare_policy_from_flags(*, skip_prepare: bool, force_prepare: bool) -> RawPreparePolicy | None:
+class PrepareChoice(str, Enum):
+    auto = "auto"
+    skip = "skip"
+    force = "force"
+
+
+def _raw_prepare_policy_from_flags(
+    *,
+    prepare: PrepareChoice | None = None,
+    skip_prepare: bool,
+    force_prepare: bool,
+) -> RawPreparePolicy | None:
+    if prepare is not None:
+        if skip_prepare or force_prepare:
+            raise typer.BadParameter("Use either --prepare or --skip-prepare/--force-prepare, not both.")
+        if prepare == PrepareChoice.auto:
+            return RawPreparePolicy.auto
+        if prepare == PrepareChoice.skip:
+            return RawPreparePolicy.skip_model
+        if prepare == PrepareChoice.force:
+            return RawPreparePolicy.force_model
     if skip_prepare and force_prepare:
         raise typer.BadParameter("Use either --skip-prepare or --force-prepare, not both.")
     if skip_prepare:
@@ -58,6 +79,21 @@ def _raw_prepare_policy_from_flags(*, skip_prepare: bool, force_prepare: bool) -
     if force_prepare:
         return RawPreparePolicy.force_model
     return None
+
+
+def _raw_prepare_command_suffix(
+    *,
+    prepare: PrepareChoice | None = None,
+    skip_prepare: bool,
+    force_prepare: bool,
+) -> str:
+    if prepare is not None:
+        return f" --prepare {prepare.value}"
+    if skip_prepare:
+        return " --skip-prepare"
+    if force_prepare:
+        return " --force-prepare"
+    return ""
 
 
 @app.command()
@@ -84,6 +120,11 @@ def ingest_run(
     profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
     mode: RunMode = RunMode.dev,
+    prepare: Optional[PrepareChoice] = typer.Option(
+        None,
+        "--prepare",
+        help="Raw prepare policy: auto, skip, or force.",
+    ),
     skip_prepare: bool = typer.Option(
         False,
         "--skip-prepare",
@@ -101,6 +142,7 @@ def ingest_run(
         if fixture_dir is not None and mock_fixture_dir is not None:
             raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
         raw_prepare_policy = _raw_prepare_policy_from_flags(
+            prepare=prepare,
             skip_prepare=skip_prepare,
             force_prepare=force_prepare,
         )
@@ -200,6 +242,11 @@ def ingest_raw_candidates(
 def ingest_raw_prepare_check(
     vault: Path,
     raw: Path,
+    prepare: Optional[PrepareChoice] = typer.Option(
+        None,
+        "--prepare",
+        help="Preview raw prepare policy: auto, skip, or force.",
+    ),
     skip_prepare: bool = typer.Option(
         False,
         "--skip-prepare",
@@ -215,14 +262,21 @@ def ingest_raw_prepare_check(
     """Preview whether raw_prepare will use deterministic passthrough or model cleanup."""
     try:
         raw_prepare_policy = _raw_prepare_policy_from_flags(
+            prepare=prepare,
             skip_prepare=skip_prepare,
             force_prepare=force_prepare,
         ) or RawPreparePolicy.auto
+        prepare_cli_suffix = _raw_prepare_command_suffix(
+            prepare=prepare,
+            skip_prepare=skip_prepare,
+            force_prepare=force_prepare,
+        )
         payload = build_raw_prepare_diagnostic(
             vault=vault,
             raw_file=raw,
             raw_prepare_policy=raw_prepare_policy,
         )
+        payload["prepare_cli_suffix"] = prepare_cli_suffix
     except (PipelineError, ProviderConfigError, WorkspaceError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -249,6 +303,11 @@ def ingest_run_next(
     profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
     mode: RunMode = RunMode.dev,
+    prepare: Optional[PrepareChoice] = typer.Option(
+        None,
+        "--prepare",
+        help="Raw prepare policy: auto, skip, or force.",
+    ),
     skip_prepare: bool = typer.Option(
         False,
         "--skip-prepare",
@@ -266,6 +325,12 @@ def ingest_run_next(
         if fixture_dir is not None and mock_fixture_dir is not None:
             raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
         raw_prepare_policy = _raw_prepare_policy_from_flags(
+            prepare=prepare,
+            skip_prepare=skip_prepare,
+            force_prepare=force_prepare,
+        )
+        prepare_cli_suffix = _raw_prepare_command_suffix(
+            prepare=prepare,
             skip_prepare=skip_prepare,
             force_prepare=force_prepare,
         )
@@ -282,11 +347,17 @@ def ingest_run_next(
         raw_abs = Path(report.vault) / candidate.raw_path
         if dry_run:
             if json_output:
-                typer.echo(json.dumps(_run_next_payload(report, candidate, raw_abs, dry_run=True), ensure_ascii=False, indent=2))
+                typer.echo(
+                    json.dumps(
+                        _run_next_payload(report, candidate, raw_abs, dry_run=True, prepare_cli_suffix=prepare_cli_suffix),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
                 return
             console.print(f"selected raw: `{raw_abs}`")
             console.print(f"status: `{candidate.status}`")
-            console.print(f"next: `llmwiki ingest run {report.vault} {raw_abs}`")
+            console.print(f"next: `llmwiki ingest run {report.vault} {raw_abs}{prepare_cli_suffix}`")
             return
         if not json_output:
             console.print(f"selected raw: `{raw_abs}`")
@@ -416,6 +487,11 @@ def ingest_resume(
         "--mock-fixture-dir",
         help="Force resumed model-backed steps to use mock:fixture with this fixture directory.",
     ),
+    prepare: Optional[PrepareChoice] = typer.Option(
+        None,
+        "--prepare",
+        help="Raw prepare policy when resuming from raw_prepare or earlier: auto, skip, or force.",
+    ),
     skip_prepare: bool = typer.Option(
         False,
         "--skip-prepare",
@@ -431,6 +507,7 @@ def ingest_resume(
     """Resume using the current provider config for steps that will execute."""
     try:
         raw_prepare_policy = _raw_prepare_policy_from_flags(
+            prepare=prepare,
             skip_prepare=skip_prepare,
             force_prepare=force_prepare,
         )
@@ -686,7 +763,15 @@ def _print_raw_prepare_diagnostic(payload: dict[str, object]) -> None:
     else:
         flag = recommendation.get("recommended_flag")
     raw_abs = payload.get("raw_absolute_path") or payload.get("raw_path")
-    command_flag = f" {flag}" if flag else ""
+    prepare_cli_suffix = str(payload.get("prepare_cli_suffix") or "")
+    if (
+        prepare_cli_suffix
+        and selected_policy == RawPreparePolicy.skip_model.value
+        and not bool(selected_report.get("eligible"))
+    ):
+        command_flag = ""
+    else:
+        command_flag = prepare_cli_suffix or (f" {flag}" if flag else "")
     console.print(f"next: `llmwiki ingest run {payload.get('vault')} {raw_abs}{command_flag}`")
 
 
@@ -708,6 +793,7 @@ def _run_next_payload(
     *,
     dry_run: bool,
     manifest: OperationManifest | None = None,
+    prepare_cli_suffix: str = "",
 ) -> dict[str, object]:
     operation_id = manifest.operation_id if manifest is not None else None
     operation_status = manifest.status.value if manifest is not None else None
@@ -722,7 +808,7 @@ def _run_next_payload(
         "operation_status": operation_status,
         "awaiting_review_step": _awaiting_review_step_name(manifest) if manifest is not None else None,
         "artifact_hints": _run_next_artifact_hints(Path(report.vault), operation_id) if operation_id else [],
-        "next_command": f"llmwiki ingest run {report.vault} {raw_abs}" if dry_run else (
+        "next_command": f"llmwiki ingest run {report.vault} {raw_abs}{prepare_cli_suffix}" if dry_run else (
             f"llmwiki ingest status {report.vault} {operation_id}" if operation_id else None
         ),
     }
