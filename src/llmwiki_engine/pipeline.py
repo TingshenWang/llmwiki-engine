@@ -12271,6 +12271,14 @@ def collect_grounding_claims(
                 and not attributed_quote_context(body, quote_start=quote_start)
                 and examples_memory_query_quote(body, normalized_quote, quote, quote_start=quote_start)
             )
+            is_query_template_example = (
+                section_key == "examples"
+                and not supported
+                and not is_explicit_quote
+                and not strict_direct_quote_context(body, quote_start=quote_start)
+                and not attributed_quote_context(body, quote_start=quote_start)
+                and examples_query_template_quote(body, normalized_quote, quote, quote_start=quote_start)
+            )
             if (
                 not is_explicit_quote
                 and (
@@ -12279,6 +12287,7 @@ def collect_grounding_claims(
                     or is_abstract_placeholder_example
                     or is_generic_prompt_example
                     or is_memory_query_example
+                    or is_query_template_example
                 )
             ) or is_concept_label_quote:
                 reason = "短标题/概念短语按概念标签处理，不要求 raw exact match。"
@@ -12286,6 +12295,8 @@ def collect_grounding_claims(
                     reason = "例子区的抽象占位符示例按 illustrative example 处理，不要求 raw exact match。"
                 elif is_memory_query_example:
                     reason = "例子区的抽象记忆查询样例按 illustrative example 处理，不要求 raw exact match。"
+                elif is_query_template_example:
+                    reason = "例子区的短查询/请求模板按 illustrative example 处理，不要求 raw exact match。"
                 elif is_generic_prompt_example:
                     reason = "例子区的通用问题/指令示例按 illustrative example 处理，不要求 raw exact match。"
                 elif section_key == "examples":
@@ -12878,6 +12889,110 @@ def examples_memory_query_quote(body: str, normalized: str, original: str = "", 
         "信息",
     ]
     return any(marker in normalized for marker in query_markers)
+
+
+def examples_query_template_quote(body: str, normalized: str, original: str = "", *, quote_start: int | None = None) -> bool:
+    if not normalized or len(normalized) > 40:
+        return False
+    if quote_start is None or quote_start < 0:
+        return False
+    if examples_query_template_has_unsafe_marker(normalized, original):
+        return False
+    if not examples_query_template_local_context(body, quote_start, original):
+        return False
+    query_template_markers = [
+        "方法",
+        "步骤",
+        "怎么",
+        "如何",
+        "查询",
+        "搜索",
+        "请求",
+        "问题",
+        "问句",
+        "片段",
+        "信息",
+        "记忆",
+        "安装",
+        "设置",
+        "配置",
+        "调用",
+        "接入",
+        "教程",
+        "指南",
+    ]
+    lowered_original = original.lower()
+    return any(marker in normalized for marker in query_template_markers) or any(
+        marker in lowered_original for marker in ["how to", "install", "setup", "configure", "query", "search"]
+    )
+
+
+def examples_query_template_local_context(body: str, quote_start: int, original: str) -> bool:
+    prefix = re.sub(r"\s+", "", body[max(0, quote_start - 28) : quote_start])
+    quote_end = quote_start + len(original) + 2
+    suffix = re.sub(r"\s+", "", body[quote_end : quote_end + 24])
+    if re.search(r"(?:问及|提问|询问|查询|请求|搜索|类似|例如|比如|示例|例子|如果用|可以用|输入)$", prefix):
+        return True
+    return bool(re.match(r"(?:的)?(?:请求|问题|问句|查询|搜索|询问|提问|输入|query|prompt|request)", suffix, re.IGNORECASE))
+
+
+def examples_query_template_has_unsafe_marker(normalized: str, original: str = "") -> bool:
+    if looks_like_mixed_unsupported_example_fact(normalized):
+        return True
+    if looks_like_user_id_literal(normalized):
+        return True
+    if contains_hard_fact_marker(normalized):
+        return True
+    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
+        return True
+    if re.search(r"`[^`]*(?:--|=|/|\\|\d)[^`]*`", original):
+        return True
+    lowered_original = original.lower()
+    unsafe_word_pattern = (
+        r"\b(?:order|ticket|issue|status|success|failed|failure|error|token|api[_-]?key|password|"
+        r"passwd|secret|credential|account|permission|payment|refund|delete|deleted|revenue)\b"
+    )
+    if re.search(unsafe_word_pattern, lowered_original):
+        return True
+    unsafe_markers = [
+        "最佳",
+        "推荐",
+        "证明",
+        "导致",
+        "造成",
+        "提升",
+        "适合",
+        "优于",
+        "已经",
+        "发布",
+        "推出",
+        "上线",
+        "支持",
+        "发现",
+        "认为",
+        "应该",
+        "必须",
+        "订单",
+        "交易",
+        "付款",
+        "支付",
+        "退款",
+        "删除",
+        "凭证",
+        "密码",
+        "密钥",
+        "账户",
+        "账号",
+        "权限",
+        "收入",
+        "状态",
+        "张三",
+        "李四",
+        "王五",
+    ]
+    if any(marker in normalized for marker in unsafe_markers):
+        return True
+    return bool(re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original))
 
 
 def memory_query_call_argument_context(body: str, quote_start: int | None) -> bool:
