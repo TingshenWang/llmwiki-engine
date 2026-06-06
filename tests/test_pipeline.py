@@ -7086,6 +7086,20 @@ def test_grounding_examples_allow_user_preference_placeholder() -> None:
     assert [claim.text for claim in review.claims] == ["用户偏好 X"]
 
 
+def test_grounding_examples_allow_abstract_memory_query_literals() -> None:
+    review = build_examples_grounding_review(
+        '- `recall("用户最近的工单信息")`\n'
+        '- `search_context("用户之前提到的项目截止日期")`'
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [
+        "用户最近的工单信息",
+        "用户之前提到的项目截止日期",
+    ]
+    assert {claim.reason for claim in review.claims} == {"例子区的抽象记忆查询样例按 illustrative example 处理，不要求 raw exact match。"}
+
+
 @pytest.mark.parametrize(
     "examples",
     [
@@ -7105,6 +7119,12 @@ def test_grounding_examples_allow_user_preference_placeholder() -> None:
         "- “某个用户购买了OPPO手机”",
         "- “某个用户在成都门店消费过”",
         "- “某个用户喜欢紫色”",
+        '- `recall("张三的工单 1234")`',
+        '- `search_context("Alice order 1234")`',
+        '- `recall("用户喜欢蓝色")`',
+        '- `recall("某个用户在北京门店消费过")`',
+        '- `recall("用户最近的订单状态")`',
+        '- `mem0 search "用户最近的工单信息" --user-id user123`',
     ],
 )
 def test_grounding_examples_placeholder_bypass_keeps_concrete_or_attributed_quotes_strict(examples: str) -> None:

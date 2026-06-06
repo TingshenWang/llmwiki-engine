@@ -11616,6 +11616,14 @@ def collect_grounding_claims(
                 and not attributed_quote_context(body, quote_start=quote_start)
                 and examples_generic_prompt_quote(normalized_quote, quote)
             )
+            is_memory_query_example = (
+                section_key == "examples"
+                and not supported
+                and not is_explicit_quote
+                and not strict_direct_quote_context(body, quote_start=quote_start)
+                and not attributed_quote_context(body, quote_start=quote_start)
+                and examples_memory_query_quote(body, normalized_quote, quote, quote_start=quote_start)
+            )
             if (
                 not is_explicit_quote
                 and (
@@ -11623,11 +11631,14 @@ def collect_grounding_claims(
                     or is_memory_example
                     or is_abstract_placeholder_example
                     or is_generic_prompt_example
+                    or is_memory_query_example
                 )
             ) or is_concept_label_quote:
                 reason = "短标题/概念短语按概念标签处理，不要求 raw exact match。"
                 if is_abstract_placeholder_example:
                     reason = "例子区的抽象占位符示例按 illustrative example 处理，不要求 raw exact match。"
+                elif is_memory_query_example:
+                    reason = "例子区的抽象记忆查询样例按 illustrative example 处理，不要求 raw exact match。"
                 elif is_generic_prompt_example:
                     reason = "例子区的通用问题/指令示例按 illustrative example 处理，不要求 raw exact match。"
                 elif section_key == "examples":
@@ -12196,6 +12207,37 @@ def examples_generic_prompt_quote(normalized: str, original: str = "") -> bool:
     return any(marker in normalized for marker in generic_instruction_markers)
 
 
+def examples_memory_query_quote(body: str, normalized: str, original: str = "", *, quote_start: int | None = None) -> bool:
+    if not normalized or len(normalized) > 48:
+        return False
+    if examples_quote_has_concrete_marker(normalized, original):
+        return False
+    if not memory_query_call_argument_context(body, quote_start):
+        return False
+    query_markers = [
+        "用户",
+        "记忆",
+        "偏好",
+        "上下文",
+        "问题",
+        "工单",
+        "任务",
+        "项目",
+        "截止日期",
+        "历史",
+        "状态",
+        "信息",
+    ]
+    return any(marker in normalized for marker in query_markers)
+
+
+def memory_query_call_argument_context(body: str, quote_start: int | None) -> bool:
+    if quote_start is None or quote_start < 0:
+        return False
+    prefix = body[max(0, quote_start - 48) : quote_start]
+    return bool(re.search(r"(?:^|[^\w])(?:[\w.]+\.)?(?:recall|search_context)\s*\(\s*$", prefix))
+
+
 def examples_quote_has_concrete_marker(normalized: str, original: str = "") -> bool:
     if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
         return True
@@ -12235,6 +12277,16 @@ def examples_quote_has_concrete_marker(normalized: str, original: str = "") -> b
         "张三",
         "李四",
         "王五",
+        "订单",
+        "交易",
+        "付款",
+        "支付",
+        "退款",
+        "删除",
+        "凭证",
+        "密码",
+        "密钥",
+        "token",
     ]
     return any(marker.lower() in lowered_original for marker in concrete_markers) or any(
         marker in normalized for marker in ["购买了华为", "北京门店", "星巴克"]
