@@ -11375,7 +11375,7 @@ def old_additional_note_boundary_paraphrase_absorbed(note: str, target: str) -> 
 
 
 def old_additional_note_target_has_user_confirmation_boundary(target_norm: str) -> bool:
-    decision_markers = ("重要决定", "重要决策", "重大决策", "决定", "决策")
+    decision_markers = ("重要决定", "重要决策", "重大决策")
     positive_markers = ("需要", "仍需", "仍需要", "应由", "必须", "由用户确认")
     negative_markers = ("不需要", "无需", "不必", "不再需要", "免于")
     for clause in old_additional_note_supersession_clauses(target_norm):
@@ -11391,9 +11391,19 @@ def old_additional_note_target_has_user_confirmation_boundary(target_norm: str) 
 def old_additional_note_target_has_memory_context_boundary(target_norm: str) -> bool:
     boundary_markers = ("辅助上下文", "有帮助的上下文", "作为上下文", "只能作为", "不能只依赖", "不能依赖", "不是绝对真实", "非绝对真实")
     for clause in old_additional_note_supersession_clauses(target_norm):
-        if re.search(r"召回的?记忆|记忆召回", clause) and any(marker in clause for marker in boundary_markers):
+        if not re.search(r"召回的?记忆|记忆召回", clause):
+            continue
+        if old_additional_note_clause_negates_memory_context(clause):
+            continue
+        if any(marker in clause for marker in boundary_markers):
             return True
     return False
+
+
+def old_additional_note_clause_negates_memory_context(clause: str) -> bool:
+    negative = ("不是", "并非", "不作为", "不能作为", "不应作为", "不再作为")
+    context_terms = ("辅助上下文", "有帮助的上下文", "上下文")
+    return any(re.search(rf"{marker}.{{0,8}}{term}", clause) for marker in negative for term in context_terms)
 
 
 def old_additional_note_superseded(note: str, target: str) -> bool:

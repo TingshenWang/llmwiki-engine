@@ -4813,6 +4813,28 @@ def test_merge_update_section_additional_notes_scattered_signals_do_not_absorb_b
     assert change.preserved_old == [old]
 
 
+def test_merge_update_section_additional_notes_login_confirmation_does_not_absorb_boundary() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "系统决定需要用户确认邮箱后才能登录，召回的记忆只能作为辅助上下文。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
+def test_merge_update_section_additional_notes_negative_memory_context_does_not_absorb_boundary() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "重要决策仍应由用户确认，召回的记忆不是辅助上下文。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
 def test_merge_update_section_additional_notes_does_not_keep_question_like_note() -> None:
     old = "是否需要为召回记忆设计用户确认机制？"
     new = "本页面补充通用记忆架构。"
