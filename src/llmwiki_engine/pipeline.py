@@ -11186,19 +11186,27 @@ def merge_update_section(
         added.append(new)
     if old and not retained and old != new and not is_empty_placeholder(old):
         if section_key == "additional_notes":
-            preserved_notes, removed_notes = split_high_signal_old_additional_notes(
+            preserved_notes, removed_notes, absorbed_notes = split_high_signal_old_additional_notes(
                 old,
                 new,
                 absorption_context=absorption_context or "",
             )
             if preserved_notes:
                 new = merge_markdown_blocks(new, preserved_old_additional_notes_block(preserved_notes))
-                retained.extend(preserved_notes)
+                retained.extend([*absorbed_notes, *preserved_notes])
                 preserved_old.extend(preserved_notes)
                 removed.extend(removed_notes)
                 removal_reason = (
-                    "高信号旧补充观察已自动追加；低信号或已覆盖的旧补充观察不机械保留。"
+                    "高信号旧补充观察已自动保留为 legacy note；无需阻塞审批，建议后续按需整理。"
+                    "低信号或已覆盖的旧补充观察不机械保留。"
                 )
+            elif absorbed_notes:
+                retained.extend(absorbed_notes)
+                removed.extend(removed_notes)
+                removal_reason = "高信号旧补充观察已被新草稿吸收；低信号旧补充观察不机械保留。"
+            elif removed_notes:
+                removed.extend(removed_notes)
+                removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
             else:
                 removed.append(old)
                 removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
@@ -11241,17 +11249,22 @@ def split_high_signal_old_additional_notes(
     new: str,
     *,
     absorption_context: str,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     preserved: list[str] = []
     removed: list[str] = []
+    absorbed: list[str] = []
     for note in old_additional_note_units(old):
         if not old_additional_note_is_high_signal_boundary(note):
             removed.append(note)
             continue
+        if old_additional_note_superseded(note, new) or old_additional_note_superseded(note, absorption_context):
+            removed.append(note)
+            continue
         if old_additional_note_absorbed(note, new) or old_additional_note_absorbed(note, absorption_context):
+            absorbed.append(note)
             continue
         preserved.append(note)
-    return _dedupe_strings(preserved), _dedupe_strings(removed)
+    return _dedupe_strings(preserved), _dedupe_strings(removed), _dedupe_strings(absorbed)
 
 
 def old_additional_note_units(text: str) -> list[str]:
@@ -11274,7 +11287,14 @@ def old_additional_note_units(text: str) -> list[str]:
         paragraph.append(stripped)
     if paragraph:
         units.append(" ".join(paragraph).strip())
-    return [unit for unit in _dedupe_strings(units) if unit and not is_empty_placeholder(unit)]
+    normalized_units = [strip_old_additional_note_label(unit) for unit in units]
+    return [unit for unit in _dedupe_strings(normalized_units) if unit and not is_empty_placeholder(unit)]
+
+
+def strip_old_additional_note_label(text: str) -> str:
+    stripped = text.strip()
+    stripped = re.sub(r"^(?:旧页补充观察|旧页保留观察)[:：]\s*", "", stripped)
+    return stripped.strip()
 
 
 def old_additional_note_is_high_signal_boundary(note: str) -> bool:
@@ -11282,6 +11302,8 @@ def old_additional_note_is_high_signal_boundary(note: str) -> bool:
     if len(normalized) < 12:
         return False
     if re.search(r"[?？]$", normalized) or normalized.startswith(("如何", "是否", "为什么", "能否", "有没有")):
+        return False
+    if re.search(r"(?:需要|待|尚需|仍需)?确认是否|待确认|尚需确认|仍需确认|是否存在|待验证|待补来源", normalized):
         return False
     if any(marker in normalized for marker in ["暂无", "没有明确", "可与", "关联阅读", "后续可以继续补充"]):
         return False
@@ -11297,8 +11319,6 @@ def old_additional_note_is_high_signal_boundary(note: str) -> bool:
         "重要决定",
         "重大决策",
         "不可逆",
-        "不应",
-        "必须",
         "安全风险",
         "可靠性风险",
         "隐私风险",
@@ -11325,12 +11345,39 @@ def old_additional_note_absorbed(note: str, target: str) -> bool:
         return True
     note_key = open_question_key(note)
     if note_key:
-        target_question_keys = {open_question_key(question) for question in meaningful_open_question_lines(target)}
-        if note_key in target_question_keys:
+        if any(
+            old_additional_note_overlaps_open_question(note, note_key, question)
+            for question in meaningful_open_question_lines(target)
+        ):
             return True
     normalized_note = normalized_source_match_text(note)
     normalized_target = normalized_source_match_text(target)
     return bool(normalized_note and normalized_note in normalized_target)
+
+
+def old_additional_note_overlaps_open_question(note: str, note_key: str, question: str) -> bool:
+    question_key = open_question_key(question)
+    if not note_key or not question_key:
+        return False
+    if note_key == question_key or open_question_key_contains_other(note_key, question_key):
+        return True
+    note_norm = open_question_similarity_text(note)
+    question_norm = open_question_similarity_text(question)
+    if open_question_key_contains_other(note_norm, question_norm):
+        return True
+    return open_question_token_overlap(note_norm, question_norm) >= 0.56
+
+
+def old_additional_note_superseded(note: str, target: str) -> bool:
+    if not note.strip() or not target.strip():
+        return False
+    normalized_target = re.sub(r"\s+", "", unicodedata.normalize("NFKC", target.lower()))
+    supersession_markers = ("不再需要", "已改为", "改为", "替代", "不适用", "deprecated", "废弃", "已废弃", "新版")
+    if not any(marker in normalized_target for marker in supersession_markers):
+        return False
+    note_terms = source_digest_non_generic_terms(source_digest_similarity_terms(note))
+    target_terms = source_digest_non_generic_terms(source_digest_similarity_terms(target))
+    return bool(note_terms and target_terms and note_terms & target_terms)
 
 
 def preserved_old_additional_notes_block(notes: list[str]) -> str:

@@ -4802,6 +4802,91 @@ def test_merge_update_section_additional_notes_does_not_keep_question_like_note(
     assert change.needs_manual_resolution is False
 
 
+def test_merge_update_section_additional_notes_does_not_keep_confirm_whether_note() -> None:
+    old = "需要确认是否存在记忆回滚或修正机制。"
+    new = "本页面补充通用记忆架构。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert change.retained == []
+    assert change.preserved_old == []
+    assert change.removed == [old]
+
+
+def test_merge_update_section_additional_notes_does_not_keep_generic_must_note() -> None:
+    old = "本页面必须与 Redis 页面联动阅读。"
+    new = "本页面补充通用记忆架构。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert change.retained == []
+    assert change.preserved_old == []
+    assert change.removed == [old]
+
+
+def test_merge_update_section_additional_notes_does_not_reintroduce_superseded_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "新版系统已改为自动校验召回记忆，重要决定不再需要用户确认。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert "旧页补充观察" not in merged
+    assert change.retained == []
+    assert change.preserved_old == []
+    assert change.removed == [old]
+
+
+def test_merge_update_section_additional_notes_strips_legacy_label_before_preserving() -> None:
+    note = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
+    old = f"旧页补充观察：{note}"
+    new = "本页面补充 Redis 等实现方式。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged.count("旧页补充观察") == 1
+    assert f"旧页补充观察：{note}" in merged
+    assert f"旧页补充观察：旧页补充观察：{note}" not in merged
+    assert change.retained == [note]
+    assert change.preserved_old == [note]
+
+
+def test_merge_update_section_additional_notes_does_not_duplicate_open_question_overlap() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "本页面补充通用记忆架构。"
+    context = f"{new}\n\n- 重要决定是否需要用户确认？"
+
+    merged, change = pipeline_module.merge_update_section(
+        "additional_notes",
+        old,
+        new,
+        absorption_context=context,
+    )
+
+    assert merged == new
+    assert "旧页补充观察" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == []
+    assert change.removed == []
+
+
+def test_merge_update_section_additional_notes_reports_absorbed_and_removed_units_separately() -> None:
+    absorbed = "重要决定需要用户确认，不能只依赖召回记忆。"
+    low = "本页面可与 Redis 页面联动阅读。"
+    old = f"- {absorbed}\n- {low}"
+    new = "召回记忆可作为上下文，但重要决定需要用户确认。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert change.retained == [absorbed]
+    assert change.preserved_old == []
+    assert change.removed == [low]
+    assert old not in change.removed
+
+
 def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-TYPO",
