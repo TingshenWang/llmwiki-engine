@@ -4909,6 +4909,9 @@ def chunks(items: list[WikiMergePlanItem], size: int) -> list[list[WikiMergePlan
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+PAGE_SCOPED_DRAFT_REPAIR_ISSUE_CODES = {"unsupported_new_fact", "model_self_talk_leak"}
+
+
 def build_draft_rendering_missing_page_repair_payload(
     *,
     task: str,
@@ -4986,11 +4989,142 @@ def build_draft_rendering_missing_page_repair_payload(
     }
 
 
+def build_draft_rendering_page_repair_payload(
+    *,
+    task: str,
+    raw: str,
+    issues: list[StructuredIssue],
+    output_model: type[BaseModel],
+    ctx: StepRunContext,
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    source_excerpt_pack: dict[str, Any],
+    update_preservation_pack: dict[str, Any],
+    approved_prepared_text: str,
+) -> dict[str, Any] | None:
+    failing_ids = draft_repair_page_plan_ids_from_issues(issues, merge_plan)
+    if not failing_ids:
+        return None
+    required_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
+    required_ids = {item.page_plan_id for item in required_items}
+    accepted_ids = required_ids - failing_ids
+    if not accepted_ids or not failing_ids < required_ids:
+        return None
+    partial = extract_valid_partial_draft_rendering(
+        raw,
+        merge_plan,
+        snapshot,
+        accepted_page_plan_ids=accepted_ids,
+        update_preservation_pack=update_preservation_pack,
+        approved_prepared_text=approved_prepared_text,
+        language=ctx.manifest.vault_config_snapshot.wiki_language,
+    )
+    if partial is None or not partial.pages:
+        return None
+    repair_items = [item for item in required_items if item.page_plan_id in failing_ids]
+    if not repair_items:
+        return None
+    repair_plan = merge_plan.model_copy(update={"items": repair_items})
+    repair_source_excerpt_pack = build_draft_source_excerpt_pack(
+        approved_prepared_text,
+        digest,
+        repair_plan,
+        force_excerpt=True,
+    )
+    repair_update_preservation_pack = build_update_preservation_pack(repair_plan, snapshot)
+    repair_payload = draft_rendering_model_payload(
+        build_draft_rendering_payload(
+            ctx=ctx,
+            digest=digest,
+            merge_plan=repair_plan,
+            snapshot=snapshot,
+            source_excerpt_pack=repair_source_excerpt_pack,
+            update_preservation_pack=repair_update_preservation_pack,
+            approved_prepared_text=approved_prepared_text,
+        )
+    )
+    return {
+        "repair_contract": {
+            "goal": "Repair page-scoped draft_rendering issues without regenerating pages that already passed local validation.",
+            "mode": "page_scoped_repair",
+            "task": task,
+            "rules": [
+                "Return only one complete JSON object matching the schema.",
+                "The pages array must contain every accepted_partial_pages item unchanged plus exactly one repaired page for each repair_page_plan_id.",
+                "Do not regenerate, rewrite, remove, or reorder accepted_partial_pages; copy them into pages exactly as provided.",
+                "accepted_partial_pages may be used only for cross-page consistency and related-page wording; do not regenerate them.",
+                "Generate only the failing pages from repair_page_payload; do not create pages outside repair_page_plan_ids.",
+                "All user-visible repaired content must follow the language and grounding rules inside repair_page_payload.",
+            ],
+            "issues": [issue.model_dump(mode="json") for issue in issues],
+            "accepted_page_plan_ids": [page.page_plan_id for page in partial.pages],
+            "repair_page_plan_ids": [item.page_plan_id for item in repair_items],
+            "required_page_plan_ids": [item.page_plan_id for item in required_items],
+            "schema": output_model.model_json_schema(),
+        },
+        "accepted_partial_pages": [page.model_dump(mode="json") for page in partial.pages],
+        "repair_page_payload": repair_payload,
+        "source_excerpt_pack_omitted_reason": (
+            "The original batch payload is intentionally replaced by a compact repair_page_payload; "
+            f"previous full/pack source refs remain {source_excerpt_pack.get('approved_prepared_ref', '')}."
+        ),
+    }
+
+
+def draft_repair_page_plan_ids_from_issues(
+    issues: list[StructuredIssue],
+    merge_plan: WikiMergePlanArtifact,
+) -> set[str] | None:
+    if not issues:
+        return None
+    draftable_ids = {item.page_plan_id for item in merge_plan.items if item.action in {"create", "update"}}
+    page_plan_ids: set[str] = set()
+    for issue in issues:
+        if issue.issue_code not in PAGE_SCOPED_DRAFT_REPAIR_ISSUE_CODES:
+            return None
+        match = re.match(r"^pages\.([^.]+)\.", issue.field_path or "")
+        if not match:
+            return None
+        page_plan_id = match.group(1)
+        if page_plan_id not in draftable_ids:
+            return None
+        page_plan_ids.add(page_plan_id)
+    return page_plan_ids or None
+
+
+def accepted_partial_page_copy_issues(
+    draft: DraftRenderingArtifact,
+    accepted_pages_by_id: dict[str, dict[str, Any]],
+) -> list[StructuredIssue]:
+    if not accepted_pages_by_id:
+        return []
+    pages_by_id = {page.page_plan_id: page for page in draft.pages}
+    issues: list[StructuredIssue] = []
+    for page_plan_id, expected in accepted_pages_by_id.items():
+        page = pages_by_id.get(page_plan_id)
+        if page is None or page.model_dump(mode="json") != expected:
+            issues.append(
+                StructuredIssue(
+                    issue_code="accepted_partial_page_changed",
+                    field_path=f"pages.{page_plan_id}",
+                    validator_id="draft_page_scoped_repair",
+                    message=(
+                        f"Page-scoped draft repair changed accepted partial page `{page_plan_id}`; "
+                        "copy accepted_partial_pages exactly and only repair failing page ids."
+                    ),
+                    repairability="repairable",
+                )
+            )
+    return issues
+
+
 def extract_valid_partial_draft_rendering(
     raw: str,
     merge_plan: WikiMergePlanArtifact,
     snapshot: WikiContextSnapshot,
     *,
+    accepted_page_plan_ids: set[str] | None = None,
     update_preservation_pack: dict[str, Any],
     approved_prepared_text: str,
     language: str | None,
@@ -5001,6 +5135,13 @@ def extract_valid_partial_draft_rendering(
         candidate = finalize_draft_rendering(artifact, merge_plan, snapshot)
     except Exception:
         return None
+    if accepted_page_plan_ids is not None:
+        existing_ids = {page.page_plan_id for page in candidate.pages}
+        if not accepted_page_plan_ids <= existing_ids:
+            return None
+        candidate = DraftRenderingArtifact(
+            pages=[page for page in candidate.pages if page.page_plan_id in accepted_page_plan_ids]
+        )
     present_ids = {page.page_plan_id for page in candidate.pages}
     required_ids = {item.page_plan_id for item in merge_plan.items if item.action in {"create", "update"}}
     if not present_ids or not present_ids < required_ids:
@@ -5053,12 +5194,14 @@ def run_single_draft_rendering_model_call(
     write_draft_digest_projection_report(output_dir, payload["approved_digest_projection_report"])
     write_draft_payload_projection_reports(output_dir, payload)
     model_payload = draft_rendering_model_payload(payload)
+    accepted_repair_pages_by_id: dict[str, dict[str, Any]] = {}
 
     def validate_draft_rendering_model(model: DraftRenderingArtifact) -> None:
         candidate = finalize_draft_rendering(model, merge_plan, snapshot)
         validate_draft_rendering(candidate, merge_plan, language=ctx.manifest.vault_config_snapshot.wiki_language)
         repair_issues = draft_self_talk_issues(candidate)
         repair_issues.extend(update_preservation_issues(candidate, update_preservation_pack))
+        repair_issues.extend(accepted_partial_page_copy_issues(candidate, accepted_repair_pages_by_id))
         rewritten_candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(
             candidate,
             approved_prepared_text,
@@ -5083,18 +5226,15 @@ def run_single_draft_rendering_model_call(
                 issues=repair_issues,
             )
 
-    draft_artifact, _ = StructuredModelCall(
-        provider,
-        output_dir=output_dir,
-        result_filename="provider_result.json",
-        redactor=ctx.execution_context.redactor,
-    ).run(
-        "draft_rendering",
-        model_payload,
-        DraftRenderingArtifact,
-        validator=validate_draft_rendering_model,
-        accept_after_repair_issue_codes={"unsupported_new_fact", "old_knowledge_not_absorbed"},
-        repair_payload_builder=lambda task, _payload, raw, issues, output_model: build_draft_rendering_missing_page_repair_payload(
+    def build_repair_payload(
+        task: str,
+        _payload: dict[str, Any],
+        raw: str,
+        issues: list[StructuredIssue],
+        output_model: type[BaseModel],
+    ) -> dict[str, Any] | None:
+        nonlocal accepted_repair_pages_by_id
+        page_repair_payload = build_draft_rendering_page_repair_payload(
             task=task,
             raw=raw,
             issues=issues,
@@ -5106,7 +5246,41 @@ def run_single_draft_rendering_model_call(
             source_excerpt_pack=source_excerpt_pack,
             update_preservation_pack=update_preservation_pack,
             approved_prepared_text=approved_prepared_text,
-        ),
+        )
+        if page_repair_payload is not None:
+            accepted_repair_pages_by_id = {
+                str(page.get("page_plan_id", "")): page
+                for page in page_repair_payload.get("accepted_partial_pages", [])
+                if isinstance(page, dict) and page.get("page_plan_id")
+            }
+            return page_repair_payload
+        accepted_repair_pages_by_id = {}
+        return build_draft_rendering_missing_page_repair_payload(
+            task=task,
+            raw=raw,
+            issues=issues,
+            output_model=output_model,
+            ctx=ctx,
+            digest=digest,
+            merge_plan=merge_plan,
+            snapshot=snapshot,
+            source_excerpt_pack=source_excerpt_pack,
+            update_preservation_pack=update_preservation_pack,
+            approved_prepared_text=approved_prepared_text,
+        )
+
+    draft_artifact, _ = StructuredModelCall(
+        provider,
+        output_dir=output_dir,
+        result_filename="provider_result.json",
+        redactor=ctx.execution_context.redactor,
+    ).run(
+        "draft_rendering",
+        model_payload,
+        DraftRenderingArtifact,
+        validator=validate_draft_rendering_model,
+        accept_after_repair_issue_codes={"unsupported_new_fact", "old_knowledge_not_absorbed"},
+        repair_payload_builder=build_repair_payload,
     )
     draft_artifact = _redacted_model(ctx, draft_artifact, DraftRenderingArtifact)
     draft_artifact = finalize_draft_rendering(draft_artifact, merge_plan, snapshot)

@@ -4746,6 +4746,192 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
     assert extracted is None
 
 
+def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_failing_page(tmp_path: Path) -> None:
+    vault, _raw = make_vault(tmp_path)
+    profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
+    ctx = types.SimpleNamespace(
+        profile=profile,
+        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.VaultConfig()),
+    )
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试 page scoped repair。",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="C-OK",
+                name="通过页",
+                type="concept",
+                one_sentence_summary="通过页摘要。",
+                why_matters="通过页重要。",
+                wiki_value="通过页可复用。",
+                suggested_page_title="通过页",
+            ),
+            SourceDigestCandidate(
+                candidate_id="C-BAD",
+                name="失败页",
+                type="concept",
+                one_sentence_summary="失败页摘要。",
+                why_matters="失败页重要。",
+                wiki_value="失败页可复用。",
+                suggested_page_title="失败页",
+            ),
+        ],
+    )
+    ok_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-OK",
+        source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
+        action="create",
+        canonical_target_path="concepts/Concept_OK.md",
+        display_title="通过页",
+        page_type="concept",
+        new_understanding="通过页摘要。",
+        section_plans={"summary": "摘要", "detail": "详情"},
+        reason="test",
+    )
+    bad_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-BAD",
+        source_basis=SourceBasis(source_candidate_ids=["C-BAD"]),
+        action="create",
+        canonical_target_path="concepts/Concept_BAD.md",
+        display_title="失败页",
+        page_type="concept",
+        new_understanding="失败页摘要。",
+        section_plans={"summary": "摘要", "detail": "详情"},
+        reason="test",
+    )
+    merge_plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, bad_item])
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
+            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
+        ],
+    )
+    raw_text = (
+        "# 测试材料\n\n"
+        "## 通过页\n\n通过页用于验证 accepted partial pages 会被保留。\n\n"
+        "## 失败页\n\n失败页用于验证 repair payload 只重写失败页面。\n"
+    )
+    source_excerpt_pack = pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
+    update_preservation_pack = pipeline_module.build_update_preservation_pack(merge_plan, snapshot)
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-OK",
+                action="create",
+                canonical_target_path="concepts/Concept_OK.md",
+                section_bodies={
+                    "summary": "通过页摘要。",
+                    "detail": "通过页用于验证 accepted partial pages 会被保留。",
+                },
+                change_summary="创建通过页。",
+                source_coverage_notes="依据测试材料生成。",
+            ),
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-BAD",
+                action="create",
+                canonical_target_path="concepts/Concept_BAD.md",
+                section_bodies={
+                    "summary": "失败页摘要。",
+                    "detail": "失败页用于验证 repair payload。",
+                    "examples": "例如，“用户喜欢蓝色”。",
+                },
+                change_summary="创建失败页。",
+                source_coverage_notes="依据测试材料生成。",
+            ),
+        ]
+    )
+    issues = [
+        pipeline_module.StructuredIssue(
+            issue_code="unsupported_new_fact",
+            field_path="pages.PP-BAD.examples",
+            validator_id="draft_grounding_review",
+            message="unsupported",
+            repairability="repairable",
+        )
+    ]
+
+    repair_prompt = pipeline_module.build_draft_rendering_page_repair_payload(
+        task="draft_rendering",
+        raw=json.dumps(draft.model_dump(mode="json"), ensure_ascii=False),
+        issues=issues,
+        output_model=pipeline_module.DraftRenderingArtifact,
+        ctx=ctx,
+        digest=digest,
+        merge_plan=merge_plan,
+        snapshot=snapshot,
+        source_excerpt_pack=source_excerpt_pack,
+        update_preservation_pack=update_preservation_pack,
+        approved_prepared_text=raw_text,
+    )
+
+    assert repair_prompt is not None
+    assert repair_prompt["repair_contract"]["mode"] == "page_scoped_repair"
+    assert repair_prompt["repair_contract"]["accepted_page_plan_ids"] == ["PP-OK"]
+    assert repair_prompt["repair_contract"]["repair_page_plan_ids"] == ["PP-BAD"]
+    assert [page["page_plan_id"] for page in repair_prompt["accepted_partial_pages"]] == ["PP-OK"]
+    assert repair_prompt["repair_page_payload"]["required_page_plan_ids"] == ["PP-BAD"]
+    assert "PP-OK" not in repair_prompt["repair_page_payload"]["required_page_plan_ids"]
+
+
+def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> None:
+    merge_plan = WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-OK",
+                source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
+                action="create",
+                canonical_target_path="concepts/Concept_OK.md",
+                display_title="通过页",
+                page_type="concept",
+                new_understanding="通过页摘要。",
+                section_plans={"summary": "摘要", "detail": "详情"},
+                reason="test",
+            )
+        ],
+    )
+    issues = [
+        pipeline_module.StructuredIssue(
+            issue_code="unsupported_new_fact",
+            field_path="pages.PP-OK.examples",
+            validator_id="draft_grounding_review",
+            message="unsupported",
+            repairability="repairable",
+        ),
+        pipeline_module.StructuredIssue(
+            issue_code="missing_page_plan_coverage",
+            field_path="pages",
+            validator_id="validate_draft_rendering",
+            message="global",
+            repairability="repairable",
+        ),
+    ]
+
+    assert pipeline_module.draft_repair_page_plan_ids_from_issues(issues, merge_plan) is None
+
+
+def test_accepted_partial_page_copy_issues_detect_rewritten_accepted_page() -> None:
+    accepted = pipeline_module.DraftPageItem(
+        page_plan_id="PP-OK",
+        action="create",
+        canonical_target_path="concepts/Concept_OK.md",
+        section_bodies={"summary": "原摘要。", "detail": "原详情。"},
+        change_summary="创建原页面。",
+        source_coverage_notes="测试。",
+    )
+    changed = accepted.model_copy(update={"change_summary": "被模型改写。"})
+
+    issues = pipeline_module.accepted_partial_page_copy_issues(
+        pipeline_module.DraftRenderingArtifact(pages=[changed]),
+        {"PP-OK": accepted.model_dump(mode="json")},
+    )
+
+    assert [issue.issue_code for issue in issues] == ["accepted_partial_page_changed"]
+    assert issues[0].field_path == "pages.PP-OK"
+
+
 def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None:
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
