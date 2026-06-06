@@ -8236,6 +8236,25 @@ def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() ->
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
+def test_cleanup_unsupported_example_literals_preserves_inline_command_syntax() -> None:
+    draft, plan, snapshot = build_examples_grounding_case('- `mem0 add --user-id "user123" --text "用户喜欢蓝色"`')
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert report["changed"] is True
+    assert report["replacement_count"] == 2
+    assert '`mem0 add --user-id "<user_id>" --text "<memory_text>"`' in cleaned.pages[0].section_bodies["examples"]
+    assert " `<user_id>` " not in cleaned.pages[0].section_bodies["examples"]
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+
+
 def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
     draft, plan, snapshot = build_examples_grounding_case(
         "- 例子区没有具体值。",
@@ -8306,7 +8325,34 @@ def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> Non
 
     assert cleaned == draft
     assert report["changed"] is False
-    assert report["skipped"][0]["reason"] == "skipped_metric_or_outcome_fact"
+    assert report["skipped"][0]["reason"] == "skipped_mixed_fact_literal"
+    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "2025年第三季度收入增长三倍",
+        "ABC123 导致错误响应",
+        "订单 ABC123 失败导致退款",
+        "Build number 1234 completed with status success",
+    ],
+)
+def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal: str) -> None:
+    draft, plan, snapshot = build_examples_grounding_case(f"- “{literal}” 不应被整体替成占位符。")
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert {item["reason"] for item in report["skipped"]} == {"skipped_mixed_fact_literal"}
     assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 

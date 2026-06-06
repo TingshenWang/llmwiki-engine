@@ -13349,7 +13349,13 @@ def replace_unsupported_example_literal_once(body: str, text: str) -> tuple[str,
         return body, example_literal_skip_result(text, "skipped_attributed_or_direct_quote_context")
     if position_inside_fenced_code_block(body, quote_start):
         return body, example_literal_skip_result(text, "skipped_inside_fenced_code")
-    replacement, reason = unsupported_example_literal_placeholder(text, body, quote_start)
+    inside_inline_code = position_inside_inline_code_span(body, quote_start)
+    replacement, reason = unsupported_example_literal_placeholder(
+        text,
+        body,
+        quote_start,
+        inside_inline_code=inside_inline_code,
+    )
     if not replacement:
         return body, example_literal_skip_result(text, reason or "skipped_no_safe_placeholder")
     updated = body[:quote_start] + replacement + body[quote_start + len(quoted_text) :]
@@ -13388,29 +13394,86 @@ def example_literal_skip_result(text: str, reason: str) -> dict[str, Any]:
     }
 
 
-def unsupported_example_literal_placeholder(text: str, body: str, quote_start: int) -> tuple[str, str]:
+def unsupported_example_literal_placeholder(
+    text: str,
+    body: str,
+    quote_start: int,
+    *,
+    inside_inline_code: bool = False,
+) -> tuple[str, str]:
     normalized = unicodedata.normalize("NFKC", text).strip()
     compact = re.sub(r"\s+", "", normalized)
     lowered = normalized.lower()
+    if looks_like_mixed_unsupported_example_fact(normalized):
+        return "", "skipped_mixed_fact_literal"
     if memory_query_call_argument_context(body, quote_start):
-        return '"<memory_query>"', "memory_query_argument_placeholder"
+        return example_angle_placeholder("memory_query", quoted=True), "memory_query_argument_placeholder"
     if re.search(r"\b(?:user|uid|customer|account)[-_ ]?\d+\b", lowered) or re.search(r"用户\s*\d+", normalized):
-        return "`<user_id>`", "user_id_placeholder"
+        return example_angle_placeholder("user_id", quoted=inside_inline_code), "user_id_placeholder"
     if re.search(r"\b(?:api[_-]?key|password|passwd|secret|token)\b", lowered) or any(marker in compact for marker in ["密钥", "密码", "令牌", "凭证"]):
-        return "`<api_key>`", "secret_placeholder"
+        return example_angle_placeholder("api_key", quoted=inside_inline_code), "secret_placeholder"
     if looks_like_time_period_literal(normalized):
-        return "`<time_period>`", "time_period_placeholder"
+        return example_angle_placeholder("time_period", quoted=inside_inline_code), "time_period_placeholder"
     if looks_like_example_identifier_literal(normalized):
-        return "`<example_id>`", "example_id_placeholder"
+        return example_angle_placeholder("example_id", quoted=inside_inline_code), "example_id_placeholder"
     if looks_like_metric_or_outcome_literal(compact):
         return "", "skipped_metric_or_outcome_fact"
     if looks_like_user_preference_literal(normalized):
+        if inside_inline_code:
+            return example_angle_placeholder("memory_text", quoted=True), "memory_text_placeholder"
         return "用户偏好 X", "user_preference_placeholder"
     if looks_like_location_consumption_literal(normalized):
+        if inside_inline_code:
+            return example_angle_placeholder("memory_text", quoted=True), "memory_text_placeholder"
         return "某个用户在某个地点消费过", "location_consumption_placeholder"
     if looks_like_product_usage_literal(normalized):
+        if inside_inline_code:
+            return example_angle_placeholder("memory_text", quoted=True), "memory_text_placeholder"
         return "某个用户使用某类产品", "product_usage_placeholder"
     return "", "skipped_no_safe_placeholder"
+
+
+def example_angle_placeholder(name: str, *, quoted: bool = False) -> str:
+    value = f"<{name}>"
+    return f'"{value}"' if quoted else f"`{value}`"
+
+
+def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    compact = re.sub(r"\s+", "", normalized)
+    lowered = normalized.lower()
+    if looks_like_metric_or_outcome_literal(compact):
+        return True
+    markers = [
+        "导致",
+        "造成",
+        "引发",
+        "影响",
+        "失败",
+        "成功",
+        "完成",
+        "错误",
+        "异常",
+        "退款",
+        "付款",
+        "支付",
+        "交易",
+        "订单",
+        "状态",
+        "收入",
+        "成本",
+        "completed",
+        "status",
+        "success",
+        "failed",
+        "failure",
+        "error",
+        "refund",
+        "payment",
+        "order",
+        "revenue",
+    ]
+    return any(marker in lowered for marker in markers)
 
 
 def looks_like_time_period_literal(text: str) -> bool:
@@ -13526,6 +13589,18 @@ def position_inside_fenced_code_block(text: str, position: int) -> bool:
             fence_length = len(marker)
         cursor = line_end
     return bool(fence_char and position >= cursor)
+
+
+def position_inside_inline_code_span(text: str, position: int) -> bool:
+    line_start = text.rfind("\n", 0, position) + 1
+    line_end = text.find("\n", position)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    local_position = position - line_start
+    before = line[:local_position]
+    after = line[local_position:]
+    return before.count("`") % 2 == 1 and after.count("`") > 0
 
 
 def open_question_scope_cleanup_claim(claim: GroundingClaim, item: WikiMergePlanItem | None) -> bool:
