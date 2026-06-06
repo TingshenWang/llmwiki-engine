@@ -389,7 +389,20 @@ def create_reason_needs_repair(text: str) -> bool:
         for marker in ["范围", "边界", "增量", "来源", "材料", "旧页", "已有页", "覆盖", "补充", "价值点", "例子", "适用"]
     ):
         return True
+    if not create_reason_has_concrete_anchor(normalized):
+        return True
     return False
+
+
+def create_reason_has_concrete_anchor(text: str) -> bool:
+    if any(marker in text for marker in ["`", "“", "”", "《", "》"]):
+        return True
+    ascii_terms = {
+        term.lower()
+        for term in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b", text)
+        if term.lower() not in {"create", "update", "noop", "related", "source", "scope", "delta"}
+    }
+    return bool(ascii_terms)
 
 
 def _strip_markdown_noise(text: str) -> str:

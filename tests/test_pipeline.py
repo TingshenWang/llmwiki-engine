@@ -10946,6 +10946,158 @@ def test_strong_context_create_is_finalized_to_needs_human_decision(tmp_path: Pa
     assert plan.items[0].strongest_overlap.strength == "strong"
 
 
+def merge_review_create_item(
+    page_plan_id: str,
+    *,
+    strength: str = "none",
+    why_not_update: str = "",
+) -> pipeline_module.WikiMergePlanItem:
+    return pipeline_module.WikiMergePlanItem(
+        page_plan_id=page_plan_id,
+        source_basis=SourceBasis(source_candidate_ids=[page_plan_id]),
+        action="create",
+        model_action="create",
+        canonical_target_path=f"concepts/Concept_{page_plan_id}.md",
+        display_title=f"Concept {page_plan_id}",
+        page_type="concept",
+        inspected_context_paths=[f"concepts/Concept_Old_{page_plan_id}.md"] if strength != "none" else [],
+        strongest_overlap=pipeline_module.ContextOverlapSignal(
+            strength=strength,
+            match_basis="embedding" if strength != "none" else "",
+            path=f"concepts/Concept_Old_{page_plan_id}.md" if strength != "none" else "",
+            score={"none": 0.0, "weak": 0.4, "medium": 0.67, "strong": 0.82}[strength],
+            reason="test overlap",
+        ),
+        why_not_update=why_not_update,
+        why_create_or_update="测试 create。",
+        new_understanding="新增知识。",
+        section_plans={"摘要": "写摘要。"},
+        reason="测试 create。",
+    )
+
+
+def merge_review_plan(*items: pipeline_module.WikiMergePlanItem) -> pipeline_module.WikiMergePlanArtifact:
+    return pipeline_module.WikiMergePlanArtifact(log_date="2026-06-07", context_snapshot_ref="", items=list(items))
+
+
+def test_all_create_medium_with_concrete_reason_does_not_force_review() -> None:
+    reason = (
+        "新页范围是通用 AI 代理记忆；旧页范围是 Mem0 多级记忆实现。"
+        "本轮来源增量来自 Redis 播客，直接更新旧页会让 Mem0 页面失焦，"
+        "只做 Related 不能承载新增例子和价值点。"
+    )
+    plan = merge_review_plan(merge_review_create_item("PP-1", strength="medium", why_not_update=reason))
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_with_weak_reason_still_waits_for_review() -> None:
+    plan = merge_review_plan(merge_review_create_item("PP-1", strength="medium", why_not_update="更适合新建。"))
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "理由不充分" in reason
+
+
+def test_all_create_medium_with_generic_marker_reason_still_waits_for_review() -> None:
+    plan = merge_review_plan(
+        merge_review_create_item(
+            "PP-1",
+            strength="medium",
+            why_not_update="旧页范围不同，来源材料不同，更新旧页不合适，Related 不够。",
+        )
+    )
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "理由不充分" in reason
+
+
+def test_all_create_medium_with_long_generic_reason_still_waits_for_review() -> None:
+    plan = merge_review_plan(
+        merge_review_create_item(
+            "PP-1",
+            strength="medium",
+            why_not_update=(
+                "新页范围和旧页范围不一样，本轮来源材料也不一样，直接更新旧页会让旧页范围变大，"
+                "已有页覆盖不了新增内容，只做 Related 不够承载新增结构和价值点，所以应该创建新页。"
+            ),
+        )
+    )
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "理由不充分" in reason
+
+
+def test_all_create_medium_with_locally_synthesized_reason_still_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-1",
+        strength="medium",
+        why_not_update=(
+            "本地补充：scope_delta：新页范围是通用概念；旧页范围是产品实现。"
+            "source_delta：本轮来源增量不同。why_update_not_enough：直接更新会失焦。"
+            "why_related_link_not_enough：只做 Related 不能承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "finalization_reason": (
+                f"medium overlap create 缺少 why_not_update，已{pipeline_module.LOCAL_MEDIUM_CREATE_REASON_MARKER}。"
+            )
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "仅由本地补充" in reason
+
+
+def test_all_create_strong_overlap_still_waits_for_review() -> None:
+    reason = (
+        "新页范围和旧页有差异，来源也不同；更新旧页会扩大旧页范围，"
+        "只做 Related 不能承载新增结构。"
+    )
+    plan = merge_review_plan(merge_review_create_item("PP-1", strength="strong", why_not_update=reason))
+
+    assert "强召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
+def test_all_create_page_count_cap_waits_for_review_at_thirteen() -> None:
+    allowed = [
+        merge_review_create_item(f"PP-{index}", strength="none")
+        for index in range(pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS)
+    ]
+    blocked = [
+        merge_review_create_item(f"PP-{index}", strength="none")
+        for index in range(pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS + 1)
+    ]
+
+    assert pipeline_module.merge_plan_all_create_review_reason(merge_review_plan(*allowed)) == ""
+    assert "超过自动通过上限" in pipeline_module.merge_plan_all_create_review_reason(merge_review_plan(*blocked))
+
+
+def test_all_create_page_count_cap_can_use_vault_budget() -> None:
+    items = [merge_review_create_item(f"PP-{index}", strength="none") for index in range(5)]
+
+    assert (
+        "超过自动通过上限 4"
+        in pipeline_module.merge_plan_all_create_review_reason(merge_review_plan(*items), max_auto_create_items=4)
+    )
+
+
+def test_all_create_review_limit_never_exceeds_internal_cap() -> None:
+    assert pipeline_module.merge_plan_auto_create_review_limit(4) == 4
+    assert (
+        pipeline_module.merge_plan_auto_create_review_limit(pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS + 8)
+        == pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS
+    )
+
+
 def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path: Path) -> None:
     vault, _ = make_vault(tmp_path)
     existing = vault / "wiki" / "concepts" / "Concept_AI_PM_Career.md"
@@ -11046,7 +11198,9 @@ def test_wiki_merge_planning_locally_fills_missing_medium_create_reason(tmp_path
     assert "why_update_not_enough" in plan["items"][0]["why_not_update"]
     assert "why_related_link_not_enough" in plan["items"][0]["why_not_update"]
     assert "本地补充结构化 create/update 对比理由" in plan["items"][0]["finalization_reason"]
-    assert read_manifest(RunStore(vault).manifest_path(manifest.operation_id)).steps[8].status == StepStatus.completed
+    saved_manifest = read_manifest(RunStore(vault).manifest_path(manifest.operation_id))
+    assert saved_manifest.steps[8].status == StepStatus.completed
+    assert saved_manifest.steps[9].status == StepStatus.awaiting_review
     assert manifest.status == OperationStatus.awaiting_review
 
 

@@ -169,6 +169,8 @@ MODEL_RELATED_SUGGESTION_LIMIT = 2
 FINAL_RELATED_LIMIT = 3
 DRAFT_RENDERING_BATCH_PAGE_LIMIT = 4
 DRAFT_RENDERING_MAX_PARALLEL_BATCHES = 3
+MAX_AUTO_APPROVED_ALL_CREATE_ITEMS = 12
+LOCAL_MEDIUM_CREATE_REASON_MARKER = "本地补充结构化 create/update 对比理由"
 DRAFT_RENDERING_GROUNDING_RISK_RULES = (
     "Do not wrap paraphrases, inferred concept labels, or rewritten source ideas in Chinese/English quotation marks; "
     "use quotes only for text that exact-matches source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
@@ -3542,7 +3544,10 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     feedback_path.write_text("", encoding="utf-8")
     prompt_path.write_text(render_merge_plan_review_prompt(plan), encoding="utf-8")
     has_needs_human = any(item.action == "needs_human_decision" or item.apply_eligibility == "blocked" for item in plan.items)
-    all_create_risk = merge_plan_all_create_review_reason(plan)
+    all_create_risk = merge_plan_all_create_review_reason(
+        plan,
+        max_auto_create_items=merge_plan_auto_create_review_limit(ctx.manifest.vault_config_snapshot.max_ingest_candidates),
+    )
     if has_needs_human or all_create_risk:
         pending_path = step_root / "pending_merge_plan.json"
         pending_path.write_text(plan_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -9539,7 +9544,7 @@ def finalize_wiki_merge_plan(
                     snapshot=snapshot,
                 )
                 item = item.model_copy(update={"why_not_update": synthesized_reason})
-                finalization_notes.append("medium overlap create 缺少 why_not_update，已本地补充结构化 create/update 对比理由。")
+                finalization_notes.append(f"medium overlap create 缺少 why_not_update，已{LOCAL_MEDIUM_CREATE_REASON_MARKER}。")
             elif medium_missing_policy == "block":
                 action = "needs_human_decision"
                 apply_eligibility = "blocked"
@@ -10037,14 +10042,44 @@ def render_merge_plan_review_prompt(plan: WikiMergePlanArtifact) -> str:
     )
 
 
-def merge_plan_all_create_review_reason(plan: WikiMergePlanArtifact) -> str:
+def merge_plan_all_create_review_reason(
+    plan: WikiMergePlanArtifact,
+    *,
+    max_auto_create_items: int = MAX_AUTO_APPROVED_ALL_CREATE_ITEMS,
+) -> str:
     if not plan.items or any(item.action != "create" for item in plan.items):
         return ""
-    risky = merge_plan_create_overlap_risk_items(plan)
-    if not risky:
+    if len(plan.items) > max_auto_create_items:
+        return (
+            f"合并计划一次 create {len(plan.items)} 个页面，超过自动通过上限 "
+            f"{max_auto_create_items}；请 revise 聚合或延后低优先级页面。"
+        )
+    strong_risky = [
+        item
+        for item in merge_plan_create_overlap_risk_items(plan)
+        if item.strongest_overlap.strength == "strong"
+    ]
+    if strong_risky:
+        names = ", ".join(f"{item.page_plan_id}:strong" for item in strong_risky[:8])
+        return f"合并计划全部为 create，但存在强召回风险（{names}）；请审核这些页面为什么不应 update 到已有知识页。"
+    weak_reason_medium = [
+        item
+        for item in merge_plan_create_overlap_risk_items(plan)
+        if item.strongest_overlap.strength == "medium"
+        and (create_reason_needs_repair(item.why_not_update) or medium_create_reason_was_locally_synthesized(item))
+    ]
+    if not weak_reason_medium:
         return ""
-    names = ", ".join(f"{item.page_plan_id}:{item.strongest_overlap.strength or 'none'}" for item in risky[:8])
-    return f"合并计划全部为 create，但存在召回风险（{names}）；请审核这些页面为什么不应 update 到已有知识页。"
+    names = ", ".join(f"{item.page_plan_id}:medium" for item in weak_reason_medium[:8])
+    return f"合并计划全部为 create，但存在中等召回风险且 create 理由不充分或仅由本地补充（{names}）；请审核这些页面为什么不应 update 到已有知识页。"
+
+
+def merge_plan_auto_create_review_limit(configured_candidate_budget: int) -> int:
+    return min(configured_candidate_budget, MAX_AUTO_APPROVED_ALL_CREATE_ITEMS)
+
+
+def medium_create_reason_was_locally_synthesized(item: WikiMergePlanItem) -> bool:
+    return item.why_not_update.startswith("本地补充：") or LOCAL_MEDIUM_CREATE_REASON_MARKER in item.finalization_reason
 
 
 def merge_plan_create_overlap_risk_items(plan: WikiMergePlanArtifact) -> list[WikiMergePlanItem]:
