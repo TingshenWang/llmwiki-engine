@@ -10889,9 +10889,21 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
             "如果是 CLI/API/code 示例，命令参数要么照抄来源 literal，要么改成 `<memory_text>`、`<user_id>`、`<memory_query>` 这类占位符；"
             "不要把被拒绝的具体偏好、用户 ID、查询或命令参数换成另一个具体值。"
         )
+    if grounding_claim_targets_open_question(claim) and claim.section_key != "open_questions":
+        reason = (
+            f"{reason} 这是 open_questions 页面；无来源支撑的场景、后果或影响推测不要留在 detail/examples 当事实；"
+            "请移动到 section_bodies.open_questions，改写成问题并标注 待补来源，不要换成另一个具体后果。"
+        )
     if not text:
         return reason
     return f"{reason} 触发文本：{text[:240]}"
+
+
+def grounding_claim_targets_open_question(claim: GroundingClaim) -> bool:
+    target_path = claim.target_path.strip().replace("\\", "/")
+    if target_path.startswith("wiki/"):
+        target_path = target_path[5:]
+    return target_path.startswith("open_questions/")
 
 
 def unsupported_backing_marker(text: str) -> str | None:

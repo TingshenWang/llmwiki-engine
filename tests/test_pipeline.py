@@ -7495,6 +7495,28 @@ def test_grounding_scope_speculation_allows_open_question() -> None:
     assert review.unsupported_new_facts == []
 
 
+def test_grounding_open_question_repair_message_moves_speculation_to_open_questions() -> None:
+    claim = pipeline_module.GroundingClaim(
+        page_plan_id="PP-QUESTION",
+        target_path="wiki/open_questions/Open_Question_记忆可信度.md",
+        section_key="examples",
+        claim_type="new_fact",
+        text="如果记忆不准确，可能导致错误交易。",
+        support="unsupported",
+        action="needs_review",
+        reason="新增影响范围/受影响对象推测 `导致` 未被 raw 或 inspected wiki 同句级支撑；请删除该推测，或改写为来源明确陈述。",
+    )
+
+    message = pipeline_module.grounding_issue_message(claim)
+
+    assert "section_bodies.open_questions" in message
+    assert "改写成问题" in message
+    assert "待补来源" in message
+    assert "detail/examples" in message
+    assert "不要换成另一个具体后果" in message
+    assert "<user_id>" in message
+
+
 def test_grounding_external_backing_accepts_english_widely_used_anchor() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-NYU-CTF",
