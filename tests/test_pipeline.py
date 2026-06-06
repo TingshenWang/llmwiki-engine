@@ -3099,6 +3099,9 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "approved_prepared_markdown" in grounding_risk_rules
     assert "可能伴随" in grounding_risk_rules
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
+    assert "Across all section_bodies" in contract_rules
+    assert "张三" in contract_rules
+    assert "user-123" in contract_rules
     assert "do not invent concrete user facts" in contract_rules
     assert "用户偏好 X" in contract_rules
     assert "CLI/API/code examples" in contract_rules
@@ -3107,6 +3110,9 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "<memory_query>" in contract_rules
     assert "explicit exception to the zh-CN translation rule" in contract_rules
     assert "do not translate a source literal into a new concrete preference" in contract_rules
+    assert "do not invent causal outcomes" in contract_rules
+    assert "导致" in contract_rules
+    assert "recommendation or best practice" in contract_rules
     assert "Stable English product/protocol terms" in contract_rules
 
     sidecar = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
