@@ -5191,6 +5191,7 @@ def build_draft_rendering_payload(
                 "For zh-CN vaults, translate or paraphrase English raw examples into Chinese; do not paste whole English sentences into examples, detail, value_points, additional_notes, open_questions, change_summary, or source_coverage_notes.",
                 "Stable English product/protocol terms such as Claude Code, Managed Agents, harness, sandbox, session, MCP, Eval, TTFT, CLI, API, and Cowork may remain in English, but surrounding prose must be Chinese.",
                 "Ground examples, value points, and reuse scenarios in source content.",
+                "In section_bodies.examples, do not invent concrete user facts, user ids, preferences, dates, plans, metrics, credentials, or command arguments unless exact source text supports them; for generic explanation, use abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
                 *DRAFT_RENDERING_GROUNDING_RISK_RULES,
                 "Do not write implementation details, examples, or claims as facts unless they are supported by source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
                 "If a useful detail is plausible but unsupported, put it under open_questions as 待补来源 instead of writing it as fact.",
@@ -10529,6 +10530,11 @@ def preserved_old_section_block(old: str) -> str:
 def grounding_issue_message(claim: GroundingClaim) -> str:
     reason = claim.reason or "unsupported new_fact"
     text = re.sub(r"\s+", " ", claim.text).strip()
+    if claim.section_key == "examples":
+        reason = (
+            f"{reason} 例子区不应换一个具体用户事实继续尝试；"
+            "请改成抽象占位符（如 `某个用户`、`用户偏好 X`、`user_id`、`memory`）或删除该例子。"
+        )
     if not text:
         return reason
     return f"{reason} 触发文本：{text[:240]}"

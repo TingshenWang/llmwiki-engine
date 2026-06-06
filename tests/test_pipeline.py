@@ -3018,6 +3018,8 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "approved_prepared_markdown" in grounding_risk_rules
     assert "可能伴随" in grounding_risk_rules
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
+    assert "do not invent concrete user facts" in contract_rules
+    assert "用户偏好 X" in contract_rules
     assert "Stable English product/protocol terms" in contract_rules
 
     sidecar = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
@@ -6396,6 +6398,9 @@ def test_grounding_examples_hard_facts_still_require_support() -> None:
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["销量增长三倍"]
+    message = pipeline_module.grounding_issue_message(review.unsupported_new_facts[0])
+    assert "例子区不应换一个具体用户事实继续尝试" in message
+    assert "用户偏好 X" in message
 
 
 def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match() -> None:
