@@ -8571,6 +8571,15 @@ def test_grounding_examples_allow_isolated_query_template_contexts(examples: str
         "类似“Redis config supports cluster”的请求",
         "类似“Redis config improves latency”的请求",
         "类似“Redis configuration is best”的请求",
+        "例如“Redis config supports cluster”",
+        "比如“Redis config improves latency”",
+        "示例“Redis configuration is best”",
+        "例如“Redis supports cluster”",
+        "类似“query user SSN”的请求",
+        "类似“query users SSNs”的请求",
+        "类似“query user social security number”的请求",
+        "类似“query customer passport number”的请求",
+        "类似“query customer license number”的请求",
     ],
 )
 def test_grounding_examples_query_template_keeps_fact_like_quotes_strict(examples: str) -> None:

@@ -12978,11 +12978,11 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
     lowered_original = original.lower()
     unsafe_word_pattern = (
         r"\b(?:order|ticket|issue|status|success|failed|failure|error|token|api[_-]?key|password|"
-        r"passwd|secret|credential|account|permission|payment|refund|delete|deleted|revenue|"
-        r"support|supports|supported|improve|improves|improved|best|better|recommend|recommended|recommends|"
-        r"prove|proves|proved|cause|causes|caused|release|released|releases|launch|launched|launches)\b"
+        r"passwd|secret|credential|account|permission|payment|refund|delete|deleted|revenue)\b"
     )
     if re.search(unsafe_word_pattern, lowered_original):
+        return True
+    if examples_quote_has_factual_eval_marker(original):
         return True
     unsafe_markers = [
         "最佳",
@@ -13032,9 +13032,23 @@ def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str =
         return True
     if examples_quote_has_sensitive_user_data_marker(normalized, original):
         return True
+    if examples_quote_has_factual_eval_marker(original):
+        return True
     if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
         return True
     return False
+
+
+def examples_quote_has_factual_eval_marker(original: str = "") -> bool:
+    lowered_original = original.lower()
+    return bool(
+        re.search(
+            r"\b(?:support|supports|supported|improve|improves|improved|best|better|recommend|recommended|"
+            r"recommends|prove|proves|proved|cause|causes|caused|release|released|releases|launch|"
+            r"launched|launches)\b",
+            lowered_original,
+        )
+    )
 
 
 def examples_quote_has_personal_name_reference(normalized: str, original: str = "") -> bool:
@@ -13151,7 +13165,8 @@ def examples_english_sensitive_user_data_query(lowered_original: str) -> bool:
         r"ip\s+address|ips|ip|email\s+address|email|emails|addresses|address|names|name|birthdays|birthday|"
         r"birth\s*date|birthdate|profiles|profile|locations|location|ids|id|credit\s+cards|credit\s+card|"
         r"cards|card|tokens|token|sessions|session|passwords|password|credentials|credential|"
-        r"accounts|account|permissions|permission|cookies|cookie"
+        r"accounts|account|permissions|permission|cookies|cookie|ssns|ssn|social\s+security\s+numbers|"
+        r"social\s+security\s+number|passport\s+numbers|passport\s+number|license\s+numbers|license\s+number"
     )
     return bool(
         re.search(rf"\b(?:{user_markers})\b.{{0,32}}\b(?:{sensitive_objects})\b", lowered_original)
