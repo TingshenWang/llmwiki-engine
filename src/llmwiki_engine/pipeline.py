@@ -11351,7 +11351,42 @@ def old_additional_note_absorbed(note: str, target: str) -> bool:
         return False
     normalized_note = normalized_source_match_text(note)
     normalized_target = normalized_source_match_text(target)
-    return bool(normalized_note and normalized_note in normalized_target)
+    if normalized_note and normalized_note in normalized_target:
+        return True
+    return old_additional_note_boundary_paraphrase_absorbed(note, target)
+
+
+def old_additional_note_boundary_paraphrase_absorbed(note: str, target: str) -> bool:
+    note_norm = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note.lower()))
+    target_norm = re.sub(r"\s+", "", unicodedata.normalize("NFKC", target.lower()))
+    obligations: list[str] = []
+    if "用户确认" in note_norm:
+        obligations.append("user_confirmation")
+    if "召回记忆" in note_norm and any(marker in note_norm for marker in ["不能只依赖", "不能依赖", "绝对真实", "上下文"]):
+        obligations.append("memory_context_boundary")
+    if not obligations:
+        return False
+    for obligation in obligations:
+        if obligation == "user_confirmation" and not old_additional_note_target_has_user_confirmation_boundary(target_norm):
+            return False
+        if obligation == "memory_context_boundary" and not old_additional_note_target_has_memory_context_boundary(target_norm):
+            return False
+    return True
+
+
+def old_additional_note_target_has_user_confirmation_boundary(target_norm: str) -> bool:
+    if "用户确认" not in target_norm:
+        return False
+    return any(marker in target_norm for marker in ["重要决定", "重要决策", "重大决策", "决定", "决策"])
+
+
+def old_additional_note_target_has_memory_context_boundary(target_norm: str) -> bool:
+    if not re.search(r"召回的?记忆|记忆召回", target_norm):
+        return False
+    return any(
+        marker in target_norm
+        for marker in ["辅助上下文", "有帮助的上下文", "作为上下文", "只能作为", "不能只依赖", "不能依赖", "不是绝对真实", "非绝对真实"]
+    )
 
 
 def old_additional_note_superseded(note: str, target: str) -> bool:
@@ -11372,8 +11407,6 @@ def old_additional_note_supersession_anchors(note: str) -> list[str]:
     normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note.lower()))
     anchors = [
         "用户确认",
-        "重要决定",
-        "重大决策",
         "不可逆",
         "绝对真实",
         "召回记忆",

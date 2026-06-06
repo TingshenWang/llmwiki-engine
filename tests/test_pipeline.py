@@ -4789,6 +4789,19 @@ def test_merge_update_section_additional_notes_does_not_duplicate_absorbed_note(
     assert change.removed == []
 
 
+def test_merge_update_section_additional_notes_does_not_duplicate_paraphrased_boundary() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "召回的记忆只能作为辅助上下文，重要决策仍应由用户确认。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert "旧页补充观察" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == []
+    assert change.removed == []
+
+
 def test_merge_update_section_additional_notes_does_not_keep_question_like_note() -> None:
     old = "是否需要为召回记忆设计用户确认机制？"
     new = "本页面补充通用记忆架构。"
@@ -4854,6 +4867,17 @@ def test_merge_update_section_additional_notes_user_confirmation_deprecated_is_s
 def test_merge_update_section_additional_notes_unrelated_no_longer_needed_clause_preserves_note() -> None:
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "重要决定需要用户确认，但旧 API 不再需要。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
+def test_merge_update_section_additional_notes_unrelated_approval_change_preserves_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "重要决定不再需要额外审批，但仍需要用户确认。"
 
     merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
 
