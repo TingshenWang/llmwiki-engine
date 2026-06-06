@@ -5510,16 +5510,17 @@ def extract_valid_partial_draft_rendering(
     if update_preservation_issues(candidate, update_preservation_pack):
         return None
     candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(candidate, approved_prepared_text)
-    grounding_review = build_draft_grounding_review(candidate, partial_plan, snapshot, approved_prepared_text)
-    candidate, example_cleanup_report = cleanup_unsupported_example_literals(
-        candidate,
+    grounding_candidate = candidate
+    grounding_review = build_draft_grounding_review(grounding_candidate, partial_plan, snapshot, approved_prepared_text)
+    grounding_candidate, example_cleanup_report = cleanup_unsupported_example_literals(
+        grounding_candidate,
         partial_plan,
         snapshot,
         approved_prepared_text,
         review=grounding_review,
     )
     if example_cleanup_report.get("changed"):
-        grounding_review = build_draft_grounding_review(candidate, partial_plan, snapshot, approved_prepared_text)
+        grounding_review = build_draft_grounding_review(grounding_candidate, partial_plan, snapshot, approved_prepared_text)
     if grounding_review.requires_review:
         return None
     return candidate
@@ -13454,6 +13455,9 @@ def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
         "完成",
         "错误",
         "异常",
+        "购买",
+        "买了",
+        "删除",
         "退款",
         "付款",
         "支付",
@@ -13462,6 +13466,17 @@ def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
         "状态",
         "收入",
         "成本",
+        "凭证",
+        "密码",
+        "账户",
+        "账号",
+        "权限",
+        "授权",
+        "敏感",
+        "purchased",
+        "bought",
+        "deleted",
+        "delete",
         "completed",
         "status",
         "success",
@@ -13472,6 +13487,12 @@ def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
         "payment",
         "order",
         "revenue",
+        "credential",
+        "credentials",
+        "password",
+        "account",
+        "permission",
+        "sensitive",
     ]
     return any(marker in lowered for marker in markers)
 

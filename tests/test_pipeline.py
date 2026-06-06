@@ -5482,6 +5482,77 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
     assert extracted is None
 
 
+def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> None:
+    ok_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-OK",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_OK.md",
+        display_title="OK",
+        page_type="concept",
+        new_understanding="通过页摘要。",
+        section_plans={"summary": "摘要", "examples": "例子"},
+        reason="测试 partial draft。",
+    )
+    missing_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MISSING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Missing.md",
+        display_title="Missing",
+        page_type="concept",
+        new_understanding="另一个待生成页面。",
+        section_plans={"detail": "详情"},
+        reason="测试 partial draft。",
+    )
+    partial = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-OK",
+                action="create",
+                canonical_target_path="concepts/Concept_OK.md",
+                section_bodies={
+                    "summary": "通过页摘要。",
+                    "detail": "这个页面用于说明 deterministic cleanup 的使用场景和边界：只处理 examples 里的示例参数，不把结果事实当占位符。",
+                    "examples": "- 示例构建编号是 “ABC123”。",
+                },
+                change_summary="创建通过页。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, missing_item])
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
+            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_Missing.md", expected_state="missing"),
+        ],
+    )
+
+    extracted = pipeline_module.extract_valid_partial_draft_rendering(
+        json.dumps(partial.model_dump(mode="json"), ensure_ascii=False),
+        plan,
+        snapshot,
+        update_preservation_pack={"schema_version": "update_preservation_pack.v1", "pages": []},
+        approved_prepared_text="",
+        language="zh-CN",
+    )
+
+    assert extracted is not None
+    assert "ABC123" in extracted.pages[0].section_bodies["examples"]
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        extracted,
+        plan.model_copy(update={"items": [ok_item]}),
+        snapshot,
+        "",
+    )
+    assert report["changed"] is True
+    assert report["replacement_count"] == 1
+    assert "`<example_id>`" in cleaned.pages[0].section_bodies["examples"]
+
+
 def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_failing_page(tmp_path: Path) -> None:
     vault, _raw = make_vault(tmp_path)
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
@@ -8336,6 +8407,10 @@ def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> Non
         "ABC123 导致错误响应",
         "订单 ABC123 失败导致退款",
         "Build number 1234 completed with status success",
+        "Alice 在 2026 年买了 MacBook。",
+        "user-123 purchased MacBook in 2025",
+        "用户 1234 删除了凭证",
+        "客户 user123 喜欢蓝色并删除了密码",
     ],
 )
 def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal: str) -> None:
