@@ -4778,7 +4778,7 @@ def test_merge_update_section_additional_notes_does_not_preserve_low_signal_note
 
 def test_merge_update_section_additional_notes_does_not_duplicate_absorbed_note() -> None:
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
-    new = "召回记忆可作为上下文，但重要决定需要用户确认。"
+    new = f"本页延续旧边界：{old}"
 
     merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
 
@@ -4842,6 +4842,29 @@ def test_merge_update_section_additional_notes_does_not_reintroduce_superseded_n
 def test_merge_update_section_additional_notes_user_confirmation_deprecated_is_superseded() -> None:
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "用户确认机制已废弃，系统改为自动校验。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert "旧页补充观察" not in merged
+    assert change.preserved_old == []
+    assert change.removed == [old]
+
+
+def test_merge_update_section_additional_notes_unrelated_no_longer_needed_clause_preserves_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "重要决定需要用户确认，但旧 API 不再需要。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
+def test_merge_update_section_additional_notes_superseded_anchor_not_hidden_by_preserved_anchor() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "重要决定不再需要用户确认，但召回记忆仍可作为上下文。"
 
     merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
 
@@ -4917,11 +4940,33 @@ def test_merge_update_section_additional_notes_unrelated_replacement_with_anchor
     assert change.preserved_old == [old]
 
 
+def test_merge_update_section_additional_notes_recall_memory_metadata_change_preserves_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "新版 API 已改为支持召回记忆元数据。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
+def test_merge_update_section_additional_notes_recall_memory_field_rename_preserves_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "召回记忆字段已改为 memories。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
 def test_merge_update_section_additional_notes_reports_absorbed_and_removed_units_separately() -> None:
     absorbed = "重要决定需要用户确认，不能只依赖召回记忆。"
     low = "本页面可与 Redis 页面联动阅读。"
     old = f"- {absorbed}\n- {low}"
-    new = "召回记忆可作为上下文，但重要决定需要用户确认。"
+    new = f"本页延续旧边界：{absorbed}"
 
     merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
 

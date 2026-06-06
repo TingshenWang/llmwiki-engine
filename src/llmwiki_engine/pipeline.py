@@ -11180,6 +11180,11 @@ def merge_update_section(
         if context_text and context_text != new:
             context_absorbed, context_matched_phrases, _ = update_section_absorption(old, context_text)
             absorbed = context_absorbed
+    if section_key == "additional_notes":
+        absorbed = False
+        context_absorbed = False
+        matched_phrases = []
+        context_matched_phrases = []
     if old and new and absorbed:
         retained.append(old)
     if new and not is_empty_placeholder(new):
@@ -11344,9 +11349,6 @@ def old_additional_note_is_high_signal_boundary(note: str) -> bool:
 def old_additional_note_absorbed(note: str, target: str) -> bool:
     if not note.strip() or not target.strip():
         return False
-    absorbed, matched, _ = update_section_absorption(note, target)
-    if absorbed and matched:
-        return True
     normalized_note = normalized_source_match_text(note)
     normalized_target = normalized_source_match_text(target)
     return bool(normalized_note and normalized_note in normalized_target)
@@ -11360,8 +11362,6 @@ def old_additional_note_superseded(note: str, target: str) -> bool:
         return False
     for sentence in old_additional_note_supersession_sentences(target):
         if not any(anchor in sentence for anchor in anchors):
-            continue
-        if old_additional_note_sentence_preserves_anchor(sentence, anchors):
             continue
         if old_additional_note_sentence_supersedes_anchor(sentence, anchors):
             return True
@@ -11392,25 +11392,50 @@ def old_additional_note_supersession_sentences(text: str) -> list[str]:
     return [sentence for sentence in re.split(r"[。！？!?；;\n]+", normalized) if sentence]
 
 
-def old_additional_note_sentence_preserves_anchor(sentence: str, anchors: list[str]) -> bool:
+def old_additional_note_supersession_clauses(sentence: str) -> list[str]:
+    return [clause for clause in re.split(r"[，,、]|但|不过|然而|而|同时|并且", sentence) if clause]
+
+
+def old_additional_note_clause_preserves_anchor(clause: str, anchor: str) -> bool:
     preservation_markers = ("仍", "仍然", "继续", "依然", "还是")
-    for anchor in anchors:
-        for marker in preservation_markers:
-            if re.search(rf"{marker}.{{0,8}}{re.escape(anchor)}|{re.escape(anchor)}.{{0,8}}{marker}", sentence):
-                return True
+    for marker in preservation_markers:
+        if re.search(rf"{marker}.{{0,8}}{re.escape(anchor)}|{re.escape(anchor)}.{{0,8}}{marker}", clause):
+            return True
     return False
 
 
 def old_additional_note_sentence_supersedes_anchor(sentence: str, anchors: list[str]) -> bool:
-    strong_markers = ("不再需要", "不适用", "deprecated", "废弃", "已废弃")
-    for anchor in anchors:
-        escaped = re.escape(anchor)
-        if any(marker in sentence for marker in strong_markers):
-            return True
-        if re.search(rf"{escaped}.{{0,12}}(?:已)?改为|(?:已)?改为.{{0,12}}{escaped}", sentence):
-            return True
-        if re.search(rf"{escaped}.{{0,12}}替代|替代.{{0,12}}{escaped}", sentence):
-            return True
+    for clause in old_additional_note_supersession_clauses(sentence):
+        for anchor in anchors:
+            if anchor not in clause:
+                continue
+            if old_additional_note_clause_preserves_anchor(clause, anchor):
+                continue
+            if old_additional_note_clause_is_capability_change(clause, anchor):
+                continue
+            if old_additional_note_clause_supersedes_anchor(clause, anchor):
+                return True
+    return False
+
+
+def old_additional_note_clause_is_capability_change(clause: str, anchor: str) -> bool:
+    capability_terms = r"(?:元数据|字段|日志|api|接口|能力|属性|参数)"
+    if re.search(r"(?:已)?改为(?:支持|提供|记录|返回|包含)", clause) and re.search(capability_terms, clause):
+        return True
+    if re.search(r"(?:已)?改为", clause) and re.search(rf"{re.escape(anchor)}.{{0,8}}{capability_terms}", clause):
+        return True
+    return False
+
+
+def old_additional_note_clause_supersedes_anchor(clause: str, anchor: str) -> bool:
+    escaped = re.escape(anchor)
+    strong_markers = ("不再需要", "不再依赖", "不适用", "deprecated", "废弃", "已废弃")
+    if any(re.search(rf"{marker}.{{0,8}}{escaped}|{escaped}.{{0,8}}{marker}", clause) for marker in strong_markers):
+        return True
+    if re.search(rf"{escaped}.{{0,12}}(?:已)?改为|(?:已)?改为.{{0,12}}{escaped}", clause):
+        return True
+    if re.search(rf"{escaped}.{{0,12}}替代|替代.{{0,12}}{escaped}", clause):
+        return True
     return False
 
 
