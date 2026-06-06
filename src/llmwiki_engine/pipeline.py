@@ -12984,7 +12984,44 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
         return True
     if examples_quote_has_factual_eval_marker(original):
         return True
-    unsafe_markers = [
+    if examples_quote_has_chinese_factual_eval_marker(normalized):
+        return True
+    unsafe_markers = ["订单", "交易", "付款", "支付", "退款", "删除", "凭证", "密码", "密钥", "账户", "账号", "权限", "收入", "状态", "张三", "李四", "王五"]
+    if any(marker in normalized for marker in unsafe_markers):
+        return True
+    return bool(re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original))
+
+
+def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
+    if looks_like_user_id_literal(normalized):
+        return True
+    if examples_quote_has_personal_name_reference(normalized, original):
+        return True
+    if examples_quote_has_sensitive_user_data_marker(normalized, original):
+        return True
+    if examples_quote_has_factual_eval_marker(original):
+        return True
+    if examples_quote_has_chinese_factual_eval_marker(normalized):
+        return True
+    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
+        return True
+    return False
+
+
+def examples_quote_has_factual_eval_marker(original: str = "") -> bool:
+    lowered_original = original.lower()
+    return bool(
+        re.search(
+            r"\b(?:support|supports|supported|improve|improves|improved|best|better|recommend|recommended|"
+            r"recommends|prove|proves|proved|cause|causes|caused|release|released|releases|launch|"
+            r"launched|launches)\b",
+            lowered_original,
+        )
+    )
+
+
+def examples_quote_has_chinese_factual_eval_marker(normalized: str) -> bool:
+    factual_eval_markers = [
         "最佳",
         "推荐",
         "证明",
@@ -13002,53 +13039,8 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
         "认为",
         "应该",
         "必须",
-        "订单",
-        "交易",
-        "付款",
-        "支付",
-        "退款",
-        "删除",
-        "凭证",
-        "密码",
-        "密钥",
-        "账户",
-        "账号",
-        "权限",
-        "收入",
-        "状态",
-        "张三",
-        "李四",
-        "王五",
     ]
-    if any(marker in normalized for marker in unsafe_markers):
-        return True
-    return bool(re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original))
-
-
-def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
-    if looks_like_user_id_literal(normalized):
-        return True
-    if examples_quote_has_personal_name_reference(normalized, original):
-        return True
-    if examples_quote_has_sensitive_user_data_marker(normalized, original):
-        return True
-    if examples_quote_has_factual_eval_marker(original):
-        return True
-    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
-        return True
-    return False
-
-
-def examples_quote_has_factual_eval_marker(original: str = "") -> bool:
-    lowered_original = original.lower()
-    return bool(
-        re.search(
-            r"\b(?:support|supports|supported|improve|improves|improved|best|better|recommend|recommended|"
-            r"recommends|prove|proves|proved|cause|causes|caused|release|released|releases|launch|"
-            r"launched|launches)\b",
-            lowered_original,
-        )
-    )
+    return any(marker in normalized for marker in factual_eval_markers)
 
 
 def examples_quote_has_personal_name_reference(normalized: str, original: str = "") -> bool:
@@ -13112,7 +13104,8 @@ def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str
     lowered_original = original.lower()
     if re.search(
         r"\b(?:payment|refund|credential|credentials|account|permission|password|passwd|secret|"
-        r"api[_-]?key|token|tokens|session|cookie|cookies|email|emails|phone|login|passwords)\b",
+        r"api[ _-]?keys?|token|tokens|session|cookie|cookies|email|emails|phone|login|passwords|"
+        r"secrets|passwds)\b",
         lowered_original,
     ):
         return True
@@ -13166,7 +13159,8 @@ def examples_english_sensitive_user_data_query(lowered_original: str) -> bool:
         r"birth\s*date|birthdate|profiles|profile|locations|location|ids|id|credit\s+cards|credit\s+card|"
         r"cards|card|tokens|token|sessions|session|passwords|password|credentials|credential|"
         r"accounts|account|permissions|permission|cookies|cookie|ssns|ssn|social\s+security\s+numbers|"
-        r"social\s+security\s+number|passport\s+numbers|passport\s+number|license\s+numbers|license\s+number"
+        r"social\s+security\s+number|passport\s+numbers|passport\s+number|license\s+numbers|license\s+number|"
+        r"api\s+keys|api\s+key|secrets|secret|passwds|passwd"
     )
     return bool(
         re.search(rf"\b(?:{user_markers})\b.{{0,32}}\b(?:{sensitive_objects})\b", lowered_original)
