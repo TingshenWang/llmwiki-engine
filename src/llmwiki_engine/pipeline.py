@@ -5192,6 +5192,7 @@ def build_draft_rendering_payload(
                 "Stable English product/protocol terms such as Claude Code, Managed Agents, harness, sandbox, session, MCP, Eval, TTFT, CLI, API, and Cowork may remain in English, but surrounding prose must be Chinese.",
                 "Ground examples, value points, and reuse scenarios in source content.",
                 "In section_bodies.examples, do not invent concrete user facts, user ids, preferences, dates, plans, metrics, credentials, or command arguments unless exact source text supports them; for generic explanation, use abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
+                "For CLI/API/code examples, Chinese surrounding explanation is fine, but command/API literal arguments are an explicit exception to the zh-CN translation rule: they must either copy exact source literals or use placeholders such as `<memory_text>`, `<user_id>`, or `<memory_query>`; do not translate a source literal into a new concrete preference, user id, query, path, or command argument.",
                 *DRAFT_RENDERING_GROUNDING_RISK_RULES,
                 "Do not write implementation details, examples, or claims as facts unless they are supported by source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
                 "If a useful detail is plausible but unsupported, put it under open_questions as 待补来源 instead of writing it as fact.",
@@ -5308,11 +5309,9 @@ def draft_rendering_relevant_wiki_paths(merge_plan: WikiMergePlanArtifact) -> tu
             item.canonical_target_path,
             item.matched_page or "",
         ]
-        context_paths = [
-            item.strongest_overlap.path,
-            *item.inspected_context_paths,
-            *[related.target_path for related in item.related_pages],
-        ]
+        context_paths = [related.target_path for related in item.related_pages]
+        if should_include_draft_inspected_context(item):
+            context_paths.extend([item.strongest_overlap.path, *item.inspected_context_paths])
         for raw_path in [*target_paths, *context_paths]:
             normalized = normalize_wiki_snapshot_path(raw_path)
             if normalized:
@@ -5327,6 +5326,12 @@ def draft_rendering_relevant_wiki_paths(merge_plan: WikiMergePlanArtifact) -> tu
             if normalized:
                 content_paths.add(normalized)
     return metadata_paths, content_paths
+
+
+def should_include_draft_inspected_context(item: WikiMergePlanItem) -> bool:
+    if item.action == "update":
+        return True
+    return item.strongest_overlap.strength in {"medium", "strong"}
 
 
 def normalize_wiki_snapshot_path(path: str) -> str:
@@ -10534,6 +10539,8 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
         reason = (
             f"{reason} 例子区不应换一个具体用户事实继续尝试；"
             "请改成抽象占位符（如 `某个用户`、`用户偏好 X`、`user_id`、`memory`）或删除该例子。"
+            "如果是 CLI/API/code 示例，命令参数要么照抄来源 literal，要么改成 `<memory_text>`、`<user_id>`、`<memory_query>` 这类占位符；"
+            "不要把被拒绝的具体偏好、用户 ID、查询或命令参数换成另一个具体值。"
         )
     if not text:
         return reason

@@ -3020,6 +3020,12 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
     assert "do not invent concrete user facts" in contract_rules
     assert "用户偏好 X" in contract_rules
+    assert "CLI/API/code examples" in contract_rules
+    assert "<memory_text>" in contract_rules
+    assert "<user_id>" in contract_rules
+    assert "<memory_query>" in contract_rules
+    assert "explicit exception to the zh-CN translation rule" in contract_rules
+    assert "do not translate a source literal into a new concrete preference" in contract_rules
     assert "Stable English product/protocol terms" in contract_rules
 
     sidecar = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
@@ -3068,7 +3074,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert context_projection_ref.schema_version == "draft_context_projection_report.v1"
 
 
-def test_draft_context_projection_keeps_create_neighbors_metadata_only() -> None:
+def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspected() -> None:
     update_item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["C001"]),
@@ -3077,6 +3083,12 @@ def test_draft_context_projection_keeps_create_neighbors_metadata_only() -> None
         matched_page="entities/Entity_Claude Code.md",
         display_title="Claude Code",
         page_type="entity",
+        strongest_overlap=pipeline_module.ContextOverlapSignal(
+            strength="weak",
+            path="concepts/Concept_Update_Strongest.md",
+            reason="weak update overlap should still keep metadata",
+        ),
+        inspected_context_paths=["concepts/Concept_Update_Inspected.md"],
         new_understanding="补充产品视角。",
         section_plans={"detail": "详情"},
         reason="测试 draft context projection。",
@@ -3099,7 +3111,7 @@ def test_draft_context_projection_keeps_create_neighbors_metadata_only() -> None
             )
         ],
         inspected_context_paths=["concepts/Concept_大脑与双手解耦.md"],
-        reason="测试 create 邻居只保留 metadata。",
+        reason="测试 create related 保留 metadata，但 weak inspected 不进入 draft payload。",
     )
     snapshot = pipeline_module.WikiContextSnapshot(
         log_date="2026-06-06",
@@ -3116,6 +3128,18 @@ def test_draft_context_projection_keeps_create_neighbors_metadata_only() -> None
                 expected_state="present",
                 preimage_sha256="old-managed",
                 content="# Managed Agents\n\n" + ("相关旧页正文不应进入 create draft payload。\n" * 40),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Update_Strongest.md",
+                expected_state="present",
+                preimage_sha256="old-update-strongest",
+                content="# Update Strongest\n\n" + ("update inspected context 正文不应进入 draft payload。\n" * 40),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Update_Inspected.md",
+                expected_state="present",
+                preimage_sha256="old-update-inspected",
+                content="# Update Inspected\n\n" + ("update inspected context 正文不应进入 draft payload。\n" * 40),
             ),
             pipeline_module.WikiContextEntry(
                 path="wiki/concepts/Concept_大脑与双手解耦.md",
@@ -3143,14 +3167,120 @@ def test_draft_context_projection_keeps_create_neighbors_metadata_only() -> None
     entries = {entry["path"]: entry for entry in projection["entries"]}
 
     assert "wiki/entities/Entity_Claude Code.md" in report["content_paths"]
+    assert pipeline_module.should_include_draft_inspected_context(update_item) is True
     assert entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"]
     assert entries["wiki/entities/Entity_Claude Code.md"]["content_role"] == "draft_context"
+    assert entries["wiki/concepts/Concept_Update_Strongest.md"]["content_excerpt"] == ""
+    assert entries["wiki/concepts/Concept_Update_Strongest.md"]["content_role"] == "metadata_only"
+    assert entries["wiki/concepts/Concept_Update_Inspected.md"]["content_excerpt"] == ""
+    assert entries["wiki/concepts/Concept_Update_Inspected.md"]["content_role"] == "metadata_only"
     assert entries["wiki/entities/Entity_Managed Agents.md"]["content_excerpt"] == ""
     assert entries["wiki/entities/Entity_Managed Agents.md"]["content_role"] == "metadata_only"
-    assert entries["wiki/concepts/Concept_大脑与双手解耦.md"]["content_excerpt"] == ""
+    assert "wiki/concepts/Concept_大脑与双手解耦.md" not in entries
+    assert "wiki/concepts/Concept_大脑与双手解耦.md" not in report["relevant_paths"]
     assert report["projected_content_entry_count"] == 1
     assert projection["included_content_entry_count"] == 1
     assert projection["included_entry_content_chars"] == len(entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"])
+
+
+def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> None:
+    medium_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MEDIUM",
+        source_basis=SourceBasis(source_candidate_ids=["C001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Medium_New.md",
+        display_title="Medium New",
+        page_type="concept",
+        strongest_overlap=pipeline_module.ContextOverlapSignal(
+            strength="medium",
+            path="concepts/Concept_Medium_Context.md",
+            reason="medium overlap should keep metadata",
+        ),
+        inspected_context_paths=["concepts/Concept_Medium_Inspected.md"],
+        new_understanding="新增 medium create。",
+        section_plans={"detail": "详情"},
+        reason="测试 medium create 保留 inspected metadata。",
+    )
+    strong_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-STRONG",
+        source_basis=SourceBasis(source_candidate_ids=["C002"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Strong_New.md",
+        display_title="Strong New",
+        page_type="concept",
+        strongest_overlap=pipeline_module.ContextOverlapSignal(
+            strength="strong",
+            path="concepts/Concept_Strong_Context.md",
+            reason="strong overlap should keep content",
+        ),
+        inspected_context_paths=["concepts/Concept_Strong_Inspected.md"],
+        new_understanding="新增 strong create。",
+        section_plans={"detail": "详情"},
+        reason="测试 strong create 保留 strongest overlap 正文。",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Medium_Context.md",
+                expected_state="present",
+                preimage_sha256="medium-context",
+                content="# Medium Context\n\n" + ("medium overlap 正文不应进入 create payload。\n" * 20),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Medium_Inspected.md",
+                expected_state="present",
+                preimage_sha256="medium-inspected",
+                content="# Medium Inspected\n\n" + ("medium inspected 正文不应进入 create payload。\n" * 20),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Strong_Context.md",
+                expected_state="present",
+                preimage_sha256="strong-context",
+                content="# Strong Context\n\nstrong overlap 正文应进入 create payload。\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Strong_Inspected.md",
+                expected_state="present",
+                preimage_sha256="strong-inspected",
+                content="# Strong Inspected\n\n" + ("strong inspected 只保留 metadata。\n" * 20),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Medium_New.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Strong_New.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            ),
+        ],
+    )
+
+    metadata_paths, content_paths = pipeline_module.draft_rendering_relevant_wiki_paths(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[medium_item, strong_item])
+    )
+    projection, report = pipeline_module.compact_snapshot_for_draft_rendering(
+        snapshot,
+        metadata_paths,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+        content_paths=content_paths,
+    )
+    entries = {entry["path"]: entry for entry in projection["entries"]}
+
+    assert pipeline_module.should_include_draft_inspected_context(medium_item) is True
+    assert pipeline_module.should_include_draft_inspected_context(strong_item) is True
+    assert entries["wiki/concepts/Concept_Medium_Context.md"]["content_role"] == "metadata_only"
+    assert entries["wiki/concepts/Concept_Medium_Inspected.md"]["content_role"] == "metadata_only"
+    assert entries["wiki/concepts/Concept_Strong_Context.md"]["content_role"] == "draft_context"
+    assert entries["wiki/concepts/Concept_Strong_Context.md"]["content_excerpt"]
+    assert entries["wiki/concepts/Concept_Strong_Inspected.md"]["content_role"] == "metadata_only"
+    assert "wiki/concepts/Concept_Strong_Context.md" in report["content_paths"]
+    assert "wiki/concepts/Concept_Medium_Context.md" not in report["content_paths"]
 
 
 def test_wiki_merge_planning_payload_uses_compact_context_projection(
@@ -6492,6 +6622,21 @@ def test_grounding_examples_hard_facts_still_require_support() -> None:
     message = pipeline_module.grounding_issue_message(review.unsupported_new_facts[0])
     assert "例子区不应换一个具体用户事实继续尝试" in message
     assert "用户偏好 X" in message
+    assert "<memory_text>" in message
+    assert "<user_id>" in message
+    assert "另一个具体值" in message
+
+
+def test_grounding_examples_repair_message_guides_cli_argument_placeholders() -> None:
+    review = build_examples_grounding_review('- `mem0 add --user-id user123 --text "用户喜欢科技类文章"`')
+
+    assert review.requires_review is True
+    message = pipeline_module.grounding_issue_message(review.unsupported_new_facts[0])
+    assert "<memory_text>" in message
+    assert "<user_id>" in message
+    assert "<memory_query>" in message
+    assert "命令参数" in message
+    assert "不要把被拒绝的具体偏好" in message
 
 
 def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match() -> None:
