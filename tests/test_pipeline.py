@@ -5633,6 +5633,190 @@ def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_pag
     ) == {"PP-BAD-1", "PP-BAD-2"}
 
 
+def test_cleanup_open_question_unsupported_scope_claims_moves_fact_to_question() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-OQ",
+        source_basis=SourceBasis(source_candidate_ids=["O001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+        display_title="记忆准确性",
+        page_type="open_question",
+        new_understanding="讨论记忆准确性。",
+        section_plans={"summary": "摘要", "examples": "例子", "open_questions": "问题"},
+        reason="test",
+    )
+    plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[item])
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[pipeline_module.WikiContextEntry(path="wiki/open_questions/Open_Question_记忆准确性.md", expected_state="missing")],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-OQ",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+                section_bodies={
+                    "summary": "讨论记忆准确性。",
+                    "examples": "例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。如何确保召回准确性？",
+                    "open_questions": "- 如何确认召回结果？",
+                },
+                change_summary="创建开放问题。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "记忆召回结果需要确认。")
+    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+        draft,
+        plan,
+        snapshot,
+        "记忆召回结果需要确认。",
+    )
+    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
+
+    page = cleaned.pages[0]
+    assert review_before.requires_review
+    assert report["changed"] is True
+    assert report["relocation_count"] == 1
+    assert "导致错误响应" not in page.section_bodies["examples"]
+    assert "如何确保召回准确性？" in page.section_bodies["examples"]
+    assert "待补来源：召回到不准确的用户偏好时，系统应如何确认与纠正？" in page.section_bodies["open_questions"]
+    assert not review_after.requires_review
+
+    cleaned_again, report_again = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+        cleaned,
+        plan,
+        snapshot,
+        "记忆召回结果需要确认。",
+    )
+    assert cleaned_again == cleaned
+    assert report_again["changed"] is False
+    assert report_again["relocation_count"] == 0
+
+
+def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-OQ",
+        source_basis=SourceBasis(source_candidate_ids=["O001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+        display_title="记忆准确性",
+        page_type="open_question",
+        new_understanding="讨论记忆准确性。",
+        section_plans={"summary": "摘要", "examples": "例子", "open_questions": "问题"},
+        reason="test",
+    )
+    plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[item])
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[pipeline_module.WikiContextEntry(path="wiki/open_questions/Open_Question_记忆准确性.md", expected_state="missing")],
+    )
+    duplicate_question = "待补来源：召回到不准确的用户偏好时，系统应如何确认与纠正？"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-OQ",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+                section_bodies={
+                    "summary": "讨论记忆准确性。",
+                    "examples": "例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。如何确保召回准确性？",
+                    "open_questions": f"- 如何确认召回结果？\n- {duplicate_question}",
+                },
+                change_summary="创建开放问题。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+        draft,
+        plan,
+        snapshot,
+        "记忆召回结果需要确认。",
+    )
+
+    page = cleaned.pages[0]
+    assert report["changed"] is True
+    assert report["pages"][0]["relocations"][0]["append_decision"] == "skipped_duplicate_question"
+    assert "导致错误响应" not in page.section_bodies["examples"]
+    assert page.section_bodies["open_questions"].count(duplicate_question) == 1
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
+
+
+def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CONCEPT",
+        source_basis=SourceBasis(source_candidate_ids=["C001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_记忆准确性.md",
+        display_title="记忆准确性",
+        page_type="concept",
+        new_understanding="讨论记忆准确性。",
+        section_plans={"summary": "摘要", "examples": "例子", "open_questions": "问题"},
+        reason="test",
+    )
+    plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[item])
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_记忆准确性.md", expected_state="missing")],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CONCEPT",
+                action="create",
+                canonical_target_path="concepts/Concept_记忆准确性.md",
+                section_bodies={
+                    "summary": "讨论记忆准确性。",
+                    "examples": "例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。",
+                    "open_questions": "- 如何确认召回结果？",
+                },
+                change_summary="创建概念页。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+        draft,
+        plan,
+        snapshot,
+        "记忆召回结果需要确认。",
+    )
+
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
+
+
+def test_draft_rendering_batch_refs_include_open_question_cleanup_schema(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    step_root = run_dir / "draft_rendering"
+    report_path = step_root / "model_batches" / "batch-001" / "open_question_grounding_cleanup_report.json"
+    report_path.parent.mkdir(parents=True)
+    write_json(
+        report_path,
+        {
+            "schema_version": "open_question_grounding_cleanup_report.v1",
+            "changed": False,
+            "relocation_count": 0,
+            "skipped_count": 0,
+            "pages": [],
+        },
+    )
+
+    refs = pipeline_module.draft_rendering_model_batch_refs(run_dir, step_root, "draft_rendering")
+    cleanup_ref = next(ref for ref in refs if ref.relative_path.endswith("open_question_grounding_cleanup_report.json"))
+
+    assert cleanup_ref.schema_version == "open_question_grounding_cleanup_report.v1"
+
+
 def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> None:
     merge_plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
