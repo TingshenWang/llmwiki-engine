@@ -581,8 +581,9 @@ def _fetch_url(url: str, *, timeout: float, max_bytes: int, client: httpx.Client
 
 def _read_limited_response(url: str, response: httpx.Response, *, max_bytes: int) -> httpx.Response:
     response.raise_for_status()
+    is_encoded = bool(response.headers.get("content-encoding"))
     content_length = response.headers.get("content-length")
-    if content_length:
+    if content_length and not is_encoded:
         try:
             declared_bytes = int(content_length)
         except ValueError:
@@ -596,11 +597,16 @@ def _read_limited_response(url: str, response: httpx.Response, *, max_bytes: int
         if total > max_bytes:
             raise RawUrlImportError(f"Fetched content is too large: {total} bytes > {max_bytes} max_bytes")
         chunks.append(chunk)
+    headers = httpx.Headers(response.headers)
+    for transport_header in ("content-encoding", "content-length", "transfer-encoding"):
+        if transport_header in headers:
+            del headers[transport_header]
     return httpx.Response(
         response.status_code,
-        headers=response.headers,
+        headers=headers,
         content=b"".join(chunks),
         request=response.request,
+        extensions=response.extensions,
     )
 
 

@@ -60,6 +60,7 @@ from llmwiki_engine.steps import (
     step_output_dir,
 )
 from llmwiki_engine.system_pages import local_date
+from llmwiki_engine.validators import validate_wiki_merge_plan
 from llmwiki_engine.verify import VerifyError, verify_run
 from llmwiki_engine.workspace import RunStore, WorkspaceError, ensure_workspace_layout
 
@@ -2206,6 +2207,83 @@ def test_raw_prepare_noise_profile_does_not_count_url_scheme_as_speaker_turn() -
     )
 
     assert noise["speaker_turn_count"] == 1
+
+
+def test_raw_prepare_noise_profile_does_not_count_explanatory_colon_labels_as_speaker_turn() -> None:
+    noise = pipeline_module.raw_prepare_noise_profile(
+        "When to use this workflow: choose it when the path is predictable.\n"
+        "Examples where routing helps: customer service and model selection.\n"
+        "Sectioning: break a task into independent subtasks.\n"
+        "Voting: run the same task multiple times.\n"
+        "Table 1: accuracy and cost comparison.\n"
+        "## Product Strategy: release approach.\n"
+        "- Key Idea: keep routing explicit.\n"
+        "- Agent Design: document tool contracts.\n"
+        "- Speaker: bullet role labels still count.\n"
+        "- Speaker 1: numbered bullet speaker labels still count.\n"
+        "- Interviewer A: lettered bullet role labels still count.\n"
+        "User: this is a real transcript turn.\n"
+        "Cat Wu: this is also a real speaker turn.\n"
+        "主持人：这是中文主持人发言。\n"
+    )
+
+    assert noise["speaker_turn_count"] == 6
+
+
+def test_raw_prepare_fast_path_allows_structured_web_article_with_colon_labels(tmp_path: Path) -> None:
+    raw = tmp_path / "anthropic-agent-patterns.md"
+    sections = []
+    for heading in [
+        "What are agents?",
+        "When and how to use frameworks",
+        "Building block: The augmented LLM",
+        "Workflow: Prompt chaining",
+        "Workflow: Routing",
+        "Workflow: Parallelization",
+        "Workflow: Orchestrator-workers",
+        "Workflow: Evaluator-optimizer",
+    ]:
+        sections.append(
+            f"## {heading}\n\n"
+            f"When to use this workflow: choose it when {heading.lower()} fits the task boundary.\n"
+            f"Examples where this helps: customer support, coding tasks, and evaluation loops.\n"
+            f"Sectioning: split the problem when independent work can run in parallel.\n"
+            f"Voting: repeat the same judgment when confidence matters.\n"
+            + "\n".join(
+                f"This paragraph {index} explains a practical agentic system pattern with clear punctuation."
+                for index in range(1, 5)
+            )
+        )
+    raw.write_text(
+        "# Building Effective AI Agents\n\n"
+        "Imported from: https://www.anthropic.com/research/building-effective-agents\n"
+        "Fetched URL: https://www.anthropic.com/engineering/building-effective-agents\n\n"
+        "Q: Should teams always build agents?\n"
+        "A: No, teams should start with the simplest useful system.\n\n"
+        + "\n\n".join(sections),
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/anthropic-agent-patterns.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/anthropic-agent-patterns.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert report["eligible"] is True
+    assert report["noise_profile"]["speaker_turn_count"] == 2
+    assert "raw looks like a speaker-turn transcript" not in report["reasons"]
+    assert preparation.document_kind == "article"
+    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
 
 
 def test_raw_prepare_skip_prepare_records_local_provider(tmp_path: Path) -> None:
@@ -9449,6 +9527,27 @@ def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> 
 
 def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(tmp_path: Path) -> None:
     vault, _ = make_vault(tmp_path)
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id=f"CAND00{index}",
+                name=title,
+                type=page_type,
+                one_sentence_summary=f"{title} 摘要。",
+                why_matters="它值得沉淀。",
+                wiki_value="它属于 wiki。",
+                suggested_page_title=title,
+            )
+            for index, page_type, title in [
+                (1, "concept", "Agent 与 Workflow 对比"),
+                (2, "comparison", "Workflow vs Agent"),
+                (3, "concept", "RAG 概念"),
+                (4, "design", "RAG 系统设计"),
+            ]
+        ],
+    )
     resolution = CandidateResolutionArtifact(
         items=[
             resolution_item("CAND001", page_type="concept", target_path="concepts/Concept_Agent 与 Workflow 对比.md", display_title="Agent 与 Workflow 对比"),
@@ -9459,7 +9558,14 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
     )
     snapshot = build_wiki_context_snapshot(vault, resolution, log_date="2026-06-06", source_target_path="sources/Source_Test.md")
 
-    def plan_item(page_plan_id: str, candidate_id: str, page_type: str, target_path: str, title: str) -> pipeline_module.WikiMergePlanItem:
+    def plan_item(
+        page_plan_id: str,
+        candidate_id: str,
+        page_type: str,
+        target_path: str,
+        title: str,
+        related_pages: list[pipeline_module.RelatedPageRef] | None = None,
+    ) -> pipeline_module.WikiMergePlanItem:
         return pipeline_module.WikiMergePlanItem(
             page_plan_id=page_plan_id,
             source_basis=SourceBasis(source_candidate_ids=[candidate_id]),
@@ -9472,6 +9578,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
             why_this_matters="帮助判断什么时候用稳定流程，什么时候用智能体。",
             value_points=["帮助判断方案边界。"],
             section_plans={"summary": f"{title} 摘要。", "detail": f"{title} 讨论 Agent 与 Workflow 的差异。"},
+            related_pages=related_pages or [],
             reason=f"{title} 值得沉淀。",
         )
 
@@ -9480,7 +9587,21 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
             log_date="2026-06-06",
             context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
                 items=[
-                    plan_item("PP-CAND001", "CAND001", "concept", "concepts/Concept_Agent 与 Workflow 对比.md", "Agent 与 Workflow 对比"),
+                    plan_item(
+                        "PP-CAND001",
+                        "CAND001",
+                        "concept",
+                        "concepts/Concept_Agent 与 Workflow 对比.md",
+                        "Agent 与 Workflow 对比",
+                        related_pages=[
+                            pipeline_module.RelatedPageRef(
+                                target_path="comparisons/Comparison_Workflow vs Agent.md",
+                                display_title="Workflow vs Agent",
+                                source="source_digest",
+                                reason="两页描述同一组边界。",
+                            )
+                        ],
+                    ),
                     plan_item("PP-CAND002", "CAND002", "comparison", "comparisons/Comparison_Workflow vs Agent.md", "Workflow vs Agent"),
                     pipeline_module.WikiMergePlanItem(
                         page_plan_id="PP-CAND003",
@@ -9494,6 +9615,14 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
                         why_this_matters="帮助区分 RAG 概念和具体系统设计。",
                         value_points=["帮助判断什么时候需要检索增强。"],
                         section_plans={"summary": "RAG 概念摘要。", "detail": "RAG 概念讨论检索增强生成的定义和边界。"},
+                        related_pages=[
+                            pipeline_module.RelatedPageRef(
+                                target_path="concepts/Concept_Agent 与 Workflow 对比.md",
+                                display_title="Agent 与 Workflow 对比",
+                                source="source_digest",
+                                reason="RAG 概念可与 Agent/Workflow 边界对比。",
+                            )
+                        ],
                         reason="RAG 概念值得沉淀。",
                     ),
                 pipeline_module.WikiMergePlanItem(
@@ -9526,6 +9655,12 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
     assert set(agent_item.source_basis.source_candidate_ids) == {"CAND001", "CAND002"}
     assert {"PP-CAND001", "PP-CAND002"} <= set(agent_item.merged_page_plan_ids)
     assert "合并自" in "\n".join(agent_item.section_plans.values())
+    assert agent_item.related_pages == []
+    rag_item = next(item for item in plan.items if item.canonical_target_path == "concepts/Concept_RAG 概念.md")
+    assert [(related.target_path, related.display_title) for related in rag_item.related_pages] == [
+        ("comparisons/Comparison_Workflow vs Agent.md", "Workflow vs Agent")
+    ]
+    validate_wiki_merge_plan(digest, plan, resolution, snapshot, language="zh-CN")
 
 
 def test_source_recorded_operation_cannot_resume(tmp_path: Path) -> None:

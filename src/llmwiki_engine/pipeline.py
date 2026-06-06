@@ -441,11 +441,23 @@ MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK = 2
 MERGE_PLANNING_CONTEXT_QUERY_LIMIT = 420
 MERGE_PLANNING_ENTRY_EXCERPT_LIMIT = 900
 TRANSCRIPT_TIMESTAMP_RE = re.compile(r"^\s*(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\d{1,2}:\d{2}(?::\d{2})?\s*[-–—])")
-SPEAKER_TURN_RE = re.compile(
-    r"^\s*(?:"
-    r"(?:Q|A|问|答|主持人|嘉宾|采访者|受访者|Speaker|Interviewer|Interviewee)\s*[:：](?!//)"
-    r"|[A-Z][A-Za-z ._-]{1,32}\s*:(?!//)"
-    r")"
+SPEAKER_TURN_RE = re.compile(r"^\s*(?P<label>[^:：\n]{1,48})\s*[:：](?!//)\s*(?P<body>.*)$")
+SPEAKER_ROLE_LABEL_RE = re.compile(
+    r"(?i)^(?:"
+    r"(?:q|a|qa|question|answer|user|assistant|human|system|speaker|host|guest|moderator|"
+    r"interviewer|interviewee|participant|audience)(?:\s*(?:#?\d+|[A-Z]))?"
+    r"|(?:问|答|主持人|嘉宾|采访者|受访者|提问|回答)(?:[A-Za-z0-9一二三四五六七八九十]+)?"
+    r")$"
+)
+SPEAKER_EXPLANATORY_LABEL_RE = re.compile(
+    r"(?i)\b(?:"
+    r"when|where|why|how|what|example|examples|sectioning|voting|workflow|workflows|pattern|"
+    r"steps?|input|output|use|best for|limitations?|notes?|summary|goal|tables?|figures?|appendix|"
+    r"imported from|"
+    r"fetched url|final url|content type|source|title|author|tags"
+    r")\b"
+    r"|何时|哪里|为什么|如何|什么|示例|例子|分片|投票|工作流|模式|步骤|输入|输出|用法|"
+    r"适用|限制|注意|摘要|目标|表格|图表|附录|来源|标题|作者|标签"
 )
 MARKDOWN_MEDIA_EMBED_RE = re.compile(r"!\[[^\]\n]*\]\([^)]+\)")
 INTERVIEW_TRANSCRIPT_MARKER_RE = re.compile(r"(?im)^\s*#{1,3}\s*(?:访谈全文|采访全文|完整访谈|Transcript|Full Transcript)\s*$")
@@ -1532,7 +1544,7 @@ def raw_prepare_noise_profile(text: str) -> dict[str, Any]:
     body_lines = raw_prepare_body_lines_for_noise(text)
     body_line_count = len(body_lines)
     timestamp_line_count = sum(1 for line in lines if TRANSCRIPT_TIMESTAMP_RE.search(line))
-    speaker_turn_count = sum(1 for line in lines if SPEAKER_TURN_RE.search(line))
+    speaker_turn_count = sum(1 for line in lines if looks_like_speaker_turn_line(line))
     heading_count = sum(1 for line in lines if re.match(r"^\s{0,3}#{1,6}\s+\S", line))
     short_body_line_count = sum(1 for line in body_lines if len(line) <= 32)
     missing_sentence_terminal_count = sum(
@@ -1591,6 +1603,54 @@ def raw_prepare_noise_profile(text: str) -> dict[str, Any]:
     noise["transcript_provenance_risk"] = raw_prepare_transcript_provenance_risk(noise)
     noise["structured_markdown_quality_risk"] = raw_prepare_structured_markdown_quality_risk(noise)
     return noise
+
+
+def looks_like_speaker_turn_line(line: str) -> bool:
+    stripped = line.strip()
+    if re.match(r"#{1,6}\s+\S", stripped):
+        return False
+    list_prefix_match = re.match(r"(?:[-*+]|\d+[.)])\s+", stripped)
+    in_list_item = list_prefix_match is not None
+    if list_prefix_match is not None:
+        stripped = stripped[list_prefix_match.end() :]
+    match = SPEAKER_TURN_RE.match(stripped)
+    if match is None:
+        return False
+    label = match.group("label").strip().strip("*_`[]()")
+    body = match.group("body").strip()
+    if not label or not raw_prepare_speaker_turn_body_has_content(body):
+        return False
+    if SPEAKER_EXPLANATORY_LABEL_RE.search(label):
+        return False
+    if SPEAKER_ROLE_LABEL_RE.fullmatch(label):
+        return True
+    if raw_prepare_short_cjk_speaker_label(label):
+        return True
+    return (not in_list_item) and raw_prepare_title_case_speaker_label(label)
+
+
+def raw_prepare_speaker_turn_body_has_content(body: str) -> bool:
+    if not body:
+        return False
+    if re.fullmatch(r"https?://\S+", body, flags=re.IGNORECASE):
+        return False
+    return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", body))
+
+
+def raw_prepare_short_cjk_speaker_label(label: str) -> bool:
+    compact = re.sub(r"\s+", "", label)
+    if not re.search(r"[\u4e00-\u9fff]", compact):
+        return False
+    return bool(re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9·・]{2,8}", compact))
+
+
+def raw_prepare_title_case_speaker_label(label: str) -> bool:
+    if len(label) > 40:
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z.'_-]*", label)
+    if not 1 <= len(words) <= 4:
+        return False
+    return all(word[0].isupper() or word.isupper() for word in words)
 
 
 def raw_prepare_body_lines_for_noise(text: str) -> list[str]:
@@ -1698,7 +1758,7 @@ def raw_prepare_structured_markdown_quality_risk(noise: dict[str, Any]) -> bool:
 def infer_passthrough_document_kind(text: str, noise: dict[str, Any]) -> Literal["transcript", "article", "notes", "mixed", "unknown"]:
     if noise.get("paper_like_marker"):
         return "article"
-    if noise["timestamp_line_count"] or noise["speaker_turn_count"]:
+    if raw_prepare_timestamp_transcript_noise(noise) or raw_prepare_speaker_turn_transcript_noise(noise):
         return "transcript"
     if noise.get("interview_transcript_marker"):
         return "transcript"
@@ -9379,6 +9439,7 @@ def merge_update_noop_same_targets(items: list[WikiMergePlanItem]) -> list[WikiM
 
 def merge_same_source_duplicate_creates(items: list[WikiMergePlanItem]) -> list[WikiMergePlanItem]:
     result = list(items)
+    related_redirects: dict[str, str] = {}
     changed = True
     while changed:
         changed = False
@@ -9394,6 +9455,10 @@ def merge_same_source_duplicate_creates(items: list[WikiMergePlanItem]) -> list[
                     continue
                 canonical, suppressed = choose_duplicate_canonical(left, right)
                 merged = absorb_duplicate_create(canonical, suppressed)
+                suppressed_path = normalize_related_candidate_path(suppressed.canonical_target_path)
+                canonical_path = normalize_related_candidate_path(merged.canonical_target_path)
+                if suppressed_path is not None and canonical_path is not None and suppressed_path != canonical_path:
+                    related_redirects[suppressed_path] = canonical_path
                 keep_index = left_index if canonical is left else right_index
                 drop_index = right_index if canonical is left else left_index
                 result[keep_index] = merged
@@ -9402,7 +9467,60 @@ def merge_same_source_duplicate_creates(items: list[WikiMergePlanItem]) -> list[
                 break
             if changed:
                 break
-    return result
+    return rewrite_related_pages_after_path_redirects(result, related_redirects)
+
+
+def rewrite_related_pages_after_path_redirects(
+    items: list[WikiMergePlanItem],
+    redirects: dict[str, str],
+) -> list[WikiMergePlanItem]:
+    if not redirects:
+        return items
+    title_by_path = {
+        path: item.display_title
+        for item in items
+        if (path := normalize_related_candidate_path(item.canonical_target_path)) is not None
+    }
+    rewritten: list[WikiMergePlanItem] = []
+    for item in items:
+        item_path = normalize_related_candidate_path(item.canonical_target_path)
+        related_pages: list[RelatedPageRef] = []
+        seen_related: set[str] = set()
+        for related in item.related_pages:
+            path = normalize_related_candidate_path(related.target_path)
+            if path is None:
+                continue
+            target_path = resolve_related_redirect(path, redirects)
+            if target_path == item_path or target_path in seen_related:
+                continue
+            seen_related.add(target_path)
+            related_pages.append(
+                related.model_copy(
+                    update={
+                        "target_path": target_path,
+                        "display_title": title_by_path.get(target_path, related.display_title),
+                    }
+                )
+            )
+            if len(related_pages) >= FINAL_RELATED_LIMIT:
+                break
+        related_absence_reason = item.related_absence_reason
+        if not related_pages and related_absence_reason is None:
+            related_absence_reason = "self_link_only" if item.related_pages else "no_candidate"
+        rewritten.append(item.model_copy(update={"related_pages": related_pages, "related_absence_reason": related_absence_reason}))
+    return rewritten
+
+
+def resolve_related_redirect(path: str, redirects: dict[str, str]) -> str:
+    current = path
+    seen: set[str] = set()
+    while current in redirects and current not in seen:
+        seen.add(current)
+        next_path = redirects[current]
+        if next_path == current:
+            break
+        current = next_path
+    return current
 
 
 def same_source_duplicate_create(left: WikiMergePlanItem, right: WikiMergePlanItem) -> bool:

@@ -1,6 +1,8 @@
+import gzip
+from pathlib import Path
+
 import httpx
 import pytest
-from pathlib import Path
 
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.pipeline import init_vault, scan_raw_ingest_candidates
@@ -164,6 +166,40 @@ def test_import_raw_url_aborts_stream_when_max_bytes_exceeded(tmp_path: Path) ->
 
     assert stream.yielded == 3
     assert list((vault / "raw").glob("*.md")) == []
+
+
+def test_import_raw_url_handles_gzip_stream_without_double_decompression(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    html = b"""
+    <html>
+      <head><title>Compressed Article</title></head>
+      <body><article><h1>Compressed Body</h1><p>Decoded text survives.</p></article></body>
+    </html>
+    """
+    compressed = gzip.compress(html)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/html; charset=utf-8",
+                "content-encoding": "gzip",
+                "content-length": str(len(compressed)),
+            },
+            content=compressed,
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = import_raw_url(vault, "https://example.com/compressed", client=client)
+
+    text = Path(result.absolute_path).read_text(encoding="utf-8")
+    assert result.content_type == "text/html"
+    assert result.format == "html"
+    assert result.raw_path == "raw/Compressed Article.md"
+    assert "# Compressed Body" in text
+    assert "Decoded text survives." in text
 
 
 def test_import_arxiv_search_imports_top_result_via_html(tmp_path: Path) -> None:
