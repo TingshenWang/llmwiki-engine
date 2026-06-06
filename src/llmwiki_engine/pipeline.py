@@ -12253,6 +12253,7 @@ def collect_grounding_claims(
                 is_concept_label_quote = False
             if examples_unsafe_bypass_quote:
                 is_illustrative_example = False
+                is_memory_example = False
             section_example_hard_fact = section_key == "examples" and (
                 contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote)
             )
@@ -12942,11 +12943,22 @@ def examples_query_template_quote(body: str, normalized: str, original: str = ""
 
 def examples_query_template_local_context(body: str, quote_start: int, original: str) -> bool:
     prefix = re.sub(r"\s+", "", body[max(0, quote_start - 28) : quote_start])
-    quote_end = quote_start + len(original) + 2
+    quote_end = examples_quote_end_index(body, quote_start, original)
     suffix = re.sub(r"\s+", "", body[quote_end : quote_end + 24])
     if re.search(r"(?:问及|提问|询问|查询|请求|搜索|类似|例如|比如|示例|例子|如果用|可以用|输入)$", prefix):
         return True
     return bool(re.match(r"(?:的)?(?:请求|问题|问句|查询|搜索|询问|提问|输入|query|prompt|request)", suffix, re.IGNORECASE))
+
+
+def examples_quote_end_index(body: str, quote_start: int, original: str) -> int:
+    if quote_start < 0 or quote_start >= len(body):
+        return max(0, quote_start) + len(original)
+    opening = body[quote_start]
+    closing = "”" if opening == "“" else '"'
+    quote_end = body.find(closing, quote_start + 1)
+    if quote_end >= 0:
+        return quote_end + 1
+    return quote_start + len(original) + 2
 
 
 def examples_query_template_has_unsafe_marker(normalized: str, original: str = "") -> bool:
@@ -13023,18 +13035,9 @@ def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str =
 
 
 def examples_quote_has_personal_name_reference(normalized: str, original: str = "") -> bool:
-    if any(marker in normalized for marker in ["某个用户", "某位用户", "该用户", "用户", "客户"]):
-        abstracted = (
-            normalized.replace("某个用户", "")
-            .replace("某位用户", "")
-            .replace("该用户", "")
-            .replace("用户", "")
-            .replace("客户", "")
-        )
-    else:
-        abstracted = normalized
-    if re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original):
-        return True
+    abstracted = normalized
+    for marker in ["某个用户", "某位用户", "该用户", "某个客户", "某位客户", "该客户"]:
+        abstracted = abstracted.replace(marker, "<abstract_user>")
     surnames = (
         "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜谢邹喻柏"
         "水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费廉岑薛雷贺倪"
@@ -13056,9 +13059,22 @@ def examples_quote_has_personal_name_reference(normalized: str, original: str = 
         "记忆|片段|对话|摘要|工单|订单|偏好|账户|账号|手机号|手机号码|电话|邮箱|"
         "邮件|登录|记录|凭证|密码|密钥|权限|身份证|证件|银行卡|信用卡"
     )
-    return bool(
+    chinese_person_ref = bool(
         re.search(rf"[{surnames}][\u4e00-\u9fff]{{1,2}}的(?:{person_objects})", abstracted)
-        or re.search(rf"(?:查询|搜索|查看|读取|获取)[{surnames}][\u4e00-\u9fff]{{1,2}}(?:{direct_person_objects})", abstracted)
+        or re.search(
+            rf"(?:查询|搜索|查看|读取|获取)[{surnames}][\u4e00-\u9fff]{{1,2}}(?:{direct_person_objects})",
+            abstracted,
+        )
+    )
+    if chinese_person_ref:
+        return True
+    latin_person = r"[A-Z][A-Za-z]{1,31}"
+    english_person_objects = r"memory|memories|ticket|order|account|phone|email|login|session|cookie|credential|credentials"
+    return bool(
+        re.search(rf"{latin_person}的(?:{person_objects})", original)
+        or re.search(rf"(?:查询|搜索|查看|读取|获取){latin_person}(?:的)?(?:{direct_person_objects})", original)
+        or re.search(rf"\b(?:query|search|lookup|find|get)\s+{latin_person}\s+(?:{english_person_objects})\b", original, re.IGNORECASE)
+        or re.search(rf"\b{latin_person}(?:'s|’s)\s+(?:{english_person_objects})\b", original, re.IGNORECASE)
     )
 
 

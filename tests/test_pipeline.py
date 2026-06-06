@@ -8503,6 +8503,20 @@ def test_grounding_examples_query_template_direct_quote_still_requires_support()
 @pytest.mark.parametrize(
     "examples",
     [
+        "类似“查询某个用户的记忆片段”的请求",
+        "类似“查询某个用户的记忆片段”的请求可以作为模板。",
+        "类似“Redis setup guide”的请求",
+    ],
+)
+def test_grounding_examples_allow_isolated_query_template_contexts(examples: str) -> None:
+    review = build_examples_grounding_review(examples)
+
+    assert review.requires_review is False
+
+
+@pytest.mark.parametrize(
+    "examples",
+    [
         "类似“Redis 支持集群模式”的问题",
         "类似“用户 1234 删除了凭证”的请求",
         "类似“Alice uses MacBook in 2026”的请求",
@@ -8513,6 +8527,8 @@ def test_grounding_examples_query_template_direct_quote_still_requires_support()
         "类似“查询某个用户的邮箱地址”的请求",
         "类似“查询用户登录记录”的请求",
         "类似“query a user's email address”的请求",
+        "类似“查询Alice的记忆片段”的请求",
+        "类似“查询Charlie的记忆片段”的请求",
     ],
 )
 def test_grounding_examples_query_template_keeps_fact_like_quotes_strict(examples: str) -> None:
@@ -8532,6 +8548,21 @@ def test_grounding_examples_query_template_keeps_fact_like_quotes_strict(example
     ],
 )
 def test_grounding_examples_sensitive_quotes_do_not_use_bypass_paths(examples: str) -> None:
+    review = build_examples_grounding_review(examples)
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+@pytest.mark.parametrize(
+    "examples",
+    [
+        "问句“查询某个用户的手机号”用于评估。",
+        "记忆评估问题“用户登录记录是什么？”",
+        "记忆评估问题“王小明的手机号是多少？”",
+    ],
+)
+def test_grounding_examples_sensitive_memory_eval_quotes_stay_strict(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
     assert review.requires_review is True
@@ -8562,6 +8593,7 @@ def test_grounding_examples_sensitive_quotes_do_not_use_bypass_paths(examples: s
         '- `recall("用户喜欢蓝色")`',
         '- `recall("某个用户在北京门店消费过")`',
         '- `recall("用户最近的订单状态")`',
+        '- `recall("查询某个用户的手机号")`',
         '- `mem0 search "用户最近的工单信息" --user-id user123`',
     ],
 )
