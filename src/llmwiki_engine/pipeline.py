@@ -11293,7 +11293,11 @@ def old_additional_note_units(text: str) -> list[str]:
 
 def strip_old_additional_note_label(text: str) -> str:
     stripped = text.strip()
-    stripped = re.sub(r"^(?:旧页补充观察|旧页保留观察)[:：]\s*", "", stripped)
+    while True:
+        next_value = re.sub(r"^(?:旧页补充观察|旧页保留观察)[:：]\s*", "", stripped).strip()
+        if next_value == stripped:
+            break
+        stripped = next_value
     return stripped.strip()
 
 
@@ -11343,41 +11347,44 @@ def old_additional_note_absorbed(note: str, target: str) -> bool:
     absorbed, matched, _ = update_section_absorption(note, target)
     if absorbed and matched:
         return True
-    note_key = open_question_key(note)
-    if note_key:
-        if any(
-            old_additional_note_overlaps_open_question(note, note_key, question)
-            for question in meaningful_open_question_lines(target)
-        ):
-            return True
     normalized_note = normalized_source_match_text(note)
     normalized_target = normalized_source_match_text(target)
     return bool(normalized_note and normalized_note in normalized_target)
-
-
-def old_additional_note_overlaps_open_question(note: str, note_key: str, question: str) -> bool:
-    question_key = open_question_key(question)
-    if not note_key or not question_key:
-        return False
-    if note_key == question_key or open_question_key_contains_other(note_key, question_key):
-        return True
-    note_norm = open_question_similarity_text(note)
-    question_norm = open_question_similarity_text(question)
-    if open_question_key_contains_other(note_norm, question_norm):
-        return True
-    return open_question_token_overlap(note_norm, question_norm) >= 0.56
 
 
 def old_additional_note_superseded(note: str, target: str) -> bool:
     if not note.strip() or not target.strip():
         return False
     normalized_target = re.sub(r"\s+", "", unicodedata.normalize("NFKC", target.lower()))
-    supersession_markers = ("不再需要", "已改为", "改为", "替代", "不适用", "deprecated", "废弃", "已废弃", "新版")
+    supersession_markers = ("不再需要", "已改为", "改为", "替代", "不适用", "deprecated", "废弃", "已废弃")
     if not any(marker in normalized_target for marker in supersession_markers):
         return False
     note_terms = source_digest_non_generic_terms(source_digest_similarity_terms(note))
     target_terms = source_digest_non_generic_terms(source_digest_similarity_terms(target))
-    return bool(note_terms and target_terms and note_terms & target_terms)
+    shared_terms = note_terms & target_terms
+    anchors = old_additional_note_supersession_anchors(note)
+    if any(anchor in normalized_target for anchor in anchors):
+        return True
+    return len(shared_terms) >= 2
+
+
+def old_additional_note_supersession_anchors(note: str) -> list[str]:
+    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note.lower()))
+    anchors = [
+        "用户确认",
+        "重要决定",
+        "重大决策",
+        "不可逆",
+        "绝对真实",
+        "召回记忆",
+        "权限边界",
+        "隔离边界",
+        "安全风险",
+        "可靠性风险",
+        "隐私风险",
+        "成本约束",
+    ]
+    return [anchor for anchor in anchors if anchor in normalized]
 
 
 def preserved_old_additional_notes_block(notes: list[str]) -> str:

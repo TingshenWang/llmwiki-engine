@@ -4841,7 +4841,7 @@ def test_merge_update_section_additional_notes_does_not_reintroduce_superseded_n
 
 def test_merge_update_section_additional_notes_strips_legacy_label_before_preserving() -> None:
     note = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
-    old = f"旧页补充观察：{note}"
+    old = f"旧页补充观察：旧页补充观察：{note}"
     new = "本页面补充 Redis 等实现方式。"
 
     merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
@@ -4853,7 +4853,7 @@ def test_merge_update_section_additional_notes_strips_legacy_label_before_preser
     assert change.preserved_old == [note]
 
 
-def test_merge_update_section_additional_notes_does_not_duplicate_open_question_overlap() -> None:
+def test_merge_update_section_additional_notes_keeps_boundary_even_when_open_question_overlaps() -> None:
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "本页面补充通用记忆架构。"
     context = f"{new}\n\n- 重要决定是否需要用户确认？"
@@ -4865,11 +4865,33 @@ def test_merge_update_section_additional_notes_does_not_duplicate_open_question_
         absorption_context=context,
     )
 
-    assert merged == new
-    assert "旧页补充观察" not in merged
+    assert "旧页补充观察" in merged
+    assert old in merged
     assert change.retained == [old]
-    assert change.preserved_old == []
+    assert change.preserved_old == [old]
     assert change.removed == []
+
+
+def test_merge_update_section_additional_notes_generic_new_version_does_not_supersede_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "新版页面补充通用记忆架构。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
+
+
+def test_merge_update_section_additional_notes_unrelated_replacement_does_not_supersede_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "新版 API 已改为支持记忆元数据。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.preserved_old == [old]
 
 
 def test_merge_update_section_additional_notes_reports_absorbed_and_removed_units_separately() -> None:
