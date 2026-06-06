@@ -29,6 +29,12 @@ class RunMode(str, Enum):
     standard = "standard"
 
 
+class RawPreparePolicy(str, Enum):
+    auto = "auto"
+    force_model = "force-model"
+    skip_model = "skip-model"
+
+
 class ArtifactVisibility(str, Enum):
     run_cache = "run_cache"
     committed_receipt = "committed_receipt"
@@ -67,6 +73,8 @@ class VerificationStatus(str, Enum):
 class VaultConfig(StrictModel):
     wiki_language: Literal["zh-CN"] = "zh-CN"
     max_context_chars: int = 800_000
+    max_ingest_candidates: int = 12
+    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto
     embedding_retrieval: "EmbeddingRetrievalConfig" = Field(default_factory=lambda: EmbeddingRetrievalConfig())
 
 
@@ -75,6 +83,10 @@ class EmbeddingRetrievalConfig(StrictModel):
     backend: Literal["sentence_transformers", "exact"] = "sentence_transformers"
     model: str = "Qwen/Qwen3-Embedding-0.6B"
     device: str = "cpu"
+    local_files_only: bool = True
+    page_vector_cache: bool = True
+    max_embedding_page_chars: int = 360
+    max_embedding_query_chars: int = 700
     top_k: int = 5
     cache_dir: str = "~/.llmwiki/cache/embeddings"
     strong_score: float = 0.78
@@ -116,9 +128,11 @@ class ProviderResult(StrictModel):
     raw_output: str
     parsed_output: dict[str, Any] | None = None
     parse_success: bool = False
+    json_repair_applied: bool = False
     schema_valid: bool = False
     repair_attempted: bool = False
     latency_ms: int = 0
+    payload_char_count: int = 0
     cost_usd: float | None = None
     errors: list[str] = Field(default_factory=list)
 
@@ -261,6 +275,7 @@ class SourceDigestArtifact(StrictModel):
     designs: list[SourceDigestCandidate] = Field(default_factory=list)
     comparisons: list[SourceDigestCandidate] = Field(default_factory=list)
     open_questions: list[SourceDigestCandidate] = Field(default_factory=list)
+    budget_deferred_candidates: list[SourceDigestCandidate] = Field(default_factory=list)
     weak_or_noise_items: list[WeakOrNoiseItem] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -292,6 +307,16 @@ class SourceBasis(StrictModel):
     source_candidate_ids: list[str] = Field(default_factory=list)
     prepared_discovered_candidates: list[str] = Field(default_factory=list)
     source_locator: str = ""
+
+    @field_validator("source_candidate_ids", "prepared_discovered_candidates")
+    @classmethod
+    def normalize_candidate_refs(cls, value: list[str]) -> list[str]:
+        refs: list[str] = []
+        for item in value:
+            ref = str(item).strip()
+            if ref and ref not in refs:
+                refs.append(ref)
+        return refs
 
 
 class CandidateResolutionItem(StrictModel):
@@ -432,8 +457,10 @@ class CandidateContextHit(StrictModel):
     path: str
     display_title: str
     score: float = 0.0
+    score_bucket: int = 0
     strength: Literal["weak", "medium", "strong"] = "weak"
     match_basis: str = ""
+    sort_explanation: str = ""
     forced: bool = False
     page_sha256: str
     excerpt: str = ""
@@ -452,7 +479,15 @@ class CandidateContextsArtifact(StrictModel):
     retrieval_backend: str
     model: str = ""
     model_revision: str = ""
+    local_files_only: bool = False
     cache_dir: str = ""
+    embedding_load_duration_ms: int = 0
+    embedding_encode_duration_ms: int = 0
+    embedding_total_duration_ms: int = 0
+    embedding_page_vector_cache_hit: bool = False
+    embedding_page_count: int = 0
+    embedding_query_count: int = 0
+    embedding_text_char_count: int = 0
     top_k: int = 5
     candidate_pool_size: int = 0
     candidate_pool_sha256: str = ""
@@ -482,6 +517,34 @@ class SourceDuplicateGuardArtifact(StrictModel):
     reason: str
 
 
+class RawIngestCandidate(StrictModel):
+    raw_path: str
+    status: Literal["unprocessed", "changed", "duplicate_hash", "duplicate_url", "processed"]
+    raw_sha256: str
+    size_bytes: int
+    mtime: str
+    matched_by: Literal["none", "path", "hash", "url", "path_and_hash"] = "none"
+    source_pages: list[str] = Field(default_factory=list)
+    operation_ids: list[str] = Field(default_factory=list)
+    reason: str
+
+
+class RawIngestCandidateReport(StrictModel):
+    schema_version: Literal["raw_ingest_candidates.v1"] = "raw_ingest_candidates.v1"
+    vault: str
+    raw_root: str
+    include_processed: bool = False
+    limit: int | None = None
+    total_raw_files: int = 0
+    candidate_count: int = 0
+    processed_count: int = 0
+    changed_count: int = 0
+    duplicate_hash_count: int = 0
+    duplicate_url_count: int = 0
+    unprocessed_count: int = 0
+    items: list[RawIngestCandidate] = Field(default_factory=list)
+
+
 class DraftPageItem(StrictModel):
     page_plan_id: str
     action: Literal["create", "update"]
@@ -501,6 +564,8 @@ class DraftPageItem(StrictModel):
         coverage_checks = data.pop("source_coverage_checks", None)
         if coverage_checks is not None and not data.get("source_coverage_notes"):
             data["source_coverage_notes"] = _coerce_section_body_scalar(coverage_checks)
+        if "quality_risks" in data:
+            data["quality_risks"] = _coerce_string_list(data["quality_risks"])
         section_bodies = data.get("section_bodies")
         if not isinstance(section_bodies, dict):
             return data
@@ -531,6 +596,23 @@ def _coerce_section_body_scalar(value: Any) -> str:
     return str(value)
 
 
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, list):
+        items: list[str] = []
+        for item in value:
+            stripped = _coerce_section_body_scalar(item).strip()
+            if stripped:
+                items.append(stripped)
+        return items
+    stripped = _coerce_section_body_scalar(value).strip()
+    return [stripped] if stripped else []
+
+
 class DraftRenderingArtifact(StrictModel):
     schema_version: Literal["draft_rendering.v3"] = "draft_rendering.v3"
     pages: list[DraftPageItem] = Field(default_factory=list)
@@ -541,6 +623,8 @@ class SectionMergeChange(StrictModel):
     retained: list[str] = Field(default_factory=list)
     added: list[str] = Field(default_factory=list)
     removed: list[str] = Field(default_factory=list)
+    preserved_old: list[str] = Field(default_factory=list)
+    needs_manual_resolution: bool = False
     removal_reason: str = ""
 
 
@@ -644,6 +728,8 @@ class ProviderRuntimeSpec(StrictModel):
     spec: str
     endpoint: str | None = None
     fixture_dir: str | None = None
+    max_retries: int | None = None
+    retry_backoff_seconds: float | None = None
 
 
 class ProviderContextRecord(StrictModel):

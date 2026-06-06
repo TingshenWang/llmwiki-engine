@@ -177,6 +177,37 @@ def test_candidate_resolution_target_path_is_relative_to_wiki_root() -> None:
         validate_candidate_resolution(digest, resolution)
 
 
+def test_source_basis_strips_and_drops_empty_candidate_refs() -> None:
+    source_basis = SourceBasis(
+        source_candidate_ids=[" CAND001 ", "", "CAND001"],
+        prepared_discovered_candidates=["  ", "prepared topic", "prepared topic"],
+    )
+
+    assert source_basis.source_candidate_ids == ["CAND001"]
+    assert source_basis.prepared_discovered_candidates == ["prepared topic"]
+
+
+def test_candidate_resolution_rejects_empty_prepared_discovered_source_basis() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/sample.md", summary="No formal candidates.")
+    resolution = CandidateResolutionArtifact(
+        items=[
+            CandidateResolutionItem(
+                page_plan_id="PP-EMPTY",
+                source_basis=SourceBasis(prepared_discovered_candidates=["  "]),
+                page_type="concept",
+                display_title="Empty basis",
+                candidate_target_path="concepts/Concept_Empty_basis.md",
+                topic_summary="Empty basis topic.",
+                why_this_page="This should not pass without a real source basis.",
+                reason="test",
+            )
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="source_basis must not be empty"):
+        validate_candidate_resolution(digest, resolution)
+
+
 @pytest.mark.parametrize("target_path", ["", "../outside.md", "/tmp/outside.md"])
 def test_candidate_resolution_rejects_unsafe_target_paths(target_path: str) -> None:
     digest = _digest()
@@ -199,6 +230,32 @@ def test_wiki_merge_plan_update_requires_matched_page() -> None:
     plan = _merge_plan([_plan_item("CAND001", action="update", matched_page=None)])
 
     with pytest.raises(ValidationError, match="update action must include matched_page"):
+        validate_wiki_merge_plan(digest, plan)
+
+
+def test_wiki_merge_plan_rejects_empty_prepared_discovered_source_basis() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/sample.md", summary="No formal candidates.")
+    plan = WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
+        items=[
+            WikiMergePlanItem(
+                page_plan_id="PP-EMPTY",
+                source_basis=SourceBasis(prepared_discovered_candidates=[""]),
+                page_type="concept",
+                canonical_target_path="concepts/Concept_Empty_basis.md",
+                display_title="Empty basis",
+                action="create",
+                new_understanding="This should not pass without a real source basis.",
+                section_plans={"summary": "Summary"},
+                reason="test",
+                apply_eligibility="applyable",
+                related_absence_reason="no_candidate",
+            )
+        ],
+    )
+
+    with pytest.raises(ValidationError, match="source_basis must not be empty"):
         validate_wiki_merge_plan(digest, plan)
 
 

@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 import re
+import tempfile
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import unified_diff
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal, TypeVar
 
 import yaml
@@ -15,9 +18,9 @@ from rich.console import Console
 from pydantic import BaseModel
 
 from . import __version__
-from .events import EventLogger
+from .events import EventLogger, format_duration
 from .hash_utils import artifact_ref, sha256_bytes, sha256_file
-from .io import read_model, read_yaml, write_json, write_yaml
+from .io import read_json, read_model, read_yaml, write_json, write_yaml
 from .manifest import (
     begin_model_step_attempt,
     begin_step_attempt,
@@ -49,10 +52,14 @@ from .models import (
     GroundingClaim,
     OperationManifest,
     OperationStatus,
+    ProviderResult,
     RawBinding,
+    RawIngestCandidate,
+    RawIngestCandidateReport,
     RawLinkCleanupArtifact,
     RawLinkCleanupLink,
     RawLinkCleanupWarning,
+    RawPreparePolicy,
     RawPreparationArtifact,
     ReviewDecision,
     RunMode,
@@ -64,6 +71,7 @@ from .models import (
     SourceDigestArtifact,
     SourceDigestCandidate,
     StepStatus,
+    StructuredAttemptRef,
     StructuredIssue,
     StructuredRepairReport,
     UpdateMergeReport,
@@ -82,10 +90,12 @@ from .models import (
     utc_now,
 )
 from .provider_config import ProviderExecutionContext, build_provider_execution_context
+from .providers import Provider
 from .profiles import load_profile, page_output_path, safe_filename
 from .rendering import source_title_for_raw
 from .retrieval import (
     RetrievalError,
+    SCORE_BUCKET_EPSILON,
     build_candidate_contexts,
     build_knowledge_pool,
     candidate_pool_sha256,
@@ -102,7 +112,7 @@ from .steps import (
     step_index,
     step_output_dir,
 )
-from .structured import StructuredModelCall
+from .structured import StructuredModelCall, parse_structured_json_object
 from .system_pages import (
     assert_current_system_page,
     ensure_system_pages,
@@ -116,6 +126,7 @@ from .validators import (
     ValidationError as ContractValidationError,
     create_reason_needs_repair,
     looks_like_untranslated_english,
+    nonempty_prepared_discovered_candidates,
     text_contains_source_graph_link,
     validate_candidate_resolution,
     validate_raw_preparation,
@@ -132,6 +143,17 @@ class PipelineError(RuntimeError):
     pass
 
 
+RAW_INGEST_TEXT_SUFFIXES = {".md", ".markdown", ".mdown", ".txt"}
+
+
+@dataclass(frozen=True)
+class _SourceRawCoverageRecord:
+    source_page: str
+    raw_paths: tuple[str, ...]
+    raw_hashes: tuple[str, ...]
+    operation_ids: tuple[str, ...]
+
+
 RAW_PREPARE_CONTRACT = {
     "goal": "Create a higher-quality canonical prepared raw for downstream knowledge compilation.",
     "rules": [
@@ -145,6 +167,304 @@ RAW_PREPARE_CONTRACT = {
 
 MODEL_RELATED_SUGGESTION_LIMIT = 2
 FINAL_RELATED_LIMIT = 3
+DRAFT_RENDERING_BATCH_PAGE_LIMIT = 4
+DRAFT_RENDERING_MAX_PARALLEL_BATCHES = 3
+DRAFT_RENDERING_GROUNDING_RISK_RULES = (
+    "Do not wrap paraphrases, inferred concept labels, or rewritten source ideas in Chinese/English quotation marks; "
+    "use quotes only for text that exact-matches source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
+    "For interview, ASR/OCR, or translated transcript source text, treat speaker-like Chinese wording as paraphrase "
+    "unless the exact span is present; prefer indirect attribution such as 访谈中提到、她描述、团队讨论.",
+    "Avoid broad external-backing/adoption phrases such as 被广泛应用、被广泛使用、公认、业界普遍、被多个社区引用 "
+    "unless the exact source/wiki context says them; prefer source-local wording such as 本材料提到、访谈中讨论、"
+    "团队成员提到、本材料将该说法用于解释.",
+    "High-risk causal/scope terms such as 导致、造成、证明、表明、必然、长期来看、用户会、影响到 require same sentence "
+    "or clearly adjacent explicit support in source_excerpt_pack, approved_prepared_markdown, or inspected wiki context. "
+    "If the source only gives a tradeoff or concern, write 可能伴随、需要权衡、访谈中提到, or move the claim to open_questions.",
+)
+UNSUPPORTED_BACKING_MARKERS = (
+    "被广泛应用",
+    "被广泛使用",
+    "广泛应用",
+    "广泛使用",
+    "被多个",
+    "被广泛",
+    "公认",
+    "业界普遍",
+    "多个社区",
+)
+EXTERNAL_BACKING_EQUIVALENTS = (
+    "widely used",
+    "widely adopted",
+    "widely adopt",
+    "widely applied",
+    "widely across tasks",
+    "use widely",
+    "used widely",
+    "commonly used",
+    "extensively used",
+    "broadly used",
+    "de-facto standard",
+    "de facto standard",
+)
+EXTERNAL_BACKING_ZH_EN_ANCHORS = (
+    ("评估", "evaluat"),
+    ("基准", "benchmark"),
+    ("智能体", "agent"),
+    ("模型", "model"),
+    ("网络安全", "cybersecurity"),
+    ("安全", "security"),
+    ("作弊", "cheat"),
+    ("污染", "contamination"),
+    ("产品", "product"),
+    ("开发", "develop"),
+)
+EXTERNAL_BACKING_GENERIC_ANCHORS = {
+    "agent",
+    "agents",
+    "benchmark",
+    "benchmarks",
+    "bench",
+    "evaluat",
+    "evaluation",
+    "evaluating",
+    "framework",
+    "frameworks",
+    "llm",
+    "llms",
+    "model",
+    "models",
+    "product",
+    "products",
+    "system",
+    "systems",
+    "develop",
+}
+DRAFT_SELF_TALK_MARKERS = (
+    "我记错",
+    "可能我记错",
+    "检查原文",
+    "查看原文",
+    "我会修正",
+    "输出已经确定",
+    "我还没输出",
+    "但现在我们无法修改",
+    "等等，原文",
+    "目前wiki中无此页面",
+    "当前wiki没有相关知识页",
+    "当前wiki没有此页面",
+    "创建后可与",
+    "创建后可和",
+    "创建后可互链",
+)
+OPEN_QUESTION_SEMANTIC_CLUSTERS = (
+    (
+        "semantic:agi_pm_role_necessity",
+        (("agi",), ("pm", "产品经理"), ("消失", "必要", "取代", "替代", "还有价值", "是否需要", "需要")),
+    ),
+    (
+        "semantic:model_capability_product_function_boundary",
+        (("模型能力",), ("产品功能", "产品边界"), ("吞噬", "吞掉", "取代", "替代", "边界")),
+    ),
+    (
+        "semantic:product_judgement_training",
+        (("产品品味", "产品判断"), ("训练", "提升", "培养", "系统化")),
+    ),
+    (
+        "semantic:ai_pm_role_evolution",
+        (("ai", "agi", "agent"), ("pm", "产品经理"), ("演变", "变化", "转型", "未来")),
+    ),
+    (
+        "semantic:claude_code_product_experience_harness_boundary",
+        (("claudecode", "claude code"), ("产品体验", "体验"), ("harness", "安全边界"), ("掩盖", "重要性")),
+    ),
+    (
+        "semantic:rapid_iteration_quality_safety_research_preview",
+        (("快速发布", "快速迭代"), ("质量", "安全"), ("研究预览", "用户预期", "长期产品一致性")),
+    ),
+    (
+        "semantic:model_progress_feature_lifecycle",
+        (("模型", "模型能力", "模型进步"), ("功能", "产品功能", "ui元素"), ("保留", "移除", "废弃", "过时", "存废", "淘汰")),
+    ),
+    (
+        "semantic:agent_hand_transfer_mechanism",
+        (("大脑", "brain"), ("传递", "pass", "handoff"), ("双手", "hand", "hands"), ("机制", "实现细节", "高效")),
+    ),
+)
+SOURCE_DIGEST_BUDGET_GROUP_ORDER = ("concepts", "designs", "comparisons", "open_questions", "entities")
+SOURCE_DIGEST_AGGREGATION_MIN_CANDIDATES = 2
+SOURCE_DIGEST_AGGREGATION_CLUSTER_SIMILARITY = 0.18
+SOURCE_DIGEST_PROMOTED_AGGREGATION_MIN_REPLACEMENT_SIMILARITY = 0.35
+DEFERRED_AGGREGATION_GROUP_LABELS = {
+    "concepts": "延后概念",
+    "designs": "延后设计模式",
+    "comparisons": "延后对比",
+    "open_questions": "延后未决问题",
+    "entities": "延后实体",
+}
+SOURCE_DIGEST_ANCHOR_ENTITIES: dict[str, dict[str, str]] = {
+    "Managed Agents": {
+        "summary": "Managed Agents 是源材料显式讨论的托管智能体系统，用于将大脑、会话和双手解耦，并容纳未来不同 harness、sandbox 或其他组件。",
+        "why_matters": "它是本材料的中心系统名称，后续材料很可能继续补充其产品、架构和使用边界。",
+        "wiki_value": "作为稳定实体锚点，可承接后续关于 Claude Code、harness、sandbox、session 与托管代理能力的更新。",
+        "resolution_hint": "deterministic_source_anchor_entity: source title/body repeatedly names Managed Agents; keep as a central reusable entity anchor before page budget.",
+    },
+    "Claude Code": {
+        "summary": "Claude Code 是源材料显式提到的 Anthropic 编程 harness/产品，在本材料中作为 Managed Agents 可适配并广泛使用的 harness 示例出现。",
+        "why_matters": "它是后续访谈、产品方法和托管智能体材料之间最容易复用的产品实体锚点。",
+        "wiki_value": "让后续 Claude Code 访谈可以 update 既有页面，而不是把架构材料中的 harness 视角遗失到孤立相关页里。",
+        "resolution_hint": "deterministic_source_anchor_entity: source body explicitly names Claude Code as an excellent harness; keep as a reusable update target when the model omits it.",
+    },
+    "Cowork": {
+        "summary": "Cowork 是源材料显式提到的 Anthropic 知识工作协作者产品，可作为 Claude Code 之外的产品实体锚点。",
+        "why_matters": "它经常与 Claude Code 同源出现，适合承接后续关于非编程知识工作场景的更新。",
+        "wiki_value": "提供稳定产品实体页，便于后续比较、团队组织和使用场景材料进行 update 或互链。",
+        "resolution_hint": "deterministic_source_anchor_entity: source explicitly names Cowork as a durable product/entity anchor.",
+    },
+}
+RAW_PREPARE_FAST_PATH_RULE_VERSION = "markdown_passthrough.v1"
+REFERENCE_SECTION_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s+(?:references|bibliography|works cited|参考文献|参考资料)\s*:?\s*$",
+    re.IGNORECASE,
+)
+APPENDIX_SECTION_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s+(?:appendix|appendices|supplementary|附录)\b",
+    re.IGNORECASE,
+)
+REFERENCE_TRUNCATION_MIN_DOCUMENT_CHARS = 8_000
+REFERENCE_TRUNCATION_MIN_OMITTED_CHARS = 1_500
+REFERENCE_TRUNCATION_MIN_START_RATIO = 0.45
+APPENDIX_COMPACTION_MIN_DOCUMENT_CHARS = 24_000
+APPENDIX_COMPACTION_MIN_OMITTED_CHARS = 4_000
+APPENDIX_COMPACTION_MIN_START_RATIO = 0.45
+APPENDIX_COMPACTION_SECTION_EXCERPT_LIMIT = 700
+APPENDIX_COMPACTION_MAX_SECTIONS = 12
+UPDATE_PRESERVATION_SECTION_KEYS = ("summary", "detail", "value_points")
+UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION = 8
+UPDATE_PRESERVATION_CONCEPT_GROUPS = (
+    {
+        "name": "managed_agents",
+        "label": "Managed Agents / 托管智能体",
+        "terms": ("Managed Agents", "托管智能体"),
+    },
+    {
+        "name": "harness",
+        "label": "harness / 适配框架",
+        "terms": ("harness", "Harness", "harnesses", "适配框架", "元harness", "元适配框架"),
+    },
+    {
+        "name": "brain_hands_decoupling",
+        "label": "大脑与双手解耦",
+        "terms": (
+            "大脑与双手",
+            "大脑双手",
+            "brain and hands",
+            "brain hands",
+            "brain & hands",
+            "separate the model brain from execution hands",
+            "model brain from execution hands",
+            "model brain and execution hands",
+            "model brain / execution hands",
+            "推理和规划",
+            "工具执行",
+            "解耦",
+            "路由模型意图",
+            "模型意图路由",
+        ),
+    },
+    {
+        "name": "session_context",
+        "label": "会话/持久上下文",
+        "terms": (
+            "session object",
+            "persistent session",
+            "persistent context",
+            "durable context",
+            "session state",
+            "session context",
+            "会话对象",
+            "持久上下文",
+            "上下文对象",
+            "会话是持久",
+            "执行状态",
+        ),
+    },
+    {
+        "name": "safety_boundary",
+        "label": "安全边界/权限限制",
+        "terms": ("安全边界", "权限", "限制文件", "文件、网络和资源", "文件网络和资源", "无限本机权限"),
+    },
+    {
+        "name": "isolated_execution",
+        "label": "隔离执行/容器",
+        "terms": (
+            "隔离容器",
+            "隔离执行环境",
+            "container",
+            "containers",
+            "containerized",
+            "sandbox",
+            "sandboxed",
+            "sandboxes",
+            "容器",
+            "沙箱",
+        ),
+    },
+    {
+        "name": "system_architecture_view",
+        "label": "系统架构视角",
+        "terms": ("系统架构视角", "产品功能列表", "只写成产品功能列表"),
+    },
+)
+DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT = 24_000
+DRAFT_RENDERING_EXCERPT_TOTAL_CHAR_LIMIT = 24_000
+DRAFT_RENDERING_EXCERPT_PER_PAGE_LIMIT = 1_600
+DRAFT_RENDERING_GLOBAL_EXCERPT_LIMIT = 2_400
+DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO = 0.55
+DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS = 600
+DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT = 1_200
+CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT = 20_000
+CANDIDATE_RESOLUTION_GLOBAL_EXCERPT_LIMIT = 1_600
+CANDIDATE_RESOLUTION_PER_CANDIDATE_EXCERPT_LIMIT = 500
+SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT = 24_000
+SOURCE_DIGEST_SOURCE_MAP_TOTAL_LIMIT = 22_000
+SOURCE_DIGEST_SOURCE_MAP_GLOBAL_EXCERPT_LIMIT = 2_400
+SOURCE_DIGEST_SOURCE_MAP_MIN_SECTION_EXCERPT_LIMIT = 320
+SOURCE_DIGEST_SOURCE_MAP_MAX_SECTION_EXCERPT_LIMIT = 900
+SOURCE_DIGEST_SOURCE_MAP_MAX_SECTIONS = 56
+SOURCE_DIGEST_SOURCE_MAP_MAX_CAPTIONS = 24
+MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT = 16_000
+MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT = 1_600
+MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT = 700
+MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT = 240
+MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT = 120
+MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK = 2
+MERGE_PLANNING_CONTEXT_QUERY_LIMIT = 420
+MERGE_PLANNING_ENTRY_EXCERPT_LIMIT = 900
+TRANSCRIPT_TIMESTAMP_RE = re.compile(r"^\s*(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\d{1,2}:\d{2}(?::\d{2})?\s*[-–—])")
+SPEAKER_TURN_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:Q|A|问|答|主持人|嘉宾|采访者|受访者|Speaker|Interviewer|Interviewee)\s*[:：](?!//)"
+    r"|[A-Z][A-Za-z ._-]{1,32}\s*:(?!//)"
+    r")"
+)
+MARKDOWN_MEDIA_EMBED_RE = re.compile(r"!\[[^\]\n]*\]\([^)]+\)")
+INTERVIEW_TRANSCRIPT_MARKER_RE = re.compile(r"(?im)^\s*#{1,3}\s*(?:访谈全文|采访全文|完整访谈|Transcript|Full Transcript)\s*$")
+PAPER_SECTION_HEADING_RE = re.compile(
+    r"(?im)^\s{0,3}#{1,6}\s+"
+    r"(?:abstract|introduction|related work|methodology|method|experiments?|evaluation|results?|discussion|conclusion|references)\b"
+)
+PAPER_CAPTION_RE = re.compile(r"(?im)^\s*(?:table|figure)\s+\d+\s*:")
+ARXIV_IMPORT_MARKER_RE = re.compile(r"(?im)^\s*(?:imported from|fetched url|final url):\s+https?://(?:www\.)?arxiv\.org/")
+YOUTUBE_URL_RE = re.compile(r"(?i)https?://(?:www\.)?(?:youtube\.com|youtu\.be)/")
+PODCAST_MARKER_RE = re.compile(r"(?i)\bpodcast\b|播客")
+AUDIO_VIDEO_SOURCE_MARKER_RE = re.compile(r"(?i)\b(?:youtube|video|audio|episode)\b|视频|音频|节目")
+TRANSLATION_MARKER_RE = re.compile(r"(?i)\b(?:translated|translation)\b|翻译|译文")
+ASR_SOURCE_MARKER_RE = re.compile(
+    r"(?i)\b(?:asr|auto[- ]?generated|automatic captions?|machine transcript|transcribed by)\b"
+    r"|自动(?:转录|生成|字幕)|语音识别|机翻字幕|字幕稿|转写|转录"
+)
+SENTENCE_TERMINAL_PUNCTUATION = "。！？；：.!?;:"
+INLINE_PUNCTUATION = SENTENCE_TERMINAL_PUNCTUATION + "，,、"
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
     profile = load_profile(profile_name)
@@ -177,9 +497,11 @@ def run_simplified_ingest(
     vault: Path,
     raw_file: Path,
     fixture_dir: Path | None = None,
+    mock_fixture_dir: Path | None = None,
     profile_name: str | None = None,
     slug: str | None = None,
     run_mode: RunMode = RunMode.dev,
+    raw_prepare_policy: RawPreparePolicy | None = None,
     console: Console | None = None,
 ) -> OperationManifest:
     ensure_workspace_layout(vault)
@@ -189,16 +511,25 @@ def run_simplified_ingest(
     store = RunStore(vault)
     resolved_profile_name = resolve_vault_profile_name(vault, profile_name)
     profile = load_profile(vault / ".llmwiki" / "profiles" / resolved_profile_name)
+    vault_config = read_vault_config(vault)
+    if raw_prepare_policy is not None:
+        vault_config.raw_prepare_policy = raw_prepare_policy
+    model_steps = model_steps_for_raw_prepare_policy(
+        list(MODEL_BACKED_STEPS),
+        raw_path=raw_path,
+        raw_rel=raw_rel,
+        raw_prepare_policy=vault_config.raw_prepare_policy,
+    )
     provider_execution_context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
         fixture_dir=fixture_dir,
+        mock_fixture_dir=mock_fixture_dir,
         source="initial_run",
         from_step=None,
-        tasks=list(MODEL_BACKED_STEPS),
+        tasks=model_steps,
     )
     with apply_lock(vault):
-        vault_config = read_vault_config(vault)
         run_dir = store.run_dir(operation_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         manifest = OperationManifest(
@@ -231,6 +562,8 @@ def resume_ingest(
     operation_id: str,
     from_step: str | None = None,
     run_mode: RunMode | None = None,
+    mock_fixture_dir: Path | None = None,
+    raw_prepare_policy: RawPreparePolicy | None = None,
     console: Console | None = None,
 ) -> OperationManifest:
     store = RunStore(vault)
@@ -246,14 +579,29 @@ def resume_ingest(
         start, reset_from_step = default_resume_start(vault, store.run_dir(operation_id), manifest, from_step)
         if start is None:
             return manifest
+        if raw_prepare_policy is not None:
+            if step_index(start) > step_index("raw_prepare"):
+                raise PipelineError("raw prepare override only applies when raw_prepare will rerun; resume from raw_prepare or earlier.")
+            manifest.vault_config_snapshot.raw_prepare_policy = raw_prepare_policy
         validate_raw_link_cleanup_resume(run_dir=store.run_dir(operation_id), manifest=manifest, start=start)
         validate_resume_start(manifest, start)
         ensure_wiki_context_current_before_resume(vault, store.run_dir(operation_id), start)
         model_steps = model_steps_from(start)
+        if "raw_prepare" in model_steps:
+            raw_binding = manifest.raw_bindings[0] if manifest.raw_bindings else None
+            raw_rel = raw_binding.relative_path if raw_binding is not None else ""
+            raw_path = vault / raw_rel if raw_rel else vault
+            model_steps = model_steps_for_raw_prepare_policy(
+                model_steps,
+                raw_path=raw_path,
+                raw_rel=raw_rel,
+                raw_prepare_policy=manifest.vault_config_snapshot.raw_prepare_policy,
+            )
         provider_execution_context = build_provider_execution_context(
             vault=vault,
             manifest_contexts=manifest.provider_contexts,
             fixture_dir=None,
+            mock_fixture_dir=mock_fixture_dir,
             source="resume_current_config",
             from_step=start,
             tasks=model_steps,
@@ -387,6 +735,96 @@ def ensure_pipeline_completed(manifest: OperationManifest) -> None:
         raise PipelineError(f"Operation is not draft-ready; incomplete step(s): {details}")
 
 
+def model_steps_for_raw_prepare_policy(
+    model_steps: list[str],
+    *,
+    raw_path: Path,
+    raw_rel: str,
+    raw_prepare_policy: RawPreparePolicy,
+) -> list[str]:
+    if "raw_prepare" not in model_steps:
+        return model_steps
+    if raw_prepare_policy != RawPreparePolicy.skip_model:
+        return model_steps
+    if not raw_prepare_skip_model_passthrough_expected(raw_path=raw_path, raw_rel=raw_rel):
+        return model_steps
+    return [step for step in model_steps if step != "raw_prepare"]
+
+
+def raw_prepare_skip_model_passthrough_expected(*, raw_path: Path, raw_rel: str) -> bool:
+    if not raw_path.is_file():
+        return False
+    try:
+        original_text = raw_path.read_text(encoding="utf-8")
+        cleaned_text, links, warnings, preserved_media_count = cleanup_raw_wikilinks(original_text)
+        pre_hash = sha256_file(raw_path)
+        post_hash = sha256_bytes(cleaned_text.encode("utf-8"))
+        cleanup = RawLinkCleanupArtifact(
+            raw_path=raw_rel,
+            changed=cleaned_text != original_text,
+            pre_cleanup_sha256=pre_hash,
+            post_cleanup_sha256=post_hash,
+            cleaned_link_count=len(links),
+            preserved_media_embed_count=preserved_media_count,
+            links=links,
+            warnings=warnings,
+        )
+        if cleanup.changed:
+            with tempfile.TemporaryDirectory(prefix="llmwiki-raw-prepare-skip-check-") as tmp_dir:
+                candidate_path = Path(tmp_dir) / raw_path.name
+                candidate_path.write_text(cleaned_text, encoding="utf-8")
+                preparation, _report = build_raw_prepare_fast_path(
+                    raw_path=candidate_path,
+                    raw_rel=raw_rel,
+                    input_raw_sha256=post_hash,
+                    cleanup=cleanup,
+                    cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+                    raw_prepare_policy=RawPreparePolicy.skip_model,
+                )
+        else:
+            preparation, _report = build_raw_prepare_fast_path(
+                raw_path=raw_path,
+                raw_rel=raw_rel,
+                input_raw_sha256=post_hash,
+                cleanup=cleanup,
+                cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+                raw_prepare_policy=RawPreparePolicy.skip_model,
+            )
+    except Exception:
+        return False
+    return preparation is not None
+
+
+def model_backed_step_can_run_locally(
+    *,
+    step_name: str,
+    vault: Path,
+    run_dir: Path,
+    raw_path: Path,
+    manifest: OperationManifest,
+    provider_runtime_present: bool,
+) -> bool:
+    if provider_runtime_present or step_name != "raw_prepare":
+        return False
+    if manifest.vault_config_snapshot.raw_prepare_policy != RawPreparePolicy.skip_model:
+        return False
+    try:
+        cleanup_path = require_step_output_dir(run_dir, "raw_link_cleanup") / "raw_link_cleanup.json"
+        cleanup = read_model(cleanup_path, RawLinkCleanupArtifact)
+        raw_rel = relative_to_vault(vault, raw_path)
+        preparation, _report = build_raw_prepare_fast_path(
+            raw_path=raw_path,
+            raw_rel=raw_rel,
+            input_raw_sha256=sha256_file(raw_path),
+            cleanup=cleanup,
+            cleanup_ref=cleanup_path.relative_to(run_dir).as_posix(),
+            raw_prepare_policy=RawPreparePolicy.skip_model,
+        )
+    except Exception:
+        return False
+    return preparation is not None
+
+
 def _run_step(
     step_name: str,
     vault: Path,
@@ -403,23 +841,36 @@ def _run_step(
         raise PipelineError(f"Unknown step: {step_name}")
     provider_record = execution_context.record if runner.spec.model_backed else None
     provider_runtime = provider_record.providers.get(step_name) if provider_record else None
+    provider_spec_for_attempt = provider_runtime.spec if provider_runtime else None
+    local_model_backed_step = runner.spec.model_backed and model_backed_step_can_run_locally(
+        step_name=step_name,
+        vault=vault,
+        run_dir=run_dir,
+        raw_path=raw_path,
+        manifest=manifest,
+        provider_runtime_present=provider_runtime is not None,
+    )
     logger.emit(
         step_name,
         "started",
         status="running",
         model_backed=runner.spec.model_backed,
-        provider_spec=provider_runtime.spec if provider_runtime else None,
+        provider_spec=provider_spec_for_attempt,
+        may_use_local_shortcut=step_name in {"raw_prepare", "wiki_merge_planning"},
     )
     if runner.spec.model_backed:
-        if provider_record is None or provider_runtime is None:
+        if local_model_backed_step:
+            begin_step_attempt(manifest, step_name)
+        elif provider_record is None or provider_runtime is None:
             raise PipelineError(f"No provider execution context found for model-backed step: {step_name}")
-        begin_model_step_attempt(
-            manifest,
-            step_name,
-            provider_record_id=provider_record.record_id,
-            provider_spec=provider_runtime.spec,
-            provider_context_source=provider_record.source,
-        )
+        else:
+            begin_model_step_attempt(
+                manifest,
+                step_name,
+                provider_record_id=provider_record.record_id,
+                provider_spec=provider_spec_for_attempt,
+                provider_context_source=provider_record.source,
+            )
     else:
         begin_step_attempt(manifest, step_name)
     write_manifest(manifest_path, manifest)
@@ -662,6 +1113,828 @@ def render_raw_link_cleanup_markdown(artifact: RawLinkCleanupArtifact) -> str:
     )
 
 
+def raw_prepare_fast_path_provider_allowed(ctx: StepRunContext, step_name: str) -> bool:
+    if ctx.execution_context.record is None:
+        return False
+    runtime = ctx.execution_context.record.providers.get(step_name)
+    if runtime is None:
+        return False
+    return raw_prepare_fast_path_provider_spec_allowed(runtime.spec)
+
+
+def raw_prepare_fast_path_provider_spec_allowed(provider_spec: str | None) -> bool:
+    return bool(provider_spec and provider_spec.startswith("openai_compatible:"))
+
+
+def build_raw_prepare_fast_path(
+    *,
+    raw_path: Path,
+    raw_rel: str,
+    input_raw_sha256: str,
+    cleanup: RawLinkCleanupArtifact,
+    cleanup_ref: str,
+    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto,
+) -> tuple[RawPreparationArtifact | None, dict[str, Any]]:
+    raw_text = raw_path.read_text(encoding="utf-8")
+    policy = RawPreparePolicy(raw_prepare_policy)
+    hard_reasons: list[str] = []
+    auto_reasons: list[str] = []
+    if raw_path.suffix.lower() not in {".md", ".markdown", ".mdown"}:
+        hard_reasons.append("raw file extension is not markdown")
+    cleanup_fast_path_compatible = raw_link_cleanup_fast_path_compatible(cleanup)
+    if cleanup.changed and not cleanup_fast_path_compatible:
+        auto_reasons.append("raw_link_cleanup changed the raw text")
+    if cleanup.preserved_media_embed_count:
+        auto_reasons.append("raw contains preserved media embeds")
+    if not raw_text.strip():
+        hard_reasons.append("raw text is empty")
+    noise = raw_prepare_noise_profile(raw_text)
+    structured_markdown_passthrough = raw_prepare_structured_markdown_fast_path_allowed(noise)
+    structured_quality_risk = raw_prepare_structured_markdown_quality_risk(noise)
+    allowed_soft_markers: list[str] = []
+    if policy == RawPreparePolicy.skip_model:
+        allowed_soft_markers.append("user_skip_prepare")
+    if cleanup_fast_path_compatible:
+        allowed_soft_markers.append("raw_link_cleanup_text_unwrap")
+    if structured_quality_risk:
+        auto_reasons.append("structured markdown looks like noisy ASR or translated transcript")
+    if noise["markdown_media_embed_count"]:
+        if policy == RawPreparePolicy.skip_model:
+            auto_reasons.append("raw contains markdown media embeds")
+            allowed_soft_markers.append("markdown_media_embed")
+        elif structured_markdown_passthrough:
+            allowed_soft_markers.append("markdown_media_embed")
+        else:
+            auto_reasons.append("raw contains markdown media embeds")
+    if raw_prepare_timestamp_transcript_noise(noise):
+        auto_reasons.append("raw looks like a timestamped transcript")
+        if policy == RawPreparePolicy.skip_model:
+            allowed_soft_markers.append("timestamp_transcript_marker")
+    if raw_prepare_speaker_turn_transcript_noise(noise):
+        auto_reasons.append("raw looks like a speaker-turn transcript")
+        if policy == RawPreparePolicy.skip_model:
+            allowed_soft_markers.append("speaker_turn_transcript_marker")
+    if noise["interview_transcript_marker"]:
+        if policy == RawPreparePolicy.skip_model:
+            auto_reasons.append("raw contains interview/transcript section markers")
+            allowed_soft_markers.append("interview_transcript_marker")
+        elif structured_markdown_passthrough:
+            allowed_soft_markers.append("interview_transcript_marker")
+        else:
+            auto_reasons.append("raw contains interview/transcript section markers")
+    if noise["webvtt_marker"]:
+        auto_reasons.append("raw contains WebVTT transcript markers")
+        if policy == RawPreparePolicy.skip_model:
+            allowed_soft_markers.append("webvtt_marker")
+    if policy == RawPreparePolicy.force_model:
+        reasons = ["raw_prepare policy forces model cleaning"]
+        policy_suppressed_reasons: list[str] = []
+    elif policy == RawPreparePolicy.skip_model:
+        reasons = hard_reasons
+        policy_suppressed_reasons = auto_reasons
+    else:
+        reasons = hard_reasons + auto_reasons
+        policy_suppressed_reasons = []
+    structured_soft_marker_passthrough = structured_markdown_passthrough and any(
+        marker in {"markdown_media_embed", "interview_transcript_marker"} for marker in allowed_soft_markers
+    )
+    if policy == RawPreparePolicy.skip_model:
+        fast_path_mode = "user_skip_model_passthrough"
+    elif structured_soft_marker_passthrough:
+        fast_path_mode = "structured_markdown_passthrough"
+    else:
+        fast_path_mode = "clean_markdown_passthrough"
+    report = {
+        "schema_version": "raw_prepare_fast_path.v1",
+        "rule_version": RAW_PREPARE_FAST_PATH_RULE_VERSION,
+        "raw_prepare_policy": policy.value,
+        "eligible": not reasons,
+        "source_raw_path": raw_rel,
+        "input_raw_sha256": input_raw_sha256,
+        "raw_link_cleanup_ref": cleanup_ref,
+        "reasons": reasons,
+        "policy_suppressed_reasons": policy_suppressed_reasons,
+        "noise_profile": noise,
+        "fast_path_mode": fast_path_mode,
+        "allowed_soft_markers": allowed_soft_markers,
+        "raw_link_cleanup_fast_path_compatible": cleanup_fast_path_compatible,
+    }
+    if reasons:
+        return None, report
+    document_kind = infer_passthrough_document_kind(raw_text, noise)
+    prepared_markdown, reference_truncation = truncate_reference_section_for_prepared_markdown(raw_text)
+    prepared_markdown, appendix_compaction = compact_appendix_sections_for_prepared_markdown(
+        prepared_markdown,
+        enabled=bool(noise.get("paper_like_marker")),
+    )
+    if policy == RawPreparePolicy.skip_model:
+        operations_applied = ["user_skip_model_markdown_passthrough"]
+    else:
+        operations_applied = [
+            "deterministic_structured_markdown_passthrough"
+            if structured_soft_marker_passthrough
+            else "deterministic_markdown_passthrough"
+        ]
+    if reference_truncation.get("truncated"):
+        operations_applied.append("deterministic_reference_section_truncation")
+    if appendix_compaction.get("compacted"):
+        operations_applied.append("deterministic_appendix_section_compaction")
+    if policy == RawPreparePolicy.skip_model:
+        review_notes = (
+            "User selected --skip-prepare; raw markdown was passed through without model cleanup. "
+            "Auto quality blockers were recorded as policy_suppressed_reasons for audit."
+        )
+    elif structured_soft_marker_passthrough:
+        review_notes = (
+            "Structured markdown used deterministic fast-path: media/interview markers were present, "
+            "but heading density was high and timestamp/speaker-turn transcript noise did not trigger."
+        )
+    elif cleanup_fast_path_compatible:
+        review_notes = (
+            "Raw markdown used deterministic fast-path after audited raw_link_cleanup text wikilink unwrap; "
+            "transcript/media-noise heuristics did not trigger."
+        )
+    else:
+        review_notes = (
+            "Raw markdown used deterministic fast-path: raw_link_cleanup made no content changes "
+            "and transcript/media-noise heuristics did not trigger."
+        )
+    preparation = RawPreparationArtifact(
+        source_raw_path=raw_rel,
+        input_raw_sha256=input_raw_sha256,
+        raw_link_cleanup_ref=cleanup_ref,
+        document_kind=document_kind,
+        prepared_markdown=prepared_markdown,
+        operations_applied=operations_applied,
+        omission_policy=(
+            deterministic_omission_policy(
+                reference_truncated=bool(reference_truncation.get("truncated")),
+                appendix_compacted=bool(appendix_compaction.get("compacted")),
+            )
+        ),
+        uncertain_items=[],
+        risk_level="medium" if policy == RawPreparePolicy.skip_model and policy_suppressed_reasons else "low",
+        requires_human_review=policy == RawPreparePolicy.skip_model and bool(policy_suppressed_reasons),
+        review_notes=review_notes,
+    )
+    if cleanup_fast_path_compatible:
+        preparation.review_notes += (
+            " Raw link cleanup only unwrapped Obsidian text wikilinks and is recorded in raw_link_cleanup artifacts."
+        )
+    if reference_truncation.get("truncated"):
+        preparation.review_notes += (
+            " Reference section was omitted from prepared markdown to reduce digest noise; "
+            "the original raw retains the full reference list."
+        )
+    if appendix_compaction.get("compacted"):
+        preparation.review_notes += (
+            " Appendix sections were compacted to headings and short excerpts in prepared markdown; "
+            "the original raw retains the full appendix."
+        )
+    report["document_kind"] = document_kind
+    report["reference_truncation"] = reference_truncation
+    report["appendix_compaction"] = appendix_compaction
+    return preparation, report
+
+
+def raw_link_cleanup_fast_path_compatible(cleanup: RawLinkCleanupArtifact) -> bool:
+    if not cleanup.changed:
+        return False
+    if cleanup.warnings or cleanup.preserved_media_embed_count:
+        return False
+    if cleanup.cleaned_link_count <= 0 or cleanup.cleaned_link_count != len(cleanup.links):
+        return False
+    return all(link.cleanup_action == "unwrap_text" for link in cleanup.links)
+
+
+def build_raw_prepare_diagnostic(
+    *,
+    vault: Path,
+    raw_file: Path,
+    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto,
+) -> dict[str, Any]:
+    """Preview raw_prepare fast-path/model decision without mutating raw or creating a run."""
+    raw_path, raw_rel = resolve_raw_path(vault, raw_file)
+    original_text = raw_path.read_text(encoding="utf-8")
+    cleaned_text, links, warnings, preserved_media_count = cleanup_raw_wikilinks(original_text)
+    pre_hash = sha256_file(raw_path)
+    post_hash = sha256_bytes(cleaned_text.encode("utf-8"))
+    cleanup = RawLinkCleanupArtifact(
+        raw_path=raw_rel,
+        changed=cleaned_text != original_text,
+        pre_cleanup_sha256=pre_hash,
+        post_cleanup_sha256=post_hash,
+        cleaned_link_count=len(links),
+        preserved_media_embed_count=preserved_media_count,
+        links=links,
+        warnings=warnings,
+    )
+    provider_context = build_provider_execution_context(
+        vault=vault,
+        manifest_contexts=[],
+        fixture_dir=None,
+        mock_fixture_dir=None,
+        source="initial_run",
+        from_step=None,
+        tasks=["raw_prepare"],
+        require_mock_fixture=False,
+    )
+    provider_runtime = provider_context.record.providers.get("raw_prepare") if provider_context.record else None
+    provider_spec = provider_runtime.spec if provider_runtime is not None else None
+    provider_fast_path_allowed = raw_prepare_fast_path_provider_spec_allowed(provider_spec)
+
+    def build_for(policy: RawPreparePolicy, candidate_path: Path) -> dict[str, Any]:
+        _preparation, report = build_raw_prepare_fast_path(
+            raw_path=candidate_path,
+            raw_rel=raw_rel,
+            input_raw_sha256=post_hash,
+            cleanup=cleanup,
+            cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+            raw_prepare_policy=policy,
+        )
+        if policy == RawPreparePolicy.auto and not provider_fast_path_allowed:
+            provider_report = build_raw_prepare_provider_ineligible_report(
+                raw_path=candidate_path,
+                raw_rel=raw_rel,
+                input_raw_sha256=post_hash,
+                cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+                raw_prepare_policy=policy,
+                provider_spec=provider_spec,
+            )
+            provider_report["raw_fast_path_report"] = report
+            provider_report["raw_hard_blockers"] = raw_prepare_hard_blockers(report)
+            return provider_report
+        return report
+
+    policies = [RawPreparePolicy.auto, RawPreparePolicy.skip_model, RawPreparePolicy.force_model]
+    if cleanup.changed:
+        with tempfile.TemporaryDirectory(prefix="llmwiki-raw-prepare-check-") as tmp_dir:
+            candidate_path = Path(tmp_dir) / raw_path.name
+            candidate_path.write_text(cleaned_text, encoding="utf-8")
+            reports = {policy.value: build_for(policy, candidate_path) for policy in policies}
+    else:
+        reports = {policy.value: build_for(policy, raw_path) for policy in policies}
+
+    selected_policy = RawPreparePolicy(raw_prepare_policy)
+    auto_report = reports[RawPreparePolicy.auto.value]
+    skip_report = reports[RawPreparePolicy.skip_model.value]
+    return {
+        "schema_version": "raw_prepare_diagnostic.v1",
+        "vault": vault.resolve().as_posix(),
+        "raw_path": raw_rel,
+        "raw_absolute_path": raw_path.as_posix(),
+        "selected_policy": selected_policy.value,
+        "selected_report": reports[selected_policy.value],
+        "auto_report": auto_report,
+        "skip_prepare_report": skip_report,
+        "force_prepare_report": reports[RawPreparePolicy.force_model.value],
+        "provider": {
+            "raw_prepare_spec": provider_spec or "",
+            "fast_path_allowed": provider_fast_path_allowed,
+            "diagnostic_requires_fixture": bool(provider_spec == "mock:fixture" and not (provider_runtime and provider_runtime.fixture_dir)),
+        },
+        "recommendation": raw_prepare_diagnostic_recommendation(
+            auto_report=auto_report,
+            skip_report=skip_report,
+            selected_report=reports[selected_policy.value],
+        ),
+        "raw_link_cleanup": cleanup.model_dump(mode="json"),
+    }
+
+
+def build_raw_prepare_provider_ineligible_report(
+    *,
+    raw_path: Path,
+    raw_rel: str,
+    input_raw_sha256: str,
+    cleanup_ref: str,
+    raw_prepare_policy: RawPreparePolicy,
+    provider_spec: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "raw_prepare_fast_path.v1",
+        "rule_version": RAW_PREPARE_FAST_PATH_RULE_VERSION,
+        "raw_prepare_policy": raw_prepare_policy.value,
+        "eligible": False,
+        "source_raw_path": raw_rel,
+        "input_raw_sha256": input_raw_sha256,
+        "raw_link_cleanup_ref": cleanup_ref,
+        "reasons": ["configured provider is not eligible for deterministic fast-path"],
+        "policy_suppressed_reasons": [],
+        "noise_profile": raw_prepare_noise_profile(raw_path.read_text(encoding="utf-8")),
+        "provider_spec": provider_spec or "",
+        "provider_fast_path_allowed": False,
+    }
+
+
+def raw_prepare_diagnostic_recommendation(
+    *,
+    auto_report: dict[str, Any],
+    skip_report: dict[str, Any],
+    selected_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    auto_reasons = [str(reason) for reason in auto_report.get("reasons", [])]
+    skip_reasons = [str(reason) for reason in skip_report.get("reasons", [])]
+    noise = auto_report.get("noise_profile", {})
+    raw_fast_path_report = auto_report.get("raw_fast_path_report") if isinstance(auto_report.get("raw_fast_path_report"), dict) else auto_report
+    hard_blockers = raw_prepare_hard_blockers(raw_fast_path_report)
+    skip_available = not skip_reasons
+    selected_estimated_model_prepare = not bool((selected_report or auto_report).get("eligible"))
+    if bool(auto_report.get("eligible")):
+        return {
+            "decision": "auto_deterministic_fast_path",
+            "recommended_flag": "",
+            "summary": "auto 会使用 deterministic raw_prepare fast-path，不调用模型清洗。",
+            "skip_prepare_available": skip_available,
+            "force_prepare_available": True,
+            "auto_estimated_model_prepare": False,
+            "selected_estimated_model_prepare": selected_estimated_model_prepare,
+            "estimated_model_prepare": selected_estimated_model_prepare,
+            "raw_hard_blockers": hard_blockers,
+        }
+    if hard_blockers:
+        return {
+            "decision": "model_prepare_required",
+            "recommended_flag": "",
+            "summary": "auto 会走模型 raw_prepare；当前 raw 不是可安全 passthrough 的 Markdown，--skip-prepare 也不能覆盖硬性原因。",
+            "skip_prepare_available": skip_available,
+            "force_prepare_available": True,
+            "auto_estimated_model_prepare": True,
+            "selected_estimated_model_prepare": selected_estimated_model_prepare,
+            "estimated_model_prepare": selected_estimated_model_prepare,
+            "raw_hard_blockers": hard_blockers,
+        }
+    if "configured provider is not eligible for deterministic fast-path" in auto_reasons:
+        return {
+            "decision": "auto_provider_prepare_required",
+            "recommended_flag": "",
+            "summary": "auto 会调用 raw_prepare provider；当前 provider 不支持 deterministic fast-path。",
+            "skip_prepare_available": skip_available,
+            "force_prepare_available": True,
+            "auto_estimated_model_prepare": True,
+            "selected_estimated_model_prepare": selected_estimated_model_prepare,
+            "estimated_model_prepare": selected_estimated_model_prepare,
+            "raw_hard_blockers": hard_blockers,
+        }
+    noisy_transcript = bool(
+        noise.get("transcript_provenance_risk")
+        or noise.get("structured_markdown_quality_risk")
+        or noise.get("webvtt_marker")
+        or raw_prepare_timestamp_transcript_noise(noise)
+        or raw_prepare_speaker_turn_transcript_noise(noise)
+    )
+    if noisy_transcript:
+        return {
+            "decision": "auto_model_prepare_recommended",
+            "recommended_flag": "",
+            "summary": "auto 会走模型 raw_prepare；材料像播客/视频转写或翻译稿，建议保留清洗。若你确认 raw 已人工校对，可用 --skip-prepare 节省模型时间。",
+            "skip_prepare_available": skip_available,
+            "force_prepare_available": True,
+            "auto_estimated_model_prepare": True,
+            "selected_estimated_model_prepare": selected_estimated_model_prepare,
+            "estimated_model_prepare": selected_estimated_model_prepare,
+            "raw_hard_blockers": hard_blockers,
+        }
+    return {
+        "decision": "auto_model_prepare_user_choice",
+        "recommended_flag": "--skip-prepare" if skip_available else "",
+        "summary": "auto 会走模型 raw_prepare，但阻断原因不像强 ASR/翻译风险；若你确认 raw 质量足够，可以用 --skip-prepare。",
+        "skip_prepare_available": skip_available,
+        "force_prepare_available": True,
+        "auto_estimated_model_prepare": True,
+        "selected_estimated_model_prepare": selected_estimated_model_prepare,
+        "estimated_model_prepare": selected_estimated_model_prepare,
+        "raw_hard_blockers": hard_blockers,
+    }
+
+
+def raw_prepare_hard_blockers(report: dict[str, Any]) -> list[str]:
+    return [
+        str(reason)
+        for reason in report.get("reasons", [])
+        if str(reason) in {"raw file extension is not markdown", "raw text is empty"}
+    ]
+
+
+def deterministic_omission_policy(*, reference_truncated: bool, appendix_compacted: bool) -> str:
+    if reference_truncated and appendix_compacted:
+        return "reference_section_omitted_and_appendix_compacted_from_prepared_markdown_raw_retained"
+    if reference_truncated:
+        return "reference_section_omitted_from_prepared_markdown_raw_retained"
+    if appendix_compacted:
+        return "appendix_compacted_from_prepared_markdown_raw_retained"
+    return "none"
+
+
+def raw_prepare_noise_profile(text: str) -> dict[str, Any]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    line_count = len(lines)
+    body_lines = raw_prepare_body_lines_for_noise(text)
+    body_line_count = len(body_lines)
+    timestamp_line_count = sum(1 for line in lines if TRANSCRIPT_TIMESTAMP_RE.search(line))
+    speaker_turn_count = sum(1 for line in lines if SPEAKER_TURN_RE.search(line))
+    heading_count = sum(1 for line in lines if re.match(r"^\s{0,3}#{1,6}\s+\S", line))
+    short_body_line_count = sum(1 for line in body_lines if len(line) <= 32)
+    missing_sentence_terminal_count = sum(
+        1 for line in body_lines if line and line[-1] not in SENTENCE_TERMINAL_PUNCTUATION
+    )
+    low_punctuation_body_line_count = sum(
+        1 for line in body_lines if len(line) >= 16 and not any(mark in line for mark in INLINE_PUNCTUATION)
+    )
+    long_unpunctuated_body_line_count = sum(
+        1 for line in body_lines if len(line) >= 24 and not any(mark in line for mark in INLINE_PUNCTUATION)
+    )
+    paper_section_marker_count = len(PAPER_SECTION_HEADING_RE.findall(text))
+    paper_caption_count = len(PAPER_CAPTION_RE.findall(text))
+    arxiv_import_marker = bool(ARXIV_IMPORT_MARKER_RE.search(text))
+    paper_like_marker = raw_prepare_paper_like_markdown(
+        line_count=line_count,
+        heading_count=heading_count,
+        arxiv_import_marker=arxiv_import_marker,
+        paper_section_marker_count=paper_section_marker_count,
+        paper_caption_count=paper_caption_count,
+        text=text,
+    )
+    noise = {
+        "line_count": line_count,
+        "body_line_count": body_line_count,
+        "heading_count": heading_count,
+        "heading_ratio": heading_count / line_count if line_count else 0.0,
+        "short_body_line_count": short_body_line_count,
+        "short_body_line_ratio": short_body_line_count / body_line_count if body_line_count else 0.0,
+        "missing_sentence_terminal_count": missing_sentence_terminal_count,
+        "missing_sentence_terminal_ratio": (
+            missing_sentence_terminal_count / body_line_count if body_line_count else 0.0
+        ),
+        "low_punctuation_body_line_count": low_punctuation_body_line_count,
+        "low_punctuation_body_line_ratio": (
+            low_punctuation_body_line_count / body_line_count if body_line_count else 0.0
+        ),
+        "long_unpunctuated_body_line_count": long_unpunctuated_body_line_count,
+        "timestamp_line_count": timestamp_line_count,
+        "timestamp_line_ratio": timestamp_line_count / line_count if line_count else 0.0,
+        "speaker_turn_count": speaker_turn_count,
+        "speaker_turn_ratio": speaker_turn_count / line_count if line_count else 0.0,
+        "markdown_media_embed_count": len(MARKDOWN_MEDIA_EMBED_RE.findall(text)),
+        "interview_transcript_marker": bool(INTERVIEW_TRANSCRIPT_MARKER_RE.search(text)),
+        "webvtt_marker": bool(re.search(r"(?im)^\s*WEBVTT\s*$", text)),
+        "youtube_url_count": len(YOUTUBE_URL_RE.findall(text)),
+        "podcast_marker_count": len(PODCAST_MARKER_RE.findall(text)),
+        "audio_video_marker_count": len(AUDIO_VIDEO_SOURCE_MARKER_RE.findall(text)),
+        "translation_marker_count": len(TRANSLATION_MARKER_RE.findall(text)),
+        "asr_source_marker_count": len(ASR_SOURCE_MARKER_RE.findall(text)),
+        "arxiv_import_marker": arxiv_import_marker,
+        "paper_section_marker_count": paper_section_marker_count,
+        "paper_caption_count": paper_caption_count,
+        "paper_like_marker": paper_like_marker,
+    }
+    noise["transcript_provenance_risk"] = raw_prepare_transcript_provenance_risk(noise)
+    noise["structured_markdown_quality_risk"] = raw_prepare_structured_markdown_quality_risk(noise)
+    return noise
+
+
+def raw_prepare_body_lines_for_noise(text: str) -> list[str]:
+    body_lines: list[str] = []
+    in_frontmatter = False
+    in_fenced_code = False
+    for index, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if index == 1 and stripped == "---":
+            in_frontmatter = True
+            continue
+        if in_frontmatter:
+            if stripped == "---":
+                in_frontmatter = False
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fenced_code = not in_fenced_code
+            continue
+        if in_fenced_code or not stripped:
+            continue
+        if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
+            continue
+        if MARKDOWN_MEDIA_EMBED_RE.search(stripped):
+            continue
+        if re.match(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", stripped):
+            continue
+        stripped = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", stripped)
+        if stripped:
+            body_lines.append(stripped)
+    return body_lines
+
+
+def raw_prepare_paper_like_markdown(
+    *,
+    line_count: int,
+    heading_count: int,
+    arxiv_import_marker: bool,
+    paper_section_marker_count: int,
+    paper_caption_count: int,
+    text: str,
+) -> bool:
+    if line_count < 80 or heading_count < 6:
+        return False
+    if not arxiv_import_marker and "doi" not in text[:5000].lower():
+        return False
+    return paper_section_marker_count >= 2 or paper_caption_count >= 3 or bool(REFERENCE_SECTION_HEADING_RE.search(text))
+
+
+def raw_prepare_structured_markdown_fast_path_allowed(noise: dict[str, Any]) -> bool:
+    if noise.get("webvtt_marker"):
+        return False
+    if raw_prepare_timestamp_transcript_noise(noise):
+        return False
+    if raw_prepare_speaker_turn_transcript_noise(noise):
+        return False
+    if raw_prepare_structured_markdown_quality_risk(noise):
+        return False
+    return noise.get("line_count", 0) >= 40 and noise.get("heading_count", 0) >= 6
+
+
+def raw_prepare_timestamp_transcript_noise(noise: dict[str, Any]) -> bool:
+    return noise.get("timestamp_line_count", 0) >= 8 or noise.get("timestamp_line_ratio", 0.0) >= 0.05
+
+
+def raw_prepare_speaker_turn_transcript_noise(noise: dict[str, Any]) -> bool:
+    if noise.get("paper_like_marker") and noise.get("speaker_turn_ratio", 0.0) < 0.15:
+        return False
+    return noise.get("speaker_turn_count", 0) >= 20 or noise.get("speaker_turn_ratio", 0.0) >= 0.10
+
+
+def raw_prepare_transcript_provenance_risk(noise: dict[str, Any]) -> bool:
+    if noise.get("paper_like_marker"):
+        return False
+    if noise.get("asr_source_marker_count", 0) > 0:
+        return True
+    has_external_media = noise.get("youtube_url_count", 0) > 0 or noise.get("markdown_media_embed_count", 0) > 0
+    transcriptish = bool(noise.get("interview_transcript_marker")) or noise.get("podcast_marker_count", 0) > 0
+    translated = noise.get("translation_marker_count", 0) > 0
+    if has_external_media and (transcriptish or translated):
+        return True
+    if noise.get("podcast_marker_count", 0) > 0 and (bool(noise.get("interview_transcript_marker")) or translated):
+        return True
+    if translated and bool(noise.get("interview_transcript_marker")) and noise.get("heading_count", 0) >= 4:
+        return True
+    return False
+
+
+def raw_prepare_structured_markdown_quality_risk(noise: dict[str, Any]) -> bool:
+    if noise.get("paper_like_marker"):
+        return False
+    if raw_prepare_transcript_provenance_risk(noise):
+        return True
+    body_line_count = noise.get("body_line_count", 0)
+    if body_line_count >= 30 and noise.get("low_punctuation_body_line_ratio", 0.0) >= 0.40:
+        return True
+    if (
+        body_line_count >= 40
+        and noise.get("short_body_line_ratio", 0.0) >= 0.55
+        and noise.get("missing_sentence_terminal_ratio", 0.0) >= 0.35
+    ):
+        return True
+    return noise.get("long_unpunctuated_body_line_count", 0) >= 8
+
+
+def infer_passthrough_document_kind(text: str, noise: dict[str, Any]) -> Literal["transcript", "article", "notes", "mixed", "unknown"]:
+    if noise.get("paper_like_marker"):
+        return "article"
+    if noise["timestamp_line_count"] or noise["speaker_turn_count"]:
+        return "transcript"
+    if noise.get("interview_transcript_marker"):
+        return "transcript"
+    non_empty = [line for line in text.splitlines() if line.strip()]
+    if not non_empty:
+        return "unknown"
+    heading_count = sum(1 for line in non_empty if line.lstrip().startswith("#"))
+    bullet_count = sum(1 for line in non_empty if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line))
+    bullet_ratio = bullet_count / len(non_empty)
+    if bullet_ratio >= 0.35:
+        return "notes"
+    if heading_count and len(non_empty) >= 6:
+        return "article"
+    if bullet_count:
+        return "notes"
+    return "mixed"
+
+
+def truncate_reference_section_for_prepared_markdown(text: str) -> tuple[str, dict[str, Any]]:
+    report: dict[str, Any] = {
+        "truncated": False,
+        "reason": "no eligible reference section found",
+        "omitted_char_count": 0,
+    }
+    if len(text) < REFERENCE_TRUNCATION_MIN_DOCUMENT_CHARS:
+        report["reason"] = "document is below reference truncation size threshold"
+        return text.rstrip() + "\n", report
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        if not REFERENCE_SECTION_HEADING_RE.match(line.strip()):
+            continue
+        start = offsets[index]
+        next_appendix_index = next(
+            (
+                following_index
+                for following_index in range(index + 1, len(lines))
+                if APPENDIX_SECTION_HEADING_RE.match(lines[following_index].strip())
+            ),
+            None,
+        )
+        end = offsets[next_appendix_index] if next_appendix_index is not None else len(text)
+        omitted_char_count = end - start
+        if start / len(text) < REFERENCE_TRUNCATION_MIN_START_RATIO:
+            report["reason"] = "reference section starts too early"
+            continue
+        if omitted_char_count < REFERENCE_TRUNCATION_MIN_OMITTED_CHARS:
+            report["reason"] = "reference section is below truncation size threshold"
+            continue
+        heading = line.strip()
+        marker = (
+            f"{heading}\n\n"
+            "[Reference section omitted from prepared markdown; original raw retains the full reference list.]\n"
+        )
+        suffix = text[end:].lstrip("\n")
+        prepared = text[:start].rstrip() + "\n\n" + marker
+        if suffix:
+            prepared = prepared.rstrip() + "\n\n" + suffix
+        return prepared.rstrip() + "\n", {
+            "truncated": True,
+            "reference_heading": heading,
+            "start_line": index + 1,
+            "start_char": start,
+            "end_line": next_appendix_index + 1 if next_appendix_index is not None else len(lines),
+            "end_char": end,
+            "preserved_following_appendix": next_appendix_index is not None,
+            "omitted_char_count": omitted_char_count,
+            "reason": "reference section omitted from prepared markdown while raw retains full text",
+        }
+    return text.rstrip() + "\n", report
+
+
+def compact_appendix_sections_for_prepared_markdown(
+    text: str,
+    *,
+    enabled: bool,
+    min_document_chars: int = APPENDIX_COMPACTION_MIN_DOCUMENT_CHARS,
+    min_omitted_chars: int = APPENDIX_COMPACTION_MIN_OMITTED_CHARS,
+    min_start_ratio: float = APPENDIX_COMPACTION_MIN_START_RATIO,
+    section_excerpt_limit: int = APPENDIX_COMPACTION_SECTION_EXCERPT_LIMIT,
+    max_sections: int = APPENDIX_COMPACTION_MAX_SECTIONS,
+) -> tuple[str, dict[str, Any]]:
+    report: dict[str, Any] = {
+        "compacted": False,
+        "reason": "appendix compaction disabled",
+        "omitted_char_count": 0,
+    }
+    if not enabled:
+        return text.rstrip() + "\n", report
+    if len(text) < min_document_chars:
+        report["reason"] = "document is below appendix compaction size threshold"
+        return text.rstrip() + "\n", report
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    appendix_index = next(
+        (index for index, line in enumerate(lines) if APPENDIX_SECTION_HEADING_RE.match(line.strip())),
+        None,
+    )
+    if appendix_index is None:
+        report["reason"] = "no appendix-like heading found"
+        return text.rstrip() + "\n", report
+    appendix_start = offsets[appendix_index]
+    if appendix_start / len(text) < min_start_ratio:
+        report["reason"] = "appendix starts too early"
+        return text.rstrip() + "\n", report
+    appendix_text = text[appendix_start:]
+    compacted_appendix, appendix_report = compact_appendix_text(
+        appendix_text,
+        section_excerpt_limit=section_excerpt_limit,
+        max_sections=max_sections,
+    )
+    omitted_char_count = len(appendix_text.rstrip()) - len(compacted_appendix.rstrip())
+    if omitted_char_count < min_omitted_chars:
+        report["reason"] = "appendix omitted chars below compaction threshold"
+        report["omitted_char_count"] = max(0, omitted_char_count)
+        return text.rstrip() + "\n", report
+    prepared = text[:appendix_start].rstrip() + "\n\n" + compacted_appendix.rstrip() + "\n"
+    return prepared, {
+        "compacted": True,
+        "appendix_start_line": appendix_index + 1,
+        "appendix_start_char": appendix_start,
+        "original_appendix_char_count": len(appendix_text.rstrip()),
+        "compacted_appendix_char_count": len(compacted_appendix.rstrip()),
+        "omitted_char_count": omitted_char_count,
+        "section_excerpt_limit": section_excerpt_limit,
+        "max_sections": max_sections,
+        **appendix_report,
+        "reason": "appendix sections compacted while raw retains full appendix",
+    }
+
+
+def compact_appendix_text(
+    appendix_text: str,
+    *,
+    section_excerpt_limit: int,
+    max_sections: int,
+) -> tuple[str, dict[str, Any]]:
+    lines = appendix_text.splitlines(keepends=True)
+    heading_indices = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^\s{0,3}#{2,6}\s+\S", line) or (index == 0 and APPENDIX_SECTION_HEADING_RE.match(line.strip()))
+    ]
+    if not heading_indices or heading_indices[0] != 0:
+        heading_indices.insert(0, 0)
+    heading_indices = sorted(set(heading_indices))
+    sections: list[tuple[int, int]] = []
+    for position, start_index in enumerate(heading_indices):
+        end_index = heading_indices[position + 1] if position + 1 < len(heading_indices) else len(lines)
+        sections.append((start_index, end_index))
+    output: list[str] = []
+    compacted_sections = 0
+    omitted_sections = 0
+    for section_number, (start_index, end_index) in enumerate(sections, start=1):
+        section_text = "".join(lines[start_index:end_index]).strip()
+        if not section_text:
+            continue
+        heading = lines[start_index].strip() if start_index < len(lines) else f"Appendix section {section_number}"
+        if section_number > max_sections:
+            omitted_sections += 1
+            continue
+        excerpt = compact_payload_text(section_text, section_excerpt_limit)
+        if len(section_text) > len(excerpt):
+            compacted_sections += 1
+            output.append(
+                f"{excerpt}\n\n"
+                "[Appendix section compacted in prepared markdown; original raw retains the full appendix section.]"
+            )
+        else:
+            output.append(section_text)
+        if section_number == max_sections and len(sections) > max_sections:
+            omitted_sections += len(sections) - max_sections
+            output.append(
+                "## Additional Appendix Sections Omitted\n\n"
+                f"[{len(sections) - max_sections} additional appendix section(s) omitted from prepared markdown; original raw retains them.]"
+            )
+            break
+    return "\n\n".join(output).rstrip() + "\n", {
+        "original_section_count": len(sections),
+        "included_section_count": min(len(sections), max_sections),
+        "compacted_section_count": compacted_sections,
+        "omitted_section_count": omitted_sections,
+    }
+
+
+def write_raw_prepare_fast_path_report(step_root: Path, report: dict[str, Any]) -> tuple[Path, Path]:
+    json_path = step_root / "raw_prepare_fast_path.json"
+    md_path = step_root / "raw_prepare_fast_path.md"
+    write_json(json_path, report)
+    reason_rows = [[reason] for reason in report.get("reasons", [])]
+    suppressed_reason_rows = [[reason] for reason in report.get("policy_suppressed_reasons", [])]
+    noise = report.get("noise_profile", {})
+    noise_rows = [
+        [key, f"{value:.3f}" if isinstance(value, float) else str(value)]
+        for key, value in noise.items()
+    ]
+    reference_truncation = report.get("reference_truncation", {})
+    reference_rows = [[key, str(value)] for key, value in reference_truncation.items()]
+    appendix_compaction = report.get("appendix_compaction", {})
+    appendix_rows = [[key, str(value)] for key, value in appendix_compaction.items()]
+    success_note = (
+        "_无，已使用 --skip-prepare passthrough。_"
+        if report.get("raw_prepare_policy") == RawPreparePolicy.skip_model.value
+        else "_无，已使用 deterministic markdown passthrough。_"
+    )
+    md_path.write_text(
+        "# Raw Prepare Fast Path\n\n"
+        f"- 规则版本: `{report.get('rule_version', RAW_PREPARE_FAST_PATH_RULE_VERSION)}`\n"
+        f"- 清洗策略: `{report.get('raw_prepare_policy', RawPreparePolicy.auto.value)}`\n"
+        f"- 是否启用: `{str(report.get('eligible', False)).lower()}`\n"
+        f"- 原始材料: `{report.get('source_raw_path', '')}`\n"
+        f"- Raw Wikilink 规范化: `{report.get('raw_link_cleanup_ref', '')}`\n\n"
+        "## 未启用原因\n\n"
+        f"{format_markdown_table(['原因'], reason_rows) if reason_rows else success_note}\n\n"
+        "## Policy 覆盖的自动拦截原因\n\n"
+        f"{format_markdown_table(['原因'], suppressed_reason_rows) if suppressed_reason_rows else '_无。_'}\n\n"
+        "## 噪声画像\n\n"
+        f"{format_markdown_table(['字段', '值'], noise_rows) if noise_rows else '_暂无。_'}\n\n"
+        "## 参考文献截断\n\n"
+        f"{format_markdown_table(['字段', '值'], reference_rows) if reference_rows else '_未评估。_'}\n\n"
+        "## Appendix 压缩\n\n"
+        f"{format_markdown_table(['字段', '值'], appendix_rows) if appendix_rows else '_未评估。_'}\n",
+        encoding="utf-8",
+    )
+    return json_path, md_path
+
+
 def _run_raw_prepare(ctx: StepRunContext) -> None:
     step_name = "raw_prepare"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -669,11 +1942,63 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
     cleanup_path = require_step_output_dir(ctx.run_dir, "raw_link_cleanup") / "raw_link_cleanup.json"
     cleanup = read_model(cleanup_path, RawLinkCleanupArtifact)
     input_raw_sha256 = sha256_file(ctx.raw_path)
+    cleanup_ref = cleanup_path.relative_to(ctx.run_dir).as_posix()
+    fast_path_report_refs: list[ArtifactRef] = []
+    raw_prepare_policy = ctx.manifest.vault_config_snapshot.raw_prepare_policy
+    if raw_prepare_policy != RawPreparePolicy.auto or raw_prepare_fast_path_provider_allowed(ctx, step_name):
+        preparation, fast_path_report = build_raw_prepare_fast_path(
+            raw_path=ctx.raw_path,
+            raw_rel=raw_rel,
+            input_raw_sha256=input_raw_sha256,
+            cleanup=cleanup,
+            cleanup_ref=cleanup_ref,
+            raw_prepare_policy=raw_prepare_policy,
+        )
+        fast_json, fast_md = write_raw_prepare_fast_path_report(step_root, fast_path_report)
+        fast_path_report_refs = [
+            _ref(ctx.run_dir, fast_json, step_name, "json", "raw_prepare_fast_path.v1"),
+            _ref(ctx.run_dir, fast_md, step_name, "markdown"),
+        ]
+        if preparation is not None:
+            validate_raw_preparation(preparation)
+            out = step_root / "raw_preparation.json"
+            write_json(out, preparation)
+            prepared = step_root / "prepared.md"
+            prepared.parent.mkdir(parents=True, exist_ok=True)
+            prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
+            review = step_root / "preparation_review.md"
+            review.write_text(render_preparation_review(preparation), encoding="utf-8")
+            complete_step(
+                ctx.manifest,
+                step_name,
+                outputs=[
+                    _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
+                    _ref(ctx.run_dir, prepared, step_name, "markdown"),
+                    _ref(ctx.run_dir, review, step_name, "markdown"),
+                    *fast_path_report_refs,
+                ],
+            )
+            return
+    elif ctx.raw_path.suffix.lower() in {".md", ".markdown", ".mdown"}:
+        runtime = ctx.execution_context.record.providers.get(step_name) if ctx.execution_context.record else None
+        skipped_report = build_raw_prepare_provider_ineligible_report(
+            raw_path=ctx.raw_path,
+            raw_rel=raw_rel,
+            input_raw_sha256=input_raw_sha256,
+            cleanup_ref=cleanup_ref,
+            raw_prepare_policy=raw_prepare_policy,
+            provider_spec=runtime.spec if runtime is not None else None,
+        )
+        fast_json, fast_md = write_raw_prepare_fast_path_report(step_root, skipped_report)
+        fast_path_report_refs = [
+            _ref(ctx.run_dir, fast_json, step_name, "json", "raw_prepare_fast_path.v1"),
+            _ref(ctx.run_dir, fast_md, step_name, "markdown"),
+        ]
     payload = {
         "source_raw_path": raw_rel,
         "source_raw_sha256": input_raw_sha256,
         "raw_markdown": ctx.raw_path.read_text(encoding="utf-8"),
-        "raw_link_cleanup_ref": cleanup_path.relative_to(ctx.run_dir).as_posix(),
+        "raw_link_cleanup_ref": cleanup_ref,
         "raw_link_cleanup": {
             "changed": cleanup.changed,
             "cleaned_link_count": cleanup.cleaned_link_count,
@@ -686,7 +2011,7 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
         candidate = model.model_copy(
             update={
                 "input_raw_sha256": input_raw_sha256,
-                "raw_link_cleanup_ref": cleanup_path.relative_to(ctx.run_dir).as_posix(),
+                "raw_link_cleanup_ref": cleanup_ref,
             }
         )
         validate_raw_preparation(candidate)
@@ -714,7 +2039,7 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
     preparation = preparation.model_copy(
         update={
             "input_raw_sha256": input_raw_sha256,
-            "raw_link_cleanup_ref": cleanup_path.relative_to(ctx.run_dir).as_posix(),
+            "raw_link_cleanup_ref": cleanup_ref,
         }
     )
     validate_raw_preparation(preparation)
@@ -732,6 +2057,7 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
         _ref(ctx.run_dir, prepared, step_name, "markdown"),
         _ref(ctx.run_dir, review, step_name, "markdown"),
     ]
+    outputs.extend(fast_path_report_refs)
     outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=outputs)
 
@@ -740,12 +2066,37 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
     step_name = "prepared_raw_review"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     prepared = require_step_output_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
+    preparation = read_model(require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
+    fast_path_report_path = require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_prepare_fast_path.json"
+    suppressed_reasons: list[str] = []
+    if fast_path_report_path.exists():
+        try:
+            fast_path_report = json.loads(fast_path_report_path.read_text(encoding="utf-8"))
+            suppressed_reasons = [str(reason) for reason in fast_path_report.get("policy_suppressed_reasons", [])]
+        except Exception:
+            suppressed_reasons = []
     approved = step_root / "approved_prepared.md"
     approved.write_text(prepared.read_text(encoding="utf-8"), encoding="utf-8")
     prompt = step_root / "review_prompt.md"
+    risk_section = ""
+    if preparation.requires_human_review or suppressed_reasons:
+        risk_rows = [[reason] for reason in suppressed_reasons]
+        risk_section = (
+            "\n## Skip Prepare 风险提示\n\n"
+            f"- risk_level: `{preparation.risk_level}`\n"
+            f"- requires_human_review: `{str(preparation.requires_human_review).lower()}`\n"
+            "- 说明：用户显式选择了 passthrough；本步骤仍自动批准，但下游审核应知道 raw_prepare 覆盖了自动质量拦截。\n\n"
+            + (
+                format_markdown_table(["被覆盖的自动拦截原因"], risk_rows)
+                if risk_rows
+                else "_无明确 policy_suppressed_reasons。_"
+            )
+            + "\n"
+        )
     prompt.write_text(
         "# Prepared Raw 审核\n\n"
-        "当前 MVP 自动批准 prepared raw；后续会加入交互式人工审核。\n",
+        "当前 MVP 自动批准 prepared raw；后续会加入交互式人工审核。\n"
+        f"{risk_section}",
         encoding="utf-8",
     )
     feedback = step_root / "review_feedback.jsonl"
@@ -755,7 +2106,11 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
         decision="approved",
         review_mode="auto_stub",
         auto_approved=True,
-        notes="当前 MVP 自动批准；交互式审核是后续工作。",
+        notes=(
+            "当前 MVP 自动批准；交互式审核是后续工作。"
+            if not suppressed_reasons
+            else f"当前 MVP 自动批准；--skip-prepare 覆盖 {len(suppressed_reasons)} 个自动质量拦截。"
+        ),
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
@@ -772,24 +2127,271 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
     )
 
 
+def build_source_digest_source_map(
+    approved_prepared_text: str,
+    *,
+    approved_prepared_ref: str,
+    full_source_limit: int = SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT,
+    total_limit: int = SOURCE_DIGEST_SOURCE_MAP_TOTAL_LIMIT,
+    global_limit: int = SOURCE_DIGEST_SOURCE_MAP_GLOBAL_EXCERPT_LIMIT,
+    min_section_limit: int = SOURCE_DIGEST_SOURCE_MAP_MIN_SECTION_EXCERPT_LIMIT,
+    max_section_limit: int = SOURCE_DIGEST_SOURCE_MAP_MAX_SECTION_EXCERPT_LIMIT,
+    max_sections: int = SOURCE_DIGEST_SOURCE_MAP_MAX_SECTIONS,
+    max_captions: int = SOURCE_DIGEST_SOURCE_MAP_MAX_CAPTIONS,
+) -> dict[str, Any]:
+    include_full_source = len(approved_prepared_text) <= full_source_limit
+    sections = markdown_sections_for_source_map(approved_prepared_text, max_sections=max_sections)
+    section_budget_total = max(0, total_limit - global_limit)
+    section_limit = max_section_limit
+    if sections:
+        section_limit = max(min_section_limit, min(max_section_limit, section_budget_total // max(1, len(sections))))
+    source_map_sections: list[dict[str, Any]] = []
+    included_section_chars = 0
+    for section in sections:
+        excerpt = "" if include_full_source else compact_payload_text(section["text"], section_limit)
+        included_section_chars += len(excerpt)
+        source_map_sections.append(
+            {
+                "section_id": section["section_id"],
+                "heading": section["heading"],
+                "level": section["level"],
+                "line_start": section["line_start"],
+                "line_end": section["line_end"],
+                "char_start": section["char_start"],
+                "char_end": section["char_end"],
+                "original_char_count": len(section["text"]),
+                "excerpt": excerpt,
+                "excerpt_char_count": len(excerpt),
+                "truncated": len(section["text"].strip()) > len(excerpt),
+            }
+        )
+    global_excerpt = "" if include_full_source else source_global_excerpt(approved_prepared_text, global_limit)
+    captions = [] if include_full_source else source_digest_caption_snippets(approved_prepared_text, max_captions=max_captions)
+    included_chars = len(global_excerpt) + included_section_chars + sum(len(item["text"]) for item in captions)
+    return {
+        "schema_version": "source_digest_source_map.v1",
+        "approved_prepared_ref": approved_prepared_ref,
+        "full_source_in_payload": include_full_source,
+        "full_source_limit": full_source_limit,
+        "original_char_count": len(approved_prepared_text),
+        "included_char_count": included_chars,
+        "total_limit": total_limit,
+        "global_excerpt_limit": global_limit,
+        "section_excerpt_limit": section_limit,
+        "max_sections": max_sections,
+        "omitted_section_count": max(0, markdown_heading_count(approved_prepared_text) - len(source_map_sections)),
+        "global_excerpt": global_excerpt,
+        "outline": [
+            {
+                "heading": section["heading"],
+                "level": section["level"],
+                "line_start": section["line_start"],
+                "section_id": section["section_id"],
+            }
+            for section in sections
+        ],
+        "captions": captions,
+        "sections": source_map_sections,
+    }
+
+
+def markdown_heading_count(text: str) -> int:
+    return sum(1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line))
+
+
+def markdown_sections_for_source_map(text: str, *, max_sections: int) -> list[dict[str, Any]]:
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    cursor = 0
+    heading_indices: list[int] = []
+    for index, line in enumerate(lines):
+        offsets.append(cursor)
+        if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
+            heading_indices.append(index)
+        cursor += len(line)
+    if not lines:
+        return []
+    if not heading_indices or heading_indices[0] != 0:
+        heading_indices.insert(0, 0)
+    all_heading_indices = sorted(set(heading_indices))
+    heading_indices = all_heading_indices[:max_sections]
+    sections: list[dict[str, Any]] = []
+    for position, start_index in enumerate(heading_indices):
+        source_position = all_heading_indices.index(start_index)
+        end_index = all_heading_indices[source_position + 1] if source_position + 1 < len(all_heading_indices) else len(lines)
+        text_block = "".join(lines[start_index:end_index]).strip()
+        if not text_block:
+            continue
+        heading_line = lines[start_index].strip() if start_index < len(lines) else ""
+        match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$", heading_line)
+        level = len(match.group(1)) if match else 0
+        heading = match.group(2).strip() if match else "Preamble"
+        char_start = offsets[start_index] if start_index < len(offsets) else 0
+        char_end = offsets[end_index] if end_index < len(offsets) else len(text)
+        sections.append(
+            {
+                "section_id": f"S{len(sections) + 1:03d}",
+                "heading": heading,
+                "level": level,
+                "line_start": start_index + 1,
+                "line_end": end_index,
+                "char_start": char_start,
+                "char_end": char_end,
+                "text": text_block,
+            }
+        )
+    return sections
+
+
+def source_digest_caption_snippets(text: str, *, max_captions: int) -> list[dict[str, Any]]:
+    captions: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not PAPER_CAPTION_RE.match(stripped):
+            continue
+        captions.append(
+            {
+                "line": line_number,
+                "text": compact_payload_text(stripped, 280),
+            }
+        )
+        if len(captions) >= max_captions:
+            break
+    return captions
+
+
+def source_digest_language_contract(vault_config: VaultConfig) -> dict[str, Any]:
+    return {
+        "vault_language": vault_config.wiki_language,
+        "hard_requirement": (
+            "All source_digest user-visible prose fields must be written in Chinese for zh-CN vaults. "
+            "Do not answer source_digest in English and do not rely on a later repair pass to translate."
+        ),
+        "fields_must_be_chinese": [
+            "summary",
+            "key_takeaways",
+            "one_sentence_summary",
+            "why_matters",
+            "wiki_value",
+            "open_question_or_tension",
+            "resolution_hint",
+            "weak_or_noise_items.why_matches",
+        ],
+        "stable_terms_may_remain_english": [
+            "Claude Code",
+            "Cowork",
+            "PM",
+            "RAG",
+            "Workflow",
+            "Agent",
+            "API",
+            "Evals",
+            "MCP",
+        ],
+        "allowed_english_boundary": (
+            "Keep stable product names and technical terms in English when they are canonical names, "
+            "but surround them with Chinese explanation instead of writing full English sentences."
+        ),
+        "bad_example": "Cat Wu discusses how the team achieves extremely fast product development cycles.",
+        "good_example": "Cat Wu 讨论 Anthropic 团队如何缩短产品开发周期，并说明 AI 时代 PM 角色与产品品味的重要性。",
+    }
+
+
+def render_source_digest_source_map_markdown(source_map: dict[str, Any]) -> str:
+    rows = [
+        ["full_source_in_payload", str(source_map.get("full_source_in_payload", False)).lower()],
+        ["original_char_count", source_map.get("original_char_count", 0)],
+        ["included_char_count", source_map.get("included_char_count", 0)],
+        ["section_excerpt_limit", source_map.get("section_excerpt_limit", 0)],
+        ["section_count", len(source_map.get("sections", []))],
+        ["omitted_section_count", source_map.get("omitted_section_count", 0)],
+        ["caption_count", len(source_map.get("captions", []))],
+    ]
+    section_rows = [
+        [
+            section.get("section_id", ""),
+            section.get("line_start", ""),
+            "#" * int(section.get("level", 0) or 0),
+            section.get("heading", ""),
+            section.get("original_char_count", 0),
+            section.get("excerpt_char_count", 0),
+            str(section.get("truncated", False)).lower(),
+        ]
+        for section in source_map.get("sections", [])
+    ]
+    return (
+        "# Source Digest Source Map\n\n"
+        f"- Approved prepared ref: `{source_map.get('approved_prepared_ref', '')}`\n\n"
+        "## Payload Budget\n\n"
+        f"{format_markdown_table(['字段', '值'], rows)}\n\n"
+        "## Sections\n\n"
+        f"{format_markdown_table(['ID', 'Line', 'Level', 'Heading', 'Original chars', 'Excerpt chars', 'Truncated'], section_rows)}\n"
+    )
+
+
+def project_source_digest_source_map_for_payload(source_map: dict[str, Any], *, full_source_map_ref: str) -> dict[str, Any]:
+    return {
+        "schema_version": "source_digest_source_map_payload.v1",
+        "full_source_map_ref": full_source_map_ref,
+        "approved_prepared_ref": source_map.get("approved_prepared_ref", ""),
+        "full_source_in_payload": source_map.get("full_source_in_payload", False),
+        "original_char_count": source_map.get("original_char_count", 0),
+        "included_char_count": source_map.get("included_char_count", 0),
+        "section_excerpt_limit": source_map.get("section_excerpt_limit", 0),
+        "global_excerpt": source_map.get("global_excerpt", ""),
+        "captions": source_map.get("captions", []),
+        "sections": [
+            {
+                "id": section.get("section_id", ""),
+                "heading": section.get("heading", ""),
+                "level": section.get("level", 0),
+                "line_start": section.get("line_start", 0),
+                "original_char_count": section.get("original_char_count", 0),
+                "excerpt": section.get("excerpt", ""),
+            }
+            for section in source_map.get("sections", [])
+        ],
+    }
+
+
 def _run_source_digest(ctx: StepRunContext) -> None:
     step_name = "source_digest"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
     approved_prepared = require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md"
+    approved_prepared_text = approved_prepared.read_text(encoding="utf-8")
+    approved_prepared_ref = approved_prepared.relative_to(ctx.run_dir).as_posix()
+    source_map = build_source_digest_source_map(approved_prepared_text, approved_prepared_ref=approved_prepared_ref)
+    source_map_path = step_root / "source_digest_source_map.json"
+    source_map_md = step_root / "source_digest_source_map.md"
+    write_json(source_map_path, source_map)
+    source_map_md.write_text(render_source_digest_source_map_markdown(source_map), encoding="utf-8")
+    source_map_payload = project_source_digest_source_map_for_payload(
+        source_map,
+        full_source_map_ref=source_map_path.relative_to(ctx.run_dir).as_posix(),
+    )
+    source_map_payload_path = step_root / "source_digest_source_map_payload.json"
+    write_json(source_map_payload_path, source_map_payload)
     payload = {
         "source_raw_path": raw_rel,
-        "approved_prepared_markdown": approved_prepared.read_text(encoding="utf-8"),
+        "approved_prepared_markdown": approved_prepared_text if source_map["full_source_in_payload"] else "",
+        "approved_prepared_ref": approved_prepared_ref,
+        "source_digest_source_map": source_map_payload,
         "profile": ctx.profile.model_dump(mode="json"),
+        "language_contract": source_digest_language_contract(ctx.manifest.vault_config_snapshot),
         "contract": {
             "goal": "Create a complete source digest of wiki-worthy candidates from this one raw file.",
             "candidate_fields": list(SourceDigestCandidate.model_fields),
             "weak_or_noise_fields": list(WeakOrNoiseItem.model_fields),
+            "candidate_page_budget": ctx.manifest.vault_config_snapshot.max_ingest_candidates,
             "rules": [
                 "Return each candidate group as an array of candidate objects, never as bare fields.",
                 "Every candidate object must include candidate_id, name, type, one_sentence_summary, why_matters, and wiki_value.",
                 "For entities, concepts, designs, comparisons, and open_questions, suggested_page_title must be non-empty.",
                 "Do not decide create, update, duplicate, or cross-reference actions in source_digest.",
+                "Keep formal ingest candidates within candidate_page_budget; choose durable reusable themes over every subtopic.",
                 "Prefer wiki-worthy candidates over every minor mention.",
                 "Use source_locator as a lightweight review locator, not a strict evidence chain.",
                 "Put weak or noisy mentions in weak_or_noise_items instead of creating pages for them.",
@@ -799,6 +2401,9 @@ def _run_source_digest(ctx: StepRunContext) -> None:
                 "The vault language is zh-CN: write summary, key_takeaways, candidate summaries, why_matters, and wiki_value in Chinese.",
                 "Stable domain terms such as Claude Code, RAG, PM, Workflow, Agent may stay in English, but explain them in Chinese when needed.",
                 "Do not return whole English paragraphs for user-visible fields; zh-CN validation will fail instead of silently translating.",
+                "If approved_prepared_markdown is empty, use source_digest_source_map sections, outline, captions, and approved_prepared_ref instead of assuming source content is absent.",
+                "For long source-map payloads, choose durable candidates visible across the outline and section excerpts; do not create candidates from bibliography or appendix-only noise.",
+                "Use section headings, line_start, and source_map section_id values as source_locator review handles when exact full source text is not in the payload.",
             ],
         },
     }
@@ -811,13 +2416,25 @@ def _run_source_digest(ctx: StepRunContext) -> None:
     digest = _redacted_model(ctx, digest, SourceDigestArtifact)
     if digest.source_raw_path != raw_rel:
         raise PipelineError(f"source_digest source path mismatch: {digest.source_raw_path} != {raw_rel}")
+    digest = augment_source_digest_anchor_entities(digest, approved_prepared_text)
+    digest, budget_report = cap_source_digest_candidates(digest, ctx.manifest.vault_config_snapshot.max_ingest_candidates)
+    validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
     out = step_root / "source_digest.json"
     write_json(out, digest)
     digest_md = step_root / "source_digest.md"
     digest_md.write_text(render_source_digest_markdown(digest), encoding="utf-8")
+    budget_report_path = step_root / "source_digest_budget_report.json"
+    budget_report_md = step_root / "source_digest_budget_report.md"
+    write_json(budget_report_path, budget_report)
+    budget_report_md.write_text(render_source_digest_budget_report(budget_report), encoding="utf-8")
     outputs = [
+        _ref(ctx.run_dir, source_map_path, step_name, "json", "source_digest_source_map.v1"),
+        _ref(ctx.run_dir, source_map_md, step_name, "markdown"),
+        _ref(ctx.run_dir, source_map_payload_path, step_name, "json", "source_digest_source_map_payload.v1"),
         _ref(ctx.run_dir, out, step_name, "json", "source_digest.v2"),
         _ref(ctx.run_dir, digest_md, step_name, "markdown"),
+        _ref(ctx.run_dir, budget_report_path, step_name, "json", "source_digest_budget_report.v1"),
+        _ref(ctx.run_dir, budget_report_md, step_name, "markdown"),
     ]
     outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=outputs)
@@ -872,6 +2489,86 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
     )
 
 
+def build_candidate_resolution_source_pack(
+    approved_prepared_text: str,
+    digest: SourceDigestArtifact,
+    *,
+    full_source_limit: int = CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT,
+    global_limit: int = CANDIDATE_RESOLUTION_GLOBAL_EXCERPT_LIMIT,
+    per_candidate_limit: int = CANDIDATE_RESOLUTION_PER_CANDIDATE_EXCERPT_LIMIT,
+) -> dict[str, Any]:
+    include_full_source = len(approved_prepared_text) <= full_source_limit
+    global_excerpt = "" if include_full_source else source_global_excerpt(approved_prepared_text, global_limit)
+    items: list[dict[str, Any]] = []
+    included_chars = len(global_excerpt)
+    for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
+        if group_name in {"budget_deferred_candidates", "weak_or_noise_items"}:
+            continue
+        for candidate in getattr(digest, group_name):
+            cues = [
+                candidate.name,
+                candidate.suggested_page_title,
+                candidate.one_sentence_summary,
+                candidate.why_matters,
+                candidate.wiki_value,
+                candidate.source_locator,
+                candidate.open_question_or_tension,
+            ]
+            snippets = [] if include_full_source else source_snippets_for_cues(
+                approved_prepared_text,
+                cues,
+                max_chars=per_candidate_limit,
+            )
+            included_chars += sum(len(snippet["text"]) for snippet in snippets)
+            items.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "group": group_name,
+                    "name": candidate.name,
+                    "suggested_page_title": candidate.suggested_page_title,
+                    "source_locator": candidate.source_locator,
+                    "snippets": snippets,
+                }
+            )
+    return {
+        "schema_version": "candidate_resolution_source_excerpt_pack.v1",
+        "source_raw_path": digest.source_raw_path,
+        "approved_prepared_ref": "prepared_raw_review/approved_prepared.md",
+        "original_char_count": len(approved_prepared_text),
+        "included_char_count": included_chars,
+        "full_source_in_payload": include_full_source,
+        "full_source_limit": full_source_limit,
+        "global_excerpt_limit": global_limit,
+        "per_candidate_excerpt_limit": per_candidate_limit,
+        "candidate_count": len(items),
+        "global_excerpt": global_excerpt,
+        "items": items,
+    }
+
+
+def render_candidate_resolution_source_pack_markdown(pack: dict[str, Any]) -> str:
+    rows = [
+        [
+            item.get("candidate_id", ""),
+            item.get("group", ""),
+            item.get("name", ""),
+            len(item.get("snippets", [])) if isinstance(item.get("snippets", []), list) else 0,
+            item.get("source_locator", ""),
+        ]
+        for item in pack.get("items", [])
+        if isinstance(item, dict)
+    ]
+    return (
+        "# Candidate Resolution Source Excerpt Pack\n\n"
+        f"- payload 是否包含完整 source：`{str(pack.get('full_source_in_payload', False)).lower()}`\n"
+        f"- 原始 source 字符：{pack.get('original_char_count', 0)}\n"
+        f"- 入模摘录字符：{pack.get('included_char_count', 0)}\n"
+        f"- 完整 source 引用：`{pack.get('approved_prepared_ref', '')}`\n\n"
+        "## Candidate Snippets\n\n"
+        f"{format_markdown_table(['Candidate', 'Group', 'Name', 'Snippets', 'Locator'], rows) if rows else '_无 candidate snippets。_'}\n"
+    )
+
+
 def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
     step_name = "source_duplicate_guard"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -910,8 +2607,16 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
     approved_prepared = require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md"
     validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
+    approved_prepared_text = approved_prepared.read_text(encoding="utf-8")
+    source_pack = build_candidate_resolution_source_pack(approved_prepared_text, digest)
+    source_pack_path = step_root / "candidate_resolution_source_excerpt_pack.json"
+    source_pack_md = step_root / "candidate_resolution_source_excerpt_pack.md"
+    write_json(source_pack_path, source_pack)
+    source_pack_md.write_text(render_candidate_resolution_source_pack_markdown(source_pack), encoding="utf-8")
     payload = {
-        "approved_prepared_markdown": approved_prepared.read_text(encoding="utf-8"),
+        "approved_prepared_markdown": approved_prepared_text if source_pack["full_source_in_payload"] else "",
+        "approved_prepared_ref": "prepared_raw_review/approved_prepared.md",
+        "source_excerpt_pack": source_pack,
         "approved_digest": digest.model_dump(mode="json"),
         "profile": ctx.profile.model_dump(mode="json"),
         "language_contract": ctx.manifest.vault_config_snapshot.model_dump(mode="json"),
@@ -930,6 +2635,8 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
                 "Do not output weak_or_noise_items, noise-* ids, page_type=noise, or reason=ignore as formal page plans.",
                 "If a weak/noise item is not wiki-worthy, omit it entirely from candidate_resolution instead of converting it to a concept.",
                 "Use approved_digest candidates as the primary basis, but inspect approved_prepared for missed wiki-worthy topics.",
+                "When approved_prepared_markdown is empty, use source_excerpt_pack as the only model-visible source support; the full approved source remains fixed by approved_prepared_ref for local audit.",
+                "budget_deferred_candidates are not selected ingest candidates in this run; if you reuse one, put its id in prepared_discovered_candidates, not source_candidate_ids.",
                 "Put any newly discovered topic in prepared_discovered_candidates.",
                 "Do not read or infer existing wiki state.",
                 "Write all user-visible fields in Chinese unless retaining a stable domain term.",
@@ -956,6 +2663,8 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
     table = step_root / "candidate_resolution.md"
     table.write_text(render_candidate_resolution_markdown(artifact), encoding="utf-8")
     outputs = [
+        _ref(ctx.run_dir, source_pack_path, step_name, "json", "candidate_resolution_source_excerpt_pack.v1"),
+        _ref(ctx.run_dir, source_pack_md, step_name, "markdown"),
         _ref(ctx.run_dir, out, step_name, "json", "candidate_resolution.v3"),
         _ref(ctx.run_dir, table, step_name, "markdown"),
     ]
@@ -1054,6 +2763,455 @@ def block_unrepaired_medium_create_reason(plan: WikiMergePlanArtifact) -> WikiMe
     return plan.model_copy(update={"items": items})
 
 
+def build_merge_planning_context_pack(
+    *,
+    approved_prepared_text: str,
+    digest: SourceDigestArtifact,
+    resolution: CandidateResolutionArtifact,
+    snapshot: WikiContextSnapshot,
+    candidate_contexts: CandidateContextsArtifact,
+    snapshot_ref: str,
+) -> dict[str, Any]:
+    candidate_by_id = source_digest_candidate_lookup(digest)
+    include_full_source = len(approved_prepared_text) <= MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT
+    source_pack = build_merge_planning_source_pack(
+        approved_prepared_text,
+        resolution,
+        candidate_by_id,
+        include_full_source=include_full_source,
+    )
+    candidate_contexts_projection = compact_candidate_contexts_for_merge_planning(candidate_contexts)
+    relevant_paths = merge_planning_relevant_wiki_paths(resolution, candidate_contexts)
+    snapshot_projection = compact_snapshot_for_merge_planning(snapshot, relevant_paths, snapshot_ref)
+    original_counts = {
+        "approved_prepared_markdown_chars": len(approved_prepared_text),
+        "approved_digest_json_chars": json_char_count(digest.model_dump(mode="json")),
+        "candidate_resolution_json_chars": json_char_count(resolution.model_dump(mode="json")),
+        "wiki_context_snapshot_json_chars": json_char_count(snapshot.model_dump(mode="json")),
+        "candidate_contexts_json_chars": json_char_count(candidate_contexts.model_dump(mode="json")),
+        "snapshot_entries_chars": sum(len(entry.content) for entry in snapshot.entries),
+        "snapshot_entry_count": len(snapshot.entries),
+        "knowledge_metadata_pool_count": len(snapshot.knowledge_metadata_pool),
+    }
+    projected_counts = {
+        "approved_prepared_markdown_chars": len(approved_prepared_text) if include_full_source else 0,
+        "source_excerpt_chars": source_pack["included_char_count"],
+        "wiki_context_projection_json_chars": json_char_count(snapshot_projection),
+        "candidate_contexts_projection_json_chars": json_char_count(candidate_contexts_projection),
+        "projected_entry_chars": snapshot_projection["included_entry_content_chars"],
+        "projected_entry_count": len(snapshot_projection["entries"]),
+        "projected_metadata_count": len(snapshot_projection["knowledge_metadata_pool"]),
+    }
+    return {
+        "schema_version": "merge_planning_context_pack.v1",
+        "approved_prepared_ref": "prepared_raw_review/approved_prepared.md",
+        "approved_digest_ref": "source_digest_review/approved_digest.json",
+        "candidate_resolution_ref": "candidate_resolution/candidate_resolution.json",
+        "wiki_context_snapshot_ref": snapshot_ref,
+        "candidate_contexts_ref": snapshot.candidate_contexts_ref,
+        "full_source_in_payload": include_full_source,
+        "source_excerpt_pack": source_pack,
+        "wiki_context_projection": snapshot_projection,
+        "candidate_contexts_projection": candidate_contexts_projection,
+        "original_counts": original_counts,
+        "projected_counts": projected_counts,
+}
+
+
+def build_merge_planning_source_pack(
+    approved_prepared_text: str,
+    resolution: CandidateResolutionArtifact,
+    candidate_by_id: dict[str, SourceDigestCandidate],
+    *,
+    include_full_source: bool,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    included_chars = 0
+    global_excerpt = "" if include_full_source else source_global_excerpt(approved_prepared_text, MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT)
+    included_chars += len(global_excerpt)
+    for item in resolution.items:
+        candidate_cues: list[str] = []
+        source_locators = [item.source_basis.source_locator]
+        candidate_refs = source_basis_candidate_refs(item.source_basis)
+        for candidate_id in candidate_refs:
+            candidate = candidate_by_id.get(candidate_id)
+            if candidate is None:
+                continue
+            source_locators.append(candidate.source_locator)
+            candidate_cues.extend(
+                [
+                    candidate.name,
+                    candidate.suggested_page_title,
+                    candidate.one_sentence_summary,
+                    candidate.why_matters,
+                    candidate.wiki_value,
+                    candidate.source_locator,
+                    candidate.open_question_or_tension,
+                ]
+            )
+        cues = [
+            item.display_title,
+            item.topic_summary,
+            item.why_this_page,
+            item.initial_section_intent,
+            item.coverage_notes,
+            item.reason,
+            item.source_basis.source_locator,
+            *candidate_cues,
+            *item.source_basis.prepared_discovered_candidates,
+        ]
+        snippets = [] if include_full_source else source_snippets_for_cues(
+            approved_prepared_text,
+            cues,
+            max_chars=MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT,
+        )
+        included_chars += sum(len(snippet["text"]) for snippet in snippets)
+        items.append(
+            {
+                "page_plan_id": item.page_plan_id,
+                "display_title": item.display_title,
+                "candidate_target_path": item.candidate_target_path,
+                "source_candidate_ids": item.source_basis.source_candidate_ids,
+                "prepared_discovered_candidates": item.source_basis.prepared_discovered_candidates,
+                "source_candidate_refs": candidate_refs,
+                "source_locators": [locator for locator in source_locators if locator],
+                "snippets": snippets,
+            }
+        )
+    return {
+        "schema_version": "merge_planning_source_excerpt_pack.v1",
+        "original_char_count": len(approved_prepared_text),
+        "included_char_count": included_chars,
+        "full_source_in_payload": include_full_source,
+        "full_source_limit": MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT,
+        "global_excerpt_limit": MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT,
+        "per_page_excerpt_limit": MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT,
+        "global_excerpt": global_excerpt,
+        "items": items,
+    }
+
+
+def compact_candidate_contexts_for_merge_planning(candidate_contexts: CandidateContextsArtifact) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for item in candidate_contexts.items:
+        hits: list[dict[str, Any]] = []
+        for hit in item.hits:
+            excerpt_limit = (
+                merge_planning_hit_excerpt_limit(hit)
+            )
+            excerpt = compact_payload_text(hit.excerpt, excerpt_limit)
+            hits.append(
+                {
+                    "page_plan_id": hit.page_plan_id,
+                    "rank": hit.rank,
+                    "path": hit.path,
+                    "display_title": hit.display_title,
+                    "score": hit.score,
+                    "score_bucket": hit.score_bucket,
+                    "strength": hit.strength,
+                    "match_basis": hit.match_basis,
+                    "sort_explanation": hit.sort_explanation,
+                    "forced": hit.forced,
+                    "page_sha256": hit.page_sha256,
+                    "excerpt_limit": excerpt_limit,
+                    "excerpt": excerpt,
+                    "truncated": hit.truncated or len(hit.excerpt) > len(excerpt),
+                }
+            )
+        items.append(
+            {
+                "page_plan_id": item.page_plan_id,
+                "query": compact_payload_text(item.query, MERGE_PLANNING_CONTEXT_QUERY_LIMIT),
+                "hits": hits,
+                "unindexable_pages": item.unindexable_pages,
+            }
+        )
+    return {
+        "schema_version": "candidate_contexts_projection.v1",
+        "source_schema_version": candidate_contexts.schema_version,
+        "retrieval_backend": candidate_contexts.retrieval_backend,
+        "model": candidate_contexts.model,
+        "model_revision": candidate_contexts.model_revision,
+        "top_k": candidate_contexts.top_k,
+        "candidate_pool_size": candidate_contexts.candidate_pool_size,
+        "candidate_pool_sha256": candidate_contexts.candidate_pool_sha256,
+        "skipped_count": candidate_contexts.skipped_count,
+        "warnings": candidate_contexts.warnings,
+        "query_limit": MERGE_PLANNING_CONTEXT_QUERY_LIMIT,
+        "hit_excerpt_limit": MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT,
+        "weak_hit_excerpt_limit": MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT,
+        "weak_hit_excerpt_max_rank": MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK,
+        "hit_excerpt_role": "match_preview",
+        "content_evidence_ref": "wiki_context_projection.entries",
+        "items": items,
+    }
+
+
+def merge_planning_hit_excerpt_limit(hit: CandidateContextHit) -> int:
+    if hit.strength == "weak" and not hit.forced:
+        if hit.rank > MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK:
+            return 0
+        return MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+    return MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+
+
+def merge_planning_relevant_wiki_paths(
+    resolution: CandidateResolutionArtifact,
+    candidate_contexts: CandidateContextsArtifact,
+) -> set[str]:
+    paths = {f"wiki/{item.candidate_target_path}" for item in resolution.items if item.candidate_target_path}
+    for context_item in candidate_contexts.items:
+        for hit in context_item.hits:
+            paths.add(f"wiki/{hit.path}")
+    return paths
+
+
+def compact_snapshot_for_merge_planning(
+    snapshot: WikiContextSnapshot,
+    relevant_paths: set[str],
+    snapshot_ref: str,
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for entry in snapshot.entries:
+        if entry.path not in relevant_paths:
+            continue
+        content_excerpt = compact_entry_content_for_merge_planning(entry.content)
+        entries.append(
+            {
+                "path": entry.path,
+                "expected_state": entry.expected_state,
+                "preimage_sha256": entry.preimage_sha256,
+                "metadata": entry.metadata.model_dump(mode="json") if entry.metadata else None,
+                "content_excerpt": content_excerpt,
+                "content_truncated": len(entry.content.strip()) > len(content_excerpt),
+            }
+        )
+    metadata_paths = {path.removeprefix("wiki/") for path in relevant_paths}
+    metadata_pool = [
+        {
+            "path": pool_entry.path,
+            "rel_path": pool_entry.rel_path,
+            "preimage_sha256": pool_entry.preimage_sha256,
+            "metadata": pool_entry.metadata.model_dump(mode="json") if pool_entry.metadata else None,
+            "display_title": pool_entry.display_title,
+            "summary": pool_entry.summary,
+            "aliases": pool_entry.aliases,
+            "llmwiki_type": pool_entry.llmwiki_type,
+            "indexable": pool_entry.indexable,
+            "unindexable_reason": pool_entry.unindexable_reason,
+        }
+        for pool_entry in snapshot.knowledge_metadata_pool
+        if pool_entry.path in metadata_paths
+    ]
+    included_chars = sum(len(entry["content_excerpt"]) for entry in entries)
+    return {
+        "schema_version": "wiki_context_snapshot_projection.v1",
+        "source_schema_version": snapshot.schema_version,
+        "full_snapshot_ref": snapshot_ref,
+        "log_date": snapshot.log_date,
+        "source_target_path": snapshot.source_target_path,
+        "candidate_contexts_ref": snapshot.candidate_contexts_ref,
+        "candidate_pool_sha256": snapshot.candidate_pool_sha256,
+        "entry_excerpt_limit": MERGE_PLANNING_ENTRY_EXCERPT_LIMIT,
+        "full_entry_count": len(snapshot.entries),
+        "included_entry_count": len(entries),
+        "included_entry_content_chars": included_chars,
+        "omitted_entry_count": max(0, len(snapshot.entries) - len(entries)),
+        "full_metadata_pool_count": len(snapshot.knowledge_metadata_pool),
+        "included_metadata_pool_count": len(metadata_pool),
+        "knowledge_metadata_pool": metadata_pool,
+        "entries": entries,
+    }
+
+
+def compact_entry_content_for_merge_planning(text: str) -> str:
+    return source_global_excerpt(text, MERGE_PLANNING_ENTRY_EXCERPT_LIMIT)
+
+
+def compact_payload_text(text: str, limit: int) -> str:
+    stripped = text.strip()
+    if limit <= 0:
+        return ""
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[: max(0, limit - 3)].rstrip() + "..."
+
+
+def json_char_count(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False))
+
+
+def merge_planning_payload_pack_summary(pack: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in pack.items()
+        if key
+        not in {
+            "source_excerpt_pack",
+            "wiki_context_projection",
+            "candidate_contexts_projection",
+        }
+    }
+
+
+def render_merge_planning_context_pack_markdown(pack: dict[str, Any]) -> str:
+    source_pack = pack.get("source_excerpt_pack", {})
+    original = pack.get("original_counts", {})
+    projected = pack.get("projected_counts", {})
+    rows = [
+        ["approved_prepared_markdown", original.get("approved_prepared_markdown_chars", 0), projected.get("approved_prepared_markdown_chars", 0)],
+        ["source_excerpt_pack", 0, projected.get("source_excerpt_chars", 0)],
+        ["wiki_context_snapshot", original.get("wiki_context_snapshot_json_chars", 0), projected.get("wiki_context_projection_json_chars", 0)],
+        ["candidate_contexts", original.get("candidate_contexts_json_chars", 0), projected.get("candidate_contexts_projection_json_chars", 0)],
+        ["snapshot entries", original.get("snapshot_entries_chars", 0), projected.get("projected_entry_chars", 0)],
+    ]
+    context_rows = [
+        [
+            item.get("page_plan_id", ""),
+            item.get("display_title", ""),
+            item.get("candidate_target_path", ""),
+            len(item.get("snippets", [])) if isinstance(item.get("snippets", []), list) else 0,
+        ]
+        for item in source_pack.get("items", [])
+        if isinstance(item, dict)
+    ]
+    return (
+        "# Merge Planning Context Pack\n\n"
+        f"- payload 是否包含完整 source：`{str(pack.get('full_source_in_payload', False)).lower()}`\n"
+        f"- 完整 source 引用：`{pack.get('approved_prepared_ref', '')}`\n"
+        f"- 完整 snapshot 引用：`{pack.get('wiki_context_snapshot_ref', '')}`\n\n"
+        "## Payload 字符预算\n\n"
+        f"{format_markdown_table(['对象', '原始字符', '投影字符'], rows)}\n\n"
+        "## Source 页面摘录\n\n"
+        f"{format_markdown_table(['页面计划', '标题', '目标', '片段数'], context_rows)}\n"
+    )
+
+
+def empty_vault_create_merge_planning_shortcut_report(
+    digest: SourceDigestArtifact,
+    resolution: CandidateResolutionArtifact,
+    snapshot: WikiContextSnapshot,
+    candidate_contexts: CandidateContextsArtifact,
+) -> dict[str, Any]:
+    known_candidate_ids = {candidate.candidate_id for candidate in [*digest.ingest_candidates(), *digest.budget_deferred_candidates]}
+    target_paths = [item.candidate_target_path for item in resolution.items if item.candidate_target_path]
+    snapshot_by_path = {entry.path: entry for entry in snapshot.entries}
+    present_targets = [
+        target
+        for target in target_paths
+        if (entry := snapshot_by_path.get(f"wiki/{target}")) is not None and entry.expected_state == "present"
+    ]
+    missing_snapshot_targets = [target for target in target_paths if f"wiki/{target}" not in snapshot_by_path]
+    total_hits = sum(len(item.hits) for item in candidate_contexts.items)
+    source_page_plans = [item.page_plan_id for item in resolution.items if item.page_type.strip().lower() == "source"]
+    empty_target_page_plans = [item.page_plan_id for item in resolution.items if not item.candidate_target_path]
+    missing_source_candidate_page_plans = [
+        item.page_plan_id
+        for item in resolution.items
+        if not source_basis_candidate_refs(item.source_basis)
+    ]
+    unknown_source_candidate_ids = sorted(
+        {
+            candidate_id
+            for item in resolution.items
+            for candidate_id in source_basis_candidate_refs(item.source_basis)
+            if candidate_id not in known_candidate_ids
+        }
+    )
+    duplicate_targets = sorted({target for target in target_paths if target_paths.count(target) > 1})
+    blocking_conditions: list[str] = []
+    if not resolution.items:
+        blocking_conditions.append("candidate_resolution_empty")
+    if snapshot.knowledge_metadata_pool:
+        blocking_conditions.append("knowledge_metadata_pool_not_empty")
+    if total_hits:
+        blocking_conditions.append("candidate_context_hits_present")
+    if present_targets:
+        blocking_conditions.append("target_page_already_present")
+    if missing_snapshot_targets:
+        blocking_conditions.append("target_page_missing_from_snapshot")
+    if source_page_plans:
+        blocking_conditions.append("source_page_plan_present")
+    if empty_target_page_plans:
+        blocking_conditions.append("candidate_target_path_empty")
+    if missing_source_candidate_page_plans:
+        blocking_conditions.append("source_candidate_ids_empty")
+    if unknown_source_candidate_ids:
+        blocking_conditions.append("source_candidate_ids_unknown")
+    if duplicate_targets:
+        blocking_conditions.append("duplicate_candidate_target_path")
+    return {
+        "schema_version": "merge_planning_shortcut_report.v1",
+        "shortcut": "empty_vault_all_create",
+        "used": not blocking_conditions,
+        "reason": (
+            "空知识库、无候选召回命中、所有目标页均缺失；本地生成 create merge plan，跳过模型规划。"
+            if not blocking_conditions
+            else "未满足空库纯 create shortcut 条件，继续使用模型规划。"
+        ),
+        "blocking_conditions": blocking_conditions,
+        "candidate_count": len(resolution.items),
+        "knowledge_metadata_pool_count": len(snapshot.knowledge_metadata_pool),
+        "candidate_context_item_count": len(candidate_contexts.items),
+        "candidate_context_hit_count": total_hits,
+        "present_target_count": len(present_targets),
+        "missing_snapshot_target_count": len(missing_snapshot_targets),
+        "source_page_plan_count": len(source_page_plans),
+        "empty_target_page_plan_count": len(empty_target_page_plans),
+        "missing_source_candidate_page_plan_count": len(missing_source_candidate_page_plans),
+        "unknown_source_candidate_id_count": len(unknown_source_candidate_ids),
+        "duplicate_candidate_target_count": len(duplicate_targets),
+        "target_paths": target_paths,
+        "present_targets": present_targets,
+        "missing_snapshot_targets": missing_snapshot_targets,
+        "source_page_plans": source_page_plans,
+        "empty_target_page_plans": empty_target_page_plans,
+        "missing_source_candidate_page_plans": missing_source_candidate_page_plans,
+        "unknown_source_candidate_ids": unknown_source_candidate_ids,
+        "duplicate_candidate_targets": duplicate_targets,
+    }
+
+
+def source_basis_candidate_refs(source_basis: SourceBasis) -> list[str]:
+    return _dedupe_strings(
+        [
+            str(ref).strip()
+            for ref in [*source_basis.source_candidate_ids, *source_basis.prepared_discovered_candidates]
+            if str(ref).strip()
+        ]
+    )
+
+
+def render_merge_planning_shortcut_report(report: dict[str, Any]) -> str:
+    rows = [
+        ["candidate_count", report.get("candidate_count", 0)],
+        ["knowledge_metadata_pool_count", report.get("knowledge_metadata_pool_count", 0)],
+        ["candidate_context_hit_count", report.get("candidate_context_hit_count", 0)],
+        ["present_target_count", report.get("present_target_count", 0)],
+        ["missing_snapshot_target_count", report.get("missing_snapshot_target_count", 0)],
+        ["source_page_plan_count", report.get("source_page_plan_count", 0)],
+        ["empty_target_page_plan_count", report.get("empty_target_page_plan_count", 0)],
+        ["missing_source_candidate_page_plan_count", report.get("missing_source_candidate_page_plan_count", 0)],
+        ["unknown_source_candidate_id_count", report.get("unknown_source_candidate_id_count", 0)],
+        ["duplicate_candidate_target_count", report.get("duplicate_candidate_target_count", 0)],
+    ]
+    blockers = report.get("blocking_conditions", [])
+    return (
+        "# Merge Planning Shortcut Report\n\n"
+        f"- Shortcut：`{report.get('shortcut', '')}`\n"
+        f"- Used：`{str(bool(report.get('used'))).lower()}`\n"
+        f"- Reason：{report.get('reason', '')}\n"
+        f"- Blocking conditions：`{', '.join(blockers) if blockers else 'none'}`\n\n"
+        "## Guard Counters\n\n"
+        f"{format_markdown_table(['检查项', '值'], rows)}\n"
+    )
+
+
+def merge_planning_shortcut_provider_allowed(ctx: StepRunContext, step_name: str) -> bool:
+    runtime = ctx.execution_context.runtime_for_task(step_name)
+    return not runtime.spec.startswith("mock:")
+
+
 def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     step_name = "wiki_merge_planning"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -1065,18 +3223,74 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     snapshot_path = require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json"
     snapshot = read_model(snapshot_path, WikiContextSnapshot)
     candidate_contexts = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "candidate_contexts.json", CandidateContextsArtifact)
+    approved_prepared_text = (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8")
+    snapshot_ref = snapshot_path.relative_to(ctx.run_dir).as_posix()
+    context_pack = build_merge_planning_context_pack(
+        approved_prepared_text=approved_prepared_text,
+        digest=digest,
+        resolution=resolution,
+        snapshot=snapshot,
+        candidate_contexts=candidate_contexts,
+        snapshot_ref=snapshot_ref,
+    )
+    context_pack_path = step_root / "merge_planning_context_pack.json"
+    context_pack_md = step_root / "merge_planning_context_pack.md"
+    write_json(context_pack_path, context_pack)
+    context_pack_md.write_text(render_merge_planning_context_pack_markdown(context_pack), encoding="utf-8")
+    if merge_planning_shortcut_provider_allowed(ctx, step_name):
+        shortcut_report = empty_vault_create_merge_planning_shortcut_report(digest, resolution, snapshot, candidate_contexts)
+    else:
+        shortcut_report = {"used": False}
+    if shortcut_report["used"]:
+        shortcut_report_path = step_root / "merge_planning_shortcut_report.json"
+        shortcut_report_md = step_root / "merge_planning_shortcut_report.md"
+        write_json(shortcut_report_path, shortcut_report)
+        shortcut_report_md.write_text(render_merge_planning_shortcut_report(shortcut_report), encoding="utf-8")
+        plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date=snapshot.log_date)
+        plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_ref, medium_missing_policy="preserve")
+        plan = block_unrepaired_medium_create_reason(plan)
+        validate_wiki_merge_plan(digest, plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
+        out = step_root / "wiki_merge_plan.json"
+        write_json(out, plan)
+        table = step_root / "wiki_merge_plan.md"
+        table.write_text(render_merge_plan_markdown(plan), encoding="utf-8")
+        report = step_root / "merge_decision_report.md"
+        report.write_text(render_merge_decision_report(plan, snapshot), encoding="utf-8")
+        complete_step(
+            ctx.manifest,
+            step_name,
+            outputs=[
+                _ref(ctx.run_dir, context_pack_path, step_name, "json", "merge_planning_context_pack.v1"),
+                _ref(ctx.run_dir, context_pack_md, step_name, "markdown"),
+                _ref(ctx.run_dir, shortcut_report_path, step_name, "json", "merge_planning_shortcut_report.v1"),
+                _ref(ctx.run_dir, shortcut_report_md, step_name, "markdown"),
+                _ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
+                _ref(ctx.run_dir, table, step_name, "markdown"),
+                _ref(ctx.run_dir, report, step_name, "markdown"),
+            ],
+        )
+        return
     payload = {
-        "approved_prepared_markdown": (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8"),
+        "approved_prepared_markdown": approved_prepared_text if context_pack["full_source_in_payload"] else "",
+        "approved_prepared_ref": context_pack["approved_prepared_ref"],
+        "source_excerpt_pack": context_pack["source_excerpt_pack"],
         "approved_digest": digest.model_dump(mode="json"),
+        "approved_digest_ref": context_pack["approved_digest_ref"],
         "candidate_resolution": resolution.model_dump(mode="json"),
-        "wiki_context_snapshot": snapshot.model_dump(mode="json"),
-        "candidate_contexts": candidate_contexts.model_dump(mode="json"),
+        "candidate_resolution_ref": context_pack["candidate_resolution_ref"],
+        "wiki_context_snapshot": context_pack["wiki_context_projection"],
+        "wiki_context_snapshot_ref": snapshot_ref,
+        "candidate_contexts": context_pack["candidate_contexts_projection"],
+        "merge_planning_context_pack": merge_planning_payload_pack_summary(context_pack),
         "profile": ctx.profile.model_dump(mode="json"),
         "language_contract": ctx.manifest.vault_config_snapshot.model_dump(mode="json"),
         "contract": {
-            "goal": "Read the frozen wiki context and decide create/update/noop/needs_human_decision for planned pages.",
+            "goal": "Read the compact frozen wiki context projection and decide create/update/noop/needs_human_decision for planned pages.",
             "actions": ["create", "update", "noop", "needs_human_decision"],
             "rules": [
+                "approved_digest and candidate_resolution are the reviewed upstream artifacts; approved_digest_ref/candidate_resolution_ref identify their fixed local audit copies.",
+                "wiki_context_snapshot is a compact projection; the full snapshot is fixed at wiki_context_snapshot_ref and will be used by local validators.",
+                "Use source_excerpt_pack as source support when approved_prepared_markdown is empty; the full approved source remains fixed at approved_prepared_ref.",
                 "For each page_plan_id, inspect candidate_contexts Top5 before choosing create/update/noop/needs_human_decision.",
                 "Write inspected_context_paths using wiki-root-relative paths from candidate_contexts hits.",
                 "For create with medium or strong inspected overlap, explain why_not_update against the strongest inspected old page.",
@@ -1118,7 +3332,6 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
         validator=validate_merge_model,
     )
     plan = _redacted_model(ctx, plan, WikiMergePlanArtifact)
-    snapshot_ref = snapshot_path.relative_to(ctx.run_dir).as_posix()
     plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_ref, medium_missing_policy="preserve")
     plan = block_unrepaired_medium_create_reason(plan)
     validate_wiki_merge_plan(digest, plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
@@ -1129,6 +3342,8 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     report = step_root / "merge_decision_report.md"
     report.write_text(render_merge_decision_report(plan, snapshot), encoding="utf-8")
     outputs = [
+        _ref(ctx.run_dir, context_pack_path, step_name, "json", "merge_planning_context_pack.v1"),
+        _ref(ctx.run_dir, context_pack_md, step_name, "markdown"),
         _ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
         _ref(ctx.run_dir, table, step_name, "markdown"),
         _ref(ctx.run_dir, report, step_name, "markdown"),
@@ -1201,6 +3416,2179 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     )
 
 
+def build_draft_source_excerpt_pack(
+    approved_prepared_text: str,
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+    *,
+    full_source_limit: int = DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT,
+    total_limit: int = DRAFT_RENDERING_EXCERPT_TOTAL_CHAR_LIMIT,
+    per_page_limit: int = DRAFT_RENDERING_EXCERPT_PER_PAGE_LIMIT,
+    global_limit: int = DRAFT_RENDERING_GLOBAL_EXCERPT_LIMIT,
+    force_excerpt: bool = False,
+) -> dict[str, Any]:
+    include_full_source = len(approved_prepared_text) <= full_source_limit and not force_excerpt
+    candidates = source_digest_candidate_lookup(digest)
+    draftable_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
+    effective_total_limit = total_limit
+    if not include_full_source:
+        minimum_page_budget = global_limit + len(draftable_items) * DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS
+        ratio_budget = int(len(approved_prepared_text) * DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO)
+        effective_total_limit = min(total_limit, max(minimum_page_budget, ratio_budget))
+    items = []
+    used_chars = 0
+    global_excerpt = source_global_excerpt(approved_prepared_text, global_limit)
+    used_chars += len(global_excerpt)
+    for index, item in enumerate(draftable_items):
+        direct_candidate_cues = []
+        expanded_candidate_cues = []
+        source_locators = [item.source_basis.source_locator]
+        source_candidate_refs = source_basis_candidate_refs(item.source_basis)
+        expanded_candidate_ids = source_digest_candidate_id_closure(source_candidate_refs, candidates)
+        direct_candidate_ids = set(source_candidate_refs)
+        for candidate_id in expanded_candidate_ids:
+            candidate = candidates.get(candidate_id)
+            if candidate is not None:
+                source_locators.append(candidate.source_locator)
+                target_cues = direct_candidate_cues if candidate_id in direct_candidate_ids else expanded_candidate_cues
+                target_cues.extend(
+                    [
+                        candidate.name,
+                        candidate.suggested_page_title,
+                        candidate.one_sentence_summary,
+                        candidate.why_matters,
+                        candidate.wiki_value,
+                        candidate.source_locator,
+                        candidate.open_question_or_tension,
+                    ]
+                )
+        base_cues = [
+            item.display_title,
+            item.new_understanding,
+            item.why_create_or_update,
+            item.why_not_update,
+            item.prior_knowledge_state,
+            item.knowledge_delta,
+            item.why_this_matters,
+            *item.reuse_scenarios,
+            *item.value_points,
+            item.source_basis.source_locator,
+            *item.section_plans.values(),
+        ]
+        remaining_budget = max(0, effective_total_limit - used_chars)
+        remaining_items = max(1, len(draftable_items) - index)
+        if include_full_source:
+            page_limit = per_page_limit
+        else:
+            page_limit = min(per_page_limit, max(DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS, remaining_budget // remaining_items))
+        primary_cues = [*base_cues, *direct_candidate_cues, *item.source_basis.prepared_discovered_candidates]
+        snippets = source_snippets_for_cues(approved_prepared_text, primary_cues, max_chars=page_limit)
+        if source_snippets_are_start_fallback(snippets) and expanded_candidate_cues:
+            snippets = source_snippets_for_cues(
+                approved_prepared_text,
+                [*primary_cues, *expanded_candidate_cues],
+                max_chars=page_limit,
+            )
+        used_chars += sum(len(snippet["text"]) for snippet in snippets)
+        items.append(
+            {
+                "page_plan_id": item.page_plan_id,
+                "display_title": item.display_title,
+                "target_path": item.canonical_target_path,
+                "source_candidate_ids": item.source_basis.source_candidate_ids,
+                "prepared_discovered_candidates": item.source_basis.prepared_discovered_candidates,
+                "source_candidate_refs": source_candidate_refs,
+                "expanded_source_candidate_ids": expanded_candidate_ids,
+                "source_locators": [locator for locator in source_locators if locator],
+                "snippets": snippets,
+            }
+        )
+    included_chars = len(global_excerpt) + sum(
+        len(snippet["text"])
+        for item in items
+        for snippet in item["snippets"]
+    )
+    return {
+        "schema_version": "draft_source_excerpt_pack.v1",
+        "source_raw_path": digest.source_raw_path,
+        "original_char_count": len(approved_prepared_text),
+        "included_char_count": included_chars,
+        "full_source_in_payload": include_full_source,
+        "force_excerpt": force_excerpt,
+        "full_source_limit": full_source_limit,
+        "configured_total_excerpt_limit": total_limit,
+        "total_excerpt_limit": effective_total_limit,
+        "per_page_excerpt_limit": per_page_limit,
+        "global_excerpt_limit": global_limit,
+        "max_source_ratio": DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO,
+        "min_page_excerpt_chars": DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS,
+        "approved_prepared_ref": "prepared_raw_review/approved_prepared.md",
+        "truncated_for_payload": not include_full_source,
+        "global_excerpt": global_excerpt,
+        "items": items,
+    }
+
+
+def source_snippets_are_start_fallback(snippets: list[dict[str, Any]]) -> bool:
+    return not snippets or all(snippet.get("cue") == "fallback_start" for snippet in snippets)
+
+
+def source_global_excerpt(text: str, limit: int) -> str:
+    headings = "\n".join(line.strip() for line in text.splitlines() if line.lstrip().startswith("#"))
+    prefix = text.strip()[: max(0, limit - len(headings) - 4)]
+    return merge_markdown_blocks(prefix, headings)[:limit].strip()
+
+
+def source_snippets_for_cues(text: str, cues: list[str], *, max_chars: int) -> list[dict[str, Any]]:
+    if max_chars <= 0:
+        return []
+    semantic_terms = source_semantic_match_terms(cues)
+    window_candidates: list[tuple[int, int, str, int]] = []
+    seen_positions: set[int] = set()
+    for cue in source_excerpt_cues(cues):
+        position = find_source_cue(text, cue)
+        if position < 0:
+            continue
+        center = max(0, position)
+        heading_start = markdown_heading_start_at_position(text, center)
+        if heading_start is not None:
+            start = heading_start
+            line_end = text.find("\n", heading_start)
+            section_search_start = line_end + 1 if line_end >= 0 else len(text)
+            end = min(source_heading_section_end(text, section_search_start, heading_marker_at_position(text, heading_start)), start + max_chars)
+        else:
+            before_chars = min(450, max(80, max_chars // 3))
+            after_chars = min(650, max(180, max_chars - before_chars))
+            start = max(0, center - before_chars)
+            end = min(len(text), center + len(cue) + after_chars)
+            start = adjust_window_start(text, start)
+            end = adjust_window_end(text, end)
+        if any(abs(start - existing) < 120 for existing in seen_positions):
+            continue
+        seen_positions.add(start)
+        window_text = text[start:end]
+        score = source_excerpt_window_score(window_text, cue, semantic_terms)
+        if source_excerpt_low_signal_cue(cue) and score < 28:
+            continue
+        window_candidates.append((start, end, cue, score))
+    windows: list[tuple[int, int, str]] = []
+    for start, end, cue, _score in sorted(window_candidates, key=lambda item: (-item[3], item[0])):
+        if any(ranges_overlap(start, end, existing_start, existing_end, tolerance=120) for existing_start, existing_end, _ in windows):
+            continue
+        windows.append((start, end, cue))
+        if sum(existing_end - existing_start for existing_start, existing_end, _ in windows) >= max_chars:
+            break
+    if not windows:
+        semantic_window = source_semantic_fallback_window(text, cues, max_chars=max_chars)
+        if semantic_window is not None:
+            start, end, cue = semantic_window
+            return [{"cue": cue, "start": start, "end": end, "text": text[start:end].strip()}]
+        heading_window = source_heading_fallback_window(text, cues, max_chars=max_chars)
+        if heading_window is not None:
+            start, end, cue = heading_window
+            return [{"cue": cue, "start": start, "end": end, "text": text[start:end].strip()}]
+        fallback = text.strip()[:max_chars]
+        return [{"cue": "fallback_start", "start": 0, "end": len(fallback), "text": fallback}] if fallback else []
+    snippets: list[dict[str, Any]] = []
+    remaining = max_chars
+    for start, end, cue in windows:
+        if remaining <= 0:
+            break
+        snippet = text[start:end].strip()
+        if len(snippet) > remaining:
+            snippet = snippet[:remaining].rstrip()
+            end = start + len(snippet)
+        snippets.append({"cue": cue, "start": start, "end": end, "text": snippet})
+        remaining -= len(snippet)
+    return snippets
+
+
+SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES = {
+    "ai",
+    "agi",
+    "anthropic",
+    "claude",
+    "claudecode",
+    "cowork",
+    "pm",
+    "产品",
+    "模型",
+    "功能",
+    "团队",
+    "用户",
+    "角色",
+    "设计",
+    "问题",
+    "成功",
+    "未来",
+    "什么",
+    "如何",
+    "为什么",
+    "需要",
+    "应该",
+    "可以",
+    "通过",
+    "帮助",
+    "重要",
+    "不同",
+    "类型",
+    "应用",
+    "开发",
+}
+
+SOURCE_EXCERPT_SHORT_ASCII_SIGNAL_CUES = {
+    "api",
+    "arr",
+    "cli",
+    "eval",
+    "gtm",
+    "mvp",
+    "prd",
+}
+
+
+def source_excerpt_window_score(window_text: str, cue: str, semantic_terms: list[str]) -> int:
+    normalized_cue = normalized_source_match_text(cue)
+    score = min(36, len(normalized_cue))
+    if re.search(r"[\u4e00-\u9fff]", cue) and re.search(r"[A-Za-z]", cue):
+        score += 6
+    if source_excerpt_low_signal_cue(cue):
+        score -= 16
+    semantic_score, present_terms, _ = source_semantic_block_score(window_text, semantic_terms)
+    score += semantic_score
+    if len(present_terms) >= 3:
+        score += 8
+    if markdown_heading_start_at_position(window_text, 0) == 0:
+        score += 16
+    return score
+
+
+def source_excerpt_low_signal_cue(cue: str) -> bool:
+    normalized_cue = normalized_source_match_text(cue)
+    if normalized_cue in SOURCE_EXCERPT_SHORT_ASCII_SIGNAL_CUES:
+        return False
+    if normalized_cue in SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES:
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+#.-]{2,14}", cue.strip()):
+        return True
+    if re.fullmatch(r"s\d{1,4}", normalized_cue):
+        return True
+    return len(normalized_cue) < 4
+
+
+def ranges_overlap(start: int, end: int, other_start: int, other_end: int, *, tolerance: int = 0) -> bool:
+    return start < other_end + tolerance and other_start < end + tolerance
+
+
+def markdown_heading_start_at_position(text: str, position: int) -> int | None:
+    line_start = text.rfind("\n", 0, position) + 1
+    line_end = text.find("\n", position)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    return line_start if re.match(r"^#{1,6}\s+", line) else None
+
+
+def heading_marker_at_position(text: str, position: int) -> str:
+    match = re.match(r"^(#{1,6})\s+", text[position:])
+    return match.group(1) if match else "#"
+
+
+def source_heading_fallback_window(text: str, cues: list[str], *, max_chars: int) -> tuple[int, int, str] | None:
+    cue_variants = source_excerpt_cues(cues)
+    if not cue_variants:
+        return None
+    best: tuple[int, int, str, int] | None = None
+    for line_match in re.finditer(r"(?m)^(#{1,6})\s+(.+?)\s*$", text):
+        heading_text = line_match.group(2)
+        normalized_heading = normalized_source_match_text(heading_text)
+        if len(normalized_heading) < 3:
+            continue
+        for cue in cue_variants:
+            normalized_cue = normalized_source_match_text(cue)
+            if len(normalized_cue) < 3:
+                continue
+            score = heading_match_score(normalized_heading, normalized_cue)
+            if score <= 0:
+                continue
+            if best is None or score > best[3]:
+                start = line_match.start()
+                end = source_heading_section_end(text, line_match.end(), line_match.group(1))
+                best = (start, min(end, start + max_chars), f"fallback_heading:{heading_text}", score)
+    if best is None:
+        return None
+    return best[0], best[1], best[2]
+
+
+def heading_match_score(normalized_heading: str, normalized_cue: str) -> int:
+    if normalized_heading in normalized_cue or normalized_cue in normalized_heading:
+        return min(len(normalized_heading), len(normalized_cue)) + 20
+    heading_terms = meaningful_match_terms(normalized_heading)
+    cue_terms = meaningful_match_terms(normalized_cue)
+    overlap = heading_terms & cue_terms
+    if len(overlap) < 2 and not any(len(term) >= 6 for term in overlap):
+        return 0
+    if overlap:
+        return sum(len(term) for term in overlap)
+    return 0
+
+
+def source_semantic_fallback_window(text: str, cues: list[str], *, max_chars: int) -> tuple[int, int, str] | None:
+    terms = source_semantic_match_terms(cues)
+    if len(terms) < 2:
+        return None
+    best: tuple[int, int, str, int, int] | None = None
+    for block_start, block_end, block_text in source_semantic_blocks(text):
+        score, present_terms, first_position = source_semantic_block_score(block_text, terms)
+        if score <= 0:
+            continue
+        absolute_position = block_start + first_position
+        before_chars = min(420, max(100, max_chars // 3))
+        start = max(block_start, absolute_position - before_chars)
+        end = min(block_end, start + max_chars)
+        start = adjust_window_start(text, start)
+        end = adjust_window_end(text, end)
+        cue = "fallback_semantic:" + ",".join(present_terms[:4])
+        candidate = (start, end, cue, score, len(present_terms))
+        if best is None or (score, len(present_terms), block_start * -1) > (best[3], best[4], best[0] * -1):
+            best = candidate
+    if best is None:
+        return None
+    return best[0], best[1], best[2]
+
+
+def source_semantic_blocks(text: str) -> list[tuple[int, int, str]]:
+    blocks: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"(?ms)(?:^|\n{2,})(?P<body>.*?)(?=\n{2,}|\Z)", text):
+        body = match.group("body")
+        if not body.strip():
+            continue
+        leading = len(body) - len(body.lstrip())
+        trailing = len(body.rstrip())
+        start = match.start("body") + leading
+        end = match.start("body") + trailing
+        block_text = text[start:end]
+        if len(normalized_source_match_text(block_text)) < 24:
+            continue
+        blocks.append((start, end, block_text))
+    return blocks
+
+
+def source_semantic_block_score(block_text: str, terms: list[str]) -> tuple[int, list[str], int]:
+    normalized_block, position_map = normalized_source_match_text_with_positions(block_text)
+    present: list[str] = []
+    first_normalized_position: int | None = None
+    for term in terms:
+        position = normalized_block.find(term)
+        if position < 0:
+            continue
+        if any(term in existing or existing in term for existing in present):
+            continue
+        present.append(term)
+        first_normalized_position = position if first_normalized_position is None else min(first_normalized_position, position)
+    if not present:
+        return 0, [], 0
+    long_hits = [term for term in present if len(term) >= 4]
+    if len(present) < 2 and not long_hits:
+        return 0, [], 0
+    score = sum(min(12, len(term)) for term in present) + len(present) * 3
+    if len(present) >= 2:
+        score += 8
+    if not long_hits:
+        score -= 6
+    if score < 18:
+        return 0, [], 0
+    first_position = 0
+    if first_normalized_position is not None and first_normalized_position < len(position_map):
+        first_position = position_map[first_normalized_position]
+    return score, present, first_position
+
+
+def source_semantic_match_terms(cues: list[str]) -> list[str]:
+    terms: set[str] = set()
+    english_stopwords = {
+        "and",
+        "are",
+        "for",
+        "from",
+        "how",
+        "into",
+        "that",
+        "the",
+        "this",
+        "with",
+        "why",
+    }
+    cjk_stop_terms = {
+        "来源",
+        "定位",
+        "来源定位",
+        "摘要",
+        "问题",
+        "价值",
+        "页面",
+        "概念",
+        "设计",
+        "部分",
+        "小节",
+        "访谈",
+        "讨论",
+    }
+    for cue in source_excerpt_cues(cues):
+        normalized = unicodedata.normalize("NFKC", cue).lower()
+        for token in re.findall(r"[a-z][a-z0-9+#./-]{2,}", normalized):
+            if token not in english_stopwords:
+                terms.add(normalized_source_match_text(token))
+        for segment in re.findall(r"[\u4e00-\u9fff]{3,}", normalized):
+            if segment in cjk_stop_terms:
+                continue
+            max_size = min(8, len(segment))
+            for size in range(max_size, 2, -1):
+                for index in range(0, len(segment) - size + 1):
+                    term = segment[index : index + size]
+                    if term not in cjk_stop_terms:
+                        terms.add(normalized_source_match_text(term))
+    return sorted((term for term in terms if len(term) >= 3), key=lambda value: (-len(value), value))[:80]
+
+
+def meaningful_match_terms(text: str) -> set[str]:
+    terms = set(re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", text))
+    terms -= SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES
+    if not terms and len(text) >= 4:
+        terms.update(text[index : index + 4] for index in range(0, len(text) - 3))
+    return terms
+
+
+def source_heading_section_end(text: str, start: int, marker: str) -> int:
+    pattern = re.compile(r"(?m)^(#{1,%d})\s+" % len(marker))
+    match = pattern.search(text, start)
+    return match.start() if match is not None else len(text)
+
+
+def source_excerpt_cues(cues: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for cue in cues:
+        for piece in re.split(r"[\n。；;，,、|]+", cue or ""):
+            text = piece.strip().strip("`*_ ")
+            if len(text) > 160:
+                text = text[:160].rstrip()
+            for variant in source_excerpt_cue_variants(text):
+                if variant not in normalized:
+                    normalized.append(variant)
+    normalized.sort(key=lambda value: (len(normalized_source_match_text(value)) < 8, -len(normalized_source_match_text(value))))
+    return normalized[:40]
+
+
+def source_excerpt_cue_variants(text: str) -> list[str]:
+    variants: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip().strip("`*_ -")
+        if len(normalized_source_match_text(value)) < 3:
+            return
+        if value not in variants:
+            variants.append(value)
+
+    add(text)
+    without_parenthetical = re.sub(r"[\(（][^\)）]{2,80}[\)）]", " ", text)
+    add(without_parenthetical)
+    for match in re.finditer(r"[\(（]([^\)）]{2,80})[\)）]", text):
+        add(match.group(1))
+    for segment in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9 +#./-]{2,}", text):
+        add(segment)
+    return variants
+
+
+def find_source_cue(text: str, cue: str) -> int:
+    position = text.find(cue)
+    if position >= 0:
+        return position
+    normalized_cue = normalized_source_match_text(cue)
+    if len(normalized_cue) < 4:
+        return -1
+    normalized_text, position_map = normalized_source_match_text_with_positions(text)
+    normalized_position = normalized_text.find(normalized_cue)
+    if normalized_position < 0:
+        return -1
+    return position_map[normalized_position] if normalized_position < len(position_map) else -1
+
+
+def normalized_source_match_text(text: str) -> str:
+    return normalized_source_match_text_with_positions(text)[0]
+
+
+def normalized_source_match_text_with_positions(text: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(text):
+        normalized = unicodedata.normalize("NFKC", char).lower()
+        for normalized_char in normalized:
+            if normalized_char.isspace():
+                continue
+            if unicodedata.category(normalized_char).startswith("P"):
+                continue
+            chars.append(normalized_char)
+            positions.append(index)
+    return "".join(chars), positions
+
+
+def adjust_window_start(text: str, start: int) -> int:
+    newline = text.rfind("\n", 0, start)
+    return newline + 1 if newline >= 0 and start - newline < 160 else start
+
+
+def adjust_window_end(text: str, end: int) -> int:
+    newline = text.find("\n", end)
+    return newline if newline >= 0 and newline - end < 160 else end
+
+
+def render_draft_source_excerpt_pack_markdown(pack: dict[str, Any]) -> str:
+    rows = []
+    details: list[str] = []
+    for item in pack.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        snippets = item.get("snippets", [])
+        rows.append(
+            [
+                str(item.get("page_plan_id", "")),
+                str(item.get("display_title", "")),
+                str(item.get("target_path", "")),
+                str(len(snippets) if isinstance(snippets, list) else 0),
+                ", ".join(str(snippet.get("cue", "")) for snippet in snippets[:3] if isinstance(snippet, dict)) if isinstance(snippets, list) else "",
+            ]
+        )
+        details.append(f"## {item.get('display_title', item.get('page_plan_id', ''))}\n")
+        details.append(f"- 页面计划: `{item.get('page_plan_id', '')}`\n")
+        locators = item.get("source_locators", [])
+        if isinstance(locators, list) and locators:
+            details.append(f"- 来源定位: {', '.join(str(locator) for locator in locators)}\n")
+        if isinstance(snippets, list):
+            for snippet_index, snippet in enumerate(snippets, start=1):
+                if not isinstance(snippet, dict):
+                    continue
+                details.append(f"\n### Snippet {snippet_index}: {snippet.get('cue', '')}\n\n")
+                details.append(blockquote_markdown(str(snippet.get("text", ""))) + "\n")
+    return (
+        "# Draft Rendering Source Excerpt Pack\n\n"
+        f"- 原始字符数：{pack.get('original_char_count', 0)}\n"
+        f"- 纳入字符数：{pack.get('included_char_count', 0)}\n"
+        f"- payload 是否包含完整 source：`{str(pack.get('full_source_in_payload', False)).lower()}`\n"
+        f"- 是否强制使用 excerpt：`{str(pack.get('force_excerpt', False)).lower()}`\n"
+        f"- 完整 source 阈值：{pack.get('full_source_limit', 0)}\n"
+        f"- 配置总 excerpt 阈值：{pack.get('configured_total_excerpt_limit', pack.get('total_excerpt_limit', 0))}\n"
+        f"- 生效总 excerpt 阈值：{pack.get('total_excerpt_limit', 0)}\n"
+        f"- 最低单页 excerpt：{pack.get('min_page_excerpt_chars', 0)}\n"
+        f"- 最大 source 比例：{pack.get('max_source_ratio', '')}\n\n"
+        "## 页面摘录索引\n\n"
+        f"{format_markdown_table(['页面计划', '标题', '目标', '片段数', '主要 cue'], rows)}\n\n"
+        "## 全局摘录\n\n"
+        f"{blockquote_markdown(str(pack.get('global_excerpt', '')))}\n\n"
+        "## 分页摘录\n\n"
+        + "\n".join(details).rstrip()
+        + "\n"
+    )
+
+
+def blockquote_markdown(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return ">"
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def build_update_preservation_pack(merge_plan: WikiMergePlanArtifact, snapshot: WikiContextSnapshot) -> dict[str, Any]:
+    pages: list[dict[str, Any]] = []
+    for item in merge_plan.items:
+        if item.action != "update":
+            continue
+        try:
+            entry = snapshot_entry(snapshot, f"wiki/{item.canonical_target_path}")
+        except PipelineError:
+            continue
+        sections = parse_existing_sections(entry.content)
+        section_items: list[dict[str, Any]] = []
+        for section_key in UPDATE_PRESERVATION_SECTION_KEYS:
+            old_text = sections.get(section_key, "").strip()
+            if not old_text:
+                continue
+            reusable_old_text = update_preservation_non_placeholder_text(old_text)
+            phrases = update_preservation_phrases(reusable_old_text)
+            concepts = update_preservation_concepts(reusable_old_text)
+            if update_preservation_section_is_low_value(section_key, old_text, phrases, concepts):
+                continue
+            section_items.append(
+                {
+                    "section_key": section_key,
+                    "old_text": compact_payload_text(reusable_old_text, 1800),
+                    "old_char_count": len(old_text),
+                    "key_phrases": phrases,
+                    "min_required_matches": 0 if concepts else update_preservation_required_matches(phrases),
+                    "concept_obligations": concepts,
+                    "min_required_concept_matches": update_preservation_required_concept_matches(concepts),
+                }
+            )
+        section_items = collapse_update_preservation_sections(section_items)
+        if section_items:
+            pages.append(
+                {
+                    "page_plan_id": item.page_plan_id,
+                    "target_path": item.canonical_target_path,
+                    "display_title": item.display_title,
+                    "matched_page": item.matched_page,
+                    "sections": section_items,
+                }
+            )
+    return {
+        "schema_version": "update_preservation_pack.v1",
+        "goal": "For update pages, carry forward old reusable knowledge into the replacement draft or explicitly explain why it changed.",
+        "pages": pages,
+    }
+
+
+def collapse_update_preservation_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    detail = next((section for section in sections if section.get("section_key") == "detail"), None)
+    if detail is None:
+        return sections
+    detail_concepts = update_preservation_section_concept_names(detail)
+    if not detail_concepts:
+        return sections
+    collapsed: list[dict[str, Any]] = []
+    for section in sections:
+        section_key = str(section.get("section_key", ""))
+        section_concepts = update_preservation_section_concept_names(section)
+        if section_key in {"summary", "value_points"} and section_concepts and section_concepts <= detail_concepts:
+            continue
+        collapsed.append(section)
+    return collapsed
+
+
+def update_preservation_section_concept_names(section: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for concept in section.get("concept_obligations", []):
+        if isinstance(concept, dict):
+            name = str(concept.get("name") or "").strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def update_preservation_section_is_low_value(
+    section_key: str,
+    old_text: str,
+    phrases: list[str],
+    concepts: list[dict[str, Any]],
+) -> bool:
+    normalized = normalized_source_match_text(old_text)
+    meaningful_phrases = [
+        phrase
+        for phrase in phrases
+        if not update_preservation_phrase_is_placeholder(normalized_source_match_text(phrase))
+    ]
+    if not concepts and not meaningful_phrases:
+        return True
+    if update_preservation_phrase_is_placeholder(normalized):
+        return not update_preservation_has_non_placeholder_signal(old_text)
+    if section_key == "value_points" and not concepts and len(meaningful_phrases) <= 1:
+        return True
+    return False
+
+
+def update_preservation_phrases(text: str, *, limit: int = UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION) -> list[str]:
+    phrases: list[str] = []
+    for piece in re.split(r"[\n。；;，,、|：:]+", text):
+        for variant in source_excerpt_cue_variants(piece):
+            normalized = normalized_source_match_text(variant)
+            if len(normalized) < 4 or len(normalized) > 80:
+                continue
+            if update_preservation_phrase_is_noise(normalized):
+                continue
+            if variant not in phrases:
+                phrases.append(variant)
+    phrases.sort(key=lambda value: (phrase_signal_score(value), len(normalized_source_match_text(value))), reverse=True)
+    return phrases[:limit]
+
+
+def update_preservation_phrase_is_noise(normalized: str) -> bool:
+    if update_preservation_phrase_is_placeholder(normalized):
+        return True
+    if normalized in {"暂无", "没有相关", "暂无相关", "无相关", "n/a", "na"}:
+        return True
+    if normalized.startswith("旧页保留观察"):
+        return True
+    return False
+
+
+def update_preservation_has_non_placeholder_signal(text: str) -> bool:
+    reusable_text = update_preservation_non_placeholder_text(text)
+    if not reusable_text:
+        return False
+    if update_preservation_concepts(reusable_text):
+        return True
+    phrases = update_preservation_phrases(reusable_text)
+    return any(not update_preservation_phrase_is_placeholder(normalized_source_match_text(phrase)) for phrase in phrases)
+
+
+def update_preservation_non_placeholder_text(text: str) -> str:
+    raw_segments = [
+        segment.strip()
+        for segment in re.split(r"[\n。；;，,、|：:]+", text)
+        if normalized_source_match_text(segment)
+    ]
+    placeholder_flags = [
+        update_preservation_phrase_is_placeholder(normalized_source_match_text(segment))
+        for segment in raw_segments
+    ]
+    if not any(placeholder_flags):
+        return text.strip()
+    return "\n".join(segment for segment, is_placeholder in zip(raw_segments, placeholder_flags) if not is_placeholder)
+
+
+def update_preservation_phrase_is_placeholder(normalized: str) -> bool:
+    value = normalized.lower()
+    if not value or value in {"n/a", "na"}:
+        return True
+    return any(
+        marker in value
+        for marker in [
+            "待补来源",
+            "来源未提供",
+            "暂无",
+            "没有相关",
+            "无相关",
+        ]
+    )
+
+
+def update_preservation_ascii_token_spans(text: str) -> tuple[str, list[tuple[str, int, int]]]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    spans = [(match.group(0), match.start(), match.end()) for match in re.finditer(r"[a-z0-9]+", normalized)]
+    return normalized, spans
+
+
+def update_preservation_term_uses_ascii_tokens(term: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", term)) and term.isascii()
+
+
+def update_preservation_ascii_phrase_separator_allowed(separator: str, term_separator: str) -> bool:
+    if "&" in term_separator:
+        return separator.count("&") == 1 and all(char.isspace() or char == "&" for char in separator)
+    return all(char.isspace() or char in "-_/" for char in separator)
+
+
+def update_preservation_ascii_phrase_matches(text: str, term: str) -> bool:
+    normalized_term, term_spans = update_preservation_ascii_token_spans(term)
+    term_tokens = [token for token, _, _ in term_spans]
+    if not term_tokens:
+        return False
+    term_separators = [
+        normalized_term[term_spans[offset][2] : term_spans[offset + 1][1]]
+        for offset in range(len(term_spans) - 1)
+    ]
+    normalized_text, text_spans = update_preservation_ascii_token_spans(text)
+    text_tokens = [token for token, _, _ in text_spans]
+    if len(text_spans) < len(term_tokens):
+        return False
+    window_size = len(term_tokens)
+    for index in range(len(text_spans) - window_size + 1):
+        if text_tokens[index : index + window_size] != term_tokens:
+            continue
+        window_spans = text_spans[index : index + window_size]
+        separators = [
+            normalized_text[window_spans[offset][2] : window_spans[offset + 1][1]]
+            for offset in range(len(window_spans) - 1)
+        ]
+        if all(
+            update_preservation_ascii_phrase_separator_allowed(separator, term_separator)
+            for separator, term_separator in zip(separators, term_separators)
+        ):
+            return True
+    return False
+
+
+def update_preservation_term_matches(text: str, term: str) -> bool:
+    if not term.strip():
+        return False
+    if update_preservation_term_uses_ascii_tokens(term):
+        return update_preservation_ascii_phrase_matches(text, term)
+    normalized_term = normalized_source_match_text(term)
+    return bool(normalized_term) and normalized_term in normalized_source_match_text(text)
+
+
+def update_preservation_concepts(text: str) -> list[dict[str, Any]]:
+    concepts: list[dict[str, Any]] = []
+    for group in UPDATE_PRESERVATION_CONCEPT_GROUPS:
+        matched_terms = [
+            term
+            for term in group["terms"]
+            if update_preservation_term_matches(text, str(term))
+        ]
+        if matched_terms:
+            concepts.append(
+                {
+                    "name": group["name"],
+                    "label": group["label"],
+                    "matched_terms": matched_terms,
+                }
+            )
+    return concepts
+
+
+def update_preservation_required_concept_matches(concepts: list[dict[str, Any]]) -> int:
+    count = len(concepts)
+    if count <= 0:
+        return 0
+    if count <= 2:
+        return count
+    if count <= 4:
+        return 3
+    return max(3, (count * 2 + 2) // 3)
+
+
+def update_preservation_concept_absorption(old: str, new: str) -> tuple[bool, list[str], list[str], int]:
+    concepts = update_preservation_concepts(old)
+    if not concepts:
+        return True, [], [], 0
+    matched: list[str] = []
+    missing: list[str] = []
+    for concept in concepts:
+        group = next((item for item in UPDATE_PRESERVATION_CONCEPT_GROUPS if item["name"] == concept["name"]), None)
+        terms = tuple(group["terms"] if group is not None else concept.get("matched_terms", []))
+        if any(update_preservation_term_matches(new, str(term)) for term in terms):
+            matched.append(str(concept["label"]))
+        else:
+            missing.append(str(concept["label"]))
+    required = update_preservation_required_concept_matches(concepts)
+    return len(matched) >= required, matched, missing, required
+
+
+def phrase_signal_score(phrase: str) -> int:
+    normalized = normalized_source_match_text(phrase)
+    score = min(len(normalized), 40)
+    if re.search(r"[A-Za-z]", phrase):
+        score += 12
+    if any(keyword in phrase for keyword in ["harness", "Managed", "安全边界", "会话对象", "隔离", "权限", "架构", "上下文"]):
+        score += 10
+    if re.search(r"\d|%|倍|收入|用户|增长|下降|裁撤|预算|金额", phrase):
+        score += 6
+    return score
+
+
+def update_preservation_required_matches(phrases: list[str]) -> int:
+    if not phrases:
+        return 0
+    return 1 if len(phrases) <= 2 else 2
+
+
+def update_section_absorption(old: str, new: str) -> tuple[bool, list[str], list[str]]:
+    old = old.strip()
+    new = new.strip()
+    if not old or is_empty_placeholder(old):
+        return True, [], []
+    if old == new or old in new:
+        phrases = update_preservation_phrases(old)
+        return True, phrases[: update_preservation_required_matches(phrases)], phrases
+    phrases = update_preservation_phrases(old)
+    concept_absorbed, matched_concepts, _, _ = update_preservation_concept_absorption(old, new)
+    concepts = update_preservation_concepts(old)
+    if not phrases:
+        if concepts and concept_absorbed and len(matched_concepts) >= max(2, update_preservation_required_concept_matches(concepts)):
+            return True, matched_concepts, phrases
+        return False, matched_concepts, phrases
+    matched = [phrase for phrase in phrases if find_source_cue(new, phrase) >= 0]
+    required = update_preservation_required_matches(phrases)
+    if concepts and not concept_absorbed:
+        return False, [*matched, *matched_concepts], phrases
+    return len(matched) >= required or bool(matched_concepts), [*matched, *matched_concepts], phrases
+
+
+def update_preservation_section_absorption(section: dict[str, Any], new_text: str) -> dict[str, Any]:
+    old_text = str(section.get("old_text", ""))
+    phrases = [str(phrase) for phrase in section.get("key_phrases", []) if str(phrase).strip()]
+    if not phrases:
+        phrases = update_preservation_phrases(old_text)
+    if old_text.strip() and (old_text.strip() == new_text.strip() or old_text.strip() in new_text):
+        matched_phrases = phrases[: update_preservation_required_matches(phrases)]
+    else:
+        matched_phrases = [phrase for phrase in phrases if find_source_cue(new_text, phrase) >= 0]
+    required_phrases = int(section.get("min_required_matches") or update_preservation_required_matches(phrases))
+    concept_obligations = [
+        concept
+        for concept in section.get("concept_obligations", [])
+        if isinstance(concept, dict)
+    ]
+    if not concept_obligations:
+        concept_obligations = update_preservation_concepts(old_text)
+    matched_concepts: list[str] = []
+    missing_concepts: list[str] = []
+    for concept in concept_obligations:
+        name = str(concept.get("name", ""))
+        label = str(concept.get("label") or name)
+        group = next((item for item in UPDATE_PRESERVATION_CONCEPT_GROUPS if item["name"] == name), None)
+        terms = tuple(group["terms"] if group is not None else concept.get("matched_terms", []))
+        if any(update_preservation_term_matches(new_text, str(term)) for term in terms):
+            matched_concepts.append(label)
+        else:
+            missing_concepts.append(label)
+    required_concepts = int(
+        section.get("min_required_concept_matches")
+        or update_preservation_required_concept_matches(concept_obligations)
+    )
+    if required_concepts and matched_concepts:
+        phrase_absorbed = True
+    else:
+        phrase_absorbed = len(matched_phrases) >= required_phrases if required_phrases else True
+    concept_absorbed = len(matched_concepts) >= required_concepts if required_concepts else True
+    absorbed = phrase_absorbed and concept_absorbed
+    return {
+        "absorbed": absorbed,
+        "matched_phrases": matched_phrases,
+        "phrases": phrases,
+        "required_phrases": required_phrases,
+        "matched_concepts": matched_concepts,
+        "missing_concepts": missing_concepts,
+        "required_concepts": required_concepts,
+        "concept_labels": [str(concept.get("label") or concept.get("name", "")) for concept in concept_obligations],
+    }
+
+
+def update_preservation_issues(draft: DraftRenderingArtifact, pack: dict[str, Any]) -> list[StructuredIssue]:
+    pages_by_id = {page.page_plan_id: page for page in draft.pages}
+    issues: list[StructuredIssue] = []
+    for page_pack in pack.get("pages", []):
+        if not isinstance(page_pack, dict):
+            continue
+        page_plan_id = str(page_pack.get("page_plan_id", ""))
+        page = pages_by_id.get(page_plan_id)
+        if page is None:
+            continue
+        for section in page_pack.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            section_key = str(section.get("section_key", ""))
+            old_text = str(section.get("old_text", ""))
+            new_text = page.section_bodies.get(section_key, "")
+            absorption = update_preservation_section_absorption(section, new_text)
+            if absorption["absorbed"]:
+                continue
+            concept_message = ""
+            if absorption["concept_labels"]:
+                concept_message = (
+                    f" Required old concept obligations: {', '.join(absorption['concept_labels'])}. "
+                    f"Need {absorption['required_concepts']}; matched concepts: {', '.join(absorption['matched_concepts']) or 'none'}; "
+                    f"missing concepts: {', '.join(absorption['missing_concepts']) or 'none'}."
+                )
+            issues.append(
+                StructuredIssue(
+                    issue_code="old_knowledge_not_absorbed",
+                    field_path=f"pages.{page_plan_id}.section_bodies.{section_key}",
+                    validator_id="update_preservation_pack",
+                    message=(
+                        f"Update draft for `{page_pack.get('target_path', '')}` does not carry forward old `{section_key}` knowledge. "
+                        f"Retain or rewrite at least {absorption['required_phrases']} key phrase(s), such as: {', '.join(absorption['phrases'][:4])}. "
+                        f"Matched so far: {', '.join([*absorption['matched_phrases'], *absorption['matched_concepts']]) or 'none'}."
+                        f"{concept_message}"
+                    ),
+                    repairability="repairable",
+                )
+            )
+    return issues
+
+
+def reinforce_update_preservation(
+    draft: DraftRenderingArtifact,
+    pack: dict[str, Any],
+) -> tuple[DraftRenderingArtifact, dict[str, Any]]:
+    pages_by_id = {page.page_plan_id: page for page in draft.pages}
+    updated_pages: dict[str, DraftPageItem] = {}
+    report_pages: list[dict[str, Any]] = []
+    for page_pack in pack.get("pages", []):
+        if not isinstance(page_pack, dict):
+            continue
+        page_plan_id = str(page_pack.get("page_plan_id", ""))
+        page = pages_by_id.get(page_plan_id)
+        if page is None:
+            continue
+        section_reports: list[dict[str, Any]] = []
+        section_bodies = dict(page.section_bodies)
+        for section in page_pack.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            section_key = str(section.get("section_key", ""))
+            old_text = str(section.get("old_text", "")).strip()
+            if not section_key or not old_text:
+                continue
+            current = section_bodies.get(section_key, "")
+            absorption = update_preservation_section_absorption(section, current)
+            if absorption["absorbed"]:
+                continue
+            missing_concepts = list(absorption["missing_concepts"])
+            reinforcement = update_preservation_reinforcement_text(section_key, old_text, missing_concepts)
+            section_bodies[section_key] = merge_markdown_blocks(current, reinforcement)
+            section_reports.append(
+                {
+                    "section_key": section_key,
+                    "matched_before": [*absorption["matched_phrases"], *absorption["matched_concepts"]],
+                    "missing_concepts_before": missing_concepts,
+                    "required_concept_matches": absorption["required_concepts"],
+                    "key_phrases": absorption["phrases"][:4],
+                    "reinforcement_char_count": len(reinforcement),
+                    "reinforcement_preview": compact_payload_text(reinforcement, 240),
+                }
+            )
+        if section_reports:
+            updated = page.model_copy(update={"section_bodies": section_bodies})
+            updated_pages[page_plan_id] = updated
+            report_pages.append(
+                {
+                    "page_plan_id": page_plan_id,
+                    "target_path": page_pack.get("target_path", ""),
+                    "display_title": page_pack.get("display_title", ""),
+                    "sections": section_reports,
+                }
+            )
+    if updated_pages:
+        pages = [updated_pages.get(page.page_plan_id, page) for page in draft.pages]
+        draft = draft.model_copy(update={"pages": pages})
+    report = {
+        "schema_version": "update_preservation_reinforcement_report.v1",
+        "changed": bool(report_pages),
+        "reinforced_page_count": len(report_pages),
+        "reinforced_section_count": sum(len(page["sections"]) for page in report_pages),
+        "pages": report_pages,
+    }
+    return draft, report
+
+
+def update_preservation_reinforcement_text(section_key: str, old_text: str, missing_concepts: list[str]) -> str:
+    old_excerpt = compact_payload_text(old_text, 700)
+    bridge = "与旧页架构视角相衔接，"
+    if missing_concepts:
+        concept_text = "、".join(missing_concepts)
+        old_excerpt = (
+            f"从旧页保留的架构视角看，本段仍需体现：{concept_text}。"
+            "这些是旧页已经建立的理解，应与本轮新材料并列保留。"
+        )
+        bridge = ""
+    if section_key == "value_points":
+        return f"- {bridge}{old_excerpt}"
+    if section_key == "examples":
+        return f"{bridge}{old_excerpt}"
+    if section_key == "open_questions":
+        return f"{bridge}{old_excerpt}"
+    return f"{bridge}{old_excerpt}"
+
+
+def render_update_preservation_reinforcement_report(report: dict[str, Any]) -> str:
+    rows: list[list[Any]] = []
+    for page in report.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        for section in page.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            rows.append(
+                [
+                    page.get("page_plan_id", ""),
+                    page.get("display_title", ""),
+                    section.get("section_key", ""),
+                    ", ".join(str(value) for value in section.get("missing_concepts_before", [])),
+                    ", ".join(str(value) for value in section.get("key_phrases", [])),
+                    section.get("reinforcement_preview", ""),
+                ]
+            )
+    return (
+        "# Update Preservation Reinforcement Report\n\n"
+        f"- Changed: `{str(bool(report.get('changed'))).lower()}`\n"
+        f"- Reinforced pages: `{report.get('reinforced_page_count', 0)}`\n"
+        f"- Reinforced sections: `{report.get('reinforced_section_count', 0)}`\n\n"
+        + (
+            format_markdown_table(["页面计划", "标题", "段落", "补足概念", "关键短语", "补强预览"], rows)
+            if rows
+            else "_无需本地补强。_"
+        )
+        + "\n"
+    )
+
+
+def render_grounding_paraphrase_rewrite_report(report: dict[str, Any]) -> str:
+    rows: list[list[Any]] = []
+    for page in report.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        for section in page.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            for rewrite in section.get("rewrites", []):
+                if not isinstance(rewrite, dict):
+                    continue
+                rows.append(
+                    [
+                        page.get("page_plan_id", ""),
+                        page.get("target_path", ""),
+                        section.get("section_key", ""),
+                        rewrite.get("original_quote", ""),
+                        rewrite.get("replacement", ""),
+                        rewrite.get("source_sentence", ""),
+                    ]
+                )
+    return (
+        "# Grounding Paraphrase Rewrite Report\n\n"
+        f"- Changed: `{str(bool(report.get('changed'))).lower()}`\n"
+        f"- Rewrite count: `{report.get('rewrite_count', 0)}`\n\n"
+        + (
+            format_markdown_table(["页面计划", "目标", "段落", "原引号短语", "替换文本", "来源句"], rows)
+            if rows
+            else "_无需本地改写。_"
+        )
+        + "\n"
+    )
+
+
+def render_update_preservation_pack_markdown(pack: dict[str, Any]) -> str:
+    rows: list[list[Any]] = []
+    for page in pack.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        for section in page.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            rows.append(
+                [
+                    page.get("page_plan_id", ""),
+                    page.get("display_title", ""),
+                    section.get("section_key", ""),
+                    section.get("min_required_matches", 0),
+                    ", ".join(str(phrase) for phrase in section.get("key_phrases", [])[:4]),
+                    section.get("min_required_concept_matches", 0),
+                    ", ".join(str(concept.get("label", "")) for concept in section.get("concept_obligations", [])[:5] if isinstance(concept, dict)),
+                ]
+            )
+    return (
+        "# Update Preservation Pack\n\n"
+        "这些 obligations 会传给 draft_rendering，并由本地 validator 检查；如果模型未吸收旧知识，会先触发 repair，最终仍由旧页保留观察兜底。\n\n"
+        f"{format_markdown_table(['页面计划', '标题', '段落', '最少短语', '关键短语', '最少概念', '概念义务'], rows) if rows else '_本轮没有 update preservation obligations。_'}\n"
+    )
+
+
+def run_draft_rendering_model(
+    *,
+    ctx: StepRunContext,
+    step_root: Path,
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    source_excerpt_pack: dict[str, Any],
+    update_preservation_pack: dict[str, Any],
+    approved_prepared_text: str,
+) -> DraftRenderingArtifact:
+    draftable_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
+    provider = ctx.execution_context.provider_for_task("draft_rendering")
+    if len(draftable_items) <= DRAFT_RENDERING_BATCH_PAGE_LIMIT:
+        return run_single_draft_rendering_model_call(
+            ctx=ctx,
+            provider=provider,
+            output_dir=step_root,
+            digest=digest,
+            merge_plan=merge_plan,
+            snapshot=snapshot,
+            source_excerpt_pack=source_excerpt_pack,
+            update_preservation_pack=update_preservation_pack,
+            approved_prepared_text=approved_prepared_text,
+        )
+
+    batch_items_list = chunks(draftable_items, DRAFT_RENDERING_BATCH_PAGE_LIMIT)
+    provider_spec = ctx.execution_context.runtime_for_task("draft_rendering").spec
+    max_parallel_batches = draft_rendering_batch_parallelism(provider_spec, len(batch_items_list))
+    parallel = max_parallel_batches > 1
+    batch_jobs: list[dict[str, Any]] = []
+    batch_root = step_root / "model_batches"
+    for index, batch_items in enumerate(batch_items_list, start=1):
+        batch_id = f"batch-{index:03d}"
+        batch_dir = batch_root / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        batch_plan = merge_plan.model_copy(update={"items": list(batch_items)})
+        batch_source_excerpt_pack = build_draft_source_excerpt_pack(
+            approved_prepared_text,
+            digest,
+            batch_plan,
+            force_excerpt=True,
+        )
+        batch_source_pack_path = batch_dir / "draft_source_excerpt_pack.json"
+        batch_source_pack_md = batch_dir / "draft_source_excerpt_pack.md"
+        write_json(batch_source_pack_path, batch_source_excerpt_pack)
+        batch_source_pack_md.write_text(render_draft_source_excerpt_pack_markdown(batch_source_excerpt_pack), encoding="utf-8")
+        batch_update_preservation_pack = build_update_preservation_pack(batch_plan, snapshot)
+        batch_update_pack_path = batch_dir / "update_preservation_pack.json"
+        batch_update_pack_md = batch_dir / "update_preservation_pack.md"
+        write_json(batch_update_pack_path, batch_update_preservation_pack)
+        batch_update_pack_md.write_text(render_update_preservation_pack_markdown(batch_update_preservation_pack), encoding="utf-8")
+        batch_jobs.append(
+            {
+                "index": index,
+                "batch_id": batch_id,
+                "batch_items": batch_items,
+                "batch_dir": batch_dir,
+                "batch_plan": batch_plan,
+                "source_excerpt_pack": batch_source_excerpt_pack,
+                "update_preservation_pack": batch_update_preservation_pack,
+            }
+        )
+
+    def run_batch(job: dict[str, Any]) -> dict[str, Any]:
+        batch_provider = ctx.execution_context.provider_for_task("draft_rendering") if parallel else provider
+        batch_artifact = run_single_draft_rendering_model_call(
+            ctx=ctx,
+            provider=batch_provider,
+            output_dir=job["batch_dir"],
+            digest=digest,
+            merge_plan=job["batch_plan"],
+            snapshot=snapshot,
+            source_excerpt_pack=job["source_excerpt_pack"],
+            update_preservation_pack=job["update_preservation_pack"],
+            approved_prepared_text=approved_prepared_text,
+        )
+        report = read_model(job["batch_dir"] / "structured_repair_report.json", StructuredRepairReport)
+        result = read_model(job["batch_dir"] / "provider_result.json", ProviderResult)
+        reinforcement_path = job["batch_dir"] / "update_preservation_reinforcement_report.json"
+        reinforcement_report = read_json(reinforcement_path) if reinforcement_path.exists() else {}
+        grounding_rewrite_path = job["batch_dir"] / "grounding_paraphrase_rewrite_report.json"
+        grounding_rewrite_report = read_json(grounding_rewrite_path) if grounding_rewrite_path.exists() else {}
+        batch_payload_char_count = provider_results_payload_char_count(
+            [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
+        )
+        batch_items = job["batch_items"]
+        batch_id = job["batch_id"]
+        return {
+            "index": job["index"],
+            "artifact": batch_artifact,
+            "summary": {
+                "batch_id": batch_id,
+                "page_plan_ids": [item.page_plan_id for item in batch_items],
+                "target_paths": [item.canonical_target_path for item in batch_items],
+                "source_excerpt_chars": job["source_excerpt_pack"].get("included_char_count", 0),
+                "payload_char_count": batch_payload_char_count,
+                "attempt_count": report.attempt_count,
+                "repair_count": report.repair_count,
+                "duration_ms": report.duration_ms,
+                "provider": report.provider,
+                "provider_result_ref": f"model_batches/{batch_id}/provider_result.json",
+                "structured_repair_report_ref": f"model_batches/{batch_id}/structured_repair_report.json",
+                "update_preservation_reinforcement_report_ref": (
+                    f"model_batches/{batch_id}/update_preservation_reinforcement_report.json"
+                    if reinforcement_path.exists()
+                    else ""
+                ),
+                "reinforced_section_count": int(reinforcement_report.get("reinforced_section_count", 0)),
+                "grounding_paraphrase_rewrite_report_ref": (
+                    f"model_batches/{batch_id}/grounding_paraphrase_rewrite_report.json"
+                    if grounding_rewrite_path.exists()
+                    else ""
+                ),
+                "grounding_rewrite_count": int(grounding_rewrite_report.get("rewrite_count", 0)),
+                "schema_valid": result.schema_valid,
+            },
+        }
+
+    started = perf_counter()
+    if parallel:
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_parallel_batches) as executor:
+            futures = [executor.submit(run_batch, job) for job in batch_jobs]
+            for future in as_completed(futures):
+                results.append(future.result())
+    else:
+        results = [run_batch(job) for job in batch_jobs]
+    wall_duration_ms = round((perf_counter() - started) * 1000)
+
+    pages: list[DraftPageItem] = []
+    batch_summaries: list[dict[str, Any]] = []
+    for result in sorted(results, key=lambda item: int(item["index"])):
+        batch_artifact = result["artifact"]
+        pages.extend(batch_artifact.pages)
+        batch_summaries.append(result["summary"])
+    draft_artifact = finalize_draft_rendering(DraftRenderingArtifact(pages=pages), merge_plan, snapshot)
+    write_draft_rendering_batch_reports(
+        step_root,
+        draft_artifact,
+        batch_summaries,
+        max_parallel_batches=max_parallel_batches,
+        wall_duration_ms=wall_duration_ms,
+    )
+    return draft_artifact
+
+
+def draft_rendering_batch_parallelism(provider_spec: str | None, batch_count: int) -> int:
+    if batch_count <= 1:
+        return 1
+    if provider_spec and provider_spec.startswith("openai_compatible:"):
+        return min(DRAFT_RENDERING_MAX_PARALLEL_BATCHES, batch_count)
+    return 1
+
+
+def chunks(items: list[WikiMergePlanItem], size: int) -> list[list[WikiMergePlanItem]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def build_draft_rendering_missing_page_repair_payload(
+    *,
+    task: str,
+    raw: str,
+    issues: list[StructuredIssue],
+    output_model: type[BaseModel],
+    ctx: StepRunContext,
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    source_excerpt_pack: dict[str, Any],
+    update_preservation_pack: dict[str, Any],
+    approved_prepared_text: str,
+) -> dict[str, Any] | None:
+    if not issues or any(issue.issue_code != "missing_page_plan_coverage" for issue in issues):
+        return None
+    partial = extract_valid_partial_draft_rendering(
+        raw,
+        merge_plan,
+        snapshot,
+        update_preservation_pack=update_preservation_pack,
+        approved_prepared_text=approved_prepared_text,
+        language=ctx.manifest.vault_config_snapshot.wiki_language,
+    )
+    if partial is None or not partial.pages:
+        return None
+    present_ids = {page.page_plan_id for page in partial.pages}
+    required_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
+    missing_items = [item for item in required_items if item.page_plan_id not in present_ids]
+    if not missing_items:
+        return None
+    missing_plan = merge_plan.model_copy(update={"items": missing_items})
+    missing_source_excerpt_pack = build_draft_source_excerpt_pack(
+        approved_prepared_text,
+        digest,
+        missing_plan,
+        force_excerpt=True,
+    )
+    missing_update_preservation_pack = build_update_preservation_pack(missing_plan, snapshot)
+    missing_payload = draft_rendering_model_payload(
+        build_draft_rendering_payload(
+            ctx=ctx,
+            digest=digest,
+            merge_plan=missing_plan,
+            snapshot=snapshot,
+            source_excerpt_pack=missing_source_excerpt_pack,
+            update_preservation_pack=missing_update_preservation_pack,
+            approved_prepared_text=approved_prepared_text,
+        )
+    )
+    return {
+        "repair_contract": {
+            "goal": "Complete a partial draft_rendering output without regenerating pages that already passed local validation.",
+            "mode": "missing_page_completion",
+            "task": task,
+            "rules": [
+                "Return only one complete JSON object matching the schema.",
+                "The pages array must contain every accepted_partial_pages item unchanged plus exactly one generated page for each missing_page_plan_id.",
+                "Do not regenerate, rewrite, remove, or reorder accepted_partial_pages; copy them into pages exactly as provided.",
+                "Generate only the missing pages from missing_page_payload; do not create pages outside missing_page_plan_ids.",
+                "All user-visible generated content must follow the language and grounding rules inside missing_page_payload.",
+            ],
+            "issues": [issue.model_dump(mode="json") for issue in issues],
+            "accepted_page_plan_ids": [page.page_plan_id for page in partial.pages],
+            "missing_page_plan_ids": [item.page_plan_id for item in missing_items],
+            "required_page_plan_ids": [item.page_plan_id for item in required_items],
+            "schema": output_model.model_json_schema(),
+        },
+        "accepted_partial_pages": [page.model_dump(mode="json") for page in partial.pages],
+        "missing_page_payload": missing_payload,
+        "source_excerpt_pack_omitted_reason": (
+            "The original batch payload is intentionally replaced by a compact missing_page_payload; "
+            f"previous full/pack source refs remain {source_excerpt_pack.get('approved_prepared_ref', '')}."
+        ),
+    }
+
+
+def extract_valid_partial_draft_rendering(
+    raw: str,
+    merge_plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    *,
+    update_preservation_pack: dict[str, Any],
+    approved_prepared_text: str,
+    language: str | None,
+) -> DraftRenderingArtifact | None:
+    try:
+        parsed, _json_repaired = parse_structured_json_object(raw)
+        artifact = DraftRenderingArtifact.model_validate(parsed)
+        candidate = finalize_draft_rendering(artifact, merge_plan, snapshot)
+    except Exception:
+        return None
+    present_ids = {page.page_plan_id for page in candidate.pages}
+    required_ids = {item.page_plan_id for item in merge_plan.items if item.action in {"create", "update"}}
+    if not present_ids or not present_ids < required_ids:
+        return None
+    partial_plan = merge_plan.model_copy(
+        update={
+            "items": [
+                item
+                for item in merge_plan.items
+                if item.action not in {"create", "update"} or item.page_plan_id in present_ids
+            ]
+        }
+    )
+    try:
+        validate_draft_rendering(candidate, partial_plan, language=language)
+    except Exception:
+        return None
+    if draft_self_talk_issues(candidate):
+        return None
+    if update_preservation_issues(candidate, update_preservation_pack):
+        return None
+    candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(candidate, approved_prepared_text)
+    grounding_review = build_draft_grounding_review(candidate, partial_plan, snapshot, approved_prepared_text)
+    if grounding_review.requires_review:
+        return None
+    return candidate
+
+
+def run_single_draft_rendering_model_call(
+    *,
+    ctx: StepRunContext,
+    provider: Provider,
+    output_dir: Path,
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    source_excerpt_pack: dict[str, Any],
+    update_preservation_pack: dict[str, Any],
+    approved_prepared_text: str,
+) -> DraftRenderingArtifact:
+    payload = build_draft_rendering_payload(
+        ctx=ctx,
+        digest=digest,
+        merge_plan=merge_plan,
+        snapshot=snapshot,
+        source_excerpt_pack=source_excerpt_pack,
+        update_preservation_pack=update_preservation_pack,
+        approved_prepared_text=approved_prepared_text,
+    )
+    write_draft_digest_projection_report(output_dir, payload["approved_digest_projection_report"])
+    write_draft_payload_projection_reports(output_dir, payload)
+    model_payload = draft_rendering_model_payload(payload)
+
+    def validate_draft_rendering_model(model: DraftRenderingArtifact) -> None:
+        candidate = finalize_draft_rendering(model, merge_plan, snapshot)
+        validate_draft_rendering(candidate, merge_plan, language=ctx.manifest.vault_config_snapshot.wiki_language)
+        repair_issues = draft_self_talk_issues(candidate)
+        repair_issues.extend(update_preservation_issues(candidate, update_preservation_pack))
+        rewritten_candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(
+            candidate,
+            approved_prepared_text,
+        )
+        grounding_review = build_draft_grounding_review(rewritten_candidate, merge_plan, snapshot, approved_prepared_text)
+        if grounding_review.requires_review:
+            repair_issues.extend(
+                [
+                    StructuredIssue(
+                        issue_code="unsupported_new_fact",
+                        field_path=f"pages.{claim.page_plan_id}.{claim.section_key}",
+                        validator_id="draft_grounding_review",
+                        message=grounding_issue_message(claim),
+                        repairability="repairable",
+                    )
+                    for claim in grounding_review.unsupported_new_facts
+                ]
+            )
+        if repair_issues:
+            raise ContractValidationError(
+                "draft_rendering contains repairable quality issues; remove model self-talk, preserve update obligations, and fix unsupported facts.",
+                issues=repair_issues,
+            )
+
+    draft_artifact, _ = StructuredModelCall(
+        provider,
+        output_dir=output_dir,
+        result_filename="provider_result.json",
+        redactor=ctx.execution_context.redactor,
+    ).run(
+        "draft_rendering",
+        model_payload,
+        DraftRenderingArtifact,
+        validator=validate_draft_rendering_model,
+        accept_after_repair_issue_codes={"unsupported_new_fact", "old_knowledge_not_absorbed"},
+        repair_payload_builder=lambda task, _payload, raw, issues, output_model: build_draft_rendering_missing_page_repair_payload(
+            task=task,
+            raw=raw,
+            issues=issues,
+            output_model=output_model,
+            ctx=ctx,
+            digest=digest,
+            merge_plan=merge_plan,
+            snapshot=snapshot,
+            source_excerpt_pack=source_excerpt_pack,
+            update_preservation_pack=update_preservation_pack,
+            approved_prepared_text=approved_prepared_text,
+        ),
+    )
+    draft_artifact = _redacted_model(ctx, draft_artifact, DraftRenderingArtifact)
+    draft_artifact = finalize_draft_rendering(draft_artifact, merge_plan, snapshot)
+    draft_artifact, reinforcement_report = reinforce_update_preservation(draft_artifact, update_preservation_pack)
+    draft_artifact, grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(draft_artifact, approved_prepared_text)
+    reinforcement_path = output_dir / "update_preservation_reinforcement_report.json"
+    reinforcement_md = output_dir / "update_preservation_reinforcement_report.md"
+    write_json(reinforcement_path, reinforcement_report)
+    reinforcement_md.write_text(render_update_preservation_reinforcement_report(reinforcement_report), encoding="utf-8")
+    grounding_rewrite_path = output_dir / "grounding_paraphrase_rewrite_report.json"
+    grounding_rewrite_md = output_dir / "grounding_paraphrase_rewrite_report.md"
+    write_json(grounding_rewrite_path, grounding_rewrite_report)
+    grounding_rewrite_md.write_text(render_grounding_paraphrase_rewrite_report(grounding_rewrite_report), encoding="utf-8")
+    return draft_artifact
+
+
+def build_draft_rendering_payload(
+    *,
+    ctx: StepRunContext,
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    source_excerpt_pack: dict[str, Any],
+    update_preservation_pack: dict[str, Any],
+    approved_prepared_text: str,
+) -> dict[str, Any]:
+    approved_prepared_payload = approved_prepared_text if source_excerpt_pack["full_source_in_payload"] else ""
+    draftable_count = len([item for item in merge_plan.items if item.action in {"create", "update"}])
+    projected_digest, digest_projection_report = project_source_digest_for_merge_plan(digest, merge_plan)
+    projected_merge_plan, merge_plan_projection_report = project_merge_plan_for_draft_rendering(merge_plan)
+    required_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
+    snapshot_ref = merge_plan.context_snapshot_ref or "wiki_context_snapshot/wiki_context_snapshot.json"
+    relevant_snapshot_paths, content_snapshot_paths = draft_rendering_relevant_wiki_paths(merge_plan)
+    projected_snapshot, snapshot_projection_report = compact_snapshot_for_draft_rendering(
+        snapshot,
+        relevant_snapshot_paths,
+        snapshot_ref,
+        content_paths=content_snapshot_paths,
+    )
+    return {
+        "approved_prepared_markdown": approved_prepared_payload,
+        "approved_prepared_ref": source_excerpt_pack["approved_prepared_ref"],
+        "source_excerpt_pack": source_excerpt_pack,
+        "update_preservation_pack": update_preservation_pack,
+        "approved_digest": projected_digest.model_dump(mode="json"),
+        "approved_digest_ref": "source_digest_review/approved_digest.json",
+        "approved_digest_projection_report": digest_projection_report,
+        "approved_merge_plan": projected_merge_plan,
+        "approved_merge_plan_ref": "merge_plan_review/approved_merge_plan.json",
+        "approved_merge_plan_projection_report": merge_plan_projection_report,
+        "wiki_context_snapshot": projected_snapshot,
+        "wiki_context_snapshot_ref": snapshot_ref,
+        "wiki_context_snapshot_projection_report": snapshot_projection_report,
+        "profile": ctx.profile.model_dump(mode="json"),
+        "language_contract": ctx.manifest.vault_config_snapshot.model_dump(mode="json"),
+        "required_page_plan_ids": [item.page_plan_id for item in required_items],
+        "required_target_paths": [item.canonical_target_path for item in required_items],
+        "contract": {
+            "goal": "Generate structured section bodies for each create/update page from approved source excerpts/full source and frozen wiki context.",
+            "batch_note": (
+                f"This payload covers {draftable_count} create/update page(s). "
+                "Return exactly those draftable pages and no pages from other batches."
+            ),
+            "section_body_keys": ["summary", "detail", "examples", "value_points", "additional_notes", "open_questions"],
+            "rules": [
+                "Return section body content only; do not include frontmatter, level-1 headings, source wikilinks, or full markdown pages.",
+                "The output pages array must contain exactly required_page_plan_ids, one page per id, with no omissions, duplicates, or extra ids.",
+                "section_bodies must use only these exact keys: summary, detail, examples, value_points, additional_notes, open_questions.",
+                "Each section_bodies value must be one Markdown string; for bullet lists, write bullets inside that string instead of returning JSON arrays.",
+                "Use additional_notes for free-form observations or custom subtopics; do not invent custom top-level section keys.",
+                "approved_digest is a projection for this draft batch; the full reviewed digest is available by approved_digest_ref for local audit artifacts, not for model access.",
+                "approved_merge_plan and wiki_context_snapshot are compact projections for this draft batch; full reviewed artifacts are fixed by their *_ref fields for local audit and validators.",
+                "For updates, read existing page excerpts from wiki_context_snapshot and update_preservation_pack, then produce a complete replacement draft at the section-body level.",
+                "Use source_excerpt_pack as the primary source support. If approved_prepared_markdown is empty, the full approved source is intentionally omitted from this model payload and remains available only to downstream validators through approved_prepared_ref.",
+                "For updates, satisfy update_preservation_pack in the first draft: carry forward concept obligations "
+                "and reusable key phrases into the matching section body, rewritten naturally with the new source "
+                "rather than appended as a dump. change_summary may summarize retention but does not satisfy the obligation.",
+                "Do not produce pages that are only source summaries; every page must include concrete digested understanding such as viewpoint, example, use scenario, boundary condition, or value point.",
+                "For updates, change_summary must explain what the new source adds, changes, clarifies, retains, or removes from the old understanding.",
+                "If the merge plan has merged_page_plan_ids, absorb the unique section intent/examples/value points from suppressed candidates into the canonical page.",
+                "Write all user-visible content in Chinese except stable domain terms with Chinese explanation when needed.",
+                "For zh-CN vaults, translate or paraphrase English raw examples into Chinese; do not paste whole English sentences into examples, detail, value_points, additional_notes, open_questions, change_summary, or source_coverage_notes.",
+                "Stable English product/protocol terms such as Claude Code, Managed Agents, harness, sandbox, session, MCP, Eval, TTFT, CLI, API, and Cowork may remain in English, but surrounding prose must be Chinese.",
+                "Ground examples, value points, and reuse scenarios in source content.",
+                *DRAFT_RENDERING_GROUNDING_RISK_RULES,
+                "Do not write implementation details, examples, or claims as facts unless they are supported by source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
+                "If a useful detail is plausible but unsupported, put it under open_questions as 待补来源 instead of writing it as fact.",
+                "source_coverage_notes must briefly say which source/wiki context supports the page and what was intentionally left uncertain.",
+            ],
+            "grounding_risk_rules": list(DRAFT_RENDERING_GROUNDING_RISK_RULES),
+        },
+    }
+
+
+def draft_rendering_model_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    model_payload = dict(payload)
+    for key in [
+        "approved_digest_projection_report",
+        "approved_merge_plan_projection_report",
+        "wiki_context_snapshot_projection_report",
+    ]:
+        model_payload.pop(key, None)
+    return model_payload
+
+
+def project_merge_plan_for_draft_rendering(merge_plan: WikiMergePlanArtifact) -> tuple[dict[str, Any], dict[str, Any]]:
+    draftable_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
+    projected_items = [project_merge_plan_item_for_draft_rendering(item) for item in draftable_items]
+    projection = {
+        "schema_version": "draft_merge_plan_projection.v1",
+        "source_schema_version": merge_plan.schema_version,
+        "full_merge_plan_ref": "merge_plan_review/approved_merge_plan.json",
+        "context_snapshot_ref": merge_plan.context_snapshot_ref,
+        "log_date": merge_plan.log_date,
+        "draftable_item_count": len(draftable_items),
+        "omitted_non_draft_item_count": max(0, len(merge_plan.items) - len(draftable_items)),
+        "items": projected_items,
+    }
+    original_payload = merge_plan.model_dump(mode="json")
+    report = {
+        "schema_version": "draft_merge_plan_projection_report.v1",
+        "projection": "draft_rendering_batch",
+        "full_merge_plan_ref": "merge_plan_review/approved_merge_plan.json",
+        "original_item_count": len(merge_plan.items),
+        "projected_item_count": len(projected_items),
+        "omitted_non_draft_item_count": max(0, len(merge_plan.items) - len(projected_items)),
+        "original_json_chars": json_char_count(original_payload),
+        "projected_json_chars": json_char_count(projection),
+        "page_plan_ids": [item.page_plan_id for item in draftable_items],
+        "target_paths": [item.canonical_target_path for item in draftable_items],
+    }
+    return projection, report
+
+
+def project_merge_plan_item_for_draft_rendering(item: WikiMergePlanItem) -> dict[str, Any]:
+    strongest_overlap = compact_optional_dict(
+        {
+            "strength": item.strongest_overlap.strength,
+            "match_basis": item.strongest_overlap.match_basis,
+            "path": item.strongest_overlap.path,
+            "score": item.strongest_overlap.score,
+            "reason": item.strongest_overlap.reason,
+        }
+    )
+    related_pages = [
+        compact_optional_dict(
+            {
+                "target_path": related.target_path,
+                "display_title": related.display_title,
+                "source": related.source,
+                "reason": related.reason,
+            }
+        )
+        for related in item.related_pages
+    ]
+    return compact_optional_dict(
+        {
+            "page_plan_id": item.page_plan_id,
+            "source_basis": compact_optional_dict(item.source_basis.model_dump(mode="json")),
+            "action": item.action,
+            "canonical_target_path": item.canonical_target_path,
+            "display_title": item.display_title,
+            "page_type": item.page_type,
+            "matched_page": item.matched_page,
+            "inspected_context_paths": item.inspected_context_paths,
+            "strongest_overlap": strongest_overlap,
+            "why_not_update": item.why_not_update,
+            "why_create_or_update": item.why_create_or_update,
+            "prior_knowledge_state": item.prior_knowledge_state,
+            "new_understanding": item.new_understanding,
+            "changed_view": item.changed_view,
+            "knowledge_delta": item.knowledge_delta,
+            "why_this_matters": item.why_this_matters,
+            "reuse_scenarios": item.reuse_scenarios,
+            "value_points": item.value_points,
+            "section_plans": item.section_plans,
+            "related_pages": related_pages,
+            "related_absence_reason": item.related_absence_reason,
+            "related_unresolved": item.related_unresolved,
+            "unresolved_related": item.unresolved_related,
+            "conflicts": item.conflicts,
+            "uncertainties": item.uncertainties,
+            "quality_risks": item.quality_risks,
+            "reason": item.reason,
+            "merged_page_plan_ids": item.merged_page_plan_ids,
+            "merge_reason": item.merge_reason,
+        }
+    )
+
+
+def draft_rendering_relevant_wiki_paths(merge_plan: WikiMergePlanArtifact) -> tuple[set[str], set[str]]:
+    metadata_paths: set[str] = set()
+    content_paths: set[str] = set()
+    for item in merge_plan.items:
+        if item.action not in {"create", "update"}:
+            continue
+        target_paths = [
+            item.canonical_target_path,
+            item.matched_page or "",
+        ]
+        context_paths = [
+            item.strongest_overlap.path,
+            *item.inspected_context_paths,
+            *[related.target_path for related in item.related_pages],
+        ]
+        for raw_path in [*target_paths, *context_paths]:
+            normalized = normalize_wiki_snapshot_path(raw_path)
+            if normalized:
+                metadata_paths.add(normalized)
+        if item.action == "update":
+            for raw_path in target_paths:
+                normalized = normalize_wiki_snapshot_path(raw_path)
+                if normalized:
+                    content_paths.add(normalized)
+        elif item.strongest_overlap.strength == "strong":
+            normalized = normalize_wiki_snapshot_path(item.strongest_overlap.path)
+            if normalized:
+                content_paths.add(normalized)
+    return metadata_paths, content_paths
+
+
+def normalize_wiki_snapshot_path(path: str) -> str:
+    cleaned = path.strip().lstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.startswith("wiki/"):
+        return cleaned
+    return f"wiki/{cleaned}"
+
+
+def compact_snapshot_for_draft_rendering(
+    snapshot: WikiContextSnapshot,
+    relevant_paths: set[str],
+    snapshot_ref: str,
+    *,
+    content_paths: set[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    content_paths = content_paths or set()
+    entries: list[dict[str, Any]] = []
+    content_entry_count = 0
+    for entry in snapshot.entries:
+        if entry.path not in relevant_paths:
+            continue
+        include_content = entry.path in content_paths
+        content_excerpt = source_global_excerpt(entry.content, DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT) if include_content else ""
+        if content_excerpt:
+            content_entry_count += 1
+        entries.append(
+            {
+                "path": entry.path,
+                "expected_state": entry.expected_state,
+                "preimage_sha256": entry.preimage_sha256,
+                "metadata": entry.metadata.model_dump(mode="json") if entry.metadata else None,
+                "content_excerpt": content_excerpt,
+                "content_truncated": include_content and len(entry.content.strip()) > len(content_excerpt),
+                "content_role": "draft_context" if include_content else "metadata_only",
+            }
+        )
+    metadata_paths = {path.removeprefix("wiki/") for path in relevant_paths}
+    metadata_pool = [
+        {
+            "path": pool_entry.path,
+            "rel_path": pool_entry.rel_path,
+            "preimage_sha256": pool_entry.preimage_sha256,
+            "metadata": pool_entry.metadata.model_dump(mode="json") if pool_entry.metadata else None,
+            "display_title": pool_entry.display_title,
+            "summary": pool_entry.summary,
+            "aliases": pool_entry.aliases,
+            "llmwiki_type": pool_entry.llmwiki_type,
+            "indexable": pool_entry.indexable,
+            "unindexable_reason": pool_entry.unindexable_reason,
+        }
+        for pool_entry in snapshot.knowledge_metadata_pool
+        if pool_entry.path in metadata_paths
+    ]
+    projection = {
+        "schema_version": "wiki_context_snapshot_projection.v1",
+        "source_schema_version": snapshot.schema_version,
+        "full_snapshot_ref": snapshot_ref,
+        "log_date": snapshot.log_date,
+        "source_target_path": snapshot.source_target_path,
+        "candidate_contexts_ref": snapshot.candidate_contexts_ref,
+        "candidate_pool_sha256": snapshot.candidate_pool_sha256,
+        "entry_excerpt_limit": DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT,
+        "full_entry_count": len(snapshot.entries),
+        "included_entry_count": len(entries),
+        "included_content_entry_count": content_entry_count,
+        "included_entry_content_chars": sum(len(entry["content_excerpt"]) for entry in entries),
+        "omitted_entry_count": max(0, len(snapshot.entries) - len(entries)),
+        "full_metadata_pool_count": len(snapshot.knowledge_metadata_pool),
+        "included_metadata_pool_count": len(metadata_pool),
+        "knowledge_metadata_pool": metadata_pool,
+        "entries": entries,
+    }
+    original_entry_content_chars = sum(len(entry.content) for entry in snapshot.entries)
+    report = {
+        "schema_version": "draft_context_projection_report.v1",
+        "projection": "draft_rendering_batch",
+        "full_snapshot_ref": snapshot_ref,
+        "relevant_paths": sorted(relevant_paths),
+        "content_paths": sorted(content_paths),
+        "original_json_chars": json_char_count(snapshot.model_dump(mode="json")),
+        "projected_json_chars": json_char_count(projection),
+        "original_entry_count": len(snapshot.entries),
+        "projected_entry_count": len(entries),
+        "projected_content_entry_count": content_entry_count,
+        "omitted_entry_count": max(0, len(snapshot.entries) - len(entries)),
+        "original_entry_content_chars": original_entry_content_chars,
+        "projected_entry_content_chars": projection["included_entry_content_chars"],
+        "original_metadata_pool_count": len(snapshot.knowledge_metadata_pool),
+        "projected_metadata_pool_count": len(metadata_pool),
+    }
+    return projection, report
+
+
+def compact_optional_dict(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: item
+        for key, item in value.items()
+        if item is not None and item != "" and item != [] and item != {}
+    }
+
+
+def project_source_digest_for_merge_plan(
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+) -> tuple[SourceDigestArtifact, dict[str, Any]]:
+    needed_ids = source_digest_candidate_ids_for_merge_plan(digest, merge_plan)
+    original_counts = source_digest_candidate_counts(digest)
+    projected_groups: dict[str, list[SourceDigestCandidate]] = {}
+    for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
+        candidates = list(getattr(digest, group_name))
+        projected_groups[group_name] = [candidate for candidate in candidates if candidate.candidate_id in needed_ids]
+    projected_deferred = [
+        candidate
+        for candidate in digest.budget_deferred_candidates
+        if candidate.candidate_id in needed_ids
+    ]
+    projected = digest.model_copy(
+        update={
+            **projected_groups,
+            "budget_deferred_candidates": projected_deferred,
+            "weak_or_noise_items": [],
+        }
+    )
+    projected_counts = source_digest_candidate_counts(projected)
+    candidate_by_id = source_digest_candidate_lookup(digest)
+    unresolved_candidate_ids = sorted(candidate_id for candidate_id in needed_ids if candidate_id not in candidate_by_id)
+    report = {
+        "schema_version": "source_digest_projection_report.v1",
+        "projection": "draft_rendering_batch",
+        "full_digest_ref": "source_digest_review/approved_digest.json",
+        "needed_candidate_ids": sorted(needed_ids),
+        "unresolved_candidate_ids": unresolved_candidate_ids,
+        "original_counts": original_counts,
+        "projected_counts": projected_counts,
+        "removed_counts": {
+            key: max(0, int(original_counts.get(key, 0)) - int(projected_counts.get(key, 0)))
+            for key in original_counts
+        },
+    }
+    return projected, report
+
+
+def source_digest_candidate_ids_for_merge_plan(
+    digest: SourceDigestArtifact,
+    merge_plan: WikiMergePlanArtifact,
+) -> set[str]:
+    candidate_by_id = source_digest_candidate_lookup(digest)
+    needed: set[str] = set()
+    for item in merge_plan.items:
+        if item.action not in {"create", "update"}:
+            continue
+        needed.update(source_digest_candidate_id_closure(source_basis_candidate_refs(item.source_basis), candidate_by_id))
+    return needed
+
+
+def source_digest_candidate_lookup(digest: SourceDigestArtifact) -> dict[str, SourceDigestCandidate]:
+    candidates = {candidate.candidate_id: candidate for candidate in digest.ingest_candidates()}
+    for candidate in digest.budget_deferred_candidates:
+        candidates.setdefault(candidate.candidate_id, candidate)
+    return candidates
+
+
+def source_digest_candidate_id_closure(
+    candidate_ids: list[str],
+    candidate_by_id: dict[str, SourceDigestCandidate],
+) -> list[str]:
+    needed: list[str] = []
+    seen: set[str] = set()
+    queue = [candidate_id for candidate_id in candidate_ids if candidate_id]
+    while queue:
+        candidate_id = queue.pop(0)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        needed.append(candidate_id)
+        candidate = candidate_by_id.get(candidate_id)
+        if candidate is None:
+            continue
+        for related_id in candidate.related_candidates:
+            if related_id and related_id not in seen:
+                queue.append(related_id)
+    return needed
+
+
+def source_digest_candidate_counts(digest: SourceDigestArtifact) -> dict[str, int]:
+    return {
+        "entities": len(digest.entities),
+        "concepts": len(digest.concepts),
+        "designs": len(digest.designs),
+        "comparisons": len(digest.comparisons),
+        "open_questions": len(digest.open_questions),
+        "budget_deferred_candidates": len(digest.budget_deferred_candidates),
+        "weak_or_noise_items": len(digest.weak_or_noise_items),
+        "total_ingest_candidates": len(digest.ingest_candidates()),
+    }
+
+
+def write_draft_digest_projection_report(output_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
+    json_path = output_dir / "draft_digest_projection_report.json"
+    md_path = output_dir / "draft_digest_projection_report.md"
+    write_json(json_path, report)
+    rows = []
+    original_counts = report.get("original_counts", {})
+    projected_counts = report.get("projected_counts", {})
+    removed_counts = report.get("removed_counts", {})
+    for key in [
+        "entities",
+        "concepts",
+        "designs",
+        "comparisons",
+        "open_questions",
+        "budget_deferred_candidates",
+        "weak_or_noise_items",
+        "total_ingest_candidates",
+    ]:
+        rows.append(
+            [
+                key,
+                str(original_counts.get(key, 0)),
+                str(projected_counts.get(key, 0)),
+                str(removed_counts.get(key, 0)),
+            ]
+        )
+    needed = report.get("needed_candidate_ids", [])
+    unresolved = report.get("unresolved_candidate_ids", [])
+    md_path.write_text(
+        "# Draft Digest Projection Report\n\n"
+        f"- Projection: `{report.get('projection', '')}`\n"
+        f"- Full digest ref: `{report.get('full_digest_ref', '')}`\n"
+        f"- Needed candidate ids: {', '.join(f'`{candidate_id}`' for candidate_id in needed) if needed else '_none_'}\n\n"
+        f"- Unresolved candidate ids: {', '.join(f'`{candidate_id}`' for candidate_id in unresolved) if unresolved else '_none_'}\n\n"
+        "## Counts\n\n"
+        f"{format_markdown_table(['Group', 'Original', 'Projected', 'Removed'], rows)}\n",
+        encoding="utf-8",
+    )
+    return json_path, md_path
+
+
+def write_draft_payload_projection_reports(output_dir: Path, payload: dict[str, Any]) -> list[Path]:
+    written: list[Path] = []
+    merge_report = payload.get("approved_merge_plan_projection_report")
+    if isinstance(merge_report, dict):
+        written.extend(write_draft_merge_plan_projection_report(output_dir, merge_report))
+    context_report = payload.get("wiki_context_snapshot_projection_report")
+    if isinstance(context_report, dict):
+        written.extend(write_draft_context_projection_report(output_dir, context_report))
+    return written
+
+
+def write_draft_merge_plan_projection_report(output_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
+    json_path = output_dir / "draft_merge_plan_projection_report.json"
+    md_path = output_dir / "draft_merge_plan_projection_report.md"
+    write_json(json_path, report)
+    rows = [
+        ["items", report.get("original_item_count", 0), report.get("projected_item_count", 0)],
+        ["json_chars", report.get("original_json_chars", 0), report.get("projected_json_chars", 0)],
+        ["omitted_non_draft", report.get("omitted_non_draft_item_count", 0), 0],
+    ]
+    md_path.write_text(
+        "# Draft Merge Plan Projection Report\n\n"
+        f"- Projection: `{report.get('projection', '')}`\n"
+        f"- Full merge plan ref: `{report.get('full_merge_plan_ref', '')}`\n"
+        f"- Page plan ids: {', '.join(f'`{page_id}`' for page_id in report.get('page_plan_ids', [])) or '_none_'}\n\n"
+        "## Payload Budget\n\n"
+        f"{format_markdown_table(['Object', 'Original', 'Projected'], rows)}\n",
+        encoding="utf-8",
+    )
+    return json_path, md_path
+
+
+def write_draft_context_projection_report(output_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
+    json_path = output_dir / "draft_context_projection_report.json"
+    md_path = output_dir / "draft_context_projection_report.md"
+    write_json(json_path, report)
+    rows = [
+        ["snapshot_json_chars", report.get("original_json_chars", 0), report.get("projected_json_chars", 0)],
+        ["entries", report.get("original_entry_count", 0), report.get("projected_entry_count", 0)],
+        ["entry_content_chars", report.get("original_entry_content_chars", 0), report.get("projected_entry_content_chars", 0)],
+        ["metadata_pool", report.get("original_metadata_pool_count", 0), report.get("projected_metadata_pool_count", 0)],
+    ]
+    relevant_paths = report.get("relevant_paths", [])
+    md_path.write_text(
+        "# Draft Context Projection Report\n\n"
+        f"- Projection: `{report.get('projection', '')}`\n"
+        f"- Full snapshot ref: `{report.get('full_snapshot_ref', '')}`\n"
+        f"- Relevant paths: {', '.join(f'`{path}`' for path in relevant_paths) if relevant_paths else '_none_'}\n\n"
+        "## Payload Budget\n\n"
+        f"{format_markdown_table(['Object', 'Original', 'Projected'], rows)}\n",
+        encoding="utf-8",
+    )
+    return json_path, md_path
+
+
+def write_draft_rendering_batch_reports(
+    step_root: Path,
+    draft_artifact: DraftRenderingArtifact,
+    batch_summaries: list[dict[str, Any]],
+    *,
+    max_parallel_batches: int = 1,
+    wall_duration_ms: int | None = None,
+) -> None:
+    model_duration_ms = sum(int(batch["duration_ms"]) for batch in batch_summaries)
+    payload_counts = [int(batch.get("payload_char_count", 0)) for batch in batch_summaries]
+    batch_report = {
+        "schema_version": "draft_rendering_batch_report.v1",
+        "batch_page_limit": DRAFT_RENDERING_BATCH_PAGE_LIMIT,
+        "parallel": max_parallel_batches > 1,
+        "max_parallel_batches": max_parallel_batches,
+        "batch_count": len(batch_summaries),
+        "page_count": len(draft_artifact.pages),
+        "attempt_count": sum(int(batch["attempt_count"]) for batch in batch_summaries),
+        "repair_count": sum(int(batch["repair_count"]) for batch in batch_summaries),
+        "duration_ms": model_duration_ms,
+        "model_duration_ms": model_duration_ms,
+        "wall_duration_ms": wall_duration_ms if wall_duration_ms is not None else model_duration_ms,
+        "payload_char_count": sum(payload_counts),
+        "max_batch_payload_char_count": max(payload_counts) if payload_counts else 0,
+        "avg_batch_payload_char_count": round(sum(payload_counts) / len(payload_counts)) if payload_counts else 0,
+        "batches": batch_summaries,
+    }
+    write_json(step_root / "draft_rendering_batch_report.json", batch_report)
+    (step_root / "draft_rendering_batch_report.md").write_text(render_draft_rendering_batch_report(batch_report), encoding="utf-8")
+    providers = ",".join(sorted({str(batch["provider"]) for batch in batch_summaries}))
+    write_json(
+        step_root / "provider_result.json",
+        ProviderResult(
+            task="draft_rendering",
+            provider=f"batched:{providers}",
+            raw_output="",
+            parsed_output=draft_artifact.model_dump(mode="json"),
+            parse_success=True,
+            schema_valid=True,
+            repair_attempted=batch_report["repair_count"] > 0,
+            latency_ms=batch_report["duration_ms"],
+            payload_char_count=batch_report["payload_char_count"],
+        ),
+    )
+    attempts: list[StructuredAttemptRef] = []
+    next_attempt = 1
+    non_repairable: list[StructuredIssue] = []
+    max_repair_attempts = 0
+    for batch in batch_summaries:
+        report = read_model(step_root / str(batch["structured_repair_report_ref"]), StructuredRepairReport)
+        max_repair_attempts = max(max_repair_attempts, report.max_repair_attempts)
+        non_repairable.extend(report.non_repairable_issues)
+        for attempt in report.attempts:
+            attempts.append(
+                attempt.model_copy(
+                    update={
+                        "attempt": next_attempt,
+                        "provider_result_ref": f"model_batches/{batch['batch_id']}/{attempt.provider_result_ref}",
+                        "repair_prompt_ref": (
+                            f"model_batches/{batch['batch_id']}/{attempt.repair_prompt_ref}"
+                            if attempt.repair_prompt_ref
+                            else None
+                        ),
+                    }
+                )
+            )
+            next_attempt += 1
+    aggregate_report = StructuredRepairReport(
+        task="draft_rendering",
+        provider=f"batched:{providers}",
+        final_outcome="success",
+        repair_attempted=batch_report["repair_count"] > 0,
+        max_repair_attempts=max_repair_attempts,
+        attempt_count=batch_report["attempt_count"],
+        repair_count=batch_report["repair_count"],
+        duration_ms=batch_report["duration_ms"],
+        attempts=attempts,
+        final_provider_result_ref="provider_result.json",
+        non_repairable_issues=non_repairable,
+    )
+    write_json(step_root / "structured_repair_report.json", aggregate_report)
+    (step_root / "structured_repair_report.md").write_text(render_structured_repair_report_markdown(aggregate_report), encoding="utf-8")
+
+
+def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
+    rows = [
+        [
+            batch["batch_id"],
+            ", ".join(f"`{page_id}`" for page_id in batch["page_plan_ids"]),
+            str(batch["attempt_count"]),
+            str(batch["repair_count"]),
+            format_duration(batch["duration_ms"]),
+            str(batch["source_excerpt_chars"]),
+            f"{int(batch.get('payload_char_count', 0)):,}",
+            str(batch.get("reinforced_section_count", 0)),
+            str(batch.get("grounding_rewrite_count", 0)),
+        ]
+        for batch in report["batches"]
+    ]
+    return (
+        "# Draft Rendering 分批报告\n\n"
+        f"- 并行执行：`{str(bool(report.get('parallel', False))).lower()}`\n"
+        f"- 最大并行批数：{report.get('max_parallel_batches', 1)}\n"
+        f"- Batch 页面上限：{report.get('batch_page_limit', DRAFT_RENDERING_BATCH_PAGE_LIMIT)}\n"
+        f"- 模型累计耗时：{format_duration(report.get('model_duration_ms', report.get('duration_ms')))}\n"
+        f"- 墙钟耗时：{format_duration(report.get('wall_duration_ms'))}\n"
+        f"- 最大单批 payload：{int(report.get('max_batch_payload_char_count', 0)):,} chars\n"
+        f"- 平均单批 payload：{int(report.get('avg_batch_payload_char_count', 0)):,} chars\n\n"
+        + format_markdown_table(
+            [
+                "Batch",
+                "页面计划",
+                "Attempts",
+                "Repairs",
+                "Duration",
+                "Source Excerpt Chars",
+                "Payload Chars",
+                "Reinforced Sections",
+                "Grounding Rewrites",
+            ],
+            rows,
+        )
+        + "\n"
+    )
+
+
+def render_structured_repair_report_markdown(report: StructuredRepairReport) -> str:
+    lines = [
+        "# 结构化输出返工报告",
+        "",
+        f"- 任务：`{report.task}`",
+        f"- Provider：`{report.provider}`",
+        f"- 结果：`{report.final_outcome}`",
+        f"- 尝试次数：{report.attempt_count}",
+        f"- 返工次数：{report.repair_count}",
+        "",
+        "## 尝试记录",
+        "",
+    ]
+    for attempt in report.attempts:
+        issue_text = "; ".join(f"{issue.issue_code}: {issue.message}" for issue in attempt.issues) or "无"
+        prompt_text = f"；返工 prompt：`{attempt.repair_prompt_ref}`" if attempt.repair_prompt_ref else ""
+        lines.append(f"- 第 {attempt.attempt} 次：`{attempt.provider_result_ref}`{prompt_text}；问题：{issue_text}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _run_draft_rendering(ctx: StepRunContext) -> None:
     step_name = "draft_rendering"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -1215,66 +5603,56 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
     ensure_wiki_context_current(ctx.vault, snapshot)
     approved_prepared_text = (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8")
-    payload = {
-        "approved_prepared_markdown": approved_prepared_text,
-        "approved_digest": digest.model_dump(mode="json"),
-        "approved_merge_plan": merge_plan.model_dump(mode="json"),
-        "wiki_context_snapshot": snapshot.model_dump(mode="json"),
-        "profile": ctx.profile.model_dump(mode="json"),
-        "language_contract": ctx.manifest.vault_config_snapshot.model_dump(mode="json"),
-        "contract": {
-            "goal": "Generate structured section bodies for each create/update page from the full approved source and frozen wiki context.",
-            "section_body_keys": ["summary", "detail", "examples", "value_points", "additional_notes", "open_questions"],
-            "rules": [
-                "Return section body content only; do not include frontmatter, level-1 headings, source wikilinks, or full markdown pages.",
-                "section_bodies must use only these exact keys: summary, detail, examples, value_points, additional_notes, open_questions.",
-                "Each section_bodies value must be one Markdown string; for bullet lists, write bullets inside that string instead of returning JSON arrays.",
-                "Use additional_notes for free-form observations or custom subtopics; do not invent custom top-level section keys.",
-                "For updates, read the existing page content from snapshot and produce a complete replacement draft at the section-body level.",
-                "Do not produce pages that are only source summaries; every page must include concrete digested understanding such as viewpoint, example, use scenario, boundary condition, or value point.",
-                "For updates, change_summary must explain what the new source adds, changes, clarifies, retains, or removes from the old understanding.",
-                "If the merge plan has merged_page_plan_ids, absorb the unique section intent/examples/value points from suppressed candidates into the canonical page.",
-                "Write all user-visible content in Chinese except stable domain terms with Chinese explanation when needed.",
-                "Ground examples, value points, and reuse scenarios in source content.",
-                "Do not write implementation details, examples, or claims as facts unless they are supported by approved_prepared_markdown or inspected wiki context.",
-                "If a useful detail is plausible but unsupported, put it under open_questions as 待补来源 instead of writing it as fact.",
-                "source_coverage_notes must briefly say which source/wiki context supports the page and what was intentionally left uncertain.",
-            ],
-        },
-    }
-    def validate_draft_rendering_model(model: DraftRenderingArtifact) -> None:
-        candidate = finalize_draft_rendering(model, merge_plan, snapshot)
-        validate_draft_rendering(candidate, merge_plan, language=ctx.manifest.vault_config_snapshot.wiki_language)
-        grounding_review = build_draft_grounding_review(candidate, merge_plan, snapshot, approved_prepared_text)
-        if grounding_review.requires_review:
-            raise ContractValidationError(
-                "draft_rendering contains unsupported new_fact; repair by removing it, rewriting it as sourced text, or moving it to open_questions.",
-                issues=[
-                    StructuredIssue(
-                        issue_code="unsupported_new_fact",
-                        field_path=f"pages.{claim.page_plan_id}.{claim.section_key}",
-                        validator_id="draft_grounding_review",
-                        message=claim.reason or "unsupported new_fact",
-                        repairability="repairable",
-                    )
-                    for claim in grounding_review.unsupported_new_facts
-                ],
-            )
-
-    draft_artifact, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
-        step_name,
-        payload,
-        DraftRenderingArtifact,
-        validator=validate_draft_rendering_model,
-        accept_after_repair_issue_codes={"unsupported_new_fact"},
+    draftable_count = len([item for item in merge_plan.items if item.action in {"create", "update"}])
+    source_excerpt_pack = build_draft_source_excerpt_pack(
+        approved_prepared_text,
+        digest,
+        merge_plan,
+        force_excerpt=draftable_count > DRAFT_RENDERING_BATCH_PAGE_LIMIT,
     )
-    draft_artifact = _redacted_model(ctx, draft_artifact, DraftRenderingArtifact)
-    draft_artifact = finalize_draft_rendering(draft_artifact, merge_plan, snapshot)
+    source_excerpt_pack_path = step_root / "draft_source_excerpt_pack.json"
+    source_excerpt_pack_md = step_root / "draft_source_excerpt_pack.md"
+    write_json(source_excerpt_pack_path, source_excerpt_pack)
+    source_excerpt_pack_md.write_text(render_draft_source_excerpt_pack_markdown(source_excerpt_pack), encoding="utf-8")
+    update_preservation_pack = build_update_preservation_pack(merge_plan, snapshot)
+    update_preservation_pack_path = step_root / "update_preservation_pack.json"
+    update_preservation_pack_md = step_root / "update_preservation_pack.md"
+    write_json(update_preservation_pack_path, update_preservation_pack)
+    update_preservation_pack_md.write_text(render_update_preservation_pack_markdown(update_preservation_pack), encoding="utf-8")
+    _, digest_projection_report = project_source_digest_for_merge_plan(digest, merge_plan)
+    write_draft_digest_projection_report(step_root, digest_projection_report)
+    draft_artifact = run_draft_rendering_model(
+        ctx=ctx,
+        step_root=step_root,
+        digest=digest,
+        merge_plan=merge_plan,
+        snapshot=snapshot,
+        source_excerpt_pack=source_excerpt_pack,
+        update_preservation_pack=update_preservation_pack,
+        approved_prepared_text=approved_prepared_text,
+    )
     validate_draft_rendering(draft_artifact, merge_plan, language=ctx.manifest.vault_config_snapshot.wiki_language)
     draft_artifact_path = step_root / "draft_rendering.json"
     write_json(draft_artifact_path, draft_artifact)
     draft_root = step_root / "draft_pages"
-    outputs: list[Path] = []
+    outputs: list[Path] = [source_excerpt_pack_path, source_excerpt_pack_md, update_preservation_pack_path, update_preservation_pack_md]
+    for digest_projection_sidecar in [
+        step_root / "draft_digest_projection_report.json",
+        step_root / "draft_digest_projection_report.md",
+        step_root / "draft_merge_plan_projection_report.json",
+        step_root / "draft_merge_plan_projection_report.md",
+        step_root / "draft_context_projection_report.json",
+        step_root / "draft_context_projection_report.md",
+        step_root / "update_preservation_reinforcement_report.json",
+        step_root / "update_preservation_reinforcement_report.md",
+        step_root / "grounding_paraphrase_rewrite_report.json",
+        step_root / "grounding_paraphrase_rewrite_report.md",
+    ]:
+        if digest_projection_sidecar.exists():
+            outputs.append(digest_projection_sidecar)
+    for batch_sidecar in [step_root / "draft_rendering_batch_report.json", step_root / "draft_rendering_batch_report.md"]:
+        if batch_sidecar.exists():
+            outputs.append(batch_sidecar)
     target_manifest: list[DraftWriteTarget] = []
     source_title = source_title_for_raw(digest.source_raw_path)
     action_by_id = {item.page_plan_id: item for item in merge_plan.items}
@@ -1482,6 +5860,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     outputs.extend([draft_artifact_path, write_manifest_path])
     refs = [_draft_rendering_ref(ctx.run_dir, path, step_name) for path in outputs]
     refs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    refs.extend(draft_rendering_model_batch_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=refs)
 
 
@@ -1505,7 +5884,9 @@ def _run_validation(ctx: StepRunContext) -> None:
     ensure_wiki_context_current(ctx.vault, snapshot)
     if any(item.action == "needs_human_decision" for item in merge_plan.items):
         raise PipelineError("needs_human_decision must be revised to create/update/noop before validation.")
-    if not digest.ingest_candidates() and not any(item.source_basis.prepared_discovered_candidates for item in merge_plan.items):
+    if not digest.ingest_candidates() and not any(
+        nonempty_prepared_discovered_candidates(item.source_basis) for item in merge_plan.items
+    ):
         raise PipelineError("source_digest must include at least one wiki candidate")
     if not merge_plan.items:
         raise PipelineError("wiki_merge_plan must include at least one action")
@@ -1524,17 +5905,65 @@ def _run_apply_preview(ctx: StepRunContext) -> None:
     complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "apply_preview.v2")])
 
 
+def refresh_current_draft_grounding_artifacts(
+    ctx: StepRunContext,
+    draft_manifest: DraftWriteManifest,
+    draft_manifest_path: Path,
+) -> DraftWriteManifest:
+    draft_root = require_step_output_dir(ctx.run_dir, "draft_rendering")
+    draft_artifact = read_model(draft_root / "draft_rendering.json", DraftRenderingArtifact)
+    merge_plan = read_model(require_step_output_dir(ctx.run_dir, "merge_plan_review") / "approved_merge_plan.json", WikiMergePlanArtifact)
+    snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
+    approved_prepared_text = (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8")
+    grounding_review = build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
+    grounding_review_path = draft_root / "draft_grounding_review.json"
+    grounding_review_md = draft_root / "draft_grounding_review.md"
+    write_json(grounding_review_path, grounding_review)
+    grounding_review_md.write_text(render_draft_grounding_review(grounding_review), encoding="utf-8")
+    refresh_draft_rendering_artifact_refs(ctx, grounding_review_path, grounding_review_md)
+    if draft_manifest.requires_grounding_review == grounding_review.requires_review:
+        return draft_manifest
+    updated_manifest = draft_manifest.model_copy(update={"requires_grounding_review": grounding_review.requires_review})
+    write_json(draft_manifest_path, updated_manifest)
+    refresh_draft_rendering_artifact_refs(ctx, draft_manifest_path)
+    return updated_manifest
+
+
+def refresh_draft_rendering_artifact_refs(ctx: StepRunContext, *paths: Path) -> None:
+    draft_step = get_step(ctx.manifest, "draft_rendering")
+    for path in paths:
+        ref = _draft_rendering_ref(ctx.run_dir, path, "draft_rendering")
+        draft_step.outputs = replace_artifact_ref(draft_step.outputs, ref)
+        for attempt in draft_step.attempts:
+            attempt.outputs = replace_artifact_ref(attempt.outputs, ref)
+
+
+def replace_artifact_ref(refs: list[ArtifactRef], ref: ArtifactRef) -> list[ArtifactRef]:
+    replaced = False
+    next_refs: list[ArtifactRef] = []
+    for existing in refs:
+        if existing.relative_path == ref.relative_path:
+            next_refs.append(ref)
+            replaced = True
+        else:
+            next_refs.append(existing)
+    if not replaced:
+        next_refs.append(ref)
+    return next_refs
+
+
 def _run_draft_review(ctx: StepRunContext) -> None:
     step_name = "draft_review"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     draft_manifest_path = require_step_output_dir(ctx.run_dir, "draft_rendering") / "draft_write_manifest.json"
     draft_manifest = read_model(draft_manifest_path, DraftWriteManifest)
+    draft_manifest = refresh_current_draft_grounding_artifacts(ctx, draft_manifest, draft_manifest_path)
     approved_manifest_path = step_root / "approved_write_manifest.json"
     approval_path = step_root / "draft_approval.json"
     prompt_path = step_root / "review_prompt.md"
     prompt_path.write_text(render_draft_review_prompt(ctx.run_dir, draft_manifest), encoding="utf-8")
     if draft_manifest.source_only_noop:
-        approved_manifest_path.write_text(draft_manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+        write_json(approved_manifest_path, draft_manifest)
         approval = build_draft_approval(
             ctx.run_dir,
             approved_manifest_path,
@@ -1555,15 +5984,20 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
         )
         return
-    if not draft_manifest.has_updates and not draft_manifest.requires_grounding_review:
-        approved_manifest_path.write_text(draft_manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+    if not draft_review_requires_manual(ctx.run_dir, draft_manifest):
+        write_json(approved_manifest_path, draft_manifest)
+        notes = (
+            "纯 create operation，本轮按 auto-stub 自动批准。"
+            if not draft_manifest.has_updates
+            else "update operation 未发现 grounding 或旧页保留观察风险；本地旧知识补强已写入审计报告，本轮按 auto-stub 自动批准。"
+        )
         approval = build_draft_approval(
             ctx.run_dir,
             approved_manifest_path,
             decision="approved",
             review_mode="auto_stub",
             auto_approved=True,
-            notes="纯 create operation，本轮按 auto-stub 自动批准。",
+            notes=notes,
         )
         write_json(approval_path, approval)
         complete_review_step(
@@ -1578,15 +6012,15 @@ def _run_draft_review(ctx: StepRunContext) -> None:
         )
         return
     pending_manifest = step_root / "pending_write_manifest.json"
-    pending_manifest.write_text(draft_manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+    write_json(pending_manifest, draft_manifest)
+    review_reason = draft_review_reason(ctx.run_dir, draft_manifest)
     approval = DraftApproval(
         decision="pending",
         review_mode="manual",
         auto_approved=False,
-        notes="Update 草稿或 grounding review 需要显式人工批准。",
+        notes=review_reason,
     )
     write_json(approval_path, approval)
-    review_reason = "Grounding review 发现 unsupported new_fact，需要人工确认。" if draft_manifest.requires_grounding_review else "Update 草稿需要显式人工批准。"
     mark_step_awaiting_review(
         ctx.manifest,
         step_name,
@@ -1597,6 +6031,13 @@ def _run_draft_review(ctx: StepRunContext) -> None:
         ],
         reason=review_reason,
         review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
+    )
+
+
+def draft_review_requires_manual(run_dir: Path, draft_manifest: DraftWriteManifest) -> bool:
+    return bool(
+        draft_manifest.requires_grounding_review
+        or update_manual_resolution_count(run_dir)
     )
 
 
@@ -1653,10 +6094,1071 @@ def render_source_digest_markdown(digest: SourceDigestArtifact) -> str:
         ("设计", digest.designs),
         ("对比", digest.comparisons),
         ("未决问题", digest.open_questions),
+        ("预算延后候选", digest.budget_deferred_candidates),
         ("弱相关或噪声项", digest.weak_or_noise_items),
     ]:
         sections.extend(["", f"## {title}", "", render_candidate_table(candidates)])
     return "\n".join(sections).rstrip() + "\n"
+
+
+def augment_source_digest_anchor_entities(
+    digest: SourceDigestArtifact,
+    approved_prepared_text: str,
+) -> SourceDigestArtifact:
+    additions: list[SourceDigestCandidate] = []
+    existing_keys = {
+        source_digest_candidate_title_key(candidate)
+        for candidate in digest.ingest_candidates()
+        if source_digest_candidate_title_key(candidate)
+    }
+    for anchor, metadata in SOURCE_DIGEST_ANCHOR_ENTITIES.items():
+        anchor_key = normalized_source_match_text(anchor)
+        if not anchor_key or anchor_key in existing_keys:
+            continue
+        signal = source_anchor_signal(approved_prepared_text, anchor)
+        if not signal["should_add"]:
+            continue
+        candidate = SourceDigestCandidate(
+            candidate_id=f"auto-ent-{anchor_key}",
+            name=anchor,
+            type="entity",
+            one_sentence_summary=metadata["summary"],
+            why_matters=metadata["why_matters"],
+            wiki_value=metadata["wiki_value"],
+            source_locator=signal["source_locator"],
+            suggested_page_title=anchor,
+            related_candidates=source_anchor_related_candidates(anchor, digest),
+            resolution_hint=(
+                f"{metadata['resolution_hint']} occurrence_count={signal['occurrence_count']}; "
+                f"signal_reason={signal['reason']}"
+            ),
+            duplicate_risk="medium",
+        )
+        additions.append(candidate)
+        existing_keys.add(anchor_key)
+    if not additions:
+        return digest
+    return digest.model_copy(update={"entities": [*additions, *digest.entities]})
+
+
+def source_anchor_signal(text: str, anchor: str) -> dict[str, Any]:
+    occurrence_count = source_anchor_occurrence_count(text, anchor)
+    if occurrence_count <= 0:
+        return {
+            "should_add": False,
+            "occurrence_count": 0,
+            "source_locator": "",
+            "reason": "absent",
+        }
+    frontmatter = parse_frontmatter(text) or {}
+    metadata_text = "\n".join(
+        str(frontmatter.get(key) or "")
+        for key in ["title", "description", "source", "author"]
+    )
+    heading_text = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
+    high_signal_text = "\n".join([metadata_text, heading_text])
+    high_signal = source_anchor_occurrence_count(high_signal_text, anchor) > 0
+    explicit_context = source_anchor_has_explicit_context(text, anchor)
+    should_add = high_signal or occurrence_count >= 3 or explicit_context
+    reason_parts: list[str] = []
+    if high_signal:
+        reason_parts.append("metadata_or_heading")
+    if occurrence_count >= 3:
+        reason_parts.append("repeated")
+    if explicit_context:
+        reason_parts.append("explicit_context")
+    return {
+        "should_add": should_add,
+        "occurrence_count": occurrence_count,
+        "source_locator": source_anchor_first_locator(text, anchor),
+        "reason": "+".join(reason_parts) or "weak_mention",
+    }
+
+
+def source_anchor_occurrence_count(text: str, anchor: str) -> int:
+    if not text or not anchor:
+        return 0
+    pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])", re.IGNORECASE)
+    return len(pattern.findall(unicodedata.normalize("NFKC", text)))
+
+
+def source_anchor_has_explicit_context(text: str, anchor: str) -> bool:
+    lower = unicodedata.normalize("NFKC", text).lower()
+    anchor_lower = anchor.lower()
+    context_terms = {
+        "managed agents": [
+            "meta-harness",
+            "托管智能体",
+            "managed agents is",
+            "managed agents can",
+            "managed agents,",
+        ],
+        "claude code": [
+            "excellent harness",
+            "广泛使用",
+            "head of product",
+            "创建了claude code",
+            "claude code团队",
+            "claude code和cowork",
+        ],
+        "cowork": [
+            "claude code和cowork",
+            "head of product",
+            "知识工作",
+            "not code",
+            "非代码",
+        ],
+    }.get(anchor_lower, [])
+    for match in re.finditer(rf"(?<![a-z0-9]){re.escape(anchor_lower)}(?![a-z0-9])", lower):
+        window = lower[max(0, match.start() - 120) : min(len(lower), match.end() + 120)]
+        if any(term in window for term in context_terms):
+            return True
+    return False
+
+
+def source_anchor_first_locator(text: str, anchor: str) -> str:
+    pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])", re.IGNORECASE)
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if pattern.search(unicodedata.normalize("NFKC", line)):
+            return f"L{line_no}"
+    return ""
+
+
+def source_anchor_related_candidates(anchor: str, digest: SourceDigestArtifact) -> list[str]:
+    existing_titles = [candidate.suggested_page_title or candidate.name for candidate in digest.ingest_candidates()]
+    desired = {
+        "Managed Agents": ["Claude Code", "Harness（适配框架）", "Session（会话）", "大脑与双手解耦"],
+        "Claude Code": ["Managed Agents", "Harness（适配框架）", "Cowork"],
+        "Cowork": ["Claude Code"],
+    }.get(anchor, [])
+    available = [title for title in desired if title in existing_titles or title in SOURCE_DIGEST_ANCHOR_ENTITIES]
+    return available[:FINAL_RELATED_LIMIT]
+
+
+def cap_source_digest_candidates(digest: SourceDigestArtifact, max_candidates: int) -> tuple[SourceDigestArtifact, dict[str, Any]]:
+    groups: dict[str, list[SourceDigestCandidate]] = {
+        "entities": list(digest.entities),
+        "concepts": list(digest.concepts),
+        "designs": list(digest.designs),
+        "comparisons": list(digest.comparisons),
+        "open_questions": list(digest.open_questions),
+    }
+    total_before_dedupe = sum(len(items) for items in groups.values())
+    groups, deduped_candidates = dedupe_source_digest_groups(groups)
+    total = sum(len(items) for items in groups.values())
+    budget = max(1, int(max_candidates))
+    if total <= budget:
+        report = source_digest_budget_report(
+            groups,
+            {},
+            budget=budget,
+            total=total,
+            applied=False,
+            total_before_dedupe=total_before_dedupe,
+            deduped_candidates=deduped_candidates,
+        )
+        capped = digest.model_copy(
+            update={
+                "entities": groups["entities"],
+                "concepts": groups["concepts"],
+                "designs": groups["designs"],
+                "comparisons": groups["comparisons"],
+                "open_questions": groups["open_questions"],
+            }
+        )
+        return capped, report
+
+    selected: dict[str, list[SourceDigestCandidate]] = {name: [] for name in groups}
+    indexes = {name: 0 for name in groups}
+    selected_count = 0
+    while selected_count < budget:
+        progressed = False
+        for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
+            group = groups[group_name]
+            index = indexes[group_name]
+            if index >= len(group):
+                continue
+            selected[group_name].append(group[index])
+            indexes[group_name] += 1
+            selected_count += 1
+            progressed = True
+            if selected_count >= budget:
+                break
+        if not progressed:
+            break
+
+    deferred: dict[str, list[SourceDigestCandidate]] = {
+        group_name: groups[group_name][indexes[group_name] :]
+        for group_name in groups
+    }
+    selected, selected_aggregations = promote_deferred_aggregations_into_selection(selected, deferred)
+    represented_by = {
+        candidate_id: aggregation["candidate_id"]
+        for aggregation in selected_aggregations
+        for candidate_id in aggregation.get("deferred_candidate_ids", [])
+    }
+    budget_deferred_candidates = list(digest.budget_deferred_candidates)
+    for group_name, candidates in deferred.items():
+        budget_deferred_candidates.extend(
+            deferred_digest_candidate(group_name, candidate, represented_by=represented_by.get(candidate.candidate_id, ""))
+            for candidate in candidates
+        )
+    capped = digest.model_copy(
+        update={
+            "entities": selected["entities"],
+            "concepts": selected["concepts"],
+            "designs": selected["designs"],
+            "comparisons": selected["comparisons"],
+            "open_questions": selected["open_questions"],
+            "budget_deferred_candidates": budget_deferred_candidates,
+        }
+    )
+    report = source_digest_budget_report(
+        selected,
+        deferred,
+        budget=budget,
+        total=total,
+        applied=True,
+        total_before_dedupe=total_before_dedupe,
+        deduped_candidates=deduped_candidates,
+        selected_deferred_aggregations=selected_aggregations,
+    )
+    return capped, report
+
+
+def dedupe_source_digest_groups(
+    groups: dict[str, list[SourceDigestCandidate]],
+) -> tuple[dict[str, list[SourceDigestCandidate]], list[dict[str, Any]]]:
+    deduped_groups: dict[str, list[SourceDigestCandidate]] = {group_name: [] for group_name in groups}
+    deduped_candidates: list[dict[str, Any]] = []
+    for group_name, candidates in groups.items():
+        by_key: dict[str, int] = {}
+        for candidate in candidates:
+            key = source_digest_candidate_dedupe_key(group_name, candidate)
+            canonical_index: int | None = by_key.get(key) if key else None
+            if canonical_index is None and group_name != "open_questions":
+                canonical_index = source_digest_duplicate_candidate_index(
+                    group_name,
+                    deduped_groups[group_name],
+                    candidate,
+                )
+                if canonical_index is not None and not key:
+                    key = source_digest_candidate_similarity_key(group_name, deduped_groups[group_name][canonical_index], candidate)
+            if canonical_index is None:
+                if key:
+                    by_key[key] = len(deduped_groups[group_name])
+                deduped_groups[group_name].append(candidate)
+                continue
+            canonical = deduped_groups[group_name][canonical_index]
+            deduped_groups[group_name][canonical_index] = merge_source_digest_duplicate_candidate(
+                group_name,
+                key,
+                canonical,
+                candidate,
+            )
+            deduped_candidates.append(
+                {
+                    "group": group_name,
+                    "dedupe_key": key,
+                    "kept_candidate_id": canonical.candidate_id,
+                    "merged_candidate_id": candidate.candidate_id,
+                    "merged_title": candidate.suggested_page_title or candidate.name,
+                    "source_locator": candidate.source_locator,
+                }
+            )
+    return deduped_groups, deduped_candidates
+
+
+def source_digest_duplicate_candidate_index(
+    group_name: str,
+    candidates: list[SourceDigestCandidate],
+    candidate: SourceDigestCandidate,
+) -> int | None:
+    for index, existing in enumerate(candidates):
+        if source_digest_candidates_semantically_duplicate(group_name, existing, candidate):
+            return index
+    return None
+
+
+def source_digest_candidate_dedupe_key(group_name: str, candidate: SourceDigestCandidate) -> str:
+    if group_name != "open_questions":
+        key = source_digest_candidate_title_key(candidate)
+        return f"{group_name}:title:{key}" if len(key) >= 6 else ""
+    basis = (
+        candidate.open_question_or_tension
+        or candidate.suggested_page_title
+        or candidate.name
+        or candidate.one_sentence_summary
+    )
+    key = open_question_key(basis)
+    return f"open_questions:{key}" if key and len(key) >= 6 else ""
+
+
+def source_digest_candidates_semantically_duplicate(
+    group_name: str,
+    left: SourceDigestCandidate,
+    right: SourceDigestCandidate,
+) -> bool:
+    if group_name == "open_questions":
+        return source_digest_candidate_dedupe_key(group_name, left) == source_digest_candidate_dedupe_key(group_name, right)
+    left_key = source_digest_candidate_title_key(left)
+    right_key = source_digest_candidate_title_key(right)
+    if left_key and left_key == right_key:
+        return True
+    title_similarity = source_digest_text_similarity(
+        left.suggested_page_title or left.name,
+        right.suggested_page_title or right.name,
+    )
+    intent_similarity = source_digest_text_similarity(
+        source_digest_candidate_intent_text(left),
+        source_digest_candidate_intent_text(right),
+    )
+    if group_name == "entities":
+        return title_similarity >= 0.82 and intent_similarity >= 0.45
+    if group_name == "comparisons" and both_agent_workflow_compare(left.suggested_page_title or left.name, right.suggested_page_title or right.name):
+        return intent_similarity >= 0.35
+    shared_title_terms = source_digest_shared_signal_terms(left.suggested_page_title or left.name, right.suggested_page_title or right.name)
+    return (title_similarity >= 0.55 and intent_similarity >= 0.42) or (
+        title_similarity >= 0.40 and intent_similarity >= 0.55
+    ) or (intent_similarity >= 0.56 and bool(shared_title_terms))
+
+
+def source_digest_candidate_title_key(candidate: SourceDigestCandidate) -> str:
+    return source_digest_title_key(candidate.suggested_page_title or candidate.name)
+
+
+def source_digest_title_key(title: str) -> str:
+    core_title = source_digest_parenthetical_translation_core(title)
+    core_key = normalized_source_match_text(core_title)
+    if len(core_key) >= 4:
+        return core_key
+    return normalized_source_match_text(title)
+
+
+def source_digest_parenthetical_translation_core(title: str) -> str:
+    text = unicodedata.normalize("NFKC", title).strip()
+    if not text:
+        return text
+    parenthetical_parts = re.findall(r"[（(]([^）)]{1,48})[）)]", text)
+    if not parenthetical_parts:
+        return text
+    stripped = re.sub(r"\s*[（(][^）)]{1,48}[）)]\s*", " ", text)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if not stripped:
+        return text
+    stripped_has_latin = bool(re.search(r"[A-Za-z]", stripped))
+    stripped_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", stripped))
+    paren_text = " ".join(parenthetical_parts)
+    paren_has_latin = bool(re.search(r"[A-Za-z]", paren_text))
+    paren_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", paren_text))
+    if (stripped_has_latin and paren_has_cjk) or (stripped_has_cjk and paren_has_latin):
+        return stripped
+    return text
+
+
+def source_digest_candidate_similarity_key(
+    group_name: str,
+    canonical: SourceDigestCandidate,
+    duplicate: SourceDigestCandidate,
+) -> str:
+    title_similarity = source_digest_text_similarity(
+        canonical.suggested_page_title or canonical.name,
+        duplicate.suggested_page_title or duplicate.name,
+    )
+    intent_similarity = source_digest_text_similarity(
+        source_digest_candidate_intent_text(canonical),
+        source_digest_candidate_intent_text(duplicate),
+    )
+    return f"{group_name}:similarity:title={title_similarity:.2f}:intent={intent_similarity:.2f}"
+
+
+def source_digest_candidate_intent_text(candidate: SourceDigestCandidate) -> str:
+    return "\n".join(
+        [
+            candidate.suggested_page_title,
+            candidate.name,
+            candidate.one_sentence_summary,
+            candidate.why_matters,
+            candidate.wiki_value,
+            candidate.open_question_or_tension,
+        ]
+    )
+
+
+def source_digest_text_similarity(left: str, right: str) -> float:
+    return jaccard(source_digest_similarity_terms(left), source_digest_similarity_terms(right))
+
+
+def source_digest_shared_signal_terms(left: str, right: str) -> set[str]:
+    generic = {"ai", "pm", "产品", "管理", "主题", "材料", "知识", "页面"}
+    return {
+        term
+        for term in source_digest_similarity_terms(left) & source_digest_similarity_terms(right)
+        if term not in generic and len(term) >= 2
+    }
+
+
+def source_digest_similarity_terms(text: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", text.lower())
+    terms = set(re.findall(r"[a-z0-9]{2,}", normalized))
+    for segment in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+        terms.add(segment)
+        max_size = min(4, len(segment))
+        for size in range(2, max_size + 1):
+            for index in range(0, len(segment) - size + 1):
+                terms.add(segment[index : index + size])
+    stop = {
+        "concept",
+        "comparison",
+        "design",
+        "entity",
+        "open",
+        "question",
+        "概念",
+        "设计",
+        "实体",
+        "问题",
+        "对比",
+        "比较",
+        "页面",
+        "来源",
+        "摘要",
+    }
+    return {term for term in terms if term not in stop and len(term) >= 2}
+
+
+def merge_source_digest_duplicate_candidate(
+    group_name: str,
+    dedupe_key: str,
+    canonical: SourceDigestCandidate,
+    duplicate: SourceDigestCandidate,
+) -> SourceDigestCandidate:
+    duplicate_title = duplicate.suggested_page_title or duplicate.name
+    note = (
+        f"source_digest_semantic_dedupe: `{duplicate.candidate_id}` ({duplicate_title}) "
+        f"按 `{dedupe_key}` 合并进 `{canonical.candidate_id}`，不单独占用本轮页面预算。"
+    )
+    if duplicate.source_locator:
+        note += f" 来源定位：{duplicate.source_locator}。"
+    if duplicate.one_sentence_summary:
+        note += f" 变体摘要：{duplicate.one_sentence_summary}"
+    duplicate_risk = "high" if "high" in {canonical.duplicate_risk, duplicate.duplicate_risk} else (
+        "medium" if "medium" in {canonical.duplicate_risk, duplicate.duplicate_risk} else canonical.duplicate_risk
+    )
+    return canonical.model_copy(
+        update={
+            "related_candidates": _dedupe_strings(
+                [*canonical.related_candidates, duplicate.candidate_id, *duplicate.related_candidates]
+            ),
+            "resolution_hint": merge_markdown_blocks(canonical.resolution_hint, note),
+            "open_question_or_tension": merge_markdown_blocks(
+                canonical.open_question_or_tension,
+                duplicate.open_question_or_tension,
+            ),
+            "duplicate_risk": duplicate_risk,
+        }
+    )
+
+
+def promote_deferred_aggregations_into_selection(
+    selected: dict[str, list[SourceDigestCandidate]],
+    deferred: dict[str, list[SourceDigestCandidate]],
+) -> tuple[dict[str, list[SourceDigestCandidate]], list[dict[str, Any]]]:
+    selected = {group_name: list(candidates) for group_name, candidates in selected.items()}
+    selected_aggregations: list[dict[str, Any]] = []
+    for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
+        deferred_candidates = list(deferred.get(group_name, []))
+        clusters = deferred_candidate_topic_clusters(group_name, deferred_candidates)
+        if not clusters or not selected.get(group_name):
+            continue
+        remaining_selected = list(selected[group_name])
+        promoted: list[SourceDigestCandidate] = []
+        for cluster_index, cluster in enumerate(clusters, start=1):
+            if not remaining_selected:
+                break
+            replacement_index, replacement_score = select_aggregation_replacement(remaining_selected, cluster)
+            if replacement_score < SOURCE_DIGEST_PROMOTED_AGGREGATION_MIN_REPLACEMENT_SIMILARITY:
+                continue
+            replaced = remaining_selected.pop(replacement_index)
+            represented = [replaced, *cluster]
+            aggregate = deferred_aggregation_digest_candidate(group_name, represented, replaced_candidate_id=replaced.candidate_id)
+            promoted.append(aggregate)
+            selected_aggregations.append(
+                {
+                    "group": group_name,
+                    "cluster_index": cluster_index,
+                    "candidate_id": aggregate.candidate_id,
+                    "suggested_page_title": aggregate.suggested_page_title,
+                    "suggested_page_type": aggregate.type,
+                    "replaced_candidate_id": replaced.candidate_id,
+                    "replacement_similarity": round(replacement_score, 4),
+                    "represented_candidate_ids": [candidate.candidate_id for candidate in represented],
+                    "deferred_candidate_ids": [candidate.candidate_id for candidate in cluster],
+                    "cluster_terms": sorted(deferred_cluster_terms(cluster))[:8],
+                    "reason": (
+                        f"`{group_name}` deferred topic cluster {cluster_index} has {len(cluster)} candidate(s); "
+                        "one selected candidate was folded into an aggregation candidate to keep the page budget constant."
+                    ),
+                }
+            )
+        selected[group_name] = [*remaining_selected, *promoted]
+    return selected, selected_aggregations
+
+
+def deferred_candidate_topic_clusters(
+    group_name: str,
+    candidates: list[SourceDigestCandidate],
+) -> list[list[SourceDigestCandidate]]:
+    clusters: list[list[SourceDigestCandidate]] = []
+    for candidate in candidates:
+        best_index = -1
+        best_score = 0.0
+        for index, cluster in enumerate(clusters):
+            score = candidate_cluster_similarity(group_name, candidate, cluster)
+            if score > best_score:
+                best_index = index
+                best_score = score
+        if best_index >= 0 and best_score >= SOURCE_DIGEST_AGGREGATION_CLUSTER_SIMILARITY:
+            clusters[best_index].append(candidate)
+        else:
+            clusters.append([candidate])
+    return [cluster for cluster in clusters if len(cluster) >= SOURCE_DIGEST_AGGREGATION_MIN_CANDIDATES]
+
+
+def candidate_cluster_similarity(
+    group_name: str,
+    candidate: SourceDigestCandidate,
+    cluster: list[SourceDigestCandidate],
+) -> float:
+    if not cluster:
+        return 0.0
+    return min(source_digest_candidate_topic_similarity(group_name, candidate, item) for item in cluster)
+
+
+def source_digest_candidate_topic_similarity(
+    group_name: str,
+    left: SourceDigestCandidate,
+    right: SourceDigestCandidate,
+) -> float:
+    if group_name == "open_questions":
+        left_key = open_question_key(left.open_question_or_tension or left.suggested_page_title or left.name)
+        right_key = open_question_key(right.open_question_or_tension or right.suggested_page_title or right.name)
+        if left_key and right_key and left_key == right_key:
+            return 1.0
+    left_anchors = source_digest_candidate_topic_anchor_terms(left)
+    right_anchors = source_digest_candidate_topic_anchor_terms(right)
+    shared_anchors = left_anchors & right_anchors
+    if not shared_anchors:
+        return 0.0
+    left_terms = source_digest_non_generic_terms(source_digest_candidate_topic_terms(left))
+    right_terms = source_digest_non_generic_terms(source_digest_candidate_topic_terms(right))
+    if not left_terms or not right_terms:
+        return 0.0
+    anchor_score = jaccard(left_anchors, right_anchors)
+    intent_score = jaccard(left_terms, right_terms)
+    if len(shared_anchors) == 1:
+        anchor = next(iter(shared_anchors))
+        if source_digest_topic_anchor_too_broad(anchor):
+            return 0.0
+        shared_bonus = 0.22
+    else:
+        shared_bonus = min(0.50, len(shared_anchors) * 0.20)
+    return min(1.0, max(anchor_score, intent_score * 0.5) + shared_bonus)
+
+
+def source_digest_candidate_topic_terms(candidate: SourceDigestCandidate) -> set[str]:
+    return source_digest_similarity_terms(source_digest_candidate_intent_text(candidate))
+
+
+def source_digest_candidate_topic_anchor_terms(candidate: SourceDigestCandidate) -> set[str]:
+    anchor_text = "\n".join(
+        [
+            candidate.suggested_page_title,
+            candidate.name,
+            candidate.open_question_or_tension,
+        ]
+    )
+    return source_digest_non_generic_terms(source_digest_similarity_terms(anchor_text))
+
+
+def source_digest_topic_anchor_too_broad(anchor: str) -> bool:
+    broad = {
+        "agi",
+        "ai",
+        "llm",
+        "pm",
+        "模型",
+        "能力",
+        "评估",
+        "数据",
+        "用户",
+    }
+    return anchor in broad
+
+
+def source_digest_non_generic_terms(terms: set[str]) -> set[str]:
+    generic = {
+        "ai",
+        "pm",
+        "产品",
+        "管理",
+        "主题",
+        "材料",
+        "知识",
+        "页面",
+        "候选",
+        "价值",
+        "来源",
+        "概念",
+        "重要",
+        "复用",
+        "讨论",
+        "问题",
+        "方式",
+        "变化",
+        "边界",
+        "职责",
+        "执行",
+        "判断",
+        "功能",
+        "任务",
+        "组织",
+    }
+    return {term for term in terms if term not in generic and len(term) >= 2}
+
+
+def deferred_cluster_terms(cluster: list[SourceDigestCandidate]) -> set[str]:
+    if not cluster:
+        return set()
+    shared = source_digest_candidate_topic_terms(cluster[0])
+    for candidate in cluster[1:]:
+        shared &= source_digest_candidate_topic_terms(candidate)
+    if shared:
+        return source_digest_non_generic_terms(shared)
+    combined: set[str] = set()
+    for candidate in cluster:
+        combined.update(source_digest_non_generic_terms(source_digest_candidate_topic_terms(candidate)))
+    return combined
+
+
+def select_aggregation_replacement(
+    selected: list[SourceDigestCandidate],
+    cluster: list[SourceDigestCandidate],
+) -> tuple[int, float]:
+    if not selected:
+        return 0, 0.0
+    best_index = len(selected) - 1
+    best_score = -1.0
+    for index, candidate in enumerate(selected):
+        score = max(
+            source_digest_candidate_topic_similarity(deferred_candidate_group(candidate), candidate, cluster_candidate)
+            for cluster_candidate in cluster
+        )
+        if score > best_score:
+            best_index = index
+            best_score = score
+    return best_index, max(0.0, best_score)
+
+
+def deferred_aggregation_digest_candidate(
+    group_name: str,
+    candidates: list[SourceDigestCandidate],
+    *,
+    replaced_candidate_id: str,
+) -> SourceDigestCandidate:
+    aggregation = build_deferred_candidate_aggregations({group_name: candidates})[0]
+    candidate_ids = [candidate.candidate_id for candidate in candidates]
+    related_candidate_ids = [candidate_id for candidate_id in candidate_ids if candidate_id != replaced_candidate_id]
+    candidate_id = f"AGG-{group_name.replace('_', '-')}-{sha256_bytes('|'.join(candidate_ids).encode('utf-8'))[:8]}"
+    source_locators = _dedupe_strings([candidate.source_locator for candidate in candidates if candidate.source_locator])[:6]
+    tensions = _dedupe_strings([candidate.open_question_or_tension for candidate in candidates if candidate.open_question_or_tension])[:4]
+    title = str(aggregation["suggested_title"])
+    summary = str(aggregation["coverage_summary"])
+    wiki_value = str(aggregation.get("wiki_value_summary") or "") or str(aggregation["suggested_action"])
+    return SourceDigestCandidate(
+        candidate_id=candidate_id,
+        name=title,
+        type=deferred_aggregation_digest_type(group_name),
+        one_sentence_summary=summary,
+        why_matters=f"该聚合候选把 {len(candidates)} 个同组候选压缩成一个页面预算槽，避免单篇材料产生过多独立页面。",
+        wiki_value=wiki_value,
+        source_locator="；".join(source_locators),
+        suggested_page_title=title,
+        related_candidates=related_candidate_ids,
+        resolution_hint=(
+            f"source_digest_deferred_aggregation: represented_candidates={', '.join(candidate_ids)}; "
+            f"related_deferred_candidates={', '.join(related_candidate_ids) or 'none'}; "
+            f"replaced_selected_candidate={replaced_candidate_id}; page budget remains constant."
+        ),
+        duplicate_risk=source_digest_max_duplicate_risk(candidates),
+        open_question_or_tension="；".join(tensions),
+    )
+
+
+def deferred_aggregation_digest_type(group_name: str) -> str:
+    if group_name == "comparisons":
+        return "comparison"
+    if group_name == "open_questions":
+        return "open_question"
+    return "overview"
+
+
+def source_digest_max_duplicate_risk(candidates: list[SourceDigestCandidate]) -> Literal["low", "medium", "high"]:
+    risks = {candidate.duplicate_risk for candidate in candidates}
+    if "high" in risks:
+        return "high"
+    if "medium" in risks:
+        return "medium"
+    return "low"
+
+
+def deferred_digest_candidate(group_name: str, candidate: SourceDigestCandidate, *, represented_by: str = "") -> SourceDigestCandidate:
+    data = candidate.model_dump(mode="json")
+    note = f"page_budget_deferred: `{group_name}` 超出本次 max_ingest_candidates，保留在 source digest 审计中，后续可单独 ingest 或手动提升。"
+    if represented_by:
+        note += f" represented_by_aggregation: `{represented_by}` 已在本轮用聚合候选代表该候选的核心价值。"
+    data["resolution_hint"] = merge_markdown_blocks(
+        str(data.get("resolution_hint") or ""),
+        note,
+    )
+    return SourceDigestCandidate.model_validate(data)
+
+
+def source_digest_budget_report(
+    selected: dict[str, list[SourceDigestCandidate]],
+    deferred: dict[str, list[SourceDigestCandidate]],
+    *,
+    budget: int,
+    total: int,
+    applied: bool,
+    total_before_dedupe: int | None = None,
+    deduped_candidates: list[dict[str, Any]] | None = None,
+    selected_deferred_aggregations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    selected_count = sum(len(items) for items in selected.values())
+    deferred_count = sum(len(items) for items in deferred.values())
+    deduped_candidates = deduped_candidates or []
+    selected_deferred_aggregations = selected_deferred_aggregations or []
+    deferred_details = {
+        group_name: [source_digest_candidate_budget_detail(group_name, candidate) for candidate in candidates]
+        for group_name, candidates in deferred.items()
+    }
+    followup_batches = [
+        {
+            "group": group_name,
+            "count": len(candidates),
+            "candidate_ids": [candidate.candidate_id for candidate in candidates],
+            "suggested_action": (
+                f"后续如需扩展 `{group_name}`，可单独从这些 deferred candidate 建页，"
+                "或把同组候选合并进一个 overview/comparison 页面。"
+            ),
+        }
+        for group_name, candidates in deferred.items()
+        if candidates
+    ]
+    deferred_aggregations = build_deferred_candidate_aggregations(deferred)
+    return {
+        "schema_version": "source_digest_budget_report.v1",
+        "budget": budget,
+        "total_formal_candidates_before_dedupe": total_before_dedupe if total_before_dedupe is not None else total,
+        "total_formal_candidates_before_budget": total,
+        "deduped_count": len(deduped_candidates),
+        "dedupe_applied": bool(deduped_candidates),
+        "deduped_candidates": deduped_candidates,
+        "selected_deferred_aggregations": selected_deferred_aggregations,
+        "selected_count": selected_count,
+        "deferred_count": deferred_count,
+        "applied": applied,
+        "group_order": list(SOURCE_DIGEST_BUDGET_GROUP_ORDER),
+        "selected": {
+            group_name: [candidate.candidate_id for candidate in candidates]
+            for group_name, candidates in selected.items()
+        },
+        "deferred": {
+            group_name: [candidate.candidate_id for candidate in candidates]
+            for group_name, candidates in deferred.items()
+        },
+        "deferred_details": deferred_details,
+        "followup_batches": followup_batches,
+        "deferred_aggregations": deferred_aggregations,
+    }
+
+
+def build_deferred_candidate_aggregations(
+    deferred: dict[str, list[SourceDigestCandidate]] | list[SourceDigestCandidate],
+) -> list[dict[str, Any]]:
+    if isinstance(deferred, list):
+        grouped: dict[str, list[SourceDigestCandidate]] = {}
+        for candidate in deferred:
+            grouped.setdefault(deferred_candidate_group(candidate), []).append(candidate)
+    else:
+        grouped = {group_name: list(candidates) for group_name, candidates in deferred.items()}
+    aggregations: list[dict[str, Any]] = []
+    for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
+        candidates = [candidate for candidate in grouped.get(group_name, []) if isinstance(candidate, SourceDigestCandidate)]
+        if not candidates:
+            continue
+        label = DEFERRED_AGGREGATION_GROUP_LABELS.get(group_name, group_name)
+        names = [candidate.suggested_page_title or candidate.name for candidate in candidates]
+        representative = candidates[:5]
+        source_locators = _dedupe_strings([candidate.source_locator for candidate in candidates if candidate.source_locator])[:6]
+        tensions = _dedupe_strings([candidate.open_question_or_tension for candidate in candidates if candidate.open_question_or_tension])[:4]
+        wiki_values = _dedupe_strings([candidate.wiki_value for candidate in candidates if candidate.wiki_value])[:4]
+        aggregations.append(
+            {
+                "group": group_name,
+                "label": label,
+                "count": len(candidates),
+                "suggested_page_type": deferred_aggregation_page_type(group_name),
+                "suggested_title": deferred_aggregation_title(group_name, names),
+                "candidate_ids": [candidate.candidate_id for candidate in candidates],
+                "representative_candidates": [
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "title": candidate.suggested_page_title or candidate.name,
+                        "summary": candidate.one_sentence_summary,
+                    }
+                    for candidate in representative
+                ],
+                "coverage_summary": deferred_aggregation_summary(label, candidates),
+                "wiki_value_summary": "；".join(wiki_values) if wiki_values else "",
+                "source_locators": source_locators,
+                "open_questions_or_tensions": tensions,
+                "suggested_action": deferred_aggregation_action(group_name),
+            }
+        )
+    return aggregations
+
+
+def deferred_candidate_group(candidate: SourceDigestCandidate) -> str:
+    type_key = candidate.type.strip().lower()
+    mapping = {
+        "concept": "concepts",
+        "concepts": "concepts",
+        "design": "designs",
+        "designs": "designs",
+        "comparison": "comparisons",
+        "comparisons": "comparisons",
+        "open_question": "open_questions",
+        "open_questions": "open_questions",
+        "question": "open_questions",
+        "entity": "entities",
+        "entities": "entities",
+    }
+    if type_key in mapping:
+        return mapping[type_key]
+    for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
+        if f"`{group_name}`" in candidate.resolution_hint or group_name in candidate.resolution_hint:
+            return group_name
+    return "concepts"
+
+
+def deferred_aggregation_page_type(group_name: str) -> str:
+    return {
+        "comparisons": "comparison",
+        "open_questions": "open_question_overview",
+        "entities": "entity_index",
+        "designs": "design_overview",
+    }.get(group_name, "concept_overview")
+
+
+def deferred_aggregation_title(group_name: str, names: list[str]) -> str:
+    label = DEFERRED_AGGREGATION_GROUP_LABELS.get(group_name, group_name)
+    if not names:
+        return f"{label}聚合页"
+    if len(names) == 1:
+        return f"{names[0]} 后续页"
+    return f"{names[0]} 等 {len(names)} 个{label}聚合页"
+
+
+def deferred_aggregation_summary(label: str, candidates: list[SourceDigestCandidate]) -> str:
+    names = [candidate.suggested_page_title or candidate.name for candidate in candidates[:4]]
+    suffix = "" if len(candidates) <= 4 else f" 等 {len(candidates)} 项"
+    return f"本批次聚合 {label}：{', '.join(names)}{suffix}。"
+
+
+def deferred_aggregation_action(group_name: str) -> str:
+    if group_name == "comparisons":
+        return "后续可合并为一个 comparison 页面，集中比较边界、差异和适用场景。"
+    if group_name == "open_questions":
+        return "后续可合并为一个 open question overview，集中跟踪问题变体和待补来源。"
+    if group_name == "entities":
+        return "后续可合并为一个 entity index/source companion，避免为低频实体逐个建页。"
+    if group_name == "designs":
+        return "后续可合并为一个 design overview，保留模式差异和复用场景。"
+    return "后续可合并为一个 concept overview，先保留概念簇关系，再决定是否拆独立页。"
+
+
+def source_digest_candidate_budget_detail(group_name: str, candidate: SourceDigestCandidate) -> dict[str, str]:
+    return {
+        "group": group_name,
+        "candidate_id": candidate.candidate_id,
+        "type": candidate.type,
+        "name": candidate.name,
+        "suggested_page_title": candidate.suggested_page_title,
+        "one_sentence_summary": candidate.one_sentence_summary,
+        "why_matters": candidate.why_matters,
+        "wiki_value": candidate.wiki_value,
+        "source_locator": candidate.source_locator,
+        "open_question_or_tension": candidate.open_question_or_tension,
+        "resolution_hint": candidate.resolution_hint,
+    }
+
+
+def render_source_digest_budget_report(report: dict[str, Any]) -> str:
+    rows = []
+    selected = report.get("selected", {})
+    deferred = report.get("deferred", {})
+    for group_name in ["concepts", "designs", "comparisons", "open_questions", "entities"]:
+        rows.append(
+            [
+                group_name,
+                ", ".join(selected.get(group_name, [])) or "无",
+                ", ".join(deferred.get(group_name, [])) or "无",
+            ]
+        )
+    dedupe_rows = []
+    deduped_candidates = report.get("deduped_candidates", [])
+    if isinstance(deduped_candidates, list):
+        for item in deduped_candidates:
+            if not isinstance(item, dict):
+                continue
+            dedupe_rows.append(
+                [
+                    str(item.get("group", "")),
+                    str(item.get("dedupe_key", "")),
+                    str(item.get("kept_candidate_id", "")),
+                    str(item.get("merged_candidate_id", "")),
+                    str(item.get("merged_title", "")),
+                    str(item.get("source_locator", "")),
+                ]
+            )
+    detail_rows = []
+    deferred_details = report.get("deferred_details", {})
+    if isinstance(deferred_details, dict):
+        for group_name in ["concepts", "designs", "comparisons", "open_questions", "entities"]:
+            details = deferred_details.get(group_name, [])
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                detail_rows.append(
+                    [
+                        group_name,
+                        str(detail.get("candidate_id", "")),
+                        str(detail.get("suggested_page_title") or detail.get("name") or ""),
+                        str(detail.get("one_sentence_summary", "")),
+                        str(detail.get("wiki_value", "")),
+                        str(detail.get("source_locator", "")),
+                        str(detail.get("resolution_hint", "")),
+                    ]
+                )
+    selected_aggregation_rows = []
+    selected_aggregations = report.get("selected_deferred_aggregations", [])
+    if isinstance(selected_aggregations, list):
+        for aggregation in selected_aggregations:
+            if not isinstance(aggregation, dict):
+                continue
+            selected_aggregation_rows.append(
+                [
+                    str(aggregation.get("group", "")),
+                    str(aggregation.get("candidate_id", "")),
+                    str(aggregation.get("suggested_page_type", "")),
+                    str(aggregation.get("suggested_page_title", "")),
+                    str(aggregation.get("replaced_candidate_id", "")),
+                    ", ".join(aggregation.get("represented_candidate_ids", []))
+                    if isinstance(aggregation.get("represented_candidate_ids"), list)
+                    else "",
+                    str(aggregation.get("reason", "")),
+                ]
+            )
+    batch_rows = []
+    followup_batches = report.get("followup_batches", [])
+    if isinstance(followup_batches, list):
+        for batch in followup_batches:
+            if not isinstance(batch, dict):
+                continue
+            batch_rows.append(
+                [
+                    str(batch.get("group", "")),
+                    str(batch.get("count", "")),
+                    ", ".join(batch.get("candidate_ids", [])) if isinstance(batch.get("candidate_ids"), list) else "",
+                    str(batch.get("suggested_action", "")),
+                ]
+            )
+    aggregation_rows = []
+    aggregations = report.get("deferred_aggregations", [])
+    if isinstance(aggregations, list):
+        for aggregation in aggregations:
+            if not isinstance(aggregation, dict):
+                continue
+            representatives = aggregation.get("representative_candidates", [])
+            if isinstance(representatives, list):
+                rep_text = ", ".join(
+                    str(item.get("title", item.get("candidate_id", "")))
+                    for item in representatives[:4]
+                    if isinstance(item, dict)
+                )
+            else:
+                rep_text = ""
+            aggregation_rows.append(
+                [
+                    str(aggregation.get("group", "")),
+                    str(aggregation.get("suggested_page_type", "")),
+                    str(aggregation.get("suggested_title", "")),
+                    str(aggregation.get("coverage_summary", "")),
+                    rep_text,
+                    str(aggregation.get("suggested_action", "")),
+                ]
+            )
+    return (
+        "# Source Digest 页面预算报告\n\n"
+        f"- 预算：{report.get('budget', 0)}\n"
+        f"- 去重前正式候选：{report.get('total_formal_candidates_before_dedupe', report.get('total_formal_candidates_before_budget', 0))}\n"
+        f"- 预算前正式候选：{report.get('total_formal_candidates_before_budget', 0)}\n"
+        f"- 语义去重合并：{report.get('deduped_count', 0)}\n"
+        f"- 进入页面规划：{report.get('selected_count', 0)}\n"
+        f"- 延后：{report.get('deferred_count', 0)}\n"
+        f"- 是否应用预算：{'是' if report.get('applied') else '否'}\n\n"
+        + format_markdown_table(["分组", "进入页面规划", "延后"], rows)
+        + "\n\n"
+        "## 语义去重候选\n\n"
+        + (
+            format_markdown_table(["分组", "去重 Key", "保留 ID", "合并 ID", "合并标题", "来源定位"], dedupe_rows)
+            if dedupe_rows
+            else "_暂无语义去重候选。_"
+        )
+        + "\n\n"
+        "## 延后候选详情\n\n"
+        + (
+            format_markdown_table(["分组", "ID", "建议标题", "摘要", "Wiki 价值", "来源定位", "处理提示"], detail_rows)
+            if detail_rows
+            else "_暂无延后候选。_"
+        )
+        + "\n\n"
+        "## 本轮已选聚合候选\n\n"
+        + (
+            format_markdown_table(["分组", "聚合 ID", "页类型", "标题", "替换候选", "代表候选", "原因"], selected_aggregation_rows)
+            if selected_aggregation_rows
+            else "_暂无本轮已选聚合候选。_"
+        )
+        + "\n\n"
+        "## 后续处理批次\n\n"
+        + (
+            format_markdown_table(["分组", "数量", "候选 ID", "建议"], batch_rows)
+            if batch_rows
+            else "_暂无后续批次。_"
+        )
+        + "\n\n"
+        "## 延后聚合建议\n\n"
+        + (
+            format_markdown_table(["分组", "建议页类型", "建议标题", "覆盖摘要", "代表候选", "动作"], aggregation_rows)
+            if aggregation_rows
+            else "_暂无延后聚合建议。_"
+        )
+        + "\n"
+    )
 
 
 def build_wiki_merge_plan(
@@ -1667,7 +7169,7 @@ def build_wiki_merge_plan(
     log_date: str,
 ) -> WikiMergePlanArtifact:
     snapshot_by_path = {entry.path: entry for entry in snapshot.entries}
-    candidates = {candidate.candidate_id: candidate for candidate in digest.ingest_candidates()}
+    candidates = source_digest_candidate_lookup(digest)
     items: list[WikiMergePlanItem] = []
     for item in resolution.items:
         entry = snapshot_by_path.get(f"wiki/{item.candidate_target_path}")
@@ -1690,8 +7192,13 @@ def build_wiki_merge_plan(
             if strongest_hit is not None
             else ContextOverlapSignal()
         )
-        source_candidate_id = item.source_basis.source_candidate_ids[0] if item.source_basis.source_candidate_ids else ""
-        candidate = candidates[source_candidate_id]
+        candidate = first_source_basis_candidate(item.source_basis, candidates)
+        if candidate is None:
+            refs = ", ".join(source_basis_candidate_refs(item.source_basis)) or "none"
+            raise PipelineError(
+                f"Cannot build deterministic merge plan for `{item.display_title or item.page_plan_id}`: "
+                f"no source digest candidate found for refs: {refs}."
+            )
         related_pages, related_unresolved = resolve_related_pages(item, candidate, resolution, snapshot)
         items.append(
             WikiMergePlanItem(
@@ -1728,6 +7235,17 @@ def build_wiki_merge_plan(
     return WikiMergePlanArtifact(log_date=log_date, items=items, context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json")
 
 
+def first_source_basis_candidate(
+    source_basis: SourceBasis,
+    candidates: dict[str, SourceDigestCandidate],
+) -> SourceDigestCandidate | None:
+    for candidate_id in source_basis_candidate_refs(source_basis):
+        candidate = candidates.get(candidate_id)
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def existing_knowledge_page_paths(vault: Path) -> set[str]:
     return {entry.rel_path for entry in build_knowledge_pool(vault)}
 
@@ -1754,7 +7272,7 @@ def resolve_related_pages(
         candidate_id: other
         for other in resolution.items
         if other.page_type.lower() != "source"
-        for candidate_id in other.source_basis.source_candidate_ids
+        for candidate_id in source_basis_candidate_refs(other.source_basis)
     }
     by_current_title: dict[str, list[CandidateResolutionItem]] = {}
     for other in resolution.items:
@@ -1967,6 +7485,33 @@ def last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> int
 
 
 def step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
+    if step_name == "raw_prepare":
+        path = require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_prepare_fast_path.json"
+        if not path.exists():
+            return None
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if report.get("eligible") is True:
+            if report.get("raw_prepare_policy") == RawPreparePolicy.skip_model.value:
+                suppressed = report.get("policy_suppressed_reasons", [])
+                if isinstance(suppressed, list) and suppressed:
+                    return f"raw_prepare 使用 --skip-prepare passthrough，覆盖 {len(suppressed)} 个自动质量拦截；详见 raw_prepare_fast_path.md"
+                return "raw_prepare 使用 --skip-prepare passthrough，跳过模型清洗"
+            return "raw_prepare 使用 deterministic markdown passthrough，跳过模型清洗"
+        return None
+    if step_name == "wiki_merge_planning":
+        path = require_step_output_dir(ctx.run_dir, "wiki_merge_planning") / "merge_planning_shortcut_report.json"
+        if not path.exists():
+            return None
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if report.get("used") is True:
+            return f"wiki_merge_planning 使用 local shortcut: {report.get('shortcut', '')}"
+        return None
     if step_name != "raw_link_cleanup":
         return None
     path = require_step_output_dir(ctx.run_dir, "raw_link_cleanup") / "raw_link_cleanup.json"
@@ -1980,7 +7525,9 @@ def step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
 
 def refresh_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest, *, warning_console: Console | None = None) -> None:
     try:
-        write_json(run_dir / "run_metrics.json", build_run_metrics(vault, run_dir, manifest))
+        metrics = build_run_metrics(vault, run_dir, manifest)
+        write_json(run_dir / "run_metrics.json", metrics)
+        (run_dir / "run_metrics.md").write_text(render_run_metrics_markdown(metrics), encoding="utf-8")
     except Exception as exc:
         if warning_console is not None:
             warning_console.print(f"[yellow]warning:[/] run_metrics refresh failed: {exc}")
@@ -1992,18 +7539,36 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
     retry_count = 0
     internal_model_call_count = 0
     repair_count = 0
+    local_json_repair_count = 0
     repair_duration_ms = 0
     provider_result_count = 0
+    model_payload_char_count = 0
+    archived_internal_model_call_count = 0
+    archived_repair_count = 0
+    archived_local_json_repair_count = 0
+    archived_repair_duration_ms = 0
+    archived_provider_result_count = 0
+    archived_model_payload_char_count = 0
     for step in manifest.steps:
         durations = [attempt.duration_ms for attempt in step.attempts if attempt.duration_ms is not None]
         total = sum(durations)
         provider = step_provider_label(step.name, step.attempts[-1].provider_spec if step.attempts else None)
         retry_count += max(0, len(step.attempts) - 1)
-        repair_metrics = step_repair_metrics(run_dir, step.name)
+        repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=False)
+        total_repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=True)
+        archived_repair_metrics = subtract_repair_metrics(total_repair_metrics, repair_metrics)
         internal_model_call_count += repair_metrics["attempt_count"]
         repair_count += repair_metrics["repair_count"]
+        local_json_repair_count += repair_metrics["json_repair_count"]
         repair_duration_ms += repair_metrics["duration_ms"]
         provider_result_count += repair_metrics["provider_result_count"]
+        model_payload_char_count += repair_metrics["payload_char_count"]
+        archived_internal_model_call_count += archived_repair_metrics["attempt_count"]
+        archived_repair_count += archived_repair_metrics["repair_count"]
+        archived_local_json_repair_count += archived_repair_metrics["json_repair_count"]
+        archived_repair_duration_ms += archived_repair_metrics["duration_ms"]
+        archived_provider_result_count += archived_repair_metrics["provider_result_count"]
+        archived_model_payload_char_count += archived_repair_metrics["payload_char_count"]
         row = {
             "name": step.name,
             "status": step.status.value,
@@ -2015,14 +7580,61 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
         if repair_metrics["attempt_count"]:
             row["internal_model_call_count"] = repair_metrics["attempt_count"]
             row["repair_count"] = repair_metrics["repair_count"]
+            row["local_json_repair_count"] = repair_metrics["json_repair_count"]
             row["repair_duration_ms"] = repair_metrics["duration_ms"]
             row["provider_result_count"] = repair_metrics["provider_result_count"]
+            row["payload_char_count"] = repair_metrics["payload_char_count"]
+        if archived_repair_metrics["attempt_count"]:
+            row["archived_internal_model_call_count"] = archived_repair_metrics["attempt_count"]
+            row["archived_repair_count"] = archived_repair_metrics["repair_count"]
+            row["archived_local_json_repair_count"] = archived_repair_metrics["json_repair_count"]
+            row["archived_repair_duration_ms"] = archived_repair_metrics["duration_ms"]
+            row["archived_provider_result_count"] = archived_repair_metrics["provider_result_count"]
+            row["archived_payload_char_count"] = archived_repair_metrics["payload_char_count"]
+            row["total_internal_model_call_count"] = total_repair_metrics["attempt_count"]
+            row["total_repair_count"] = total_repair_metrics["repair_count"]
+            row["total_local_json_repair_count"] = total_repair_metrics["json_repair_count"]
+            row["total_repair_duration_ms"] = total_repair_metrics["duration_ms"]
+            row["total_provider_result_count"] = total_repair_metrics["provider_result_count"]
+            row["total_payload_char_count"] = total_repair_metrics["payload_char_count"]
+        fast_path_report = run_dir / step.name / "raw_prepare_fast_path.json"
+        if fast_path_report.exists():
+            try:
+                fast_path_data = json.loads(fast_path_report.read_text(encoding="utf-8"))
+                row["local_fast_path"] = bool(fast_path_data.get("eligible"))
+                row["local_fast_path_rule"] = fast_path_data.get("rule_version", "")
+                if row["local_fast_path"]:
+                    row["provider"] = raw_prepare_fast_path_provider_label(fast_path_data)
+            except Exception:
+                row["local_fast_path"] = False
+        shortcut_report = run_dir / step.name / "merge_planning_shortcut_report.json"
+        if shortcut_report.exists():
+            try:
+                shortcut_data = json.loads(shortcut_report.read_text(encoding="utf-8"))
+                row["local_shortcut"] = bool(shortcut_data.get("used"))
+                row["local_shortcut_rule"] = shortcut_data.get("shortcut", "")
+            except Exception:
+                row["local_shortcut"] = False
         waiting_ms = awaiting_review_duration_ms(step)
         if waiting_ms is not None:
             row["awaiting_review_duration_ms"] = waiting_ms
         steps.append(row)
         if step.attempts and step.attempts[-1].provider_spec:
             model_durations[step.name] = total
+    payload_steps = [
+        {
+            "name": str(row["name"]),
+            "payload_char_count": int(row.get("payload_char_count", 0) or 0),
+            "provider_result_count": int(row.get("provider_result_count", 0) or 0),
+            "repair_count": int(row.get("repair_count", 0) or 0),
+            "local_json_repair_count": int(row.get("local_json_repair_count", 0) or 0),
+            "duration_ms": int(row.get("repair_duration_ms", 0) or 0),
+        }
+        for row in steps
+        if int(row.get("payload_char_count", 0) or 0) > 0
+    ]
+    payload_steps.sort(key=lambda row: (-int(row["payload_char_count"]), str(row["name"])))
+    largest_payload = payload_steps[0] if payload_steps else None
     cleanup_count = 0
     preserved_media_count = 0
     cleanup_path = run_dir / "raw_link_cleanup" / "raw_link_cleanup.json"
@@ -2044,60 +7656,207 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
     if preview_path.exists():
         preview = read_model(preview_path, ApplyPreview)
         written_target_count = len([target for target in preview.targets if target.will_write])
+    current_attempt_duration_ms = sum(int(row.get("total_duration_ms") or 0) for row in steps)
+    current_model_duration_ms = repair_duration_ms
+    archived_model_duration_ms = archived_repair_duration_ms
+    budget_metrics = source_digest_budget_metrics(run_dir)
     return {
         "schema_version": "run_metrics.v1",
         "operation_id": manifest.operation_id,
         "status": manifest.status.value,
         "steps": steps,
         "model_durations_ms": model_durations,
+        "current_attempt_duration_ms": current_attempt_duration_ms,
+        "current_model_duration_ms": current_model_duration_ms,
+        "archived_model_duration_ms": archived_model_duration_ms,
+        "total_model_duration_ms": current_model_duration_ms + archived_model_duration_ms,
         "retry_count": retry_count,
         "internal_model_call_count": internal_model_call_count,
         "repair_count": repair_count,
+        "local_json_repair_count": local_json_repair_count,
         "repair_duration_ms": repair_duration_ms,
         "provider_result_count": provider_result_count,
+        "internal_model_payload_char_count": model_payload_char_count,
+        "payload_by_step": payload_steps,
+        "largest_payload_step": largest_payload["name"] if largest_payload else "",
+        "largest_payload_char_count": largest_payload["payload_char_count"] if largest_payload else 0,
+        "archived_internal_model_call_count": archived_internal_model_call_count,
+        "archived_repair_count": archived_repair_count,
+        "archived_local_json_repair_count": archived_local_json_repair_count,
+        "archived_repair_duration_ms": archived_repair_duration_ms,
+        "archived_provider_result_count": archived_provider_result_count,
+        "archived_internal_model_payload_char_count": archived_model_payload_char_count,
+        "total_internal_model_call_count": internal_model_call_count + archived_internal_model_call_count,
+        "total_repair_count": repair_count + archived_repair_count,
+        "total_local_json_repair_count": local_json_repair_count + archived_local_json_repair_count,
+        "total_repair_duration_ms": repair_duration_ms + archived_repair_duration_ms,
+        "total_provider_result_count": provider_result_count + archived_provider_result_count,
+        "total_internal_model_payload_char_count": model_payload_char_count + archived_model_payload_char_count,
         "created_count": created,
         "updated_count": updated,
         "noop_count": noop,
+        **budget_metrics,
         "cleaned_link_count": cleanup_count,
         "preserved_media_embed_count": preserved_media_count,
         "written_target_count": written_target_count,
     }
 
 
-def step_repair_metrics(run_dir: Path, step_name: str) -> dict[str, int]:
+def render_run_metrics_markdown(metrics: dict[str, Any]) -> str:
+    payload_rows = [
+        [
+            str(row.get("name", "")),
+            f"{int(row.get('payload_char_count', 0) or 0):,}",
+            str(row.get("provider_result_count", 0)),
+            str(row.get("repair_count", 0)),
+            str(row.get("local_json_repair_count", 0)),
+            format_duration(row.get("duration_ms")),
+        ]
+        for row in metrics.get("payload_by_step", [])
+    ]
+    step_rows = [
+        [
+            str(row.get("name", "")),
+            str(row.get("status", "")),
+            str(row.get("attempts", 0)),
+            format_duration(row.get("last_duration_ms")),
+            format_duration(row.get("total_duration_ms")),
+            f"{int(row.get('payload_char_count', 0) or 0):,}" if row.get("payload_char_count") else "",
+        ]
+        for row in metrics.get("steps", [])
+    ]
+    return (
+        "# Run Metrics\n\n"
+        f"- Operation: `{metrics.get('operation_id', '')}`\n"
+        f"- Status: `{metrics.get('status', '')}`\n"
+        f"- Current model calls: `{metrics.get('internal_model_call_count', 0)}`\n"
+        f"- Local JSON repairs: `{metrics.get('local_json_repair_count', 0)}`\n"
+        f"- Current payload chars: `{int(metrics.get('internal_model_payload_char_count', 0) or 0):,}`\n"
+        f"- Largest payload step: `{metrics.get('largest_payload_step', '') or 'none'}` "
+        f"({int(metrics.get('largest_payload_char_count', 0) or 0):,} chars)\n\n"
+        "## Payload By Step\n\n"
+        f"{format_markdown_table(['Step', 'Payload Chars', 'Provider Results', 'Model Repairs', 'Local JSON Repairs', 'Model Duration'], payload_rows) if payload_rows else '_No model payloads recorded._'}\n\n"
+        "## Steps\n\n"
+        f"{format_markdown_table(['Step', 'Status', 'Attempts', 'Last Duration', 'Attempt Total', 'Payload Chars'], step_rows)}\n"
+    )
+
+
+def source_digest_budget_metrics(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "source_digest" / "source_digest_budget_report.json"
+    if not path.exists():
+        return {}
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {
+        "candidate_page_budget": report.get("budget", 0),
+        "candidate_count_before_dedupe": report.get("total_formal_candidates_before_dedupe", report.get("total_formal_candidates_before_budget", 0)),
+        "candidate_count_before_budget": report.get("total_formal_candidates_before_budget", 0),
+        "candidate_deduped_count": report.get("deduped_count", 0),
+        "candidate_selected_count": report.get("selected_count", 0),
+        "candidate_deferred_count": report.get("deferred_count", 0),
+        "candidate_budget_applied": bool(report.get("applied")),
+    }
+
+
+def subtract_repair_metrics(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
+    return {
+        key: max(0, left.get(key, 0) - right.get(key, 0))
+        for key in ["attempt_count", "repair_count", "json_repair_count", "duration_ms", "provider_result_count", "payload_char_count"]
+    }
+
+
+def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool = True) -> dict[str, int]:
     step_dirs = [run_dir / step_name]
     archive_root = run_dir / "attempt_archive"
-    if archive_root.exists():
+    if include_archived and archive_root.exists():
         for archived_step in sorted(archive_root.glob(f"*/**/{step_name}")):
             if archived_step.is_dir():
                 step_dirs.append(archived_step)
     attempt_count = 0
     repair_count = 0
+    json_repair_count = 0
     duration_ms = 0
     provider_result_count = 0
+    payload_char_count = 0
     for step_dir in step_dirs:
+        step_attempt_count = 0
+        attempt_result_paths: list[Path] = []
         report_path = step_dir / "structured_repair_report.json"
         if report_path.exists():
             try:
                 report = read_model(report_path, StructuredRepairReport)
-                attempt_count += report.attempt_count
+                step_attempt_count = report.attempt_count
+                attempt_count += step_attempt_count
                 repair_count += report.repair_count
                 duration_ms += report.duration_ms
+                attempt_result_paths = [step_dir / attempt.provider_result_ref for attempt in report.attempts]
             except Exception:
                 pass
+        existing_attempt_result_paths = [path for path in attempt_result_paths if path.exists()]
+        if existing_attempt_result_paths:
+            provider_result_count += len(existing_attempt_result_paths)
+            payload_char_count += provider_results_payload_char_count(existing_attempt_result_paths)
+            json_repair_count += provider_results_json_repair_count(existing_attempt_result_paths)
+            continue
         provider_results_dir = step_dir / "provider_results"
         if provider_results_dir.exists():
-            provider_result_count += len(list(provider_results_dir.glob("attempt-*.json")))
+            provider_result_paths = list(provider_results_dir.glob("attempt-*.json"))
+            provider_result_count += len(provider_result_paths)
+            payload_char_count += provider_results_payload_char_count(provider_result_paths)
+            json_repair_count += provider_results_json_repair_count(provider_result_paths)
+        elif step_attempt_count:
+            provider_result_count += step_attempt_count
+            result_paths = [step_dir / "provider_result.json"]
+            payload_char_count += provider_results_payload_char_count(result_paths)
+            json_repair_count += provider_results_json_repair_count(result_paths)
         elif (step_dir / "provider_result.json").exists():
             provider_result_count += 1
+            result_paths = [step_dir / "provider_result.json"]
+            payload_char_count += provider_results_payload_char_count(result_paths)
+            json_repair_count += provider_results_json_repair_count(result_paths)
     if attempt_count == 0:
         attempt_count = provider_result_count
     return {
         "attempt_count": attempt_count,
         "repair_count": repair_count,
+        "json_repair_count": json_repair_count,
         "duration_ms": duration_ms,
         "provider_result_count": provider_result_count,
+        "payload_char_count": payload_char_count,
     }
+
+
+def provider_results_payload_char_count(paths: list[Path]) -> int:
+    total = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            result = read_model(path, ProviderResult)
+            total += int(result.payload_char_count or 0)
+        except Exception:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                total += int(data.get("payload_char_count", 0) or 0)
+            except Exception:
+                continue
+    return total
+
+
+def provider_results_json_repair_count(paths: list[Path]) -> int:
+    total = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("json_repair_applied"):
+            total += 1
+    return total
 
 
 def step_provider_label(step_name: str, provider_spec: str | None) -> str:
@@ -2106,6 +7865,13 @@ def step_provider_label(step_name: str, provider_spec: str | None) -> str:
     if step_name.endswith("_review"):
         return "local:auto_review"
     return "local"
+
+
+def raw_prepare_fast_path_provider_label(report: dict[str, Any]) -> str:
+    policy = report.get("raw_prepare_policy")
+    if policy == RawPreparePolicy.skip_model.value:
+        return "local:skip_prepare"
+    return "local:raw_prepare_fast_path"
 
 
 def awaiting_review_duration_ms(step: Any) -> int | None:
@@ -2347,6 +8113,38 @@ def structured_model_output_refs(run_dir: Path, step_root: Path, step_name: str)
     return refs
 
 
+def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
+    batch_root = step_root / "model_batches"
+    if not batch_root.exists():
+        return []
+    refs: list[ArtifactRef] = []
+    for path in sorted(batch_root.rglob("*")):
+        if not path.is_file():
+            continue
+        required = not any(part in {"provider_results", "repair_prompts"} for part in path.relative_to(step_root).parts)
+        schema = None
+        if path.name == "provider_result.json" or (path.parent.name == "provider_results" and path.name.startswith("attempt-")):
+            schema = "provider_result.v1"
+        elif path.name == "structured_repair_report.json":
+            schema = "structured_repair_report.v1"
+        elif path.name == "draft_source_excerpt_pack.json":
+            schema = "draft_source_excerpt_pack.v1"
+        elif path.name == "update_preservation_pack.json":
+            schema = "update_preservation_pack.v1"
+        elif path.name == "update_preservation_reinforcement_report.json":
+            schema = "update_preservation_reinforcement_report.v1"
+        elif path.name == "grounding_paraphrase_rewrite_report.json":
+            schema = "grounding_paraphrase_rewrite_report.v1"
+        elif path.name == "draft_digest_projection_report.json":
+            schema = "source_digest_projection_report.v1"
+        elif path.name == "draft_merge_plan_projection_report.json":
+            schema = "draft_merge_plan_projection_report.v1"
+        elif path.name == "draft_context_projection_report.json":
+            schema = "draft_context_projection_report.v1"
+        refs.append(_ref(run_dir, path, step_name, artifact_kind_for_path(path), schema, required_for_resume=required))
+    return refs
+
+
 def artifact_kind_for_path(path: Path) -> str:
     return {
         ".md": "markdown",
@@ -2359,11 +8157,19 @@ def artifact_kind_for_path(path: Path) -> str:
 def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactRef:
     schemas = {
         "draft_rendering.json": "draft_rendering.v3",
+        "draft_source_excerpt_pack.json": "draft_source_excerpt_pack.v1",
+        "update_preservation_pack.json": "update_preservation_pack.v1",
+        "update_preservation_reinforcement_report.json": "update_preservation_reinforcement_report.v1",
+        "grounding_paraphrase_rewrite_report.json": "grounding_paraphrase_rewrite_report.v1",
+        "draft_digest_projection_report.json": "source_digest_projection_report.v1",
+        "draft_merge_plan_projection_report.json": "draft_merge_plan_projection_report.v1",
+        "draft_context_projection_report.json": "draft_context_projection_report.v1",
         "draft_write_manifest.json": "draft_write_manifest.v1",
         "update_merge_report.json": "update_merge_report.v1",
         "related_merge_report.json": "related_merge_report.v1",
         "draft_grounding_review.json": "draft_grounding_review.v1",
         "index_open_questions_report.json": "index_open_questions_report.v1",
+        "draft_rendering_batch_report.json": "draft_rendering_batch_report.v1",
     }
     return _ref(run_dir, path, step_name, artifact_kind_for_path(path), schemas.get(path.name))
 
@@ -2528,6 +8334,195 @@ def scan_source_pages(vault: Path) -> list[tuple[str, dict[str, Any]]]:
     return found
 
 
+def scan_raw_ingest_candidates(
+    vault: Path,
+    *,
+    include_processed: bool = False,
+    limit: int | None = None,
+) -> RawIngestCandidateReport:
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be >= 0")
+    vault = vault.expanduser().resolve()
+    raw_root = vault / "raw"
+    if not raw_root.exists():
+        raise ValueError(f"Raw directory not found: {raw_root}")
+    records_by_path, records_by_hash = _source_raw_coverage_index(vault)
+    raw_files = _iter_raw_ingest_files(raw_root)
+    duplicate_url_first_paths = _duplicate_raw_url_first_paths(raw_files)
+    items: list[RawIngestCandidate] = []
+    for raw_path in raw_files:
+        rel_path = normalize_vault_path(raw_path.relative_to(vault).as_posix())
+        raw_hash = sha256_file(raw_path)
+        path_records = records_by_path.get(rel_path, [])
+        hash_records = records_by_hash.get(raw_hash, [])
+        duplicate_url_first_path = duplicate_url_first_paths.get(raw_path)
+        matched_records: list[_SourceRawCoverageRecord] = []
+        if any(raw_hash in record.raw_hashes for record in path_records):
+            status = "processed"
+            matched_by = "path_and_hash"
+            matched_records = [record for record in path_records if raw_hash in record.raw_hashes]
+            reason = "same raw path and content hash are already recorded in source frontmatter"
+        elif path_records and not any(record.raw_hashes for record in path_records):
+            status = "processed"
+            matched_by = "path"
+            matched_records = path_records
+            reason = "same raw path is recorded by legacy source frontmatter; content hash is unavailable"
+        elif path_records:
+            status = "changed"
+            matched_by = "path"
+            matched_records = path_records
+            reason = "same raw path is recorded, but the current content hash is different"
+        elif hash_records:
+            status = "duplicate_hash"
+            matched_by = "hash"
+            matched_records = hash_records
+            reason = "same content hash is already recorded under another raw path"
+        elif duplicate_url_first_path is not None:
+            status = "duplicate_url"
+            matched_by = "url"
+            reason = (
+                "same imported URL is already present under another raw path: "
+                f"{normalize_vault_path(duplicate_url_first_path.relative_to(vault).as_posix())}"
+            )
+        else:
+            status = "unprocessed"
+            matched_by = "none"
+            reason = "no matching source raw path or content hash found"
+        stat = raw_path.stat()
+        items.append(
+            RawIngestCandidate(
+                raw_path=rel_path,
+                status=status,
+                raw_sha256=raw_hash,
+                size_bytes=stat.st_size,
+                mtime=datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                matched_by=matched_by,
+                source_pages=_record_source_pages(matched_records),
+                operation_ids=_record_operation_ids(matched_records),
+                reason=reason,
+            )
+        )
+    status_rank = {"unprocessed": 0, "changed": 1, "duplicate_hash": 2, "duplicate_url": 3, "processed": 4}
+    items.sort(key=lambda item: (status_rank[item.status], item.raw_path))
+    visible_items = items if include_processed else [item for item in items if item.status != "processed"]
+    if limit is not None:
+        visible_items = visible_items[:limit]
+    return RawIngestCandidateReport(
+        vault=vault.as_posix(),
+        raw_root=raw_root.as_posix(),
+        include_processed=include_processed,
+        limit=limit,
+        total_raw_files=len(items),
+        candidate_count=len(visible_items),
+        processed_count=sum(1 for item in items if item.status == "processed"),
+        changed_count=sum(1 for item in items if item.status == "changed"),
+        duplicate_hash_count=sum(1 for item in items if item.status == "duplicate_hash"),
+        duplicate_url_count=sum(1 for item in items if item.status == "duplicate_url"),
+        unprocessed_count=sum(1 for item in items if item.status == "unprocessed"),
+        items=visible_items,
+    )
+
+
+def _duplicate_raw_url_first_paths(raw_files: list[Path]) -> dict[Path, Path]:
+    first_by_url: dict[str, Path] = {}
+    duplicates: dict[Path, Path] = {}
+    for raw_path in raw_files:
+        matched_first: Path | None = None
+        for url in _raw_import_urls(raw_path):
+            first = first_by_url.get(url)
+            if first is not None and first != raw_path:
+                matched_first = first
+                break
+        if matched_first is not None:
+            duplicates[raw_path] = matched_first
+            continue
+        for url in _raw_import_urls(raw_path):
+            first_by_url.setdefault(url, raw_path)
+    return duplicates
+
+
+def _raw_import_urls(raw_path: Path) -> list[str]:
+    urls: list[str] = []
+    try:
+        with raw_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            prefix = handle.read(8192)
+    except OSError:
+        return urls
+    for line in prefix.splitlines()[:24]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().lower() not in {"imported from", "fetched url", "final url"}:
+            continue
+        url = value.strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _iter_raw_ingest_files(raw_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in raw_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(raw_root).parts
+        if any(part.startswith(".") for part in relative_parts):
+            continue
+        if relative_parts and relative_parts[0] == "log":
+            continue
+        if path.suffix.lower() not in RAW_INGEST_TEXT_SUFFIXES:
+            continue
+        paths.append(path)
+    return sorted(paths)
+
+
+def _source_raw_coverage_index(
+    vault: Path,
+) -> tuple[dict[str, list[_SourceRawCoverageRecord]], dict[str, list[_SourceRawCoverageRecord]]]:
+    records_by_path: dict[str, list[_SourceRawCoverageRecord]] = {}
+    records_by_hash: dict[str, list[_SourceRawCoverageRecord]] = {}
+    for source_page, frontmatter in scan_source_pages(vault):
+        raw_paths = tuple(_frontmatter_raw_paths(frontmatter))
+        raw_hashes = tuple(value.strip() for value in _frontmatter_list(frontmatter, "source_raw_hashes") if value.strip())
+        operation_ids = tuple(
+            value.strip() for value in _frontmatter_list(frontmatter, "source_operation_ids") if value.strip()
+        )
+        if not raw_paths and not raw_hashes:
+            continue
+        record = _SourceRawCoverageRecord(
+            source_page=source_page,
+            raw_paths=raw_paths,
+            raw_hashes=raw_hashes,
+            operation_ids=operation_ids,
+        )
+        for raw_path in raw_paths:
+            records_by_path.setdefault(raw_path, []).append(record)
+        for raw_hash in raw_hashes:
+            records_by_hash.setdefault(raw_hash, []).append(record)
+    return records_by_path, records_by_hash
+
+
+def _frontmatter_raw_paths(frontmatter: dict[str, Any]) -> list[str]:
+    raw_paths: list[str] = []
+    for value in _frontmatter_list(frontmatter, "source_raw_paths"):
+        normalized = normalize_vault_path(value)
+        if normalized:
+            raw_paths.append(normalized)
+    for value in _frontmatter_list(frontmatter, "sources"):
+        normalized = normalize_vault_path(value)
+        if normalized.startswith("raw/") and normalized not in raw_paths:
+            raw_paths.append(normalized)
+    return raw_paths
+
+
+def _record_source_pages(records: list[_SourceRawCoverageRecord]) -> list[str]:
+    return sorted({record.source_page for record in records})
+
+
+def _record_operation_ids(records: list[_SourceRawCoverageRecord]) -> list[str]:
+    return sorted({operation_id for record in records for operation_id in record.operation_ids})
+
+
 def _frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:
     value = frontmatter.get(key, [])
     if isinstance(value, str):
@@ -2588,6 +8583,19 @@ def digest_candidates_with_group(digest: SourceDigestArtifact) -> list[tuple[str
 
 
 def page_type_for_digest_candidate(group_name: str, candidate: SourceDigestCandidate, profile: Any) -> str:
+    normalized = candidate.type.strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "question": "open_question",
+        "open_questions": "open_question",
+        "open_question": "open_question",
+        "concept_overview": "overview",
+        "design_overview": "overview",
+        "entity_index": "overview",
+        "open_question_overview": "open_question",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in profile.page_types and normalized != profile.source_page_type:
+        return normalized
     preferred = {
         "entities": "entity",
         "concepts": "concept",
@@ -2597,15 +8605,6 @@ def page_type_for_digest_candidate(group_name: str, candidate: SourceDigestCandi
     }.get(group_name)
     if preferred in profile.page_types:
         return preferred
-    normalized = candidate.type.strip().lower().replace(" ", "_").replace("-", "_")
-    aliases = {
-        "question": "open_question",
-        "open_questions": "open_question",
-        "open_question": "open_question",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized in profile.page_types and normalized != profile.source_page_type:
-        return normalized
     return profile.default_page_type
 
 
@@ -2617,7 +8616,78 @@ def finalize_candidate_resolution(
 ) -> CandidateResolutionArtifact:
     items: list[CandidateResolutionItem] = []
     seen_paths: dict[str, int] = {}
+    selected_candidate_ids = {candidate.candidate_id for candidate in digest.ingest_candidates()} if digest is not None else set()
     weak_or_noise_ids = {candidate.candidate_id for candidate in digest.weak_or_noise_items} if digest is not None else set()
+    sanitized_items: list[CandidateResolutionItem] = []
+    sanitation_notes = list(artifact.missed_candidate_risks)
+    for index, item in enumerate(artifact.items):
+        source_ids = list(item.source_basis.source_candidate_ids)
+        leaked_ids = [
+            candidate_id
+            for candidate_id in source_ids
+            if candidate_id in weak_or_noise_ids or candidate_id.strip().lower().startswith(("noise", "weak", "ignore"))
+        ]
+        if leaked_ids:
+            cleaned_ids = [candidate_id for candidate_id in source_ids if candidate_id not in leaked_ids]
+            if not cleaned_ids:
+                sanitation_notes.append(
+                    f"candidate_resolution item `{item.display_title or item.page_plan_id or index}` dropped because it only referenced weak/noise candidates: {sorted(leaked_ids)}."
+                )
+                continue
+            item = item.model_copy(
+                update={
+                    "source_basis": item.source_basis.model_copy(update={"source_candidate_ids": cleaned_ids}),
+                    "coverage_notes": merge_markdown_blocks(
+                        item.coverage_notes,
+                        f"系统清理 weak/noise candidate 引用：{', '.join(f'`{candidate_id}`' for candidate_id in leaked_ids)}。",
+                    ),
+                }
+            )
+            sanitation_notes.append(
+                f"candidate_resolution item `{item.display_title or item.page_plan_id or index}` removed weak/noise candidate refs: {sorted(leaked_ids)}."
+            )
+        if digest is not None:
+            unknown_source_ids = [
+                candidate_id
+                for candidate_id in item.source_basis.source_candidate_ids
+                if candidate_id not in selected_candidate_ids
+            ]
+            if unknown_source_ids:
+                prepared_discovered = list(item.source_basis.prepared_discovered_candidates)
+                cleaned_ids = [
+                    candidate_id
+                    for candidate_id in item.source_basis.source_candidate_ids
+                    if candidate_id in selected_candidate_ids
+                ]
+                if prepared_discovered:
+                    for candidate_id in unknown_source_ids:
+                        if candidate_id not in prepared_discovered:
+                            prepared_discovered.append(candidate_id)
+                    unknown_note = "系统将非 source_digest candidate id 移入 prepared_discovered_candidates："
+                    sanitation_note = "moved unknown candidate refs to prepared_discovered_candidates"
+                else:
+                    prepared_discovered = list(unknown_source_ids)
+                    unknown_note = "系统将非 source_digest candidate id 移入 prepared_discovered_candidates："
+                    sanitation_note = "moved unknown-only candidate refs to prepared_discovered_candidates"
+                item = item.model_copy(
+                    update={
+                        "source_basis": item.source_basis.model_copy(
+                            update={
+                                "source_candidate_ids": cleaned_ids,
+                                "prepared_discovered_candidates": prepared_discovered,
+                            }
+                        ),
+                        "coverage_notes": merge_markdown_blocks(
+                            item.coverage_notes,
+                            unknown_note + f"{', '.join(f'`{candidate_id}`' for candidate_id in unknown_source_ids)}。",
+                        ),
+                    }
+                )
+                sanitation_notes.append(
+                    f"candidate_resolution item `{item.display_title or item.page_plan_id or index}` {sanitation_note}: {sorted(unknown_source_ids)}."
+                )
+        sanitized_items.append(item)
+    artifact = artifact.model_copy(update={"items": sanitized_items, "missed_candidate_risks": sanitation_notes})
     issues: list[StructuredIssue] = []
     for index, item in enumerate(artifact.items):
         if item.page_type not in profile.page_types:
@@ -2630,21 +8700,6 @@ def finalize_candidate_resolution(
                         f"candidate_resolution uses unsupported page_type `{item.page_type}`; "
                         "remove weak/noise formal items or choose a valid profile page_type."
                     ),
-                    repairability="repairable",
-                )
-            )
-        leaked_ids = [
-            candidate_id
-            for candidate_id in item.source_basis.source_candidate_ids
-            if candidate_id in weak_or_noise_ids or candidate_id.strip().lower().startswith(("noise", "weak", "ignore"))
-        ]
-        if leaked_ids:
-            issues.append(
-                StructuredIssue(
-                    issue_code="weak_noise_candidate_reference",
-                    field_path=f"items.{index}.source_basis.source_candidate_ids",
-                    validator_id="finalize_candidate_resolution",
-                    message=f"remove weak/noise candidate references from formal page plans: {sorted(leaked_ids)}",
                     repairability="repairable",
                 )
             )
@@ -2718,12 +8773,13 @@ def render_candidate_resolution_markdown(artifact: CandidateResolutionArtifact) 
             item.display_title,
             f"`{item.candidate_target_path}`",
             ", ".join(item.source_basis.source_candidate_ids),
+            ", ".join(item.source_basis.prepared_discovered_candidates),
             item.why_this_page,
         ]
         for item in artifact.items
     ]
     return "# 候选页面规划\n\n" + format_markdown_table(
-        ["页面计划", "类型", "标题", "目标", "来源候选", "为什么写"],
+        ["页面计划", "类型", "标题", "目标", "来源候选", "Prepared 发现候选", "为什么写"],
         rows,
     ) + "\n"
 
@@ -3068,7 +9124,16 @@ def finalize_wiki_merge_plan(
             and strongest_overlap.path
             and create_reason_needs_repair(item.why_not_update)
         ):
-            if medium_missing_policy == "block":
+            if medium_missing_policy == "preserve":
+                synthesized_reason = synthesize_medium_create_why_not_update(
+                    item=item,
+                    resolution_item=resolution_item,
+                    strongest_hit=strongest_hit,
+                    snapshot=snapshot,
+                )
+                item = item.model_copy(update={"why_not_update": synthesized_reason})
+                finalization_notes.append("medium overlap create 缺少 why_not_update，已本地补充结构化 create/update 对比理由。")
+            elif medium_missing_policy == "block":
                 action = "needs_human_decision"
                 apply_eligibility = "blocked"
                 blocked_reason = blocked_reason or (
@@ -3127,6 +9192,63 @@ def finalize_wiki_merge_plan(
     items = merge_same_source_duplicate_creates(items)
     items = merge_update_noop_same_targets(items)
     return WikiMergePlanArtifact(log_date=snapshot.log_date, items=items, context_snapshot_ref=snapshot_ref)
+
+
+def synthesize_medium_create_why_not_update(
+    *,
+    item: WikiMergePlanItem,
+    resolution_item: CandidateResolutionItem,
+    strongest_hit: CandidateContextHit | None,
+    snapshot: WikiContextSnapshot,
+) -> str:
+    old_path = strongest_hit.path if strongest_hit is not None else ""
+    old_entry = snapshot_entry(snapshot, f"wiki/{old_path}") if old_path else WikiContextEntry(path="", expected_state="missing")
+    old_title = (
+        clean_display_title(old_entry.metadata.title)
+        if old_entry.metadata is not None
+        else clean_display_title(strongest_hit.display_title if strongest_hit is not None else "已召回旧页")
+    )
+    old_summary = old_entry.metadata.summary if old_entry.metadata is not None else ""
+    old_scope = compact_payload_text(old_summary or old_title or old_path, 120)
+    new_scope = compact_payload_text(
+        resolution_item.topic_summary
+        or item.new_understanding
+        or resolution_item.initial_section_intent
+        or resolution_item.display_title,
+        140,
+    )
+    source_delta = compact_payload_text(
+        resolution_item.why_this_page
+        or resolution_item.coverage_notes
+        or resolution_item.reason
+        or item.knowledge_delta
+        or item.why_this_matters,
+        140,
+    )
+    page_kind = chinese_page_type_label(resolution_item.page_type)
+    return (
+        "本地补充：scope_delta："
+        f"新页《{clean_display_title(resolution_item.display_title)}》按 `{resolution_item.candidate_target_path}` 独立沉淀为{page_kind}，"
+        f"核心范围是「{new_scope}」；最像旧页《{old_title}》位于 `{old_path}`，旧页范围是「{old_scope}」。"
+        "source_delta："
+        f"本轮来源增量是「{source_delta}」。"
+        "why_update_not_enough："
+        "直接 update 旧页会把旧页从原有主题扩成另一个独立知识单元，降低旧页的聚焦度。"
+        "why_related_link_not_enough："
+        "只做 Related 只能表达关联，不能承载该来源新增的可复用结构、例子和价值点。"
+    )
+
+
+def chinese_page_type_label(page_type: str) -> str:
+    mapping = {
+        "concept": "概念页",
+        "entity": "实体页",
+        "design": "设计页",
+        "comparison": "对比页",
+        "open_question": "未决问题页",
+        "overview": "总览页",
+    }
+    return mapping.get(page_type.strip().lower(), "知识页")
 
 
 def merge_update_noop_same_targets(items: list[WikiMergePlanItem]) -> list[WikiMergePlanItem]:
@@ -3248,7 +9370,7 @@ def same_source_duplicate_create(left: WikiMergePlanItem, right: WikiMergePlanIt
 
 
 def duplicate_tokens(text: str) -> set[str]:
-    normalized = unicodedata.normalize("NFKC", text.lower())
+    normalized = unicodedata.normalize("NFKC", source_digest_parenthetical_translation_core(text).lower())
     normalized = normalized.replace("workflow", "workflow").replace("workflows", "workflow")
     normalized = normalized.replace("agentic", "agent").replace("agents", "agent")
     tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", normalized))
@@ -3453,15 +9575,21 @@ def render_merge_plan_review_prompt(plan: WikiMergePlanArtifact) -> str:
 def merge_plan_all_create_review_reason(plan: WikiMergePlanArtifact) -> str:
     if not plan.items or any(item.action != "create" for item in plan.items):
         return ""
-    risky = [
-        item
-        for item in plan.items
-        if item.strongest_overlap.strength in {"medium", "strong"}
-    ]
+    risky = merge_plan_create_overlap_risk_items(plan)
     if not risky:
         return ""
     names = ", ".join(f"{item.page_plan_id}:{item.strongest_overlap.strength or 'none'}" for item in risky[:8])
     return f"合并计划全部为 create，但存在召回风险（{names}）；请审核这些页面为什么不应 update 到已有知识页。"
+
+
+def merge_plan_create_overlap_risk_items(plan: WikiMergePlanArtifact) -> list[WikiMergePlanItem]:
+    return [
+        item
+        for item in plan.items
+        if (item.model_action == "create" or item.action == "create")
+        and item.strongest_overlap.strength in {"medium", "strong"}
+        and item.strongest_overlap.path
+    ]
 
 
 def render_candidate_contexts_markdown(
@@ -3476,13 +9604,24 @@ def render_candidate_contexts_markdown(
         "",
         f"- 后端：`{artifact.retrieval_backend}`",
         f"- 模型：`{artifact.model}`",
+        f"- 本地缓存模式（local files only）：{artifact.local_files_only}",
         f"- 缓存路径（resolved cache path）：`{resolved_cache_path or artifact.cache_dir or '未使用'}`",
+        f"- Embedding 加载耗时：{format_duration(artifact.embedding_load_duration_ms)}",
+        f"- Embedding 编码耗时：{format_duration(artifact.embedding_encode_duration_ms)}",
+        f"- Embedding 总耗时：{format_duration(artifact.embedding_total_duration_ms)}",
+        f"- Embedding 页面向量缓存命中：{artifact.embedding_page_vector_cache_hit}",
+        f"- Embedding 页面/查询数量：{artifact.embedding_page_count}/{artifact.embedding_query_count}",
+        f"- Embedding 输入字符数：{artifact.embedding_text_char_count}",
         f"- TopK：{artifact.top_k}",
         f"- 候选池页面数：{artifact.candidate_pool_size}",
         f"- 查询数（query count）：{artifact.candidate_pool_size if query_count is None else query_count}",
         f"- 编码页面数：{artifact.candidate_pool_size if encoded_page_count is None else encoded_page_count}",
         f"- 不完整 frontmatter 页面数：{artifact.skipped_count}",
         f"- 候选池 Hash：`{artifact.candidate_pool_sha256}`",
+        "- 排序说明：先按强度、Score Bucket、依据、页面类型、目录和标题距离排序；Score Bucket 默认宽度为 "
+        f"{SCORE_BUCKET_EPSILON:.2f}，所以表格里的原始分数不一定逐行严格递减。",
+        "- Sort Key 说明：`bucket` 是分数分桶；`type/dir/title_distance/path` 是同一分数桶内的 tie-break。",
+        "- `lexical_expansion` 表示 query 和旧页命中了同一组高信号术语；中文相似度使用 bigram/短语重叠，避免单字重叠把泛相关页面推高。",
     ]
     if artifact.warnings:
         sections.extend(["", "## 警告", "", *[f"- {warning}" for warning in artifact.warnings]])
@@ -3493,6 +9632,8 @@ def render_candidate_contexts_markdown(
                 hit.strength,
                 hit.match_basis,
                 f"{hit.score:.4f}",
+                str(hit.score_bucket or int(hit.score / SCORE_BUCKET_EPSILON)),
+                hit.sort_explanation or "legacy artifact: sort explanation unavailable",
                 "`forced`" if hit.forced else "",
                 f"`{hit.path}`",
                 hit.display_title,
@@ -3508,7 +9649,7 @@ def render_candidate_contexts_markdown(
                 "",
                 f"查询文本: {item.query[:500]}",
                 "",
-                format_markdown_table(["排名", "强度", "依据", "分数", "强制命中", "路径", "标题", "截断", "片段"], rows)
+                format_markdown_table(["排名", "强度", "依据", "分数", "Score Bucket", "Sort Key", "强制命中", "路径", "标题", "截断", "片段"], rows)
                 if rows
                 else "未召回到候选旧页。",
             ]
@@ -3521,6 +9662,38 @@ def render_candidate_contexts_markdown(
 def render_merge_decision_report(plan: WikiMergePlanArtifact, snapshot: WikiContextSnapshot) -> str:
     context_by_id = {item.page_plan_id: item for item in snapshot.candidate_contexts.items}
     sections = ["# 合并决策报告", ""]
+    create_risks = merge_plan_create_overlap_risk_items(plan)
+    if create_risks:
+        risk_rows = []
+        for item in create_risks:
+            context = context_by_id.get(item.page_plan_id)
+            inspected = item.inspected_context_paths or ([hit.path for hit in context.hits] if context else [])
+            risk_rows.append(
+                [
+                    item.page_plan_id,
+                    item.model_action or item.action,
+                    item.action,
+                    item.strongest_overlap.strength,
+                    f"`{item.strongest_overlap.path}`",
+                    ", ".join(f"`{path}`" for path in inspected[:5]) if inspected else "无",
+                    item.why_not_update or "未提供",
+                    item.apply_eligibility,
+                    item.blocked_reason,
+                ]
+            )
+        sections.extend(
+            [
+                "## Create/Update 风险摘要",
+                "",
+                "这些项目的模型动作或最终动作包含 create，但 TopK 召回中存在 medium/strong 旧页；审核时应优先检查 why_not_update 是否具体说明范围差异、来源增量和为什么不能 update。",
+                "",
+                format_markdown_table(
+                    ["页面计划", "模型动作", "最终动作", "最强召回", "旧页", "看过的旧页", "为什么不更新", "Apply", "阻断原因"],
+                    risk_rows,
+                ),
+                "",
+            ]
+        )
     for item in plan.items:
         context = context_by_id.get(item.page_plan_id)
         inspected = item.inspected_context_paths or ([hit.path for hit in context.hits] if context else [])
@@ -3635,6 +9808,8 @@ def finalize_draft_rendering(
                     "canonical_target_path": item.canonical_target_path,
                     "preimage_sha256": entry.preimage_sha256,
                     "section_bodies": normalize_draft_section_bodies(page.section_bodies),
+                    "change_summary": finalize_draft_change_summary(page.change_summary, item),
+                    "source_coverage_notes": finalize_draft_source_coverage_notes(page.source_coverage_notes, item),
                 }
             )
         )
@@ -3644,12 +9819,41 @@ def finalize_draft_rendering(
 CANONICAL_DRAFT_SECTION_KEYS = ("summary", "detail", "examples", "value_points", "additional_notes", "open_questions")
 
 
+def default_create_change_summary(item: WikiMergePlanItem) -> str:
+    if item.action != "create":
+        return ""
+    title = item.display_title.strip() or Path(item.canonical_target_path).stem
+    return f"创建 {title} 页面。"
+
+
+def finalize_draft_change_summary(summary: str, item: WikiMergePlanItem) -> str:
+    summary = normalize_stable_brand_typos(summary.strip())
+    if item.action == "create" and (not summary or looks_like_untranslated_english(summary)):
+        return default_create_change_summary(item)
+    return summary
+
+
+def finalize_draft_source_coverage_notes(notes: str, item: WikiMergePlanItem) -> str:
+    notes = normalize_stable_brand_typos(notes.strip())
+    if not notes or looks_like_untranslated_english(notes):
+        title = item.display_title.strip() or Path(item.canonical_target_path).stem
+        basis = "本轮来源摘录"
+        if item.action == "update":
+            basis = "本轮来源摘录与已检查旧页"
+        return f"依据{basis}中与「{title}」相关的内容生成；未被来源支撑的细节保留为未决问题。"
+    notes = re.sub(r"\bapproved_digest\b", "来源摘要", notes)
+    notes = re.sub(r"\bsource_excerpt_pack\b", "来源摘录包", notes)
+    notes = re.sub(r"\bwiki_context_snapshot\b", "已检查 wiki 上下文", notes)
+    notes = re.sub(r"\bsnippets?\b", "摘录", notes, flags=re.IGNORECASE)
+    return notes
+
+
 def normalize_draft_section_bodies(section_bodies: dict[str, str]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for raw_key, raw_body in section_bodies.items():
         if not isinstance(raw_body, str):
             continue
-        body = raw_body.strip()
+        body = normalize_stable_brand_typos(raw_body.strip())
         if not body:
             continue
         canonical_key = draft_section_key_alias(raw_key)
@@ -3659,6 +9863,21 @@ def normalize_draft_section_bodies(section_bodies: dict[str, str]) -> dict[str, 
             canonical_key = "detail"
         normalized[canonical_key] = merge_markdown_blocks(normalized.get(canonical_key, ""), body)
     return normalized
+
+
+def normalize_stable_brand_typos(text: str) -> str:
+    replacements = [
+        ("Clade Code", "Claude Code"),
+        ("ClaudeCode", "Claude Code"),
+        ("Anropinic", "Anthropic"),
+        ("Anthopic", "Anthropic"),
+        ("ManagedAgents", "Managed Agents"),
+        ("Borris Cherny", "Boris Cherny"),
+        ("Borris", "Boris"),
+    ]
+    for wrong, right in replacements:
+        text = re.sub(rf"(?<![A-Za-z0-9]){re.escape(wrong)}(?![A-Za-z0-9])", right, text)
+    return text
 
 
 def draft_section_key_alias(raw_key: str) -> str | None:
@@ -3823,6 +10042,40 @@ def validate_digestive_quality(page: DraftPageItem, item: WikiMergePlanItem) -> 
         )
 
 
+def draft_self_talk_issues(artifact: DraftRenderingArtifact) -> list[StructuredIssue]:
+    issues: list[StructuredIssue] = []
+    for page in artifact.pages:
+        for section_key, body in page.section_bodies.items():
+            marker = draft_self_talk_marker(body)
+            if not marker:
+                continue
+            issues.append(
+                StructuredIssue(
+                    issue_code="model_self_talk_leak",
+                    field_path=f"pages.{page.page_plan_id}.{section_key}",
+                    validator_id="draft_content_quality",
+                    message=(
+                        f"{page.page_plan_id} section {section_key} contains model self-talk marker `{marker}`; "
+                        "remove reasoning notes about checking, uncertainty, or future edits, and keep only the final sourced page content."
+                    ),
+                    repairability="repairable",
+                )
+            )
+    return issues
+
+
+def draft_self_talk_marker(text: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    for marker in DRAFT_SELF_TALK_MARKERS:
+        if marker and marker in compact:
+            return marker
+    if "需要谨慎" in compact and any(marker in compact for marker in ["检查原文", "查看原文", "原文", "我", "记错"]):
+        return "需要谨慎"
+    if "应该是" in compact and any(marker in compact for marker in ["我", "记错", "检查原文", "原文数据", "但前面说"]):
+        return "应该是"
+    return ""
+
+
 def is_substantive_digestive_text(text: str) -> bool:
     normalized = normalized_digest_text(text)
     if not normalized or any(marker in normalized for marker in ["暂无", "没有相关", "无相关", "n/a"]):
@@ -3869,14 +10122,25 @@ def snapshot_entry(snapshot: WikiContextSnapshot, path: str) -> WikiContextEntry
 
 SECTION_TITLE_TO_KEY = {
     "摘要": "summary",
+    "Summary": "summary",
     "详情": "detail",
+    "Detail": "detail",
+    "Details": "detail",
     "例子": "examples",
+    "Examples": "examples",
     "价值点": "value_points",
+    "Value Points": "value_points",
     "补充观察": "additional_notes",
+    "Additional Notes": "additional_notes",
     "相关页面": "related",
+    "Related": "related",
+    "Related Pages": "related",
     "矛盾与未决问题": "open_questions",
     "Open Questions": "open_questions",
     "Tensions / Open Questions": "open_questions",
+}
+ENGLISH_SECTION_TITLE_TO_KEY = {
+    title.casefold(): key for title, key in SECTION_TITLE_TO_KEY.items() if title.isascii()
 }
 
 
@@ -3886,7 +10150,10 @@ def parse_existing_sections(markdown: str) -> dict[str, str]:
     for line in markdown.splitlines():
         match = re.match(r"^##\s+(.+?)\s*$", line)
         if match:
-            current_key = SECTION_TITLE_TO_KEY.get(match.group(1).strip())
+            section_title = match.group(1).strip()
+            current_key = SECTION_TITLE_TO_KEY.get(section_title)
+            if current_key is None and section_title.isascii():
+                current_key = ENGLISH_SECTION_TITLE_TO_KEY.get(section_title.casefold())
             if current_key is not None:
                 sections.setdefault(current_key, [])
             continue
@@ -3900,18 +10167,54 @@ def is_empty_placeholder(text: str) -> bool:
     return not normalized or any(marker in normalized for marker in ["暂无", "没有相关", "无相关", "N/A"])
 
 
-def merge_update_section(section_key: str, old: str, new: str) -> tuple[str, SectionMergeChange]:
+def merge_update_section(
+    section_key: str,
+    old: str,
+    new: str,
+    *,
+    absorption_context: str | None = None,
+) -> tuple[str, SectionMergeChange]:
     old = old.strip()
     new = new.strip()
     retained: list[str] = []
     added: list[str] = []
     removed: list[str] = []
-    if old and new and (old == new or old in new):
+    preserved_old: list[str] = []
+    removal_reason = ""
+    needs_manual_resolution = False
+    absorbed, matched_phrases, _ = update_section_absorption(old, new) if old and new else (False, [], [])
+    context_absorbed = False
+    context_matched_phrases: list[str] = []
+    if old and new and not absorbed and absorption_context and update_merge_should_preserve_old_section(section_key, old):
+        context_text = absorption_context.strip()
+        if context_text and context_text != new:
+            context_absorbed, context_matched_phrases, _ = update_section_absorption(old, context_text)
+            absorbed = context_absorbed
+    if old and new and absorbed:
         retained.append(old)
     if new and not is_empty_placeholder(new):
         added.append(new)
     if old and not retained and old != new and not is_empty_placeholder(old):
-        removed.append(old)
+        if update_merge_should_preserve_old_section(section_key, old):
+            preserved = preserved_old_section_block(old)
+            new = merge_markdown_blocks(new, preserved)
+            retained.append(old)
+            preserved_old.append(old)
+            needs_manual_resolution = True
+            removal_reason = "模型完整重写后未显式吸收该旧段落；系统已临时保留为旧页保留观察，draft review 需消化、改写或确认删除。"
+        else:
+            removed.append(old)
+            removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
+    elif old and retained and old != new and old not in new:
+        if context_absorbed:
+            matched = context_matched_phrases[:4]
+            removal_reason = (
+                f"模型已在新草稿其他章节吸收旧段落关键短语/概念义务：{', '.join(matched)}。"
+                if matched
+                else "模型已在新草稿其他章节吸收旧段落概念义务。"
+            )
+        elif matched_phrases:
+            removal_reason = f"模型已通过关键短语/概念义务吸收旧段落：{', '.join(matched_phrases[:4])}。"
     return (
         new,
         SectionMergeChange(
@@ -3919,9 +10222,578 @@ def merge_update_section(section_key: str, old: str, new: str) -> tuple[str, Sec
             retained=retained,
             added=added,
             removed=removed,
-            removal_reason="模型完整重写后未逐字保留该旧内容；请在 draft review 中确认其知识价值已被吸收或可剪除。" if removed else "",
+            preserved_old=preserved_old,
+            needs_manual_resolution=needs_manual_resolution,
+            removal_reason=removal_reason,
         ),
     )
+
+
+def update_merge_should_preserve_old_section(section_key: str, old_text: str) -> bool:
+    if section_key not in {"summary", "detail"}:
+        return False
+    phrases = update_preservation_phrases(old_text)
+    concepts = update_preservation_concepts(old_text)
+    return not update_preservation_section_is_low_value(section_key, old_text, phrases, concepts)
+
+
+def preserved_old_section_block(old: str) -> str:
+    return f"旧页保留观察（来自更新前页面，模型本轮未显式吸收，先保留待审）：\n\n{old.strip()}"
+
+
+def grounding_issue_message(claim: GroundingClaim) -> str:
+    reason = claim.reason or "unsupported new_fact"
+    text = re.sub(r"\s+", " ", claim.text).strip()
+    if not text:
+        return reason
+    return f"{reason} 触发文本：{text[:240]}"
+
+
+def unsupported_backing_marker(text: str) -> str | None:
+    for marker in UNSUPPORTED_BACKING_MARKERS:
+        if marker == "被多个" and not re.search(
+            r"被多个(?:社区|团队|公司|机构|组织|项目|产品|用户|客户|开发者|研究|论文|媒体|开源项目).{0,12}(?:引用|采用|使用|验证|复现|报道|认可|采纳)",
+            text,
+        ):
+            continue
+        if marker in text:
+            return marker
+    return None
+
+
+def external_backing_supported_by_context(
+    text: str,
+    marker: str,
+    approved_raw_text: str,
+    existing_wiki_text: str,
+) -> tuple[bool, str | None]:
+    if grounding_text_supported_by_context(text, approved_raw_text, existing_wiki_text):
+        return True, "raw" if quote_supported_by_text(text, approved_raw_text) else "existing_wiki"
+    if external_backing_supported_by_text(text, marker, approved_raw_text):
+        return True, "raw"
+    if external_backing_supported_by_text(text, marker, existing_wiki_text):
+        return True, "existing_wiki"
+    if external_backing_supported_by_retained_existing_fact(text, marker, existing_wiki_text):
+        return True, "existing_wiki"
+    return False, None
+
+
+def external_backing_supported_by_retained_existing_fact(text: str, marker: str, existing_wiki_text: str) -> bool:
+    if not text or not marker or not existing_wiki_text:
+        return False
+    marker_equivalents = _dedupe_strings(
+        [normalized_source_match_text(marker), *[normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
+    )
+    specific_anchors, generic_anchors = external_backing_topic_anchors(text)
+    normalized_text = normalized_source_match_text(text)
+    bridge_anchors = [
+        normalized_source_match_text(anchor)
+        for anchor in [
+            "旧页",
+            "旧页视角",
+            "existing wiki",
+            "Managed Agents / 托管智能体",
+            "Managed Agents",
+            "托管智能体",
+        ]
+    ]
+    has_bridge_context = any(anchor and anchor in normalized_text for anchor in bridge_anchors)
+    if not has_bridge_context:
+        return False
+    useful_specific = [anchor for anchor in specific_anchors if anchor not in {"managed", "agents"}]
+    all_anchors = [*useful_specific, *generic_anchors]
+    if len(all_anchors) < 2:
+        return False
+    for sentence in external_backing_source_sentences(existing_wiki_text):
+        normalized_sentence = normalized_source_match_text(sentence)
+        if not any(equivalent and equivalent in normalized_sentence for equivalent in marker_equivalents):
+            continue
+        specific_hits = external_backing_anchor_hit_count(useful_specific, normalized_sentence)
+        all_hits = external_backing_anchor_hit_count(all_anchors, normalized_sentence)
+        if specific_hits >= 1 and all_hits >= 2:
+            return True
+    return False
+
+
+def external_backing_supported_by_text(text: str, marker: str, source_text: str) -> bool:
+    if not text or not marker or not source_text:
+        return False
+    marker_equivalents = _dedupe_strings(
+        [normalized_source_match_text(marker), *[normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
+    )
+    specific_anchors, generic_anchors = external_backing_topic_anchors(text)
+    if not specific_anchors:
+        return False
+    all_anchors = [*specific_anchors, *generic_anchors]
+    if len(all_anchors) < 2:
+        return False
+    sentences = external_backing_source_sentences(source_text)
+    for index, sentence in enumerate(sentences):
+        normalized_sentence = normalized_source_match_text(sentence)
+        if not any(equivalent and equivalent in normalized_sentence for equivalent in marker_equivalents):
+            continue
+        context = " ".join(sentences[max(0, index - 1) : index + 2])
+        normalized_context = normalized_source_match_text(context)
+        if external_backing_anchor_hit_count(specific_anchors, normalized_context) < 1:
+            continue
+        if external_backing_anchor_hit_count(all_anchors, normalized_context) >= 2:
+            return True
+    return False
+
+
+def external_backing_topic_anchors(text: str) -> tuple[list[str], list[str]]:
+    specific_anchors: list[str] = []
+    generic_anchors: list[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9.+_-]{1,}", unicodedata.normalize("NFKC", text)):
+        normalized = token.lower().strip("._-+")
+        if len(normalized) < 2 or normalized in {"the", "and", "for", "with", "from", "into", "this", "that"}:
+            continue
+        target = generic_anchors if normalized in EXTERNAL_BACKING_GENERIC_ANCHORS else specific_anchors
+        if normalized not in target:
+            target.append(normalized)
+    for zh_marker, english_anchor in EXTERNAL_BACKING_ZH_EN_ANCHORS:
+        if zh_marker in text and english_anchor not in generic_anchors:
+            generic_anchors.append(english_anchor)
+    return specific_anchors[:6], generic_anchors[:8]
+
+
+def external_backing_anchor_hit_count(anchors: list[str], normalized_sentence: str) -> int:
+    hits = 0
+    for anchor in anchors:
+        if anchor and anchor in normalized_sentence:
+            hits += 1
+    return hits
+
+
+def external_backing_source_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return [sentence.strip() for sentence in re.split(r"(?<=[。！？!?\.])\s+|\n+", normalized) if sentence.strip()]
+
+
+def sentence_with_marker(text: str, marker: str) -> str:
+    marker_index = text.find(marker)
+    stripped = text.strip(" -*\t")
+    if marker_index < 0:
+        return stripped
+    boundary_chars = "。！？!?；;\n"
+    start = 0
+    for index in range(marker_index - 1, -1, -1):
+        if text[index] in boundary_chars:
+            start = index + 1
+            break
+    end = len(text)
+    for index in range(marker_index + len(marker), len(text)):
+        if text[index] in boundary_chars:
+            end = index + 1
+            break
+    return text[start:end].strip(" -*\t") or stripped
+
+
+def unsupported_scope_speculation_marker(text: str) -> str | None:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    speculative = ("可能", "也许", "或许", "推测", "疑似")
+    impact = ("受到影响", "受影响", "波及", "涉及", "牵涉", "导致", "造成", "影响到", "关联")
+    if not any(marker in compact for marker in speculative):
+        return None
+    for marker in impact:
+        if marker in compact:
+            return marker
+    return None
+
+
+def scope_speculation_supported_by_context(text: str, approved_raw_text: str, existing_wiki_text: str) -> tuple[bool, str | None]:
+    if grounding_text_supported_by_context(text, approved_raw_text, existing_wiki_text):
+        return True, "raw" if quote_supported_by_text(text, approved_raw_text) else "existing_wiki"
+    if scope_speculation_supported_by_text(text, approved_raw_text):
+        return True, "raw"
+    if scope_speculation_supported_by_text(text, existing_wiki_text):
+        return True, "existing_wiki"
+    return False, None
+
+
+def scope_speculation_supported_by_text(text: str, source_text: str) -> bool:
+    if not text or not source_text:
+        return False
+    anchors = scope_speculation_anchors(text)
+    if len(anchors) < 2:
+        return False
+    sentences = external_backing_source_sentences(source_text)
+    for index, sentence in enumerate(sentences):
+        context = " ".join(sentences[max(0, index - 1) : index + 2])
+        normalized_context = normalized_source_match_text(context)
+        if sum(1 for anchor in anchors if anchor in normalized_context) >= min(3, len(anchors)):
+            return True
+    return False
+
+
+def scope_speculation_anchors(text: str) -> list[str]:
+    normalized_text = normalized_source_match_text(text)
+    anchors: list[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9.+_-]{1,}", unicodedata.normalize("NFKC", text)):
+        normalized = token.lower().strip("._-+")
+        if len(normalized) >= 3 and normalized not in {"the", "and", "for", "with", "from", "into", "this", "that"}:
+            anchors.append(normalized)
+    for phrase in re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）()·]{2,}", text):
+        normalized = normalized_source_match_text(phrase)
+        if len(normalized) >= 2 and normalized not in {"可能", "也许", "或许", "推测", "疑似", "受到影响", "受影响", "波及", "涉及", "牵涉", "导致", "造成", "影响到", "关联"}:
+            anchors.append(normalized)
+    deduped: list[str] = []
+    for anchor in anchors:
+        if anchor and anchor in normalized_text and anchor not in deduped:
+            deduped.append(anchor)
+    return deduped[:8]
+
+
+def grounding_text_supported_by_context(text: str, approved_raw_text: str, existing_wiki_text: str) -> bool:
+    return quote_supported_by_text(text, approved_raw_text) or quote_supported_by_text(text, existing_wiki_text)
+
+
+def rewrite_grounding_sensitive_paraphrases(
+    artifact: DraftRenderingArtifact,
+    approved_raw_text: str,
+) -> tuple[DraftRenderingArtifact, dict[str, Any]]:
+    report_pages: list[dict[str, Any]] = []
+    rewritten_pages: list[DraftPageItem] = []
+    rewrite_count = 0
+    source_sentences = grounding_rewrite_source_sentences(approved_raw_text)
+    for page in artifact.pages:
+        section_bodies: dict[str, str] = {}
+        page_sections: list[dict[str, Any]] = []
+        for section_key, body in page.section_bodies.items():
+            rewritten_body, section_rewrites = rewrite_grounding_sensitive_body(body, source_sentences)
+            section_bodies[section_key] = rewritten_body
+            if section_rewrites:
+                rewrite_count += len(section_rewrites)
+                page_sections.append({"section_key": section_key, "rewrites": section_rewrites})
+        if page_sections:
+            report_pages.append(
+                {
+                    "page_plan_id": page.page_plan_id,
+                    "target_path": page.canonical_target_path,
+                    "sections": page_sections,
+                }
+            )
+            rewritten_pages.append(page.model_copy(update={"section_bodies": section_bodies}))
+        else:
+            rewritten_pages.append(page)
+    report = {
+        "schema_version": "grounding_paraphrase_rewrite_report.v1",
+        "changed": rewrite_count > 0,
+        "rewrite_count": rewrite_count,
+        "pages": report_pages,
+    }
+    if rewrite_count == 0:
+        return artifact, report
+    return artifact.model_copy(update={"pages": rewritten_pages}), report
+
+
+def rewrite_grounding_sensitive_body(body: str, source_sentences: list[str]) -> tuple[str, list[dict[str, str]]]:
+    rewritten = body
+    rewrites: list[dict[str, str]] = []
+    source_text = " ".join(source_sentences)
+    rewritten, internal_rewrites = rewrite_internal_artifact_references(rewritten)
+    rewrites.extend(internal_rewrites)
+    for quote, _quote_start in iter_grounding_quote_spans(body):
+        known_translation = grounding_known_english_quote_translation(quote)
+        if known_translation:
+            for quote_start, quoted_text in grounding_quoted_literals(rewritten, quote):
+                replacement = grounding_dequoted_source_replacement(rewritten, quote_start, known_translation)
+                rewritten = rewritten[:quote_start] + replacement + rewritten[quote_start + len(quoted_text) :]
+                rewrites.append(
+                    {
+                        "original_quote": quote,
+                        "replacement": replacement,
+                        "source_sentence": known_translation,
+                        "reason": "已知英文来源短语改写为中文意译，避免 zh-CN 页面粘贴英文概括。",
+                    }
+                )
+                break
+            continue
+        source_sentence = numeric_reliability_source_sentence(quote, source_sentences)
+        if source_sentence:
+            for quote_start, quoted_text in grounding_quoted_literals(rewritten, quote):
+                replacement = grounding_dequoted_source_replacement(rewritten, quote_start, source_sentence)
+                rewritten = rewritten[:quote_start] + replacement + rewritten[quote_start + len(quoted_text) :]
+                rewrites.append(
+                    {
+                        "original_quote": quote,
+                        "replacement": replacement,
+                        "source_sentence": source_sentence,
+                        "reason": "百分比可靠性短语改回 raw 中更具体的来源表述，避免把 paraphrase 写成直接引语。",
+                    }
+                )
+                break
+            continue
+        for quote_start, quoted_text in grounding_quoted_literals(rewritten, quote):
+            if not dequotable_grounding_paraphrase(rewritten, quote, quote_start=quote_start, source_text=source_text):
+                continue
+            replacement = quote.strip()
+            rewritten = rewritten[:quote_start] + replacement + rewritten[quote_start + len(quoted_text) :]
+            rewrites.append(
+                {
+                    "original_quote": quote,
+                    "replacement": replacement,
+                    "source_sentence": "",
+                    "reason": "非显式直接引用的长概括去除引号，避免把 paraphrase 当成 raw exact quote。",
+                }
+            )
+            break
+    return rewritten, rewrites
+
+
+def rewrite_internal_artifact_references(body: str) -> tuple[str, list[dict[str, str]]]:
+    rewrites: list[dict[str, str]] = []
+    rewritten = body
+    patterns = [
+        (
+            re.compile(
+                r"对应\s+approved_digest\s+中\s+`?[A-Za-z0-9_-]+`?\s+的\s+`?[A-Za-z0-9_]+`?\s+描述[:：]"
+            ),
+            "对应的来源要点是：",
+        ),
+        (
+            re.compile(r"approved_digest\s+中\s+`?[A-Za-z0-9_-]+`?\s+的\s+`?[A-Za-z0-9_]+`?"),
+            "来源要点",
+        ),
+    ]
+    for pattern, replacement in patterns:
+        matches = list(pattern.finditer(rewritten))
+        if not matches:
+            continue
+        rewritten = pattern.sub(replacement, rewritten)
+        for match in matches:
+            rewrites.append(
+                {
+                    "original_quote": match.group(0),
+                    "replacement": replacement,
+                    "source_sentence": "",
+                    "reason": "移除面向模型的内部 artifact 名称，改成用户可读的来源要点表达。",
+                }
+            )
+    return rewritten, rewrites
+
+
+def grounding_known_english_quote_translation(quote: str) -> str:
+    normalized = normalized_source_match_text(quote)
+    translations = {
+        "anexcellentharnessthatprovidesafocusedcodingexperience": "一种优秀的 harness，提供聚焦的编码体验",
+    }
+    return translations.get(normalized, "")
+
+
+def dequotable_grounding_paraphrase(body: str, quote: str, *, quote_start: int, source_text: str) -> bool:
+    normalized = re.sub(r"\s+", "", quote.strip())
+    if (
+        len(normalized) < 18
+        and not dequotable_source_local_concept_paraphrase(normalized)
+        and not dequotable_short_slogan_or_label(normalized)
+    ):
+        return False
+    if quote_supported_by_text(quote, source_text):
+        return False
+    if re.search(r"\d", normalized):
+        return False
+    if len(normalized) <= 32 and contains_short_fact_marker(normalized) and not dequotable_open_question_quote(normalized):
+        return False
+    if looks_like_untranslated_english(quote):
+        return False
+    if attributed_quote_context(body, quote_start=quote_start):
+        return False
+    if strict_direct_quote_context(body, quote_start=quote_start) and not dequotable_source_local_concept_paraphrase(normalized):
+        return False
+    return True
+
+
+def dequotable_short_slogan_or_label(normalized: str) -> bool:
+    if len(normalized) > 24:
+        return False
+    if not any(separator in normalized for separator in ["，", ",", "、", "/"]):
+        return False
+    if re.search(r"\d|[%％$￥¥]", normalized):
+        return False
+    if contains_short_fact_marker(normalized) or contains_hard_fact_marker(normalized):
+        return False
+    sentence_markers = [
+        "认为",
+        "表示",
+        "指出",
+        "发现",
+        "证明",
+        "承诺",
+        "宣布",
+        "导致",
+        "因为",
+        "所以",
+        "已经",
+        "正在",
+        "应该",
+        "必须",
+        "需要",
+        "推出",
+        "发布",
+        "上线",
+    ]
+    return not any(marker in normalized for marker in sentence_markers)
+
+
+def dequotable_source_local_concept_paraphrase(normalized: str) -> bool:
+    concept_pairs = [
+        ("会话", "上下文窗口"),
+        ("会话日志", "上下文窗口"),
+        ("大脑", "双手"),
+        ("harness", "容器"),
+    ]
+    return any(first in normalized and second in normalized for first, second in concept_pairs)
+
+
+def dequotable_open_question_quote(normalized: str) -> bool:
+    if not normalized.endswith(("?", "？")) and "？" not in normalized:
+        return False
+    question_markers = ["如何", "是否", "什么", "哪", "为何", "为什么", "能否", "需要"]
+    return any(marker in normalized for marker in question_markers)
+
+
+def strict_direct_quote_context(body: str, *, quote_start: int) -> bool:
+    prefix = body[max(0, quote_start - 36) : quote_start]
+    strict_markers = [
+        "原文",
+        "直接引用",
+        "引用",
+        "作者",
+        "论文",
+        "研究",
+        "他说",
+        "她说",
+        "对方说",
+        "Cat Wu指出",
+        "Cat Wu表示",
+        "Cat Wu说",
+        "Boris指出",
+        "Boris表示",
+        "Boris说",
+    ]
+    return any(marker in prefix for marker in strict_markers)
+
+
+def attributed_quote_context(body: str, *, quote_start: int) -> bool:
+    prefix = body[max(0, quote_start - 28) : quote_start]
+    explicit_attributors = [
+        "文中",
+        "原文",
+        "作者",
+        "论文",
+        "研究",
+        "访谈",
+        "报告",
+        "他说",
+        "她说",
+        "对方说",
+        "Cat Wu",
+        "Boris",
+    ]
+    if not any(marker in prefix for marker in explicit_attributors):
+        return False
+    return bool(re.search(r"(?:称|指出|表示|写道|说)\s*[：:，,]?\s*[“\"]?$", prefix))
+
+
+def grounding_quoted_literals(body: str, quote: str) -> list[tuple[int, str]]:
+    matches: list[tuple[int, str]] = []
+    for quoted in [f"“{quote}”", f'"{quote}"']:
+        start = body.find(quoted)
+        if start >= 0:
+            matches.append((start, quoted))
+    return sorted(matches, key=lambda item: item[0])
+
+
+def grounding_dequoted_source_replacement(body: str, quote_start: int, source_sentence: str) -> str:
+    source = source_sentence.strip().rstrip("。！？!?")
+    prefix = body[max(0, quote_start - 16) : quote_start]
+    if prefix.endswith(("所说", "说", "提到", "指出", "表示")):
+        return f"，{source}"
+    return source
+
+
+def grounding_rewrite_source_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return [sentence.strip() for sentence in re.split(r"(?<=[。！？!?])", normalized) if sentence.strip()]
+
+
+def numeric_reliability_source_sentence(quote: str, source_sentences: list[str]) -> str | None:
+    percentages = re.findall(r"\d+(?:\.\d+)?\s*%", quote)
+    if not percentages:
+        return None
+    normalized_quote = normalized_source_match_text(quote)
+    if not any(marker in normalized_quote for marker in ["失败", "没价值", "不够", "不是自动化", "可靠", "有效"]):
+        return None
+    normalized_percentages = {normalized_percentage_token(percentage) for percentage in percentages}
+    best: str | None = None
+    for sentence in source_sentences:
+        normalized_sentence = normalized_source_match_text(sentence)
+        sentence_percentages = {
+            normalized_percentage_token(percentage)
+            for percentage in re.findall(r"\d+(?:\.\d+)?\s*%", unicodedata.normalize("NFKC", sentence))
+        }
+        if not normalized_percentages or not normalized_percentages <= sentence_percentages:
+            continue
+        if "自动化" not in normalized_sentence:
+            continue
+        if not any(marker in normalized_sentence for marker in ["价值", "有效", "准确率", "不够", "放弃", "100"]):
+            continue
+        if not any(marker in normalized_sentence for marker in ["不", "没", "不是", "不够"]):
+            continue
+        if best is None or len(sentence) < len(best):
+            best = sentence
+    return best
+
+
+def normalized_percentage_token(percentage: str) -> str:
+    token = unicodedata.normalize("NFKC", percentage).replace(" ", "")
+    match = re.match(r"(\d+(?:\.\d+)?)%", token)
+    return f"{match.group(1)}%" if match else token
+
+
+def compact_paraphrase_supported_by_context(text: str, approved_raw_text: str, existing_wiki_text: str) -> tuple[bool, str | None]:
+    if compact_paraphrase_supported_by_text(text, approved_raw_text) or method_goal_paraphrase_supported_by_text(
+        text, approved_raw_text
+    ):
+        return True, "raw"
+    if compact_paraphrase_supported_by_text(text, existing_wiki_text) or method_goal_paraphrase_supported_by_text(
+        text, existing_wiki_text
+    ):
+        return True, "existing_wiki"
+    return False, None
+
+
+def iter_grounding_quote_spans(body: str) -> list[tuple[str, int]]:
+    spans: list[tuple[str, int]] = []
+    for match in re.finditer(r"“([^“”\n]{6,})”", body):
+        spans.append((match.group(1), match.start()))
+    index = 0
+    while index < len(body):
+        quote_start = body.find('"', index)
+        if quote_start < 0:
+            break
+        if not plausible_ascii_open_quote(body, quote_start):
+            index = quote_start + 1
+            continue
+        quote_end = body.find('"', quote_start + 1)
+        if quote_end < 0:
+            break
+        quote = body[quote_start + 1 : quote_end]
+        if len(quote) >= 6 and "\n" not in quote and not any(char in quote for char in '“”"'):
+            spans.append((quote, quote_start))
+        index = quote_end + 1
+    return sorted(spans, key=lambda span: span[1])
+
+
+def plausible_ascii_open_quote(body: str, quote_start: int) -> bool:
+    prefix = body[max(0, quote_start - 12) : quote_start]
+    if any(marker in prefix for marker in ["原文", "直接引用", "引用", "他说", "她说", "对方说", "访谈中说"]):
+        return True
+    if quote_start == 0:
+        return True
+    previous = body[quote_start - 1]
+    return previous.isspace() or previous in "([{<（【《:：,，;；.。!！?？\n\r\t-—"
 
 
 def collect_grounding_claims(
@@ -3933,8 +10805,32 @@ def collect_grounding_claims(
     claims: list[GroundingClaim],
 ) -> None:
     for section_key, body in page.section_bodies.items():
-        for quote in re.findall(r"[“\"]([^”\"]{6,})[”\"]", body):
-            if section_key == "examples" and not explicit_direct_quote_context(body, quote):
+        for quote, quote_start in iter_grounding_quote_spans(body):
+            normalized_quote = re.sub(r"\s+", "", quote.strip())
+            is_explicit_quote = explicit_direct_quote_context(body, quote, quote_start=quote_start)
+            is_illustrative_example = illustrative_example_context(body, quote, quote_start=quote_start)
+            is_memory_example = illustrative_memory_example_context(body, quote, quote_start=quote_start)
+            raw_supported = quote_supported_by_text(quote, approved_raw_text)
+            existing_supported = quote_supported_by_text(quote, existing_entry.content)
+            supported = raw_supported or existing_supported
+            is_concept_label_quote = (
+                looks_like_concept_phrase(quote)
+                or looks_like_abstract_trend_label(re.sub(r"\s+", "", quote.strip()))
+            ) and not supported and not strict_direct_quote_context(body, quote_start=quote_start) and not attributed_quote_context(body, quote_start=quote_start)
+            section_example_hard_fact = section_key == "examples" and (
+                contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote)
+            )
+            if (
+                not is_explicit_quote
+                and ((section_key == "examples" and not section_example_hard_fact) or is_illustrative_example or is_memory_example)
+            ) or is_concept_label_quote:
+                reason = "短标题/概念短语按概念标签处理，不要求 raw exact match。"
+                if section_key == "examples":
+                    reason = "例子区的通用示例句按 illustrative example 处理，不要求 raw exact match。"
+                elif is_illustrative_example:
+                    reason = "由如/例如/比如引出的通用示例句按 illustrative example 处理，不要求 raw exact match。"
+                elif is_memory_example:
+                    reason = "记忆评估中的短问句/用户偏好/对话样例按 illustrative example 处理，不要求 raw exact match。"
                 claims.append(
                     GroundingClaim(
                         page_plan_id=page.page_plan_id,
@@ -3944,11 +10840,29 @@ def collect_grounding_claims(
                         text=quote,
                         support="inference",
                         action="kept",
-                        reason="例子区的通用示例句按 illustrative example 处理，不要求 raw exact match。",
+                        reason=reason,
                     )
                 )
                 continue
-            supported = quote in approved_raw_text or quote in existing_entry.content
+            compact_supported, compact_support = (
+                (False, None)
+                if is_explicit_quote or supported
+                else compact_paraphrase_supported_by_context(quote, approved_raw_text, existing_entry.content)
+            )
+            if compact_supported:
+                claims.append(
+                    GroundingClaim(
+                        page_plan_id=page.page_plan_id,
+                        target_path=item.canonical_target_path,
+                        section_key=section_key,
+                        claim_type="inference",
+                        text=quote,
+                        support=compact_support or "raw",
+                        action="kept",
+                        reason="引号内压缩概括已被 raw 或已有 wiki 的邻近片段支撑，不按直接引用 exact match 拦截。",
+                    )
+                )
+                continue
             claims.append(
                 GroundingClaim(
                     page_plan_id=page.page_plan_id,
@@ -3956,27 +10870,72 @@ def collect_grounding_claims(
                     section_key=section_key,
                     claim_type="new_fact",
                     text=quote,
-                    support="raw" if quote in approved_raw_text else ("existing_wiki" if quote in existing_entry.content else "unsupported"),
+                    support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
                     action="kept" if supported else "needs_review",
-                    reason="直接引用必须在 raw 或已有 wiki 中 exact match。",
+                    reason=(
+                        "直接引用已在 raw 或已有 wiki 中规范化 exact match。"
+                        if supported
+                        else "直接引用必须在 raw 或已有 wiki 中 exact match。"
+                    ),
                 )
             )
-        unsupported_markers = ["被多个", "被广泛", "公认", "业界普遍", "多个社区"]
         for line in body.splitlines():
             text = line.strip(" -*")
             if not text or len(text) < 8:
                 continue
-            if any(marker in text for marker in unsupported_markers) and text not in approved_raw_text and text not in existing_entry.content:
+            scope_marker = None if section_key == "open_questions" else unsupported_scope_speculation_marker(text)
+            if scope_marker:
+                unsupported_text = sentence_with_marker(text, scope_marker)
+                supported, _support_source = scope_speculation_supported_by_context(
+                    unsupported_text,
+                    approved_raw_text,
+                    existing_entry.content,
+                )
+                if not supported:
+                    claims.append(
+                        GroundingClaim(
+                            page_plan_id=page.page_plan_id,
+                            target_path=item.canonical_target_path,
+                            section_key=section_key,
+                            claim_type="new_fact",
+                            text=unsupported_text,
+                            support="unsupported",
+                            action="needs_review",
+                            reason=(
+                                f"新增影响范围/受影响对象推测 `{scope_marker}` 未被 raw 或 inspected wiki 同句级支撑；"
+                                "请删除该推测，或改写为来源明确陈述。"
+                            ),
+                        )
+                    )
+            marker = unsupported_backing_marker(text)
+            if not marker:
+                continue
+            if unsupported_backing_marker_inside_supported_quote(
+                text,
+                marker,
+                approved_raw_text,
+                existing_entry.content,
+            ):
+                continue
+            unsupported_text = sentence_with_marker(text, marker)
+            backing_context_text = text if len(text) <= 600 else unsupported_text
+            supported, _support_source = external_backing_supported_by_context(
+                backing_context_text,
+                marker,
+                approved_raw_text,
+                existing_entry.content,
+            )
+            if not supported:
                 claims.append(
                     GroundingClaim(
                         page_plan_id=page.page_plan_id,
                         target_path=item.canonical_target_path,
                         section_key=section_key,
                         claim_type="new_fact",
-                        text=text,
+                        text=unsupported_text,
                         support="unsupported",
                         action="needs_review",
-                        reason="新增外部背书/强事实未在 raw 或 inspected wiki 中出现。",
+                        reason=f"新增外部背书/强事实标记 `{marker}` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
                     )
                 )
     if item.action == "update" and existing_entry.content:
@@ -3989,15 +10948,592 @@ def collect_grounding_claims(
                 support="existing_wiki",
                 action="kept",
             )
-        )
+                )
 
 
-def explicit_direct_quote_context(body: str, quote: str) -> bool:
-    index = body.find(quote)
+def unsupported_backing_marker_inside_supported_quote(
+    text: str,
+    marker: str,
+    approved_raw_text: str,
+    existing_wiki_text: str,
+) -> bool:
+    for quote, _quote_start in iter_grounding_quote_spans(text):
+        if marker not in quote:
+            continue
+        if quote_supported_by_text(quote, approved_raw_text) or quote_supported_by_text(quote, existing_wiki_text):
+            return True
+    return False
+
+
+def quote_supported_by_text(quote: str, text: str) -> bool:
+    if not quote or not text:
+        return False
+    if quote in text:
+        return True
+    normalized_quote_variants = normalized_quote_support_variants(quote)
+    normalized_text_variants = normalized_quote_support_variants(text)
+    for normalized_quote in normalized_quote_variants:
+        for normalized_text in normalized_text_variants:
+            if len(normalized_quote) >= 16 and normalized_quote in normalized_text:
+                if re.search(r"\d", normalized_quote) and not quote_numeric_tokens_are_exactly_present(quote, text):
+                    continue
+                return True
+            if short_quote_supported_by_normalized_text(quote, normalized_quote, text, normalized_text):
+                return True
+    return False
+
+
+def normalized_quote_support_variants(text: str) -> list[str]:
+    variants = [normalized_source_match_text(text)]
+    range_normalized = normalize_numeric_range_connectors(text)
+    if range_normalized != text:
+        variants.append(normalized_source_match_text(range_normalized))
+    enumerated_range_normalized = normalize_paired_temporal_enumerated_ranges(text)
+    if enumerated_range_normalized != text:
+        variants.append(normalized_source_match_text(enumerated_range_normalized))
+    stripped = strip_inline_term_translation_parentheticals(text)
+    if stripped != text:
+        variants.append(normalized_source_match_text(stripped))
+    if re.search(r"\d", unicodedata.normalize("NFKC", text)):
+        variants.extend(normalized_direct_quote_elision_variant(variant) for variant in list(variants))
+    return _dedupe_strings([variant for variant in variants if variant])
+
+
+def normalize_numeric_range_connectors(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return re.sub(
+        r"(\d+(?:\.\d+)?)\s*(?:[-~至到])\s*(\d+(?:\.\d+)?)(?=\s*(?:个?月|年|天|周|小时|分钟|秒|%|％|倍|人|个|项|种|类|步))",
+        r"\1到\2",
+        normalized,
+    )
+
+
+def normalize_paired_temporal_enumerated_ranges(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+
+    def replacement(match: re.Match[str]) -> str:
+        tail = normalized[match.end() : match.end() + 24]
+        if re.match(r"\s*[、,，]\s*\d", tail):
+            return match.group(0)
+        return f"{match.group(1)}到{match.group(3)}{match.group('unit')}{match.group('suffix') or ''}"
+
+    return re.sub(
+        r"(\d+(?:\.\d+)?)\s*(?P<unit>个月|年|天|周|小时|分钟|秒)\s*[、,，]\s*"
+        r"(\d+(?:\.\d+)?)\s*(?P=unit)(?P<suffix>后|前|内|间|之间|左右|以后|之内)?",
+        replacement,
+        normalized,
+    )
+
+
+def normalized_direct_quote_elision_variant(normalized_text: str) -> str:
+    if len(normalized_text) < 16:
+        return normalized_text
+    return re.sub(r"那个|这个|这些|那些|该|其|的", "", normalized_text)
+
+
+def strip_inline_term_translation_parentheticals(text: str) -> str:
+    return re.sub(
+        r"(?P<term>[A-Za-z][A-Za-z0-9.+#/-]*)\s*[（(][\u4e00-\u9fffA-Za-z0-9\s/+.-]{1,32}[）)]",
+        r"\g<term>",
+        unicodedata.normalize("NFKC", text),
+    )
+
+
+def short_quote_supported_by_normalized_text(
+    quote: str,
+    normalized_quote: str,
+    text: str,
+    normalized_text: str,
+) -> bool:
+    if len(normalized_quote) < 6 or normalized_quote not in normalized_text:
+        return False
+    if not quote_numeric_tokens_are_exactly_present(quote, text):
+        return False
+    if re.search(r"\d", normalized_quote):
+        return len(re.sub(r"\d+", "", normalized_quote)) >= 3
+    if looks_like_named_concept_label(normalized_quote):
+        return True
+    domain_anchors = [
+        "agent",
+        "claude",
+        "claudecode",
+        "cowork",
+        "eval",
+        "harness",
+        "langflow",
+        "managedagents",
+        "mcp",
+        "n8n",
+        "rag",
+        "sandbox",
+        "session",
+        "workflow",
+    ]
+    return bool(re.search(r"[a-z]", normalized_quote)) and any(anchor in normalized_quote for anchor in domain_anchors)
+
+
+def quote_numeric_tokens_are_exactly_present(quote: str, text: str) -> bool:
+    tokens = re.findall(r"\d+(?:\.\d+)?", unicodedata.normalize("NFKC", quote))
+    if not tokens:
+        return True
+    normalized_text = unicodedata.normalize("NFKC", text)
+    source_tokens = set(re.findall(r"\d+(?:\.\d+)?", normalized_text))
+    return all(token in source_tokens for token in tokens)
+
+
+def compact_paraphrase_supported_by_text(quote: str, text: str) -> bool:
+    if not quote or not text:
+        return False
+    if not any(separator in quote for separator in ["，", ",", "；", ";", "、"]):
+        return False
+    normalized_quote = normalized_source_match_text(quote)
+    if len(normalized_quote) < 16 or len(normalized_quote) > 96:
+        return False
+    if re.search(r"\d", normalized_quote):
+        return False
+    segments = [
+        segment
+        for segment in (normalized_source_match_text(part) for part in re.split(r"[，,；;、]", quote))
+        if len(segment) >= 4
+    ]
+    if len(segments) < 2:
+        return False
+    normalized_text = normalized_source_match_text(text)
+    segment_hits: list[tuple[list[int], int, bool]] = []
+    for segment in segments:
+        exact_position = normalized_text.find(segment)
+        if exact_position >= 0:
+            segment_hits.append(([exact_position], 1, True))
+            continue
+        anchors = compact_paraphrase_anchor_matches(segment, normalized_text)
+        if len(anchors) < 2:
+            return False
+        segment_hits.append(([position for _anchor, position in anchors], 2, False))
+    all_positions = sorted({position for positions, _required, _exact in segment_hits for position in positions})
+    if not all_positions:
+        return False
+    for center in all_positions:
+        window_start = center - 350
+        window_end = center + 350
+        total_match_units = 0
+        window_ok = True
+        for positions, required, exact in segment_hits:
+            hit_count = sum(1 for position in positions if window_start <= position <= window_end)
+            if hit_count < required:
+                window_ok = False
+                break
+            total_match_units += 2 if exact else hit_count
+        if window_ok and total_match_units >= 4:
+            return True
+    return False
+
+
+def method_goal_paraphrase_supported_by_text(quote: str, text: str) -> bool:
+    if not quote or not text:
+        return False
+    normalized_quote = normalized_source_match_text(quote)
+    if len(normalized_quote) < 12 or len(normalized_quote) > 64:
+        return False
+    if re.search(r"\d", normalized_quote) or contains_hard_fact_marker(normalized_quote):
+        return False
+    if not any(marker in normalized_quote for marker in ["方法", "路径", "方式", "流程", "目标", "原则", "模式", "用例"]):
+        return False
+    if re.search(r"发布(?:了|过)|推出(?:了|过)|上线(?:了|过)", normalized_quote):
+        return False
+    normalized_text = normalized_source_match_text(text)
+    anchors = compact_paraphrase_anchor_matches(normalized_quote, normalized_text)
+    anchor_occurrences = [
+        (anchor, compact_paraphrase_anchor_occurrences(anchor, normalized_text))
+        for anchor, _position in anchors
+    ]
+    anchor_occurrences = [(anchor, positions) for anchor, positions in anchor_occurrences if positions]
+    strong_anchor_count = sum(1 for anchor, _positions in anchor_occurrences if len(anchor) >= 4)
+    if len(anchor_occurrences) < 3 or strong_anchor_count < 2:
+        return False
+    all_positions = sorted({position for _anchor, positions in anchor_occurrences for position in positions})
+    for center in all_positions:
+        window_start = center - 350
+        window_end = center + 350
+        hit_count = 0
+        strong_hit_count = 0
+        for anchor, positions in anchor_occurrences:
+            if any(window_start <= position <= window_end for position in positions):
+                hit_count += 1
+                if len(anchor) >= 4:
+                    strong_hit_count += 1
+        if hit_count >= 3 and strong_hit_count >= 2:
+            return True
+    return False
+
+
+def compact_paraphrase_anchor_occurrences(anchor: str, normalized_text: str, *, limit: int = 30) -> list[int]:
+    positions: list[int] = []
+    start = 0
+    while len(positions) < limit:
+        position = normalized_text.find(anchor, start)
+        if position < 0:
+            break
+        positions.append(position)
+        start = position + max(1, len(anchor))
+    return positions
+
+
+def compact_paraphrase_anchor_matches(segment: str, normalized_text: str) -> list[tuple[str, int]]:
+    matches: list[tuple[str, int]] = []
+    max_len = min(8, len(segment))
+    for length in range(max_len, 1, -1):
+        for start in range(0, len(segment) - length + 1):
+            anchor = segment[start : start + length]
+            if compact_paraphrase_anchor_is_noise(anchor):
+                continue
+            if any(anchor in existing or existing in anchor for existing, _position in matches):
+                continue
+            position = normalized_text.find(anchor)
+            if position >= 0:
+                matches.append((anchor, position))
+        if len(matches) >= 3:
+            break
+    return matches
+
+
+def compact_paraphrase_anchor_is_noise(anchor: str) -> bool:
+    if len(anchor) < 2:
+        return True
+    if all(char in "的是了和与及或并把被在为对从到中上下一种一个这个那个其" for char in anchor):
+        return True
+    return anchor in {
+        "主要",
+        "问题",
+        "核心",
+        "用户",
+        "团队",
+        "目标",
+        "产品",
+        "功能",
+        "这个",
+        "那个",
+        "一种",
+        "一个",
+    }
+
+
+def explicit_direct_quote_context(body: str, quote: str, *, quote_start: int | None = None) -> bool:
+    index = quote_start if quote_start is not None else body.find(quote)
     if index < 0:
         return False
+    if quoted_label_context(body, quote, quote_start=index):
+        return False
     prefix = body[max(0, index - 24) : index]
-    return any(marker in prefix for marker in ["原文", "直接引用", "引用", "他说", "她说", "对方说", "访谈中说"])
+    return any(
+        marker in prefix
+        for marker in [
+            "原文",
+            "直接引用",
+            "引用",
+            "他说",
+            "她说",
+            "对方说",
+            "访谈中说",
+            "所说",
+            "指出",
+            "表示",
+            "提到",
+            "写道",
+            "称",
+        ]
+    )
+
+
+def quoted_label_context(body: str, quote: str, *, quote_start: int | None = None) -> bool:
+    index = quote_start if quote_start is not None else body.find(quote)
+    if index < 0:
+        return False
+    normalized_quote = re.sub(r"\s+", "", quote.strip())
+    if not looks_like_concept_phrase(normalized_quote) and not looks_like_abstract_trend_label(normalized_quote):
+        return False
+    prefix = body[max(0, index - 32) : index]
+    quote_end = index + len(quote) + (2 if body[index : index + 1] in {'"', "“"} else 0)
+    suffix = body[quote_end : quote_end + 16]
+    if re.search(r"(?:关于|围绕|主题为|标题为|名为|所谓|称为|叫做)[“\"]?$", prefix):
+        return True
+    if re.search(r"(?:提到|讨论|涉及|聚焦|描述|概括)的[“\"]?$", prefix) and re.match(
+        r"(?:的)?(?:讨论|趋势|概念|问题|主题|选择|定位|框架|方法|模式|说法|标题|标签)",
+        suffix,
+    ):
+        return True
+    if re.match(r"(?:的)?(?:讨论|趋势|概念|问题|主题|选择|定位|框架|方法|模式|说法|标题|标签)", suffix) and any(
+        marker in prefix for marker in ["关于", "围绕", "源自", "来自", "作为", "可称为"]
+    ):
+        return True
+    return False
+
+
+def illustrative_example_context(body: str, quote: str, *, quote_start: int | None = None) -> bool:
+    normalized = re.sub(r"\s+", "", quote.strip())
+    index = quote_start if quote_start is not None else body.find(quote)
+    if index < 0:
+        return False
+    prefix = body[max(0, index - 18) : index]
+    direct_markers = ["原文", "直接引用", "引用", "指出", "表示", "论文", "研究", "作者"]
+    if any(marker in prefix for marker in direct_markers):
+        return False
+    if not any(marker in prefix for marker in ["如", "例如", "比如", "示例", "例子", "e.g.", "for example"]):
+        return False
+    if contains_short_fact_marker(normalized) and not looks_like_instructional_example(normalized, prefix):
+        return False
+    return True
+
+
+def illustrative_memory_example_context(body: str, quote: str, *, quote_start: int | None = None) -> bool:
+    normalized = re.sub(r"\s+", "", quote.strip())
+    if len(normalized) > 48:
+        return False
+    index = quote_start if quote_start is not None else body.find(quote)
+    if index < 0:
+        return False
+    prefix = body[max(0, index - 32) : index]
+    if any(marker in prefix for marker in ["原文", "直接引用", "引用", "指出", "表示", "论文", "研究", "作者"]):
+        return False
+    if not any(marker in prefix for marker in ["如", "例如", "比如", "示例", "例子", "问题", "问句", "评估"]):
+        return False
+    window = body[max(0, index - 72) : index + len(quote) + 24]
+    if not memory_example_context_marker(window):
+        return False
+    if memory_example_question(normalized):
+        return True
+    if memory_example_user_preference(normalized) and not contains_hard_fact_marker(normalized):
+        return True
+    if memory_example_utterance(normalized):
+        return True
+    return False
+
+
+def memory_example_context_marker(text: str) -> bool:
+    markers = [
+        "记忆",
+        "智能体",
+        "MemBench",
+        "评估",
+        "事实",
+        "反思",
+        "参与场景",
+        "观察场景",
+        "单跳",
+        "多跳",
+        "知识更新",
+        "情感",
+        "偏好",
+        "任务类型",
+    ]
+    return any(marker in text for marker in markers)
+
+
+def memory_example_question(normalized: str) -> bool:
+    if not normalized.endswith(("?", "？")):
+        return False
+    return any(marker in normalized for marker in ["什么", "谁", "哪", "多少", "是否", "吗", "何时", "几", "名字", "多大", "年龄", "态度"])
+
+
+def memory_example_user_preference(normalized: str) -> bool:
+    return any(marker in normalized for marker in ["用户喜欢", "用户偏好", "用户讨厌", "我喜欢", "我讨厌", "偏好"])
+
+
+def memory_example_utterance(normalized: str) -> bool:
+    return any(marker in normalized.lower() for marker in ["用户", "我", "我的", "表哥", "表弟", "cousin", "ethan", "assistant", "智能体"])
+
+
+def contains_hard_fact_marker(normalized: str) -> bool:
+    if re.search(r"\d|[0-9]+(?:%|％)?", normalized):
+        return True
+    hard_markers = [
+        "增长",
+        "下降",
+        "增加",
+        "减少",
+        "降低",
+        "提升",
+        "裁撤",
+        "裁员",
+        "超过",
+        "超出",
+        "少于",
+        "高于",
+        "低于",
+        "达到",
+        "收入",
+        "销量",
+        "预算",
+        "成本",
+        "团队",
+        "市场份额",
+        "融资",
+        "估值",
+        "一半",
+        "三倍",
+        "两倍",
+        "数倍",
+        "百万",
+        "千万",
+        "上亿",
+        "亿元",
+        "万美元",
+        "人民币",
+    ]
+    return any(marker in normalized for marker in hard_markers)
+
+
+def looks_like_instructional_example(normalized: str, prefix: str) -> bool:
+    context_markers = ["风格", "示例", "例子", "指令", "要求", "条件性", "规定性", "禁止性", "解释性", "描述性"]
+    if not any(marker in prefix for marker in context_markers):
+        return False
+    instruction_markers = [
+        "如果",
+        "若",
+        "请",
+        "必须",
+        "不要",
+        "禁止",
+        "运行",
+        "使用",
+        "避免",
+        "优先",
+        "更新",
+        "拆分",
+        "should",
+        "must",
+        "donot",
+        "don't",
+    ]
+    return any(marker in normalized.lower() for marker in instruction_markers)
+
+
+def looks_like_concept_phrase(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.strip())
+    if not normalized:
+        return False
+    if re.search(r"[。！？!?；;，,：:]", normalized):
+        return False
+    if looks_like_evaluation_question_template(normalized):
+        return True
+    if looks_like_named_concept_label(normalized):
+        return True
+    if len(normalized) > 18:
+        return False
+    if contains_short_fact_marker(normalized):
+        return False
+    if re.search(r"发布(?:了|过|出|到|为|成)|推出(?:了|过)|上线(?:了|过)", normalized):
+        return False
+    sentence_markers = [
+        "认为",
+        "表示",
+        "指出",
+        "发现",
+        "证明",
+        "承诺",
+        "宣布",
+        "导致",
+        "因为",
+        "所以",
+        "已经",
+        "正在",
+        "应该",
+        "必须",
+    ]
+    return not any(marker in normalized for marker in sentence_markers)
+
+
+def looks_like_abstract_trend_label(normalized: str) -> bool:
+    if len(normalized) > 24:
+        return False
+    if re.search(r"\d|[%％$￥¥]|[。！？!?；;，,：:]", normalized):
+        return False
+    if not any(marker in normalized for marker in ["降低", "提升", "变化", "融合", "模糊", "吞噬", "收敛"]):
+        return False
+    abstract_subjects = [
+        "技术壁垒",
+        "进入门槛",
+        "代码成本",
+        "模型能力",
+        "角色边界",
+        "产品边界",
+        "产品一致性",
+        "产品功能",
+        "工程成本",
+        "能力边界",
+    ]
+    return any(subject in normalized for subject in abstract_subjects)
+
+
+def looks_like_named_concept_label(normalized: str) -> bool:
+    if len(normalized) > 32:
+        return False
+    if not re.search(r"[a-zA-Z]", normalized):
+        return False
+    if re.search(r"[%％$￥¥]|\d+(?:\.\d+)?(?:倍|万|亿|元|美元|%|％)", normalized):
+        return False
+    if re.search(r"(?:有|含|包含|包括|分为|需要)\d+|\d+(?:个|类|种|步|步骤|层|点|项|条|大|次|年|月|日)", normalized):
+        return False
+    if any(marker in normalized for marker in ["增长", "下降", "增加", "减少", "超过", "达到", "裁撤", "裁员", "预算", "收入", "销量"]):
+        return False
+    label_markers = [
+        "claude",
+        "cowork",
+        "工作流",
+        "agent",
+        "rag",
+        "系统",
+        "架构",
+        "对比",
+        "工程",
+        "构建",
+        "技术栈",
+        "框架",
+        "模型",
+        "定位",
+        "选择",
+        "n8n",
+        "langflow",
+    ]
+    return any(marker in normalized.lower() for marker in label_markers)
+
+
+def looks_like_evaluation_question_template(normalized: str) -> bool:
+    if not any(marker in normalized for marker in ["是否", "多少", "几", "如何", "什么", "哪"]):
+        return False
+    evaluation_markers = ["满意", "信任", "接受", "成功", "正确", "失败", "质量", "评估", "比例"]
+    return any(marker in normalized for marker in evaluation_markers)
+
+
+def contains_short_fact_marker(normalized: str) -> bool:
+    if re.search(r"\d|[0-9]+(?:%|％)?", normalized):
+        return True
+    metric_markers = [
+        "增长",
+        "下降",
+        "增加",
+        "减少",
+        "降低",
+        "提升",
+        "裁撤",
+        "裁员",
+        "超过",
+        "超出",
+        "少于",
+        "高于",
+        "低于",
+        "达到",
+        "收入",
+        "销量",
+        "预算",
+        "成本",
+        "用户",
+        "团队",
+        "市场份额",
+        "融资",
+        "估值",
+    ]
+    quantity_markers = ["一半", "三倍", "两倍", "数倍", "百万", "千万", "上亿", "亿元", "万美元", "人民币"]
+    return any(marker in normalized for marker in [*metric_markers, *quantity_markers])
 
 
 def build_draft_grounding_review(
@@ -4068,12 +11604,47 @@ def assemble_knowledge_page(
     created = metadata.created if metadata is not None and metadata.created else log_date
     section_changes: list[SectionMergeChange] = []
     if is_update:
-        summary, summary_change = merge_update_section("summary", existing_sections.get("summary", ""), summary)
-        detail, detail_change = merge_update_section("detail", existing_sections.get("detail", ""), detail)
-        examples, examples_change = merge_update_section("examples", existing_sections.get("examples", ""), examples)
-        values, values_change = merge_update_section("value_points", existing_sections.get("value_points", ""), values)
-        additional_notes, notes_change = merge_update_section("additional_notes", existing_sections.get("additional_notes", ""), additional_notes)
-        questions, questions_change = merge_update_section("open_questions", existing_sections.get("open_questions", ""), questions)
+        update_absorption_context = "\n\n".join(
+            section
+            for section in [summary, detail, examples, values, additional_notes, questions]
+            if section.strip()
+        )
+        summary, summary_change = merge_update_section(
+            "summary",
+            existing_sections.get("summary", ""),
+            summary,
+            absorption_context=update_absorption_context,
+        )
+        detail, detail_change = merge_update_section(
+            "detail",
+            existing_sections.get("detail", ""),
+            detail,
+            absorption_context=update_absorption_context,
+        )
+        examples, examples_change = merge_update_section(
+            "examples",
+            existing_sections.get("examples", ""),
+            examples,
+            absorption_context=update_absorption_context,
+        )
+        values, values_change = merge_update_section(
+            "value_points",
+            existing_sections.get("value_points", ""),
+            values,
+            absorption_context=update_absorption_context,
+        )
+        additional_notes, notes_change = merge_update_section(
+            "additional_notes",
+            existing_sections.get("additional_notes", ""),
+            additional_notes,
+            absorption_context=update_absorption_context,
+        )
+        questions, questions_change = merge_update_section(
+            "open_questions",
+            existing_sections.get("open_questions", ""),
+            questions,
+            absorption_context=update_absorption_context,
+        )
         section_changes.extend([summary_change, detail_change, examples_change, values_change, notes_change, questions_change])
     additional_notes_section = f"## 补充观察\n\n{additional_notes}\n\n" if additional_notes else ""
     related = render_related_pages(
@@ -4167,11 +11738,7 @@ def render_source_page(
     cleanup: RawLinkCleanupArtifact,
 ) -> str:
     links = "\n".join(f"- `{path}`" for path in linked_pages) or "- 暂无派生知识页。"
-    no_change = (
-        "未改动页面：\n" + "\n".join(f"- `{path}`" for path in no_change_pages)
-        if no_change_pages
-        else "暂无未写入页面。"
-    )
+    no_change = render_source_unwritten_notes(digest, no_change_pages)
     summary = neutralize_markdown_links(digest.summary)
     takeaways = "\n".join(f"- {neutralize_markdown_links(item)}" for item in digest.key_takeaways) or "- 暂无关键收获记录。"
     return (
@@ -4211,6 +11778,54 @@ def render_source_page(
         "## 未写入说明\n\n"
         f"{no_change}\n"
     )
+
+
+def render_source_unwritten_notes(digest: SourceDigestArtifact, no_change_pages: list[str]) -> str:
+    sections = [
+        (
+            "未改动页面：\n" + "\n".join(f"- `{path}`" for path in no_change_pages)
+            if no_change_pages
+            else "暂无未写入页面。"
+        )
+    ]
+    if digest.budget_deferred_candidates:
+        rows = [
+            [
+                candidate.candidate_id,
+                candidate.type,
+                neutralize_markdown_links(candidate.suggested_page_title or candidate.name),
+                neutralize_markdown_links(candidate.one_sentence_summary),
+                neutralize_markdown_links(candidate.wiki_value),
+                neutralize_markdown_links(candidate.resolution_hint),
+            ]
+            for candidate in digest.budget_deferred_candidates
+        ]
+        sections.extend(
+            [
+                "### 预算延后候选（未独立建页）",
+                "这些候选因 `max_ingest_candidates` 预算限制未进入本轮页面规划；它们保留在 source digest 和预算报告中，后续可单独建页或聚合进总览/对比页。",
+                format_markdown_table(["ID", "类型", "建议标题", "摘要", "Wiki 价值", "处理提示"], rows),
+            ]
+        )
+        aggregation_rows = [
+            [
+                aggregation["suggested_page_type"],
+                neutralize_markdown_links(str(aggregation["suggested_title"])),
+                neutralize_markdown_links(str(aggregation["coverage_summary"])),
+                ", ".join(str(candidate.get("title", candidate.get("candidate_id", ""))) for candidate in aggregation.get("representative_candidates", [])[:4]),
+                neutralize_markdown_links(str(aggregation["suggested_action"])),
+            ]
+            for aggregation in build_deferred_candidate_aggregations(digest.budget_deferred_candidates)
+        ]
+        if aggregation_rows:
+            sections.extend(
+                [
+                    "### 延后候选聚合建议",
+                    "这些聚合建议只记录后续处理路径，不会在本轮增加知识页数量。",
+                    format_markdown_table(["建议页类型", "建议标题", "覆盖摘要", "代表候选", "后续动作"], aggregation_rows),
+                ]
+            )
+    return "\n\n".join(sections)
 
 
 def neutralize_markdown_links(text: str) -> str:
@@ -4308,13 +11923,11 @@ def build_open_question_rows_with_report(
                 "page_type": item.page_type,
                 "source": "draft",
             })
-    by_key: dict[str, list[dict[str, str]]] = {}
-    for candidate in candidates:
-        by_key.setdefault(open_question_key(candidate["question"]), []).append(candidate)
+    by_key = group_open_question_candidates(candidates)
     rows: list[dict[str, str]] = []
     report_items: list[dict[str, Any]] = []
     for key, grouped in sorted(by_key.items()):
-        representative = max(grouped, key=lambda item: item["updated"])
+        representative = max(grouped, key=open_question_representative_sort_key)
         low_signal = is_low_signal_open_question(representative["question"])
         repeated_gap = len(grouped) >= 2 and low_signal
         keep = (
@@ -4351,15 +11964,133 @@ def build_open_question_rows_with_report(
         "schema_version": "index_open_questions_report.v1",
         "kept_count": sum(1 for item in report_items if item["decision"] == "kept"),
         "filtered_count": sum(1 for item in report_items if item["decision"] == "filtered"),
+        "deduped_count": sum(max(0, item["occurrences"] - 1) for item in report_items if item["decision"] == "kept"),
         "items": report_items,
     }
 
 
+def open_question_representative_sort_key(item: dict[str, str]) -> tuple[int, str, tuple[int, int, int]]:
+    question = item["question"]
+    non_low_signal = 0 if is_low_signal_open_question(question) else 1
+    return (non_low_signal, item["updated"], open_question_representative_score(question))
+
+
 def open_question_key(question: str) -> str:
-    text = re.sub(r"^\s*[-*]\s+", "", question.strip())
+    text = strip_open_question_marker(question)
     text = re.sub(r"^(待补来源|待补充来源|需要来源|缺少来源)\s*[:：]\s*", "", text)
     text = unicodedata.normalize("NFKC", text).lower()
+    normalized = re.sub(r"[\s，。；;：:、,.!?！？（）()【】\[\]\"'“”‘’]+", "", text)
+    semantic_key = semantic_open_question_key(normalized)
+    return semantic_key or normalized
+
+
+def strip_open_question_marker(question: str) -> str:
+    text = re.sub(r"^\s*[-*]\s+", "", question.strip())
+    return re.sub(r"^\s*\d+\s*[.)、．]\s*", "", text).strip()
+
+
+def group_open_question_candidates(candidates: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    groups: dict[str, list[dict[str, str]]] = {}
+    for candidate in candidates:
+        key = open_question_key(candidate["question"])
+        merge_key = next(
+            (
+                existing_key
+                for existing_key, grouped in groups.items()
+                if open_question_keys_should_merge(key, existing_key, candidate, grouped)
+            ),
+            None,
+        )
+        groups.setdefault(merge_key or key, []).append(candidate)
+    return groups
+
+
+def open_question_keys_should_merge(
+    key: str,
+    existing_key: str,
+    candidate: dict[str, str],
+    grouped: list[dict[str, str]],
+) -> bool:
+    if key == existing_key:
+        return True
+    if existing_key.startswith("semantic:") and key.startswith("semantic:"):
+        candidate_norm = open_question_similarity_text(candidate["question"])
+        return any(
+            candidate.get("path") == existing.get("path")
+            and open_question_token_overlap(candidate_norm, open_question_similarity_text(existing["question"])) >= 0.60
+            for existing in grouped
+        )
+    if open_question_key_contains_other(key, existing_key):
+        return True
+    candidate_norm = open_question_similarity_text(candidate["question"])
+    if not candidate_norm:
+        return False
+    for existing in grouped:
+        existing_norm = open_question_similarity_text(existing["question"])
+        if not existing_norm:
+            continue
+        same_path = candidate.get("path") == existing.get("path")
+        if open_question_key_contains_other(candidate_norm, existing_norm):
+            return True
+        if same_path and open_question_token_overlap(candidate_norm, existing_norm) >= 0.62:
+            return True
+    return False
+
+
+def open_question_key_contains_other(left: str, right: str) -> bool:
+    if len(left) < 12 or len(right) < 12:
+        return False
+    return left in right or right in left
+
+
+def open_question_similarity_text(question: str) -> str:
+    text = strip_open_question_marker(question)
+    text = unicodedata.normalize("NFKC", text).lower()
     return re.sub(r"[\s，。；;：:、,.!?！？（）()【】\[\]\"'“”‘’]+", "", text)
+
+
+def open_question_token_overlap(left: str, right: str) -> float:
+    left_tokens = open_question_similarity_tokens(left)
+    right_tokens = open_question_similarity_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = left_tokens & right_tokens
+    return len(intersection) / min(len(left_tokens), len(right_tokens))
+
+
+def open_question_similarity_tokens(normalized: str) -> set[str]:
+    text = normalized
+    for stop in ["如何", "是否", "能否", "会不会", "为什么", "什么", "哪些", "是否可能", "可能", "应该", "需要"]:
+        text = text.replace(stop, "")
+    tokens = set(re.findall(r"[a-z][a-z0-9_/-]{1,}", text))
+    cjk = "".join(char for char in text if "\u4e00" <= char <= "\u9fff")
+    for size in (4, 3):
+        for index in range(0, max(0, len(cjk) - size + 1)):
+            token = cjk[index : index + size]
+            if open_question_similarity_token_is_noise(token):
+                continue
+            tokens.add(token)
+    return tokens
+
+
+def open_question_similarity_token_is_noise(token: str) -> bool:
+    if all(char in "的了和与及或是否如何什么为什么可能需要应该能否会不会" for char in token):
+        return True
+    return token in {"产品", "功能", "用户", "团队", "问题", "未来", "影响", "风险"}
+
+
+def open_question_representative_score(question: str) -> tuple[int, int, int]:
+    stripped = strip_open_question_marker(question)
+    single_question = 1 if stripped.count("？") + stripped.count("?") <= 1 else 0
+    has_source_gap = 1 if is_low_signal_open_question(stripped) else 0
+    return (single_question, -has_source_gap, -len(stripped))
+
+
+def semantic_open_question_key(normalized: str) -> str:
+    for key, required_groups in OPEN_QUESTION_SEMANTIC_CLUSTERS:
+        if all(any(term in normalized for term in group) for group in required_groups):
+            return key
+    return ""
 
 
 def is_low_signal_open_question(question: str) -> bool:
@@ -4388,6 +12119,7 @@ def render_index_open_questions_report(report: dict[str, Any]) -> str:
         "# Index 未决问题筛选报告\n\n"
         f"- 保留：{report.get('kept_count', 0)}\n"
         f"- 过滤：{report.get('filtered_count', 0)}\n\n"
+        f"- 合并重复：{report.get('deduped_count', 0)}\n\n"
         + (format_markdown_table(["决策", "原因", "问题", "关联页面", "次数"], rows) if rows else "暂无未决问题。")
         + "\n"
     )
@@ -4403,7 +12135,7 @@ def extract_open_questions(markdown: str) -> list[str]:
 def meaningful_open_question_lines(text: str) -> list[str]:
     results: list[str] = []
     for raw_line in text.splitlines():
-        line = re.sub(r"^\s*[-*]\s+", "", raw_line).strip()
+        line = strip_open_question_marker(raw_line)
         line = line.strip("。；; ")
         if not line:
             continue
@@ -4444,7 +12176,9 @@ def render_related_pages(
     for candidate in candidates:
         path = normalize_related_candidate_path(candidate["target_path"])
         title = candidate["display_title"].strip() or clean_display_title(Path(candidate["target_path"]).stem)
-        reason = chinese_related_reason(candidate["reason"], "该页面与当前主题存在明确内容互补关系。")
+        reason = normalize_stable_brand_typos(
+            chinese_related_reason(candidate["reason"], "该页面与当前主题存在明确内容互补关系。")
+        )
         reject_reason = ""
         if path is None:
             reject_reason = "unknown_path"
@@ -4573,12 +12307,14 @@ def render_update_merge_report(report: UpdateMergeReport) -> str:
                 "\n".join(change.retained) or "无",
                 "\n".join(change.added) or "无",
                 "\n".join(change.removed) or "无",
+                "\n".join(change.preserved_old) or "无",
+                "是" if change.needs_manual_resolution else "否",
                 change.removal_reason,
             ]
             for change in page.sections
         ]
         sections.append(
-            format_markdown_table(["段落", "保留", "新增", "删除", "删除原因"], rows)
+            format_markdown_table(["段落", "保留", "新增", "删除", "旧页保留观察", "需人工消化", "原因"], rows)
             if rows
             else "没有记录 section 级变更。"
         )
@@ -4705,6 +12441,29 @@ def build_draft_approval(
 
 
 def render_draft_review_prompt(run_dir: Path, draft_manifest: DraftWriteManifest) -> str:
+    manual_resolution_count = update_manual_resolution_count(run_dir)
+    reinforcement_count = update_reinforcement_count(run_dir)
+    manual_resolution_note = (
+        f"是（{manual_resolution_count} 段旧页保留观察需人工消化、改写或确认删除）"
+        if manual_resolution_count
+        else "否"
+    )
+    reinforcement_note = f"是（{reinforcement_count} 段旧页知识已由系统本地补强并记录）" if reinforcement_count else "否"
+    warning = (
+        "## 旧页保留观察警示\n\n"
+        f"Update 合并报告包含 {manual_resolution_count} 段旧页保留观察。批准前需要人工消化："
+        "把仍有价值的旧知识自然改写进新页，或明确确认删除。\n\n"
+        if manual_resolution_count
+        else ""
+    )
+    reinforcement_warning = (
+        "## 本地旧知识补强提示\n\n"
+        f"Draft rendering 本地补强了 {reinforcement_count} 段旧页知识，并记录在 "
+        "`draft_rendering/update_preservation_reinforcement_report.md`。如本轮还因其他问题进入人工审核，"
+        "可顺手检查这些桥接语是否自然。\n\n"
+        if reinforcement_count
+        else ""
+    )
     rows = [
         [
             target.action,
@@ -4720,7 +12479,11 @@ def render_draft_review_prompt(run_dir: Path, draft_manifest: DraftWriteManifest
     return (
         "# 草稿审核\n\n"
         "审查这一步回答：具体写什么、是否应批准写入。\n\n"
-        f"- 需要 Grounding 人工确认：{'是' if draft_manifest.requires_grounding_review else '否'}\n\n"
+        f"- 需要 Grounding 人工确认：{'是' if draft_manifest.requires_grounding_review else '否'}\n"
+        f"- 旧页保留观察需人工消化：{manual_resolution_note}\n"
+        f"- 本地旧知识补强已执行：{reinforcement_note}\n\n"
+        f"{warning}"
+        f"{reinforcement_warning}"
         "## 核心判断\n\n"
         "- create/update 的正文是否忠实于 raw 和已召回旧页？\n"
         "- update diff 是否符合你的理解，没有覆盖掉旧页中仍然重要的内容？\n"
@@ -4744,6 +12507,47 @@ def render_draft_review_prompt(run_dir: Path, draft_manifest: DraftWriteManifest
         )
         + "\n"
     )
+
+
+def draft_review_reason(run_dir: Path, draft_manifest: DraftWriteManifest) -> str:
+    reasons: list[str] = []
+    if draft_manifest.requires_grounding_review:
+        reasons.append("Grounding review 发现 unsupported new_fact，需要人工确认。")
+    manual_resolution_count = update_manual_resolution_count(run_dir)
+    reinforcement_count = update_reinforcement_count(run_dir)
+    if manual_resolution_count:
+        reasons.append(f"Update 合并报告包含 {manual_resolution_count} 段旧页保留观察，需人工消化、改写或确认删除。")
+    return " ".join(reasons) or "草稿需要显式人工批准。"
+
+
+def update_manual_resolution_count(run_dir: Path) -> int:
+    report_path = run_dir / "draft_rendering" / "update_merge_report.json"
+    if not report_path.exists():
+        return 0
+    try:
+        report = read_model(report_path, UpdateMergeReport)
+    except Exception:
+        return 0
+    return sum(1 for page in report.pages for section in page.sections if section.needs_manual_resolution)
+
+
+def update_reinforcement_count(run_dir: Path) -> int:
+    draft_root = run_dir / "draft_rendering"
+    report_path = draft_root / "update_preservation_reinforcement_report.json"
+    if report_path.exists():
+        try:
+            report = read_json(report_path)
+            return int(report.get("reinforced_section_count", 0))
+        except Exception:
+            return 0
+    batch_report_path = draft_root / "draft_rendering_batch_report.json"
+    if not batch_report_path.exists():
+        return 0
+    try:
+        report = read_json(batch_report_path)
+        return sum(int(batch.get("reinforced_section_count", 0)) for batch in report.get("batches", []))
+    except Exception:
+        return 0
 
 
 def draft_diff_ref(run_dir: Path, target: DraftWriteTarget) -> str:
@@ -4817,10 +12621,11 @@ def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
         ],
     }
     write_set_sha = sha256_bytes(json.dumps(write_set_payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    requires_manual_draft_review = draft_review_requires_manual(run_dir, draft_manifest)
     return ApplyPreview(
         operation_id=operation_id,
         operation_applyable=bool(targets),
-        requires_draft_review=draft_manifest.has_updates or draft_manifest.requires_grounding_review,
+        requires_draft_review=requires_manual_draft_review,
         has_updates=draft_manifest.has_updates,
         has_noops=draft_manifest.has_noops,
         blocked_reasons=[],

@@ -109,6 +109,8 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
+    max_retries: 2
+    retry_backoff_seconds: 1.0
 ```
 
 OpenAI-compatible config example:
@@ -120,11 +122,20 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
+    max_retries: 2
+    retry_backoff_seconds: 1.0
   source_digest:
     spec: openai_compatible:stronger-digest
     endpoint: https://example.test/v1/chat/completions
     api_key: sk-...
 ```
+
+`max_retries` and `retry_backoff_seconds` are optional and only apply to
+`openai_compatible` ingest calls. `max_retries` is one shared transient retry
+budget per logical model call. JSON-mode compatibility fallback may add a
+prompt-only request and uses only the remaining retry budget. Retry covers
+transient transport failures, 408/409/425/429, and 5xx-like responses, but does
+not retry ordinary bad requests.
 
 Plaintext API keys are allowed in local config files, but are not written to manifests, events, provider results, status JSON, applied receipts, or CLI output.
 
@@ -157,9 +168,15 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 llmwiki init <vault> [--profile project_basic]
 llmwiki providers list
 llmwiki providers check <vault> [--live]
-llmwiki ingest run <vault> <raw> [--fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard]
+llmwiki ingest raw-prepare-check <vault> <raw> [--skip-prepare|--force-prepare] [--json]
+llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
+llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
-llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mode dev|standard]
+llmwiki ingest inspect <vault> [operation_id] [--json]
+llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
+llmwiki ingest raw-import-url <vault> <url> [--title TEXT] [--output PATH] [--overwrite] [--dedupe-url|--no-dedupe-url] [--arxiv-html|--no-arxiv-html] [--timeout SECONDS] [--max-bytes BYTES] [--json]
+llmwiki ingest raw-import-arxiv <vault> <query> [--limit N] [--dry-run] [--overwrite] [--dedupe-url|--no-dedupe-url] [--sort-by VALUE] [--sort-order VALUE] [--min-relevance-score N] [--timeout SECONDS] [--max-bytes BYTES] [--json]
+llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--skip-prepare|--force-prepare] [--mode dev|standard]
 llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
 llmwiki profile validate <path_or_name>
@@ -223,7 +240,7 @@ It checks:
 
 - whether global and vault config can be read and merged;
 - whether provider keys are limited to `default` and model-backed steps;
-- whether `spec`, `endpoint`, `api_key`, and `fixture_dir` match the provider type;
+- whether `spec`, `endpoint`, `api_key`, `fixture_dir`, `max_retries`, and `retry_backoff_seconds` match the provider type;
 - whether a mock provider lacks `fixture_dir`;
 - whether `.llmwiki/` is tracked or staged by Git.
 
@@ -251,7 +268,27 @@ uv run llmwiki providers check "$VAULT" --live
 - `max_tokens=512`
 - preferred `response_format={"type": "json_object"}`
 
-`max_tokens=512` is a completion cap, not a fixed cost. Thinking models usually stop earlier, but may consume up to that limit. If JSON mode is unsupported, the check retries once with a prompt-only JSON probe and reports a warning if that succeeds. `temperature=0` does not promise deterministic behavior for every thinking model.
+`max_tokens=512` is a completion cap, not a fixed cost. Thinking models usually stop earlier, but may consume up to that limit. If JSON mode is unsupported, the check falls back once with a prompt-only JSON probe and reports a warning if that succeeds. The live probe itself does not use transient retry, so provider checks stay quick. `temperature=0` does not promise deterministic behavior for every thinking model.
+
+## `llmwiki ingest raw-prepare-check`
+
+Preview whether `raw_prepare` will use deterministic passthrough or model cleanup before starting a real ingest. This command is read-only: it does not create an operation and does not modify the raw file.
+
+```bash
+uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW"
+uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW" --json
+```
+
+It simulates the text after `raw_link_cleanup`, reads the current raw_prepare provider, then reuses the real `raw_prepare` fast-path rules to report:
+
+- whether the current provider allows the deterministic fast path;
+- whether auto mode will use the fast path;
+- why auto mode would call the model;
+- whether `--skip-prepare` is available, and which auto blockers it would suppress;
+- whether the selected policy and auto policy are expected to call the raw_prepare provider;
+- whether podcast/video transcript, translated transcript, timestamp/speaker-turn, or media embed risk was detected.
+
+If the raw file has already been human-audited and is structurally clean, pass `--skip-prepare` to `ingest run` or to `resume` before `raw_prepare` to save model time. If the material is likely low-quality ASR or translated transcript text, keep auto mode or pass `--force-prepare` to explicitly request model cleanup.
 
 ## `llmwiki ingest run`
 
@@ -266,9 +303,12 @@ Arguments and options:
 - `VAULT`: vault path.
 - `RAW`: raw file path. It must be under `VAULT/raw/`.
 - `--fixture-dir PATH`: mock provider fixture directory. Real providers do not need it.
+- `--mock-fixture-dir PATH`: force all model-backed steps to use `mock:fixture` with this fixture directory.
 - `--profile NAME`: temporarily override the vault config profile.
 - `--slug TEXT`: readable suffix for the operation ID.
 - `--mode dev|standard`: run mode. Default: `dev`.
+- `--skip-prepare`: use deterministic passthrough for eligible Markdown raw; hard blockers such as empty or non-Markdown raw still fall back to the configured `raw_prepare` provider.
+- `--force-prepare`: force model `raw_prepare` cleanup and disable the deterministic fast path.
 
 `--slug manual` only affects the operation ID, for example:
 
@@ -329,6 +369,14 @@ Rerun from a step and downstream:
 
 ```bash
 uv run llmwiki ingest resume "$VAULT" "$OP" --from source_digest
+```
+
+Resume can also override providers or raw preparation policy for steps that will rerun:
+
+```bash
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --skip-prepare
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --force-prepare
+uv run llmwiki ingest resume "$VAULT" "$OP" --mock-fixture-dir "$FIXTURE"
 ```
 
 `--from STEP` will:

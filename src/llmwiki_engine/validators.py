@@ -98,7 +98,7 @@ def validate_candidate_resolution(digest: SourceDigestArtifact, resolution: Cand
         _raise_issue("duplicate_page_plan_id", "candidate_resolution contains duplicate page_plan_id values", validator_id="validate_candidate_resolution")
     covered_ids: set[str] = set()
     for item in resolution.items:
-        covered_ids.update(item.source_basis.source_candidate_ids)
+        covered_ids.update(nonempty_source_candidate_ids(item.source_basis))
     missing = candidate_ids - covered_ids
     if missing:
         _raise_issue("missing_candidate_coverage", f"candidate_resolution misses approved candidates: {sorted(missing)}", validator_id="validate_candidate_resolution", repairable=True)
@@ -118,7 +118,7 @@ def validate_candidate_resolution(digest: SourceDigestArtifact, resolution: Cand
         validate_wiki_relative_markdown_path(item.page_plan_id or item.display_title, item.candidate_target_path, "candidate_target_path")
         if not item.page_plan_id.strip():
             _raise_issue("missing_field", "candidate_resolution page_plan_id must not be empty", field_path="page_plan_id", validator_id="validate_candidate_resolution", repairable=True)
-        if not item.source_basis.source_candidate_ids and not item.source_basis.prepared_discovered_candidates:
+        if not nonempty_source_basis_refs(item.source_basis):
             _raise_issue("missing_field", f"{item.page_plan_id} source_basis must not be empty", field_path="source_basis", validator_id="validate_candidate_resolution", repairable=True)
         if not item.page_type.strip():
             _raise_issue("missing_field", f"{item.page_plan_id} page_type must not be empty", field_path="page_type", validator_id="validate_candidate_resolution", repairable=True)
@@ -145,6 +145,36 @@ def looks_like_noise_candidate_id(value: str) -> bool:
     return normalized.startswith(("noise", "weak", "ignore")) or normalized in {"n/a", "na"}
 
 
+def nonempty_source_candidate_ids(source_basis: object) -> list[str]:
+    ids = getattr(source_basis, "source_candidate_ids", [])
+    return _nonempty_unique_strings(ids)
+
+
+def nonempty_prepared_discovered_candidates(source_basis: object) -> list[str]:
+    ids = getattr(source_basis, "prepared_discovered_candidates", [])
+    return _nonempty_unique_strings(ids)
+
+
+def nonempty_source_basis_refs(source_basis: object) -> list[str]:
+    return _nonempty_unique_strings(
+        [
+            *nonempty_source_candidate_ids(source_basis),
+            *nonempty_prepared_discovered_candidates(source_basis),
+        ]
+    )
+
+
+def _nonempty_unique_strings(values: object) -> list[str]:
+    refs: list[str] = []
+    if not isinstance(values, list):
+        return refs
+    for value in values:
+        ref = str(value).strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
 def validate_wiki_merge_plan(
     digest: SourceDigestArtifact,
     plan: WikiMergePlanArtifact,
@@ -162,7 +192,7 @@ def validate_wiki_merge_plan(
         _raise_issue("duplicate_writable_target", "wiki_merge_plan contains duplicate writable target paths", validator_id="validate_wiki_merge_plan")
     covered_ids: set[str] = set()
     for item in plan.items:
-        covered_ids.update(item.source_basis.source_candidate_ids)
+        covered_ids.update(nonempty_source_candidate_ids(item.source_basis))
     missing = candidate_ids - covered_ids
     if missing:
         _raise_issue("missing_candidate_coverage", f"wiki_merge_plan misses approved candidates: {sorted(missing)}", validator_id="validate_wiki_merge_plan", repairable=True)
@@ -203,7 +233,7 @@ def validate_wiki_merge_plan(
             validate_wiki_relative_markdown_path(item.page_plan_id, inspected_path, "inspected_context_paths")
         if item.page_type.strip().lower() == "source":
             _raise_issue("invalid_page_type", f"{item.page_plan_id} wiki_merge_plan items must not use source page type", field_path="page_type", validator_id="validate_wiki_merge_plan")
-        if not item.source_basis.source_candidate_ids and not item.source_basis.prepared_discovered_candidates:
+        if not nonempty_source_basis_refs(item.source_basis):
             _raise_issue("missing_field", f"{item.page_plan_id} source_basis must not be empty", field_path="source_basis", validator_id="validate_wiki_merge_plan", repairable=True)
         if not item.display_title.strip():
             _raise_issue("missing_field", f"{item.page_plan_id} display_title must not be empty", field_path="display_title", validator_id="validate_wiki_merge_plan", repairable=True)

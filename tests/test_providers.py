@@ -3,14 +3,20 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import BaseModel
 
 from llmwiki_engine.models import RawPreparationArtifact, SourceDigestArtifact
-from llmwiki_engine.providers import OpenAICompatibleProvider, ProviderRegistry
+from llmwiki_engine.providers import OpenAICompatibleProvider, ProviderError, ProviderRegistry
 from llmwiki_engine.redaction import Redactor
 from llmwiki_engine.structured import StructuredModelCall, StructuredOutputError
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "simple_project" / "mock"
+
+
+class JsonLikeArtifact(BaseModel):
+    value_points: str
+    quote: str
 
 
 def test_mock_provider_returns_source_digest_fixture() -> None:
@@ -64,11 +70,17 @@ def test_openai_compatible_provider_uses_authorization_header() -> None:
 
 def test_openai_compatible_live_check_uses_twenty_second_timeout() -> None:
     seen: dict[str, object] = {}
+    calls = 0
 
     class FakeResponse:
         text = ""
 
         def raise_for_status(self) -> None:
+            nonlocal calls
+            if calls == 1:
+                request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+                response = httpx.Response(503, text="temporary", request=request)
+                raise httpx.HTTPStatusError("temporary", request=request, response=response)
             return None
 
         def json(self) -> dict[str, object]:
@@ -76,6 +88,8 @@ def test_openai_compatible_live_check_uses_twenty_second_timeout() -> None:
 
     class FakeClient:
         def post(self, endpoint, *, json, headers, timeout):
+            nonlocal calls
+            calls += 1
             seen["endpoint"] = endpoint
             seen["body"] = json
             seen["headers"] = headers
@@ -89,7 +103,9 @@ def test_openai_compatible_live_check_uses_twenty_second_timeout() -> None:
         http_client=FakeClient(),
     )
 
-    assert provider.check_live() == '{"ok": true}'
+    with pytest.raises(ProviderError, match="HTTP 503"):
+        provider.check_live()
+    assert calls == 1
     assert seen["timeout"] == 20.0
 
 
@@ -148,8 +164,348 @@ def test_openai_compatible_generate_raw_falls_back_when_json_mode_is_unsupported
     )
 
     assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert len(seen) == 2
     assert seen[0]["response_format"] == {"type": "json_object"}
     assert "response_format" not in seen[1]
+
+
+def test_openai_compatible_generate_raw_shares_retry_budget_with_json_mode_fallback() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen.append(body)
+        if len(seen) == 1:
+            return httpx.Response(503, text="temporary overload", request=request)
+        if len(seen) == 2:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "response_format is not supported"}},
+                request=request,
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert len(seen) == 3
+    assert "response_format" in seen[0]
+    assert "response_format" in seen[1]
+    assert "response_format" not in seen[2]
+
+
+def test_openai_compatible_generate_raw_allows_fallback_to_use_remaining_retry_budget() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen.append(body)
+        if len(seen) == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "response_format is not supported"}},
+                request=request,
+            )
+        if len(seen) == 2:
+            return httpx.Response(503, text="temporary overload", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert len(seen) == 3
+    assert "response_format" in seen[0]
+    assert "response_format" not in seen[1]
+    assert "response_format" not in seen[2]
+
+
+def test_openai_compatible_generate_raw_does_not_fallback_after_transient_retry_exhaustion() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen.append(body)
+        return httpx.Response(503, text="response_format is temporarily unavailable", request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderError, match="after 2 attempts"):
+        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
+    assert len(seen) == 2
+    assert all("response_format" in body for body in seen)
+
+
+def test_openai_compatible_generate_raw_combines_attempts_when_fallback_fails() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen.append(body)
+        if len(seen) == 1:
+            return httpx.Response(503, text="temporary overload", request=request)
+        if len(seen) == 2:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "response_format is not supported"}},
+                request=request,
+            )
+        return httpx.Response(503, text="fallback overloaded", request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderError) as exc:
+        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
+    assert len(seen) == 3
+    assert exc.value.status_code == 503
+    assert exc.value.attempt_count == 3
+    assert str(exc.value).endswith("(after 3 attempts)")
+    assert str(exc.value).count("after") == 1
+
+
+def test_openai_compatible_generate_raw_retries_transient_http_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadError("[Errno 54] Connection reset by peer", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert calls == 2
+
+
+def test_openai_compatible_generate_raw_retries_retryable_status() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, text="temporary overload", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert calls == 2
+
+
+def test_openai_compatible_generate_raw_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    sleeps: list[float] = []
+    monkeypatch.setattr("llmwiki_engine.providers.time.sleep", lambda delay: sleeps.append(delay))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, text="slow down", headers={"Retry-After": "0.25"}, request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        retry_backoff_seconds=999,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
+    assert calls == 2
+    assert sleeps == [0.25]
+
+
+def test_openai_compatible_generate_raw_reports_retry_exhaustion() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadError("[Errno 54] Connection reset by peer", request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=1,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderError, match="after 2 attempts"):
+        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
+    assert calls == 2
+
+
+def test_openai_compatible_generate_raw_does_not_retry_bad_request() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"error": {"message": "bad request"}}, request=request)
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=2,
+        retry_backoff_seconds=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderError, match="HTTP 400"):
+        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.InvalidURL("bad url"),
+        httpx.UnsupportedProtocol("unsupported protocol"),
+        httpx.LocalProtocolError("local protocol error"),
+    ],
+)
+def test_openai_compatible_generate_raw_does_not_retry_permanent_transport_errors(exc: Exception) -> None:
+    calls = 0
+
+    class FakeClient:
+        def post(self, endpoint, *, json, headers, timeout):
+            nonlocal calls
+            calls += 1
+            raise exc
+
+    provider = OpenAICompatibleProvider(
+        "model-test",
+        "https://example.test/v1/chat/completions",
+        "secret-key",
+        max_retries=2,
+        retry_backoff_seconds=0,
+        http_client=FakeClient(),
+    )
+
+    with pytest.raises(ProviderError):
+        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
+    assert calls == 1
+
+
+def test_structured_model_call_repairs_json_like_output_locally(tmp_path: Path) -> None:
+    class JsonLikeProvider:
+        name = "json_like"
+
+        def generate_raw(self, task, payload, output_model):
+            return """
+            Here is the JSON:
+            {
+              "value_points": [
+                "第一点",
+                "第二点"
+              ].join("\\n"),
+              "quote": "例如"用户喜欢甜食"。"
+            }
+            """
+
+    model, result = StructuredModelCall(
+        JsonLikeProvider(),
+        output_dir=tmp_path,
+        result_filename="provider_result.json",
+    ).run("draft_rendering", {}, JsonLikeArtifact)
+
+    assert model.value_points == "第一点\n第二点"
+    assert model.quote == '例如"用户喜欢甜食"。'
+    assert result.parse_success is True
+    assert result.json_repair_applied is True
+    report = json.loads((tmp_path / "structured_repair_report.json").read_text(encoding="utf-8"))
+    assert report["repair_count"] == 0
+    attempt = json.loads((tmp_path / "provider_results" / "attempt-1.json").read_text(encoding="utf-8"))
+    assert attempt["json_repair_applied"] is True
+
+
+def test_structured_model_call_repairs_control_chars_and_missing_string_quote_locally(tmp_path: Path) -> None:
+    class BrokenStringProvider:
+        name = "broken_string"
+
+        def generate_raw(self, task, payload, output_model):
+            return '{\n  "value_points": "第一点\n第二点",\n  "quote": "问题是什么？}\n}\n'
+
+    model, result = StructuredModelCall(
+        BrokenStringProvider(),
+        output_dir=tmp_path,
+        result_filename="provider_result.json",
+    ).run("draft_rendering", {}, JsonLikeArtifact)
+
+    assert model.value_points == "第一点\n第二点"
+    assert model.quote == "问题是什么？"
+    assert result.parse_success is True
+    assert result.json_repair_applied is True
+    report = json.loads((tmp_path / "structured_repair_report.json").read_text(encoding="utf-8"))
+    assert report["repair_count"] == 0
+
+
+def test_structured_model_call_repairs_common_field_alias_locally(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "mock"
+    fixture_dir.mkdir()
+    data = json.loads((FIXTURE / "source_digest.json").read_text(encoding="utf-8"))
+    data["designs"][0]["why_matches"] = data["designs"][0].pop("why_matters")
+    (fixture_dir / "source_digest.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    provider = ProviderRegistry().create("mock:fixture", fixture_dir=fixture_dir)
+
+    model, result = StructuredModelCall(
+        provider,
+        output_dir=tmp_path,
+        result_filename="provider_result.json",
+    ).run("source_digest", {}, SourceDigestArtifact)
+
+    assert model.designs[0].why_matters
+    assert result.schema_valid is True
+    assert result.json_repair_applied is True
+    report = json.loads((tmp_path / "structured_repair_report.json").read_text(encoding="utf-8"))
+    assert report["repair_count"] == 0
 
 
 def test_openai_compatible_live_check_can_skip_json_mode() -> None:

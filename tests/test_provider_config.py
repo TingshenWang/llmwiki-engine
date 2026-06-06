@@ -5,6 +5,11 @@ import pytest
 from llmwiki_engine.io import read_yaml, write_yaml
 from llmwiki_engine.pipeline import init_vault
 from llmwiki_engine.provider_config import ProviderConfigError, build_provider_execution_context
+from llmwiki_engine.providers import (
+    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
+    DEFAULT_OPENAI_COMPATIBLE_RETRY_BACKOFF_SECONDS,
+    OpenAICompatibleProvider,
+)
 
 
 def test_global_provider_default_and_vault_whole_step_override(tmp_path: Path) -> None:
@@ -243,6 +248,119 @@ def test_openai_compatible_context_omits_api_key(tmp_path: Path) -> None:
     assert context.record is not None
     assert "affected_steps" not in context.record.model_dump()
     assert secret not in context.record.model_dump_json()
+    runtime = context.record.providers["raw_prepare"]
+    assert runtime.max_retries == DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES
+    assert runtime.retry_backoff_seconds == DEFAULT_OPENAI_COMPATIBLE_RETRY_BACKOFF_SECONDS
+    provider = context.provider_for_task("raw_prepare")
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.max_retries == DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES
+    assert provider.retry_backoff_seconds == DEFAULT_OPENAI_COMPATIBLE_RETRY_BACKOFF_SECONDS
+
+
+def test_openai_compatible_context_keeps_retry_config_and_provider_uses_it(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+            "max_retries": 4,
+            "retry_backoff_seconds": 0.5,
+        }
+    }
+    write_yaml(config_path, config)
+
+    context = build_provider_execution_context(
+        vault=vault,
+        manifest_contexts=[],
+        fixture_dir=None,
+        source="initial_run",
+        from_step=None,
+        tasks=["raw_prepare"],
+    )
+
+    assert context.record is not None
+    runtime = context.record.providers["raw_prepare"]
+    assert runtime.max_retries == 4
+    assert runtime.retry_backoff_seconds == 0.5
+    provider = context.provider_for_task("raw_prepare")
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.max_retries == 4
+    assert provider.retry_backoff_seconds == 0.5
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("max_retries", -1, "Invalid provider max_retries"),
+        ("max_retries", 1.5, "Invalid provider max_retries"),
+        ("max_retries", True, "Invalid provider max_retries"),
+        ("retry_backoff_seconds", -0.1, "Invalid provider retry_backoff_seconds"),
+        ("retry_backoff_seconds", "1", "Invalid provider retry_backoff_seconds"),
+        ("retry_backoff_seconds", False, "Invalid provider retry_backoff_seconds"),
+    ],
+)
+def test_openai_compatible_rejects_invalid_retry_config(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected: str,
+) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+            field: value,
+        }
+    }
+    write_yaml(config_path, config)
+
+    with pytest.raises(ProviderConfigError, match=expected):
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=None,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
+
+
+@pytest.mark.parametrize("spec", ["mock:fixture", "human"])
+def test_non_openai_providers_reject_retry_config(tmp_path: Path, spec: str) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": spec,
+            "max_retries": 1,
+        }
+    }
+    if spec == "mock:fixture":
+        fixture_dir = tmp_path / "mock"
+        fixture_dir.mkdir()
+        config["providers"]["default"]["fixture_dir"] = fixture_dir.as_posix()
+    write_yaml(config_path, config)
+
+    with pytest.raises(ProviderConfigError, match="does not support .*max_retries"):
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=None,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
 
 
 def test_endpoint_guard_rejects_userinfo_and_secret_query(tmp_path: Path) -> None:

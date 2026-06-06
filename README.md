@@ -20,6 +20,7 @@ drafts, and produces an apply preview:
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
+llmwiki ingest raw-prepare-check /path/to/vault raw/project_note.md
 llmwiki ingest run /path/to/vault raw/project_note.md --fixture-dir tests/fixtures/simple_project/mock
 llmwiki providers check /path/to/vault
 llmwiki ingest status /path/to/vault <operation_id>
@@ -37,7 +38,11 @@ and drafts can be tested before real models are introduced.
   wikilinks such as `[[Page]]` and `[[Page|Alias]]`; web links, Markdown links,
   media embeds, and code blocks are preserved.
 - `raw_prepare` turns original raw material into the canonical prepared raw used
-  by downstream knowledge compilation.
+  by downstream knowledge compilation. Before a run, use
+  `llmwiki ingest raw-prepare-check` to preview whether auto and the selected
+  policy will call model cleanup under the current provider; use
+  `--skip-prepare` for human-audited Markdown and `--force-prepare` for
+  low-quality ASR/translated transcripts.
 - `source_digest` is the complete single-source digestion artifact used for
   human review of candidate knowledge.
 - `candidate_resolution` plans wiki topics from the approved prepared text and
@@ -56,9 +61,10 @@ and drafts can be tested before real models are introduced.
 Provider selection is configured in YAML. A vault can use local
 `.llmwiki/config.yaml`, while shared provider defaults can live in
 `~/.llmwiki/config.yaml`. Each operation records a sanitized provider context
-for the current execution. Provider records keep only `spec`, `endpoint`, and
-`fixture_dir`; plaintext API keys are allowed only in config files and are never
-written to run artifacts, status JSON, receipts, or CLI output.
+for the current execution. Provider records keep only non-secret fields such as
+`spec`, `endpoint`, `fixture_dir`, `max_retries`, and
+`retry_backoff_seconds`; plaintext API keys are allowed only in config files and
+are never written to run artifacts, status JSON, receipts, or CLI output.
 
 ```yaml
 providers:
@@ -66,6 +72,8 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
+    max_retries: 2
+    retry_backoff_seconds: 1.0
   source_digest:
     spec: mock:fixture
     fixture_dir: tests/fixtures/simple_project/mock
@@ -78,16 +86,23 @@ llmwiki providers check /path/to/vault
 llmwiki providers check /path/to/vault --live
 ```
 
-`--live` sends a small real-model probe. For thinking models it uses a
-`max_tokens=512` completion cap and prefers JSON mode, then falls back to a
-prompt-only JSON probe with a warning when JSON mode is clearly unsupported.
+`--live` sends a small JSON-mode real-model probe, then falls back once to a
+prompt-only JSON probe with a warning when JSON mode is clearly unsupported. It
+does not use transient retry. Normal ingest calls retry transient
+OpenAI-compatible provider failures such as timeouts, connection resets, 429,
+408/409/425, and 5xx responses; `max_retries` is one shared transient retry
+budget per logical model call. JSON-mode compatibility fallback may add a
+prompt-only request and uses only the remaining retry budget.
 
 Embedding retrieval is configured in `.llmwiki/config.json`, not provider YAML.
 New vaults default to local CPU `sentence_transformers` with
 `Qwen/Qwen3-Embedding-0.6B`; install it with `uv sync --extra embedding`.
 Model files are cached globally under `~/.llmwiki/cache/embeddings` so multiple
-vaults can share the same download. Mock/fixture runs use an exact lexical
-retriever and do not download embedding models.
+vaults can share the same download. By default retrieval loads embeddings from
+the local cache only (`local_files_only: true`), which keeps hand-tests from
+making background HF Hub requests; set it to `false` only for an explicit
+download-enabled run. Mock/fixture runs use an exact lexical retriever and do not
+download embedding models.
 
 Plain `llmwiki ingest resume` reads the current merged provider config for
 model-backed steps that still need to execute. Completed steps are not rerun just

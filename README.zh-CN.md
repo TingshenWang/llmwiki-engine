@@ -18,6 +18,7 @@ digest 做候选页面规划、冻结带本地 embedding 召回证据的 wiki co
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
+llmwiki ingest raw-prepare-check /path/to/vault raw/project_note.md
 llmwiki ingest run /path/to/vault raw/project_note.md --fixture-dir tests/fixtures/simple_project/mock
 llmwiki providers check /path/to/vault
 llmwiki ingest status /path/to/vault <operation_id>
@@ -34,6 +35,9 @@ llmwiki ingest apply /path/to/vault <operation_id>
 - `raw/` 是规范化材料层。MVP 只展开 `[[Page]]`、`[[Page|Alias]]` 这类
   Obsidian 文本 wikilink；网页链接、Markdown 链接、媒体 embed 和代码块保持不变。
 - `raw_prepare` 将规范化后的 raw 转换为下游知识编译使用的 canonical prepared raw。
+  运行前可用 `llmwiki ingest raw-prepare-check` 按当前 provider 预览 auto/selected policy
+  是否会调用模型清洗；对已经人工校对的 Markdown 可在 run/resume 时使用 `--skip-prepare`，
+  对低质量 ASR/翻译稿可使用 `--force-prepare`。
 - `source_digest` 是单篇 raw 的完整消化文件，用于人工审核候选知识。
 - `candidate_resolution` 基于 approved prepared 全文和 digest 规划 wiki 选题；
   `wiki_context_snapshot` 会为每个计划页召回最相关的已有 wiki 页面；
@@ -49,9 +53,9 @@ llmwiki ingest apply /path/to/vault <operation_id>
 Provider 使用 YAML 配置。单个 vault 可以使用 `.llmwiki/config.yaml`，共享的
 provider 默认配置可以放在 `~/.llmwiki/config.yaml`。每个 operation 会记录本次执行
 解析出的 sanitized provider context；每一步实际用了什么 provider 由 step attempt
-记录。Provider 记录只保留 `spec`、`endpoint`、
-`fixture_dir`；明文 API key 只允许存在于 config 文件，不会写入运行 artifacts、
-status JSON、applied receipt 或 CLI 输出。
+记录。Provider 记录只保留 `spec`、`endpoint`、`fixture_dir`、`max_retries`、
+`retry_backoff_seconds` 等非密文字段；明文 API key 只允许存在于 config 文件，不会写入运行
+artifacts、status JSON、applied receipt 或 CLI 输出。
 
 ```yaml
 providers:
@@ -59,6 +63,8 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
+    max_retries: 2
+    retry_backoff_seconds: 1.0
   source_digest:
     spec: mock:fixture
     fixture_dir: tests/fixtures/simple_project/mock
@@ -71,15 +77,19 @@ llmwiki providers check /path/to/vault
 llmwiki providers check /path/to/vault --live
 ```
 
-`--live` 会发起一次小型真实模型探针。面向 thinking 模型时，它使用
-`max_tokens=512` 的 completion 上限，并优先使用 JSON mode；如果 API 明确不支持
-JSON mode，则 fallback 到 prompt-only JSON probe，并给出 warning。
+`--live` 会发起一次小型 JSON-mode 真实模型探针；如果 API 明确不支持 JSON mode，
+则 fallback 一次到 prompt-only JSON probe，并给出 warning。它不会使用 transient
+retry。正式 ingest 调用会对 OpenAI-compatible provider 的超时、连接重置、408/409/425/429
+和 5xx 做 transient retry；`max_retries` 是每个逻辑模型调用共享的一组
+retry budget。JSON-mode 兼容 fallback 可能额外增加一次 prompt-only 请求，但只使用剩余
+retry budget。
 
 Embedding 召回配置写在 `.llmwiki/config.json`，不写在 provider YAML 里。新 vault
 默认使用本地 CPU `sentence_transformers` + `Qwen/Qwen3-Embedding-0.6B`；安装方式是
 `uv sync --extra embedding`。模型文件默认缓存在 `~/.llmwiki/cache/embeddings`，
-多个 vault 共用同一份下载。Mock/fixture run 会使用 exact lexical retriever，不会下载
-embedding 模型。
+多个 vault 共用同一份下载。默认只从本地缓存加载 embedding（`local_files_only: true`），
+避免手测时后台访问 HF Hub；只有明确需要下载模型时才把它改成 `false`。Mock/fixture run
+会使用 exact lexical retriever，不会下载 embedding 模型。
 
 普通 `llmwiki ingest resume` 会为仍需执行的模型步骤读取当前合并后的 provider
 配置。已经完成的 step 不会因为 config 改变自动重跑。

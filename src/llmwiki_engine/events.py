@@ -48,7 +48,8 @@ class EventLogger:
             provider = data.get("provider_spec")
             if data.get("model_backed"):
                 suffix = f" ({provider})" if provider else ""
-                self.console.print(f"[cyan]{self.operation_id}[/] 模型处理中: {step}{suffix} ...")
+                label = "模型/本地处理中" if data.get("may_use_local_shortcut") else "模型处理中"
+                self.console.print(f"[cyan]{self.operation_id}[/] {label}: {step}{suffix} ...")
             else:
                 self.console.print(f"[cyan]{self.operation_id}[/] 本地处理中: {step} ...")
         elif event == "completed":

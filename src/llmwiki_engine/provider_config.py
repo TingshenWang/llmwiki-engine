@@ -9,7 +9,12 @@ import yaml
 
 from .io import read_yaml
 from .models import ProviderContextRecord, ProviderRuntimeSpec
-from .providers import Provider, ProviderRegistry
+from .providers import (
+    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
+    DEFAULT_OPENAI_COMPATIBLE_RETRY_BACKOFF_SECONDS,
+    Provider,
+    ProviderRegistry,
+)
 from .redaction import Redactor
 from .steps import MODEL_BACKED_STEPS, PROVIDER_CONFIG_KEYS
 
@@ -46,12 +51,14 @@ class ProviderExecutionContext:
             fixture_dir=fixture_dir,
             endpoint=runtime.endpoint,
             api_key=self.credentials_by_task.get(task),
+            max_retries=runtime.max_retries,
+            retry_backoff_seconds=runtime.retry_backoff_seconds,
             http_client=http_client,
         )
 
 
 SECRET_QUERY_KEYS = {"api_key", "key", "token", "access_token", "authorization"}
-PROVIDER_RUNTIME_KEYS = {"spec", "endpoint", "api_key", "fixture_dir"}
+PROVIDER_RUNTIME_KEYS = {"spec", "endpoint", "api_key", "fixture_dir", "max_retries", "retry_backoff_seconds"}
 
 
 def global_config_path() -> Path:
@@ -159,6 +166,7 @@ def build_provider_execution_context(
     vault: Path,
     manifest_contexts: list[ProviderContextRecord],
     fixture_dir: Path | None,
+    mock_fixture_dir: Path | None = None,
     source: Literal["initial_run", "resume_current_config"],
     from_step: str | None,
     tasks: list[str],
@@ -168,14 +176,21 @@ def build_provider_execution_context(
     secrets: list[str] = _api_keys_from_entries(entries)
     providers: dict[str, ProviderRuntimeSpec] = {}
     credentials_by_task: dict[str, str] = {}
+    resolved_mock_fixture_dir = mock_fixture_dir.resolve() if mock_fixture_dir is not None else None
+    if resolved_mock_fixture_dir is not None and not resolved_mock_fixture_dir.is_dir():
+        raise ProviderConfigError(f"mock fixture_dir does not exist: {resolved_mock_fixture_dir}")
     for task in tasks:
-        entry = provider_entry_for_task(entries, task)
-        runtime, credential = provider_runtime_spec_for_task(
-            task,
-            entry,
-            fixture_dir=fixture_dir,
-            require_mock_fixture=require_mock_fixture,
-        )
+        if resolved_mock_fixture_dir is not None:
+            runtime = ProviderRuntimeSpec(spec="mock:fixture", fixture_dir=resolved_mock_fixture_dir.as_posix())
+            credential = None
+        else:
+            entry = provider_entry_for_task(entries, task)
+            runtime, credential = provider_runtime_spec_for_task(
+                task,
+                entry,
+                fixture_dir=fixture_dir,
+                require_mock_fixture=require_mock_fixture,
+            )
         providers[task] = runtime
         if credential is not None:
             credentials_by_task[task] = credential
@@ -204,6 +219,8 @@ def provider_runtime_spec_for_task(
     endpoint = None
     api_key = None
     config_fixture_dir = None
+    max_retries = None
+    retry_backoff_seconds = None
     if isinstance(value, dict):
         unknown = set(value) - PROVIDER_RUNTIME_KEYS
         if unknown:
@@ -213,6 +230,8 @@ def provider_runtime_spec_for_task(
         endpoint = value.get("endpoint")
         api_key = value.get("api_key")
         config_fixture_dir = value.get("fixture_dir")
+        max_retries = value.get("max_retries")
+        retry_backoff_seconds = value.get("retry_backoff_seconds")
     else:
         spec = value
     if not isinstance(spec, str) or not spec:
@@ -225,6 +244,13 @@ def provider_runtime_spec_for_task(
     _validate_optional_string(entry, task, endpoint, f"Invalid provider endpoint for task: {task}")
     _validate_optional_string(entry, task, api_key, f"Invalid provider api_key for task: {task}")
     _validate_optional_string(entry, task, config_fixture_dir, f"Invalid provider fixture_dir for task: {task}")
+    _validate_optional_nonnegative_int(entry, task, max_retries, f"Invalid provider max_retries for task: {task}")
+    _validate_optional_nonnegative_number(
+        entry,
+        task,
+        retry_backoff_seconds,
+        f"Invalid provider retry_backoff_seconds for task: {task}",
+    )
 
     if provider_name == "openai_compatible":
         if not separator or not model:
@@ -238,21 +264,43 @@ def provider_runtime_spec_for_task(
         if not api_key:
             raise _provider_error(entry, task, f"openai_compatible provider for {task} requires api_key.")
         validate_endpoint(endpoint, task, entry=entry)
-        return ProviderRuntimeSpec(spec=spec, endpoint=endpoint), api_key
+        effective_max_retries = max_retries if max_retries is not None else DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES
+        effective_retry_backoff_seconds = (
+            float(retry_backoff_seconds)
+            if retry_backoff_seconds is not None
+            else DEFAULT_OPENAI_COMPATIBLE_RETRY_BACKOFF_SECONDS
+        )
+        return (
+            ProviderRuntimeSpec(
+                spec=spec,
+                endpoint=endpoint,
+                max_retries=effective_max_retries,
+                retry_backoff_seconds=effective_retry_backoff_seconds,
+            ),
+            api_key,
+        )
 
     if provider_name == "human":
         if separator:
             raise _provider_error(entry, task, f"human provider for {task} must use spec: human.")
-        if endpoint is not None or api_key is not None or config_fixture_dir is not None:
+        if (
+            endpoint is not None
+            or api_key is not None
+            or config_fixture_dir is not None
+            or max_retries is not None
+            or retry_backoff_seconds is not None
+        ):
             raise _provider_error(
                 entry,
                 task,
-                f"human provider for {task} does not support endpoint, api_key, or fixture_dir.",
+                f"human provider for {task} does not support endpoint, api_key, fixture_dir, max_retries, or retry_backoff_seconds.",
             )
         return ProviderRuntimeSpec(spec=spec), None
 
     if endpoint is not None or api_key is not None:
         raise _provider_error(entry, task, f"mock provider for {task} does not support endpoint or api_key.")
+    if max_retries is not None or retry_backoff_seconds is not None:
+        raise _provider_error(entry, task, f"mock provider for {task} does not support max_retries or retry_backoff_seconds.")
     resolved_fixture_dir = None
     if fixture_dir is not None:
         resolved_fixture_dir = fixture_dir.resolve()
@@ -286,6 +334,20 @@ def validate_endpoint(endpoint: str, task: str, *, entry: ProviderConfigEntry | 
 
 def _validate_optional_string(entry: ProviderConfigEntry, task: str, value: Any, message: str) -> None:
     if value is not None and not isinstance(value, str):
+        raise _provider_error(entry, task, message)
+
+
+def _validate_optional_nonnegative_int(entry: ProviderConfigEntry, task: str, value: Any, message: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _provider_error(entry, task, message)
+
+
+def _validate_optional_nonnegative_number(entry: ProviderConfigEntry, task: str, value: Any, message: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
         raise _provider_error(entry, task, message)
 
 

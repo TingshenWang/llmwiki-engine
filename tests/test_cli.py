@@ -7,17 +7,32 @@ from typer.testing import CliRunner
 
 import llmwiki_engine.cli as cli_module
 from llmwiki_engine.cli import app
+from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
-from llmwiki_engine.models import RunMode
+from llmwiki_engine.models import RawPreparePolicy, RunMode
 from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, latest_operation, run_simplified_ingest
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
+from llmwiki_engine.raw_import import ArxivRawImportItem, ArxivRawImportReport, RawUrlImportResult
 from llmwiki_engine.steps import STEP_NAMES
 from llmwiki_engine.workspace import RunStore, WorkspaceError
 
 
 ROOT = Path(__file__).parent
 FIXTURE_ROOT = ROOT / "fixtures" / "simple_project"
+
+
+def configure_openai_provider(vault: Path) -> None:
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
 
 
 def test_status_verify_exit_codes(tmp_path: Path) -> None:
@@ -31,18 +46,92 @@ def test_status_verify_exit_codes(tmp_path: Path) -> None:
     assert "Review" in ok.output
     assert "Attempts" in ok.output
     assert "Last Duration" in ok.output
-    assert "Total Duration" in ok.output
+    assert "Attempt Total" in ok.output
+    assert "duration note" in ok.output
     assert "Provider" in ok.output
     assert "prepared_raw_review" in ok.output
     assert "source_digest_review" in ok.output
+    assert "current_model_calls" in ok.output
+    assert "current_attempt_duration" in ok.output
+    assert "current_model_duration" in ok.output
+    assert "current_payload_chars" in ok.output
+    assert "largest_payload_step" in ok.output
+    assert "bottlenecks:" in ok.output
+    assert "draft_rendering" in ok.output
+    assert "candidates=" in ok.output
+    assert "deduped=" in ok.output
+    assert "deferred=" in ok.output
     assert "raw cleanup" in ok.output
+    assert "run metrics" in ok.output
+    assert "global applied receipt log path" in ok.output
+    assert "current operation receipt: `not found yet`" in ok.output
+    assert ".llmwiki/applied/operations.jsonl" in _compact_output(ok.output)
     assert ok.output.count("auto_stub/approved (auto-approved)") >= 2
+    batch_report = RunStore(vault).run_dir(manifest.operation_id) / "draft_rendering" / "draft_rendering_batch_report.md"
+    batch_report.write_text("# Draft Rendering Batches\n", encoding="utf-8")
+    batch_hint = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])
+    assert batch_hint.exit_code == 0
+    assert "draft batches" in batch_hint.output
     raw_json = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--json"])
     assert json.loads(raw_json.output)["operation_id"] == manifest.operation_id
+    inspect_json = runner.invoke(app, ["ingest", "inspect", str(vault), manifest.operation_id, "--json"])
+    assert inspect_json.exit_code == 0
+    inspect_payload = json.loads(inspect_json.output)
+    assert inspect_payload["operation_id"] == manifest.operation_id
+    assert inspect_payload["operation_status"] == manifest.status.value
+    assert inspect_payload["run_mode"] == manifest.run_mode.value
+    assert inspect_payload["metrics"]["internal_model_call_count"] >= 0
+    assert inspect_payload["next_action"]
+    inspect_hints = {item["label"]: item for item in inspect_payload["artifact_hints"]}
+    assert inspect_hints["manifest"]["exists"] is True
+    assert inspect_hints["run_metrics"]["exists"] is True
+    assert inspect_hints["candidate_budget"]["exists"] is True
+    assert inspect_hints["candidate_budget"]["path"].endswith("/source_digest/source_digest_budget_report.md")
+    assert inspect_hints["draft_review"]["path"].endswith("/draft_review/review_prompt.md")
+    assert inspect_payload["current_operation_receipt_exists"] is False
+    assert inspect_payload["applied_receipt_log"].endswith("/.llmwiki/applied/operations.jsonl")
+    inspect_table = runner.invoke(app, ["ingest", "inspect", str(vault), manifest.operation_id])
+    assert inspect_table.exit_code == 0
+    assert "Ingest inspect" in inspect_table.output
+    assert "artifact_hints" in inspect_table.output
     digest = RunStore(vault).run_dir(manifest.operation_id) / "source_digest" / "source_digest.json"
     digest.write_text(digest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     drift = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--verify"])
     assert drift.exit_code == 3
+
+
+def test_ingest_run_json_with_mock_fixture_is_pure_json(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "run",
+            str(vault),
+            str(raw),
+            "--mock-fixture-dir",
+            str(FIXTURE_ROOT / "mock"),
+            "--slug",
+            "run-json-real",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["operation_id"]
+    assert payload["operation_status"] in {"awaiting_review", "drafted"}
+    assert payload["run_mode"] == RunMode.dev.value
+    assert payload["raw_bindings"][0]["relative_path"] == "raw/raw_project_note.md"
+    assert payload["metrics"]["internal_model_call_count"] >= 0
+    hints = {item["label"]: item for item in payload["artifact_hints"]}
+    assert hints["manifest"]["exists"] is True
+    assert hints["run_metrics"]["exists"] is True
+    assert hints["draft_review"]["path"].endswith("/draft_review/review_prompt.md")
 
 
 def test_resume_refresh_providers_option_is_removed(tmp_path: Path) -> None:
@@ -55,6 +144,169 @@ def test_resume_refresh_providers_option_is_removed(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert "No such option" in result.output
     assert "Traceback" not in result.output
+
+
+def test_ingest_run_reports_awaiting_review_instead_of_ready(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: 知识编译工程骨架\n"
+        "aliases: []\n"
+        "summary: 已有摘要。\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# 知识编译工程骨架\n\n"
+        "## 详情\n\n"
+        "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。\n",
+        encoding="utf-8",
+    )
+    fixture_dir = tmp_path / "grounding-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "draft_rendering.json":
+            data["pages"][0]["section_bodies"]["detail"] += "\n\n该方案被多个社区引用。"
+        write_json(fixture_dir / name, data)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "run",
+            str(vault),
+            str(raw),
+            "--fixture-dir",
+            str(fixture_dir),
+            "--slug",
+            "awaiting-review",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Operation awaiting review" in result.output
+    assert "draft_review" in result.output
+    assert "Operation ready" not in result.output
+
+
+def test_run_mock_fixture_dir_forces_mock_provider_over_live_config(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:should-not-be-used",
+            "endpoint": "https://example.invalid/v1/chat/completions",
+            "api_key": "sk-should-not-be-used",
+        }
+    }
+    write_yaml(config_path, config)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "run",
+            str(vault),
+            str(raw),
+            "--mock-fixture-dir",
+            str(FIXTURE_ROOT / "mock"),
+            "--slug",
+            "forced-mock",
+        ],
+    )
+
+    assert result.exit_code == 0
+    operation_id = latest_operation(vault)
+    assert operation_id is not None
+    manifest = read_json(RunStore(vault).manifest_path(operation_id))
+    providers = manifest["provider_contexts"][0]["providers"]
+    assert providers
+    assert {runtime["spec"] for runtime in providers.values()} == {"mock:fixture"}
+    assert {runtime["fixture_dir"] for runtime in providers.values()} == {(FIXTURE_ROOT / "mock").resolve().as_posix()}
+
+
+def test_run_rejects_fixture_dir_and_mock_fixture_dir_together(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "run",
+            str(vault),
+            str(raw),
+            "--fixture-dir",
+            str(FIXTURE_ROOT / "mock"),
+            "--mock-fixture-dir",
+            str(FIXTURE_ROOT / "mock"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Use either --fixture-dir or --mock-fixture-dir" in result.output
+
+
+def test_run_passes_skip_prepare_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    raw = tmp_path / "raw.md"
+    raw.write_text("# Raw\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def fake_run_simplified_ingest(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "run_simplified_ingest", fake_run_simplified_ingest)
+    monkeypatch.setattr(cli_module, "_print_operation_outcome", lambda manifest: None)
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), "--skip-prepare"])
+
+    assert result.exit_code == 0
+    assert seen["raw_prepare_policy"] == RawPreparePolicy.skip_model
+
+
+def test_status_labels_skip_prepare_as_local_provider(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=FIXTURE_ROOT / "mock",
+        slug="skip-prepare-status",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])
+
+    assert result.exit_code == 0
+    assert "local:skip_prepare" in result.output
+    assert "openai_compatible" not in next(line for line in result.output.splitlines() if "raw_prepare" in line)
+
+
+def test_run_rejects_skip_prepare_and_force_prepare_together(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    raw = tmp_path / "raw.md"
+    raw.write_text("# Raw\n", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), "--skip-prepare", "--force-prepare"])
+
+    assert result.exit_code != 0
+    assert "Use either --skip-prepare or --force-prepare" in result.output
 
 
 def test_resume_invalid_from_step_reports_single_line_error(tmp_path: Path) -> None:
@@ -196,6 +448,798 @@ def test_standard_status_does_not_prompt_manual_apply(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "standard mode does not allow manual apply in this MVP" in result.output
     assert "llmwiki ingest apply" not in result.output
+
+
+def test_raw_candidates_reports_unprocessed_changed_and_duplicate_hash(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    processed = vault / "raw" / "processed.md"
+    changed = vault / "raw" / "changed.md"
+    duplicate = vault / "raw" / "duplicate.md"
+    unprocessed = vault / "raw" / "unprocessed.md"
+    hidden = vault / "raw" / ".hidden.md"
+    raw_log = vault / "raw" / "log" / "日志_2026-06-06.md"
+    processed.write_text("# Processed\n\nsame content\n", encoding="utf-8")
+    changed.write_text("# Changed\n\nnew content\n", encoding="utf-8")
+    duplicate.write_text(processed.read_text(encoding="utf-8"), encoding="utf-8")
+    unprocessed.write_text("# New\n\nnew candidate\n", encoding="utf-8")
+    hidden.write_text("# Hidden\n\nignored\n", encoding="utf-8")
+    raw_log.parent.mkdir(parents=True, exist_ok=True)
+    raw_log.write_text("# Raw log\n\nignored\n", encoding="utf-8")
+    source = vault / "wiki" / "sources" / "来源_existing.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "---\n"
+        "llmwiki_type: source\n"
+        "title: Existing\n"
+        "aliases: []\n"
+        "summary: Existing source.\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-01\n"
+        "source_raw_paths:\n"
+        "  - raw/processed.md\n"
+        "  - raw/changed.md\n"
+        "source_raw_hashes:\n"
+        f"  - {sha256_file(processed)}\n"
+        "  - old-changed-hash\n"
+        "source_operation_ids:\n"
+        "  - ING-old\n"
+        "---\n\n"
+        "# Existing\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--json"])
+
+    assert result.exit_code == 0
+    report = json.loads(result.output)
+    statuses = {Path(item["raw_path"]).name: item["status"] for item in report["items"]}
+    assert statuses == {
+        "unprocessed.md": "unprocessed",
+        "changed.md": "changed",
+        "duplicate.md": "duplicate_hash",
+    }
+    assert report["processed_count"] == 1
+    assert report["changed_count"] == 1
+    assert report["duplicate_hash_count"] == 1
+    assert report["unprocessed_count"] == 1
+    assert report["total_raw_files"] == 4
+    changed_item = next(item for item in report["items"] if item["raw_path"] == "raw/changed.md")
+    assert changed_item["matched_by"] == "path"
+    assert changed_item["operation_ids"] == ["ING-old"]
+    duplicate_item = next(item for item in report["items"] if item["raw_path"] == "raw/duplicate.md")
+    assert duplicate_item["matched_by"] == "hash"
+    assert duplicate_item["source_pages"] == ["wiki/sources/来源_existing.md"]
+
+
+def test_raw_candidates_reports_duplicate_imported_url(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    first = vault / "raw" / "a-paper.md"
+    second = vault / "raw" / "b-paper.md"
+    first.write_text(
+        "# Paper\n\n"
+        "Imported from: https://arxiv.org/abs/2507.21504\n"
+        "Fetched URL: https://arxiv.org/html/2507.21504\n"
+        "Final URL: https://arxiv.org/html/2507.21504\n\n"
+        "---\n\n"
+        "first version\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "# Paper\n\n"
+        "Imported from: https://arxiv.org/pdf/2507.21504.pdf\n"
+        "Fetched URL: https://arxiv.org/html/2507.21504\n"
+        "Final URL: https://arxiv.org/html/2507.21504\n\n"
+        "---\n\n"
+        "second version with a different content hash\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault)])
+
+    assert result.exit_code == 0
+    report = json.loads(result.output)
+    statuses = {Path(item["raw_path"]).name: item["status"] for item in report["items"]}
+    assert statuses == {"a-paper.md": "unprocessed", "b-paper.md": "duplicate_url"}
+    assert report["unprocessed_count"] == 1
+    assert report["duplicate_url_count"] == 1
+    duplicate_item = next(item for item in report["items"] if item["raw_path"] == "raw/b-paper.md")
+    assert duplicate_item["matched_by"] == "url"
+    assert "raw/a-paper.md" in duplicate_item["reason"]
+    assert table_result.exit_code == 0
+    assert "duplicate_url=1" in _compact_output(table_result.output)
+
+
+def test_cli_reference_raw_import_overview_matches_current_flags() -> None:
+    for doc_path in [
+        Path("docs/cli-reference.en.md"),
+        Path("docs/cli-reference.zh-CN.md"),
+    ]:
+        lines = doc_path.read_text(encoding="utf-8").splitlines()
+        raw_url_line = next(line for line in lines if line.startswith("llmwiki ingest raw-import-url "))
+        arxiv_line = next(line for line in lines if line.startswith("llmwiki ingest raw-import-arxiv "))
+
+        assert "--output PATH" in raw_url_line
+        assert "--dedupe-url|--no-dedupe-url" in raw_url_line
+        assert "--arxiv-html|--no-arxiv-html" in raw_url_line
+        assert "--slug" not in raw_url_line
+        assert "--format" not in raw_url_line
+
+        assert "--limit N" in arxiv_line
+        assert "--sort-by VALUE" in arxiv_line
+        assert "--min-relevance-score N" in arxiv_line
+        assert "--max-results" not in arxiv_line
+
+
+def test_raw_prepare_check_reports_clean_markdown_fast_path(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    configure_openai_provider(vault)
+    raw = vault / "raw" / "clean.md"
+    raw.write_text("# Clean\n\n这是一篇结构清楚、无需模型清洗的 Markdown。\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "raw_prepare_diagnostic.v1"
+    assert payload["provider"]["fast_path_allowed"] is True
+    assert payload["auto_report"]["eligible"] is True
+    assert payload["recommendation"]["decision"] == "auto_deterministic_fast_path"
+    assert payload["recommendation"]["estimated_model_prepare"] is False
+    assert table_result.exit_code == 0
+    assert "auto_deterministic_fast_path" in table_result.output
+    assert "estimated_model_prepare" in table_result.output
+
+
+def test_raw_prepare_check_does_not_initialize_uninitialized_vault(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    raw = vault / "raw" / "clean.md"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("# Clean\n\n未初始化 vault 中的 raw。\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
+
+    assert result.exit_code != 0
+    assert not (vault / ".llmwiki").exists()
+    assert not (vault / ".gitignore").exists()
+
+
+def test_raw_prepare_check_does_not_create_run_or_rewrite_gitignore(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    configure_openai_provider(vault)
+    raw = vault / "raw" / "clean.md"
+    raw.write_text("# Clean\n\n结构清楚的 Markdown。\n", encoding="utf-8")
+    gitignore = vault / ".gitignore"
+    before_gitignore = gitignore.read_text(encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
+
+    assert result.exit_code == 0
+    assert gitignore.read_text(encoding="utf-8") == before_gitignore
+    assert list((vault / ".llmwiki" / "runs" / "ingest").iterdir()) == []
+    assert (vault / ".llmwiki" / "applied" / "operations.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_raw_prepare_check_respects_provider_fast_path_gate(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    config = read_yaml(vault / ".llmwiki" / "config.yaml")
+    config["providers"] = {"default": "mock:fixture"}
+    write_yaml(vault / ".llmwiki" / "config.yaml", config)
+    raw = vault / "raw" / "clean.md"
+    raw.write_text("# Clean\n\n这是一篇结构清楚的 Markdown，但默认 mock provider 不能走 auto fast-path。\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["provider"]["raw_prepare_spec"] == "mock:fixture"
+    assert payload["provider"]["fast_path_allowed"] is False
+    assert payload["provider"]["diagnostic_requires_fixture"] is True
+    assert payload["auto_report"]["eligible"] is False
+    assert payload["auto_report"]["reasons"] == ["configured provider is not eligible for deterministic fast-path"]
+    assert payload["recommendation"]["decision"] == "auto_provider_prepare_required"
+    assert payload["recommendation"]["estimated_model_prepare"] is True
+    assert table_result.exit_code == 0
+    assert "provider_fast_path" in table_result.output
+    assert "provider note: mock raw_prepare will require" in table_result.output
+
+
+def test_raw_prepare_check_provider_gate_still_surfaces_raw_hard_blockers(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    config = read_yaml(vault / ".llmwiki" / "config.yaml")
+    config["providers"] = {"default": "mock:fixture"}
+    write_yaml(vault / ".llmwiki" / "config.yaml", config)
+    raw = vault / "raw" / "empty.md"
+    raw.write_text("", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["auto_report"]["reasons"] == ["configured provider is not eligible for deterministic fast-path"]
+    assert payload["auto_report"]["raw_hard_blockers"] == ["raw text is empty"]
+    assert payload["auto_report"]["raw_fast_path_report"]["reasons"] == ["raw text is empty"]
+    assert payload["recommendation"]["raw_hard_blockers"] == ["raw text is empty"]
+    assert table_result.exit_code == 0
+    assert "auto blockers: configured provider is not eligible for deterministic fast-path" in table_result.output
+    assert "raw hard blockers: raw text is empty" in table_result.output
+
+
+def test_raw_prepare_check_recommends_model_for_translated_podcast_markdown(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    configure_openai_provider(vault)
+    raw = vault / "raw" / "podcast.md"
+    raw.write_text(
+        "# Cat Wu 访谈（中文翻译）\n\n"
+        "source https://www.youtube.com/watch?v=demo\n\n"
+        "![cover](cover.png)\n\n"
+        "## 访谈全文\n\n"
+        "这是一份 podcast 视频转写再翻译的文本。\n\n"
+        "### 产品速度\n\n"
+        "主持人和嘉宾讨论 AI 产品团队如何快速发布。\n\n"
+        "### Eval\n\n"
+        "他们讨论评估如何帮助产品经理判断质量。\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
+    skip_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare", "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["auto_report"]["eligible"] is False
+    assert payload["auto_report"]["noise_profile"]["transcript_provenance_risk"] is True
+    assert payload["recommendation"]["decision"] == "auto_model_prepare_recommended"
+    assert payload["recommendation"]["skip_prepare_available"] is True
+    assert "structured markdown looks like noisy ASR or translated transcript" in payload["auto_report"]["reasons"]
+    assert skip_result.exit_code == 0
+    skip_payload = json.loads(skip_result.output)
+    assert skip_payload["selected_policy"] == RawPreparePolicy.skip_model.value
+    assert skip_payload["selected_report"]["eligible"] is True
+    assert skip_payload["recommendation"]["auto_estimated_model_prepare"] is True
+    assert skip_payload["recommendation"]["selected_estimated_model_prepare"] is False
+    assert skip_payload["recommendation"]["estimated_model_prepare"] is False
+    assert set(skip_payload["selected_report"]["policy_suppressed_reasons"]) == {
+        "structured markdown looks like noisy ASR or translated transcript",
+        "raw contains markdown media embeds",
+        "raw contains interview/transcript section markers",
+    }
+    assert table_result.exit_code == 0
+    assert "--skip-prepare would suppress" in table_result.output
+    assert "markdown_media_embeds" in table_result.output
+    skip_table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare"])
+    assert skip_table_result.exit_code == 0
+    assert "--skip-prepare`" in skip_table_result.output
+
+
+def test_raw_prepare_check_skip_unavailable_omits_skip_next_command(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    configure_openai_provider(vault)
+    raw = vault / "raw" / "empty.md"
+    raw.write_text("", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare", "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["selected_policy"] == RawPreparePolicy.skip_model.value
+    assert payload["selected_report"]["eligible"] is False
+    assert payload["selected_report"]["reasons"] == ["raw text is empty"]
+    assert payload["recommendation"]["selected_estimated_model_prepare"] is True
+    assert table_result.exit_code == 0
+    assert "selected blockers: raw text is empty" in table_result.output
+    assert "--skip-prepare`" not in table_result.output
+
+
+def test_raw_candidates_all_includes_processed_and_table_gives_next_command(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    processed = vault / "raw" / "processed.md"
+    unprocessed = vault / "raw" / "unprocessed.md"
+    processed.write_text("# Processed\n", encoding="utf-8")
+    unprocessed.write_text("# Unprocessed\n", encoding="utf-8")
+    source = vault / "wiki" / "sources" / "来源_existing.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "---\n"
+        "llmwiki_type: source\n"
+        "title: Existing\n"
+        "aliases: []\n"
+        "summary: Existing source.\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-01\n"
+        "source_raw_paths:\n"
+        "  - raw/processed.md\n"
+        "source_raw_hashes:\n"
+        f"  - {sha256_file(processed)}\n"
+        "source_operation_ids:\n"
+        "  - ING-old\n"
+        "---\n\n"
+        "# Existing\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    all_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--all", "--json"])
+    table_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault)])
+
+    assert all_result.exit_code == 0
+    all_report = json.loads(all_result.output)
+    assert {Path(item["raw_path"]).name: item["status"] for item in all_report["items"]} == {
+        "unprocessed.md": "unprocessed",
+        "processed.md": "processed",
+    }
+    assert table_result.exit_code == 0
+    assert "Raw ingest candidates" in table_result.output
+    assert "processed raw files are hidden" in table_result.output
+    assert "llmwiki ingest run" in table_result.output
+    assert "raw/unprocessed.md" in table_result.output
+
+
+def test_raw_candidates_treats_legacy_sources_frontmatter_as_processed(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    legacy_raw = vault / "raw" / "legacy.md"
+    legacy_raw.write_text("# Legacy\n", encoding="utf-8")
+    source = vault / "wiki" / "sources" / "来源_legacy.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "---\n"
+        "title: Legacy source\n"
+        "type: source\n"
+        "sources:\n"
+        "  - raw/legacy.md\n"
+        "---\n\n"
+        "# Legacy source\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    default_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--json"])
+    all_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--all", "--json"])
+
+    assert default_result.exit_code == 0
+    default_report = json.loads(default_result.output)
+    assert default_report["items"] == []
+    assert default_report["processed_count"] == 1
+    assert all_result.exit_code == 0
+    all_item = json.loads(all_result.output)["items"][0]
+    assert all_item["status"] == "processed"
+    assert all_item["matched_by"] == "path"
+    assert all_item["source_pages"] == ["wiki/sources/来源_legacy.md"]
+    assert "legacy source frontmatter" in all_item["reason"]
+
+
+def test_run_next_dry_run_selects_unprocessed_raw(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = vault / "raw" / "next.md"
+    raw.write_text("# Next\n\ncandidate\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "selected raw" in result.output
+    assert "raw/next.md" in result.output
+    assert "llmwiki ingest run" in result.output
+
+
+def test_run_next_dry_run_outputs_json(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = vault / "raw" / "next.md"
+    raw.write_text("# Next\n\ncandidate\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["dry_run"] is True
+    assert payload["selected_raw_path"] == "raw/next.md"
+    assert payload["selected_raw_absolute_path"] == raw.resolve().as_posix()
+    assert payload["candidate_status"] == "unprocessed"
+    assert payload["operation_id"] is None
+    assert payload["artifact_hints"] == []
+    assert "llmwiki ingest run" in payload["next_command"]
+
+
+def test_run_next_requires_include_changed_for_changed_only_candidate(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = vault / "raw" / "changed.md"
+    raw.write_text("# Changed\n\nnew content\n", encoding="utf-8")
+    source = vault / "wiki" / "sources" / "来源_existing.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "---\n"
+        "llmwiki_type: source\n"
+        "title: Existing\n"
+        "aliases: []\n"
+        "summary: Existing source.\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-01\n"
+        "source_raw_paths:\n"
+        "  - raw/changed.md\n"
+        "source_raw_hashes:\n"
+        "  - old-hash\n"
+        "---\n\n"
+        "# Existing\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    blocked = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run"])
+    allowed = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--include-changed"])
+
+    assert blocked.exit_code != 0
+    assert "No unprocessed raw ingest candidate found" in blocked.output
+    assert allowed.exit_code == 0
+    assert "status: `changed`" in allowed.output
+    assert "raw/changed.md" in allowed.output
+
+
+def test_run_next_invokes_ingest_with_selected_raw(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = vault / "raw" / "next.md"
+    raw.write_text("# Next\n\ncandidate\n", encoding="utf-8")
+    mock_fixture_dir = tmp_path / "mock"
+    seen: dict[str, object] = {}
+
+    def fake_run_simplified_ingest(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli_module, "run_simplified_ingest", fake_run_simplified_ingest)
+    monkeypatch.setattr(cli_module, "_print_operation_outcome", lambda manifest: None)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "run-next",
+            str(vault),
+            "--mock-fixture-dir",
+            str(mock_fixture_dir),
+            "--slug",
+            "next-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen["vault"] == vault.resolve()
+    assert seen["raw_file"] == raw.resolve()
+    assert seen["mock_fixture_dir"] == mock_fixture_dir
+    assert seen["slug"] == "next-run"
+    assert seen["run_mode"] == RunMode.dev
+
+
+def test_run_next_outputs_json_after_ingest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = vault / "raw" / "next.md"
+    raw.write_text("# Next\n\ncandidate\n", encoding="utf-8")
+
+    class Status:
+        value = "awaiting_review"
+
+    class StepStatusValue:
+        value = "awaiting_review"
+
+    class Step:
+        name = "draft_review"
+        status = StepStatusValue()
+
+    class Manifest:
+        operation_id = "ING-next"
+        status = Status()
+        steps = [Step()]
+
+    def fake_run_simplified_ingest(**kwargs):
+        return Manifest()
+
+    monkeypatch.setattr(cli_module, "run_simplified_ingest", fake_run_simplified_ingest)
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "run-next", str(vault), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["dry_run"] is False
+    assert payload["selected_raw_path"] == "raw/next.md"
+    assert payload["operation_id"] == "ING-next"
+    assert payload["operation_status"] == "awaiting_review"
+    assert payload["awaiting_review_step"] == "draft_review"
+    assert payload["next_command"] == f"llmwiki ingest status {vault.resolve()} ING-next"
+    hints = {item["label"]: item for item in payload["artifact_hints"]}
+    assert hints["run_dir"]["path"] == RunStore(vault).run_dir("ING-next").as_posix()
+    assert hints["manifest"]["path"] == RunStore(vault).manifest_path("ING-next").as_posix()
+    assert hints["run_metrics"]["path"].endswith("/ING-next/run_metrics.json")
+    assert hints["draft_review"]["path"].endswith("/ING-next/draft_review/review_prompt.md")
+
+
+def test_run_next_json_with_mock_fixture_is_pure_json(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "run-next",
+            str(vault),
+            "--mock-fixture-dir",
+            str(FIXTURE_ROOT / "mock"),
+            "--slug",
+            "run-next-json-real",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["dry_run"] is False
+    assert payload["selected_raw_path"] == "raw/raw_project_note.md"
+    assert payload["selected_raw_absolute_path"] == raw.resolve().as_posix()
+    assert payload["operation_id"]
+    assert payload["operation_status"] in {"awaiting_review", "drafted"}
+    assert payload["next_command"] == f"llmwiki ingest status {vault.resolve()} {payload['operation_id']}"
+    hints = {item["label"]: item for item in payload["artifact_hints"]}
+    assert hints["manifest"]["exists"] is True
+    assert hints["run_metrics"]["exists"] is True
+    assert hints["draft_review"]["path"].endswith("/draft_review/review_prompt.md")
+
+
+def test_raw_import_url_cli_outputs_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    fake_result = RawUrlImportResult(
+        vault=vault.as_posix(),
+        url="https://example.com/source",
+        fetch_url="https://example.com/source",
+        final_url="https://example.com/source",
+        title="Research Source",
+        raw_path="raw/Research Source.md",
+        absolute_path=(vault / "raw" / "Research Source.md").as_posix(),
+        content_type="text/html",
+        format="html",
+        imported_at="2026-06-06T00:00:00+00:00",
+        sha256="abc123",
+        size_bytes=123,
+        overwritten=False,
+    )
+
+    def fake_import_raw_url(
+        received_vault: Path,
+        received_url: str,
+        *,
+        title: str | None,
+        output_name: str | None,
+        overwrite: bool,
+        dedupe_url: bool,
+        prefer_arxiv_html: bool,
+        timeout: float,
+        max_bytes: int,
+    ) -> RawUrlImportResult:
+        assert received_vault == vault
+        assert received_url == "https://example.com/source"
+        assert title == "Research Source"
+        assert output_name == "sources/source.md"
+        assert not overwrite
+        assert dedupe_url
+        assert prefer_arxiv_html
+        assert timeout == 9.0
+        assert max_bytes == 2048
+        return fake_result
+
+    monkeypatch.setattr(cli_module, "import_raw_url", fake_import_raw_url)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "raw-import-url",
+            str(vault),
+            "https://example.com/source",
+            "--title",
+            "Research Source",
+            "--output",
+            "sources/source.md",
+            "--timeout",
+            "9",
+            "--max-bytes",
+            "2048",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["raw_path"] == "raw/Research Source.md"
+    assert payload["title"] == "Research Source"
+    assert payload["sha256"] == "abc123"
+
+
+def test_raw_import_arxiv_cli_outputs_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    fake_report = ArxivRawImportReport(
+        vault=vault.as_posix(),
+        query="LLM agents",
+        search_query="all:LLM AND all:agents",
+        sort_by="lastUpdatedDate",
+        sort_order="ascending",
+        candidate_window=2,
+        min_relevance_score=3,
+        skipped_count=0,
+        limit=2,
+        dry_run=True,
+        fetched_count=1,
+        imported_count=0,
+        existing_count=0,
+        failed_count=0,
+        items=(
+            ArxivRawImportItem(
+                arxiv_id="2507.21504",
+                title="Evaluation Survey",
+                abs_url="https://arxiv.org/abs/2507.21504",
+                html_url="https://arxiv.org/html/2507.21504",
+                status="found",
+                relevance_score=8,
+            ),
+        ),
+    )
+
+    def fake_import_arxiv_search(
+        received_vault: Path,
+        received_query: str,
+        *,
+        limit: int,
+        dry_run: bool,
+        overwrite: bool,
+        dedupe_url: bool,
+        sort_by: str,
+        sort_order: str,
+        min_relevance_score: int,
+        timeout: float,
+        max_bytes: int,
+    ) -> ArxivRawImportReport:
+        assert received_vault == vault
+        assert received_query == "LLM agents"
+        assert limit == 2
+        assert dry_run is True
+        assert not overwrite
+        assert dedupe_url is False
+        assert sort_by == "lastUpdatedDate"
+        assert sort_order == "ascending"
+        assert min_relevance_score == 3
+        assert timeout == 8.0
+        assert max_bytes == 4096
+        return fake_report
+
+    monkeypatch.setattr(cli_module, "import_arxiv_search", fake_import_arxiv_search)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "raw-import-arxiv",
+            str(vault),
+            "LLM agents",
+            "--limit",
+            "2",
+            "--dry-run",
+            "--no-dedupe-url",
+            "--sort-by",
+            "lastUpdatedDate",
+            "--sort-order",
+            "ascending",
+            "--min-relevance-score",
+            "3",
+            "--timeout",
+            "8",
+            "--max-bytes",
+            "4096",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["dry_run"] is True
+    assert payload["candidate_window"] == 2
+    assert payload["min_relevance_score"] == 3
+    assert payload["items"][0]["status"] == "found"
+    assert payload["items"][0]["relevance_score"] == 8
+    assert payload["items"][0]["html_url"] == "https://arxiv.org/html/2507.21504"
+
+
+def test_raw_import_arxiv_cli_prints_direct_next_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault, profile_name="project_basic")
+    raw_path = "raw/Evaluation Survey.md"
+    fake_report = ArxivRawImportReport(
+        vault=vault.as_posix(),
+        query="LLM agents",
+        search_query="all:LLM AND all:agents",
+        sort_by="relevance",
+        sort_order="descending",
+        candidate_window=20,
+        min_relevance_score=1,
+        skipped_count=0,
+        limit=1,
+        dry_run=False,
+        fetched_count=1,
+        imported_count=1,
+        existing_count=0,
+        failed_count=0,
+        items=(
+            ArxivRawImportItem(
+                arxiv_id="2507.21504",
+                title="Evaluation Survey",
+                abs_url="https://arxiv.org/abs/2507.21504",
+                html_url="https://arxiv.org/html/2507.21504",
+                status="imported",
+                raw_path=raw_path,
+                relevance_score=8,
+            ),
+        ),
+    )
+
+    def fake_import_arxiv_search(
+        received_vault: Path,
+        received_query: str,
+        *,
+        limit: int,
+        dry_run: bool,
+        overwrite: bool,
+        dedupe_url: bool,
+        sort_by: str,
+        sort_order: str,
+        min_relevance_score: int,
+        timeout: float,
+        max_bytes: int,
+    ) -> ArxivRawImportReport:
+        assert received_vault == vault
+        assert received_query == "LLM agents"
+        assert limit == 1
+        assert dry_run is False
+        return fake_report
+
+    monkeypatch.setattr(cli_module, "import_arxiv_search", fake_import_arxiv_search)
+    runner = CliRunner()
+    result = runner.invoke(app, ["ingest", "raw-import-arxiv", str(vault), "LLM agents"])
+
+    assert result.exit_code == 0
+    compact = _compact_output(result.output)
+    assert "next: `llmwiki ingest run" in compact
+    assert "Evaluation Survey.md`" in compact
+    assert "inspect: `llmwiki ingest raw-candidates" in compact
 
 
 def _compact_output(output: str) -> str:
@@ -394,6 +1438,8 @@ def test_api_key_does_not_spread_across_e2e_cli_boundaries(monkeypatch, tmp_path
     assert status_result.exit_code == 0
     apply_result = runner.invoke(app, ["ingest", "apply", str(vault), operation_id])
     assert apply_result.exit_code == 0
+    assert "applied receipt log" in apply_result.output
+    assert ".llmwiki/applied/operations.jsonl" in _compact_output(apply_result.output)
 
     run_dir = RunStore(vault).run_dir(operation_id)
     boundaries = [

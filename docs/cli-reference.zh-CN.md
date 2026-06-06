@@ -109,6 +109,8 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
+    max_retries: 2
+    retry_backoff_seconds: 1.0
 ```
 
 openai-compatible 配置示例：
@@ -120,11 +122,19 @@ providers:
     spec: openai_compatible:deepseek-chat
     endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: sk-...
+    max_retries: 2
+    retry_backoff_seconds: 1.0
   source_digest:
     spec: openai_compatible:stronger-digest
     endpoint: https://example.test/v1/chat/completions
     api_key: sk-...
 ```
+
+`max_retries` 和 `retry_backoff_seconds` 是可选项，只对 `openai_compatible`
+的正式 ingest 调用生效。`max_retries` 是每个逻辑模型调用共享的一组 transient retry
+budget；JSON-mode 兼容 fallback 可能额外增加一次 prompt-only 请求，但只使用剩余
+retry budget。retry 只覆盖 transient transport failure、408/409/425/429 和 5xx 类响应，不会
+重试普通 bad request。
 
 API key 允许明文保存在本地 config 中，但不会写入 manifest、events、provider_result、status JSON、applied receipt 或 CLI 输出。
 
@@ -157,9 +167,15 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 llmwiki init <vault> [--profile project_basic]
 llmwiki providers list
 llmwiki providers check <vault> [--live]
-llmwiki ingest run <vault> <raw> [--fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard]
+llmwiki ingest raw-prepare-check <vault> <raw> [--skip-prepare|--force-prepare] [--json]
+llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
+llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
-llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mode dev|standard]
+llmwiki ingest inspect <vault> [operation_id] [--json]
+llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
+llmwiki ingest raw-import-url <vault> <url> [--title TEXT] [--output PATH] [--overwrite] [--dedupe-url|--no-dedupe-url] [--arxiv-html|--no-arxiv-html] [--timeout SECONDS] [--max-bytes BYTES] [--json]
+llmwiki ingest raw-import-arxiv <vault> <query> [--limit N] [--dry-run] [--overwrite] [--dedupe-url|--no-dedupe-url] [--sort-by VALUE] [--sort-order VALUE] [--min-relevance-score N] [--timeout SECONDS] [--max-bytes BYTES] [--json]
+llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--skip-prepare|--force-prepare] [--mode dev|standard]
 llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
 llmwiki profile validate <path_or_name>
@@ -223,7 +239,7 @@ uv run llmwiki providers check "$VAULT"
 
 - global/vault config 是否能读取并合并；
 - provider key 是否只包含 `default` 和模型步骤；
-- `spec`、`endpoint`、`api_key`、`fixture_dir` 是否符合 provider 类型；
+- `spec`、`endpoint`、`api_key`、`fixture_dir`、`max_retries`、`retry_backoff_seconds` 是否符合 provider 类型；
 - mock provider 是否缺少 `fixture_dir`；
 - `.llmwiki/` 是否被 Git tracked 或 staged。
 
@@ -253,8 +269,33 @@ human 不发请求。真实 provider 会收到一次小型 Chat Completions 探�
 - 优先使用 `response_format={"type": "json_object"}`
 
 `max_tokens=512` 是 completion 上限，不代表固定消耗；thinking 模型通常会提前停止，
-但最多可能用到这个上限。JSON mode 不支持时，会自动重试一次 prompt-only JSON probe，
-通过后仍会给 warning。`temperature=0` 也不承诺所有 thinking 模型都完全确定性。
+但最多可能用到这个上限。JSON mode 不支持时，会 fallback 一次到 prompt-only JSON probe，
+通过后仍会给 warning。live probe 本身不使用 transient retry，所以 provider 检查仍然保持轻量。
+`temperature=0` 也不承诺所有 thinking 模型都完全确定性。
+
+## `llmwiki ingest raw-prepare-check`
+
+在正式 ingest 前，预览 `raw_prepare` 会走 deterministic passthrough 还是模型清洗。
+这个命令只读，不创建 operation，也不会修改 raw。
+
+```bash
+uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW"
+uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW" --json
+```
+
+它会模拟 `raw_link_cleanup` 后的文本，读取当前 raw_prepare provider，并复用真实
+`raw_prepare` fast-path 规则输出：
+
+- 当前 provider 是否允许 deterministic fast-path；
+- auto 是否会启用 fast-path；
+- 如果 auto 会走模型，原因是什么；
+- `--skip-prepare` 是否可用，以及会覆盖哪些自动拦截原因；
+- selected policy 与 auto policy 各自是否预计会调用 raw_prepare provider；
+- 是否检测到播客/视频转写、翻译稿、timestamp/speaker-turn、media embed 等风险。
+
+如果 raw 已经人工校对、结构清晰，可以在 `ingest run` 或从 `raw_prepare` 之前 resume 时加
+`--skip-prepare` 节省模型时间。如果材料明显是低质量 ASR/翻译稿，可保留 auto 或加
+`--force-prepare` 明确要求模型清洗。
 
 ## `llmwiki ingest run`
 
@@ -269,9 +310,12 @@ uv run llmwiki ingest run "$VAULT" "$RAW" --fixture-dir "$FIXTURE" --slug manual
 - `VAULT`：vault 路径。
 - `RAW`：raw 文件路径，必须在 `VAULT/raw/` 下。
 - `--fixture-dir PATH`：mock provider 的 fixture 目录。真实 provider 不需要。
+- `--mock-fixture-dir PATH`：强制所有模型步骤使用指定目录的 `mock:fixture`。
 - `--profile NAME`：临时覆盖 vault config 里的 profile。
 - `--slug TEXT`：operation ID 的可读后缀，方便手动测试辨认。
 - `--mode dev|standard`：运行模式，默认 `dev`。
+- `--skip-prepare`：对符合条件的 Markdown raw 使用 deterministic passthrough；空 raw、非 Markdown 等 hard blocker 仍会回落到配置的 `raw_prepare` provider。
+- `--force-prepare`：强制模型 raw_prepare 清洗，禁用 deterministic fast-path。
 
 `--slug manual` 只影响 operation ID，例如：
 
@@ -331,6 +375,14 @@ uv run llmwiki ingest resume "$VAULT" "$OP"
 
 ```bash
 uv run llmwiki ingest resume "$VAULT" "$OP" --from source_digest
+```
+
+resume 也可以覆盖本次会重跑步骤的 provider 或 raw_prepare 策略：
+
+```bash
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --skip-prepare
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --force-prepare
+uv run llmwiki ingest resume "$VAULT" "$OP" --mock-fixture-dir "$FIXTURE"
 ```
 
 `--from STEP` 会：

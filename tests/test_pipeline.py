@@ -1,4 +1,9 @@
 import json
+import logging
+import os
+import sys
+import types
+import warnings
 from pathlib import Path
 
 import pytest
@@ -17,6 +22,7 @@ from llmwiki_engine.models import (
     CandidateResolutionItem,
     DraftRenderingArtifact,
     OperationStatus,
+    RawPreparePolicy,
     RunMode,
     SourceBasis,
     SourceDigestArtifact,
@@ -24,6 +30,7 @@ from llmwiki_engine.models import (
     StepStatus,
     VerificationStatus,
     WikiKnowledgePoolEntry,
+    WikiMergePlanArtifact,
 )
 from llmwiki_engine.pipeline import (
     PipelineError,
@@ -42,7 +49,7 @@ from llmwiki_engine.pipeline import (
     revise_review,
     status,
 )
-from llmwiki_engine.providers import OpenAICompatibleProvider
+from llmwiki_engine.providers import MockProvider, OpenAICompatibleProvider
 from llmwiki_engine.steps import (
     EVAL_MODULES,
     MODEL_BACKED_STEPS,
@@ -143,7 +150,9 @@ def test_init_creates_workspace_layout_and_gitignore(tmp_path: Path) -> None:
     config_json = read_json(vault / ".llmwiki" / "config.json")
     assert config_json["embedding_retrieval"]["backend"] == "sentence_transformers"
     assert config_json["embedding_retrieval"]["model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert config_json["embedding_retrieval"]["local_files_only"] is True
     assert config_json["embedding_retrieval"]["cache_dir"] == "~/.llmwiki/cache/embeddings"
+    assert config_json["max_ingest_candidates"] == 12
     gitignore_lines = (vault / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".llmwiki/" in gitignore_lines
     assert ".llmwiki/runs/" not in gitignore_lines
@@ -156,6 +165,1176 @@ def test_embedding_cache_dir_expands_user_home(tmp_path: Path, monkeypatch: pyte
     resolved = retrieval_module.resolve_cache_dir(tmp_path / "vault", "~/.llmwiki/cache/embeddings")
     assert resolved == home / ".llmwiki" / "cache" / "embeddings"
     assert resolved.is_dir()
+
+
+def test_huggingface_quiet_mode_suppresses_unauthenticated_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in [
+        "HF_HUB_DISABLE_PROGRESS_BARS",
+        "HF_HUB_DISABLE_TELEMETRY",
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN",
+        "HF_HUB_DISABLE_SYMLINKS_WARNING",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        retrieval_module.configure_huggingface_quiet_mode()
+        warnings.warn("Warning: You are sending unauthenticated requests to the HF Hub.", UserWarning)
+
+    assert not caught
+    assert all(
+        os.environ[name] == "1"
+        for name in [
+            "HF_HUB_DISABLE_PROGRESS_BARS",
+            "HF_HUB_DISABLE_TELEMETRY",
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN",
+            "HF_HUB_DISABLE_SYMLINKS_WARNING",
+        ]
+    )
+    assert logging.getLogger("huggingface_hub").level == logging.ERROR
+
+
+def test_sentence_transformer_ranker_uses_local_cache_only_and_reports_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = tmp_path / "vault"
+    page = vault / "wiki" / "concepts" / "Concept_Runtime.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Runtime\n"
+        "aliases: []\n"
+        "summary: 运行时摘要。\n"
+        "created: 2026-06-06\n"
+        "updated: 2026-06-06\n"
+        "---\n\n"
+        "# Runtime\n\n"
+        "Claude Code harness 负责工具执行和安全边界。\n",
+        encoding="utf-8",
+    )
+    item = CandidateResolutionItem(
+        page_plan_id="PP-RUNTIME",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        page_type="concept",
+        display_title="Runtime",
+        path_stem="Runtime",
+        candidate_target_path="concepts/Concept_Runtime.md",
+        topic_summary="Claude Code harness 运行时边界。",
+        why_this_page="验证 embedding 本地缓存加载。",
+        reason="test",
+    )
+    captured: dict[str, object] = {}
+    encode_calls: list[int] = []
+
+    class FakeSentenceTransformer:
+        revision = "abcdef1"
+
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            captured["model_name"] = model_name
+            captured.update(kwargs)
+
+        def encode(self, texts: list[str], **kwargs: object) -> list[list[float]]:
+            encode_calls.append(len(texts))
+            return [[1.0, 0.0] for _ in texts]
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    config = retrieval_module.EmbeddingRetrievalConfig(local_files_only=True)
+    scores, revision, metrics = retrieval_module.SentenceTransformerRanker(config).rank_inputs(
+        [item],
+        retrieval_module.build_knowledge_pool(vault),
+        vault,
+    )
+    _, _, cached_metrics = retrieval_module.SentenceTransformerRanker(config).rank_inputs(
+        [item],
+        retrieval_module.build_knowledge_pool(vault),
+        vault,
+    )
+
+    assert captured["model_name"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert captured["local_files_only"] is True
+    assert captured["token"] is False
+    assert Path(str(captured["cache_folder"])).is_absolute()
+    assert revision == "abcdef1"
+    assert scores["PP-RUNTIME"]["concepts/Concept_Runtime.md"] == pytest.approx(1.0)
+    assert metrics["total_duration_ms"] >= metrics["load_duration_ms"] >= 0
+    assert metrics["total_duration_ms"] >= metrics["encode_duration_ms"] >= 0
+    assert metrics["page_vector_cache_hit"] == 0
+    assert cached_metrics["page_vector_cache_hit"] == 1
+    assert encode_calls == [1, 1, 1]
+
+
+def test_retrieval_candidate_text_includes_later_body_terms(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    page = vault / "wiki" / "concepts" / "Concept_Runtime.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Runtime\n"
+        "aliases: []\n"
+        "summary: 运行时摘要。\n"
+        "created: 2026-06-06\n"
+        "updated: 2026-06-06\n"
+        "---\n\n"
+        "# Runtime\n\n"
+        "开头段落没有关键召回词。\n\n"
+        "## 后续架构线索\n\n"
+        "这里记录 Claude Code harness 如何承担安全边界和工具执行。\n",
+        encoding="utf-8",
+    )
+    entry = WikiKnowledgePoolEntry(
+        path="concepts/Concept_Runtime.md",
+        rel_path="wiki/concepts/Concept_Runtime.md",
+        preimage_sha256="sha",
+        display_title="Runtime",
+        summary="运行时摘要。",
+        llmwiki_type="concept",
+    )
+
+    text = retrieval_module.candidate_text(vault, entry)
+
+    assert "Claude Code harness" in text
+    assert retrieval_module.lexical_score("Claude Code harness 安全边界", text) > 0.5
+
+
+def test_retrieval_lexical_expansion_boosts_agent_harness_terms(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    wiki = vault / "wiki"
+    managed = wiki / "entities" / "Entity_Managed Agents.md"
+    managed.parent.mkdir(parents=True)
+    managed.write_text(
+        "---\n"
+        "llmwiki_type: entity\n"
+        "title: Managed Agents\n"
+        "aliases:\n"
+        "  - 托管代理\n"
+        "summary: Anthropic 的托管智能体运行时。\n"
+        "created: 2026-06-06\n"
+        "updated: 2026-06-06\n"
+        "---\n\n"
+        "# Managed Agents\n\n"
+        "托管代理提供 agent runtime，用 harness 负责工具编排和安全边界。\n",
+        encoding="utf-8",
+    )
+    generic = wiki / "concepts" / "Concept_Claude Code Updates.md"
+    generic.parent.mkdir(parents=True)
+    generic.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Claude Code Updates\n"
+        "aliases: []\n"
+        "summary: Claude Code 产品更新记录。\n"
+        "created: 2026-06-06\n"
+        "updated: 2026-06-06\n"
+        "---\n\n"
+        "# Claude Code Updates\n\n"
+        "Claude Code 的普通产品更新。\n",
+        encoding="utf-8",
+    )
+    item = CandidateResolutionItem(
+        page_plan_id="PP-HARNESS",
+        source_basis=SourceBasis(source_candidate_ids=["design_todo"]),
+        page_type="design",
+        display_title="待办事项列表在 Claude Code 中的应用",
+        path_stem="待办事项列表在 Claude Code 中的应用",
+        candidate_target_path="designs/Design_待办事项列表在 Claude Code 中的应用.md",
+        topic_summary="Claude Code 用 TODO list 推动大型重构。",
+        why_this_page="体现如何用 Harness 弥补模型能力不足，是 agent runtime 设计模式。",
+        reason="test",
+    )
+
+    hits = retrieval_module.rank_candidates(
+        item=item,
+        query=retrieval_module.query_for_item(item),
+        knowledge_pool=retrieval_module.build_knowledge_pool(vault),
+        vault=vault,
+        config=retrieval_module.EmbeddingRetrievalConfig(backend="exact", top_k=5),
+    )
+
+    assert hits[0].path == "entities/Entity_Managed Agents.md"
+    assert hits[0].match_basis == "lexical_expansion"
+    assert hits[0].score < retrieval_module.EmbeddingRetrievalConfig().medium_score
+    assert hits[0].strength == "weak"
+    assert hits[0].score_bucket == retrieval_module.retrieval_score_bucket(hits[0].score)
+    assert "basis_rank=" in hits[0].sort_explanation
+
+
+def test_retrieval_lexical_expansion_does_not_expand_bare_product_name() -> None:
+    score = retrieval_module.lexical_expansion_score(
+        "Claude Code",
+        "Managed Agents 托管代理提供 agent runtime 和 harness。",
+    )
+
+    assert score == 0.0
+
+
+def test_retrieval_cjk_bigram_score_does_not_inflate_generic_overlap() -> None:
+    query = "待办事项列表在 Claude Code 中的应用\n体现如何用 Harness 弥补模型能力不足，是 agent runtime 设计模式。"
+    generic = "未来模型的上下文工程不可预测性。模型在长上下文中可能产生不可预测行为，需要评估。"
+    relevant = "Managed Agents 托管代理提供 agent runtime，用 harness 负责工具编排和安全边界。"
+
+    generic_score = retrieval_module.lexical_score(query, generic)
+    relevant_expansion = retrieval_module.lexical_expansion_score(query, relevant)
+
+    assert generic_score < retrieval_module.EmbeddingRetrievalConfig().medium_score
+    assert relevant_expansion > generic_score
+
+
+def test_candidate_context_sort_explains_score_bucket_tie_breaks() -> None:
+    item = CandidateResolutionItem(
+        page_plan_id="PP-TIE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND-TIE"]),
+        page_type="concept",
+        display_title="Runtime Tie",
+        path_stem="Runtime Tie",
+        candidate_target_path="concepts/Concept_Runtime_Tie.md",
+        topic_summary="测试同一分数桶排序。",
+        why_this_page="需要解释 score 不严格递减的 tie-break。",
+        reason="test",
+    )
+    entries = {
+        "concepts/Concept_Runtime_Tie.md": WikiKnowledgePoolEntry(
+            path="concepts/Concept_Runtime_Tie.md",
+            rel_path="wiki/concepts/Concept_Runtime_Tie.md",
+            preimage_sha256="a",
+            display_title="Runtime Tie",
+            summary="same type and dir",
+            llmwiki_type="concept",
+        ),
+        "entities/Entity_Runtime_Tie.md": WikiKnowledgePoolEntry(
+            path="entities/Entity_Runtime_Tie.md",
+            rel_path="wiki/entities/Entity_Runtime_Tie.md",
+            preimage_sha256="b",
+            display_title="Runtime Tie",
+            summary="different type and dir",
+            llmwiki_type="entity",
+        ),
+    }
+    lower_score_same_type = retrieval_module.CandidateContextHit(
+        page_plan_id="PP-TIE",
+        rank=0,
+        path="concepts/Concept_Runtime_Tie.md",
+        display_title="Runtime Tie",
+        score=0.501,
+        score_bucket=retrieval_module.retrieval_score_bucket(0.501),
+        strength="weak",
+        match_basis="lexical",
+        page_sha256="a",
+    )
+    higher_score_different_type = retrieval_module.CandidateContextHit(
+        page_plan_id="PP-TIE",
+        rank=0,
+        path="entities/Entity_Runtime_Tie.md",
+        display_title="Runtime Tie",
+        score=0.509,
+        score_bucket=retrieval_module.retrieval_score_bucket(0.509),
+        strength="weak",
+        match_basis="lexical",
+        page_sha256="b",
+    )
+
+    sorted_hits = sorted(
+        [higher_score_different_type, lower_score_same_type],
+        key=lambda hit: retrieval_module.retrieval_sort_key(hit, item, entries),
+    )
+    for hit in sorted_hits:
+        hit.sort_explanation = retrieval_module.retrieval_sort_explanation(hit, item, entries)
+
+    assert sorted_hits[0].score < sorted_hits[1].score
+    assert sorted_hits[0].path == "concepts/Concept_Runtime_Tie.md"
+    assert "type=same" in sorted_hits[0].sort_explanation
+    assert "dir=same" in sorted_hits[0].sort_explanation
+    assert "type=different" in sorted_hits[1].sort_explanation
+
+
+def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
+    def candidate(candidate_id: str, name: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=name,
+            type="concept",
+            one_sentence_summary=f"{name} 摘要。",
+            why_matters=f"{name} 重要。",
+            wiki_value=f"{name} 可复用。",
+            suggested_page_title=name,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试预算。",
+        concepts=[candidate("C1", "概念一"), candidate("C2", "概念二")],
+        designs=[candidate("D1", "设计一"), candidate("D2", "设计二")],
+        comparisons=[candidate("CMP1", "对比一")],
+        open_questions=[candidate("O1", "问题一")],
+        entities=[candidate("E1", "实体一")],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 4)
+
+    assert [item.candidate_id for item in capped.concepts] == ["C1"]
+    assert [item.candidate_id for item in capped.designs] == ["D1"]
+    assert [item.candidate_id for item in capped.comparisons] == ["CMP1"]
+    assert [item.candidate_id for item in capped.open_questions] == ["O1"]
+    assert capped.entities == []
+    assert [item.candidate_id for item in capped.budget_deferred_candidates] == ["E1", "C2", "D2"]
+    assert capped.weak_or_noise_items == []
+    assert all("page_budget_deferred" in item.resolution_hint for item in capped.budget_deferred_candidates)
+    assert report["selected_count"] == 4
+    assert report["deferred_count"] == 3
+    assert report["deferred"]["entities"] == ["E1"]
+    assert report["deferred_details"]["entities"][0]["candidate_id"] == "E1"
+    assert report["deferred_details"]["entities"][0]["wiki_value"] == "实体一 可复用。"
+    assert report["followup_batches"][0]["group"] == "entities"
+    assert "overview/comparison" in report["followup_batches"][0]["suggested_action"]
+    assert report["deferred_aggregations"][0]["group"] == "concepts"
+    assert report["deferred_aggregations"][0]["suggested_page_type"] == "concept_overview"
+    assert "概念二" in report["deferred_aggregations"][0]["suggested_title"]
+    assert report["deferred_aggregations"][-1]["group"] == "entities"
+    markdown = pipeline_module.render_source_digest_budget_report(report)
+    assert "## 延后候选详情" in markdown
+    assert "实体一 可复用。" in markdown
+    assert "## 后续处理批次" in markdown
+    assert "## 延后聚合建议" in markdown
+    assert "concept_overview" in markdown
+
+
+def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_increasing_budget(tmp_path: Path) -> None:
+    def concept(candidate_id: str, name: str, summary: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=name,
+            type="concept",
+            one_sentence_summary=summary,
+            why_matters=f"{summary} 重要。",
+            wiki_value=f"{summary} 可与其他同组概念先聚合成总览。",
+            source_locator=f"section {candidate_id}",
+            suggested_page_title=name,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试延后候选聚合。",
+        concepts=[
+            concept("C1", "产品品味校准", "团队用用户反馈和设计 critique 校准产品判断。"),
+            concept("C2", "AGI PM 协作边界", "AGI 后 PM 更关注问题判断、评估设计和组织协作。"),
+            concept("C3", "AGI PM 协作职责", "AGI 后 PM 从写需求转向判断问题、组织评估和协调智能体执行。"),
+            concept("C4", "AGI PM 协作评估", "AGI 产品需要用任务成功率、可控性和反馈循环评估。"),
+        ],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 2)
+
+    assert len(capped.concepts) == 2
+    assert capped.concepts[0].candidate_id == "C1"
+    aggregate = capped.concepts[1]
+    assert aggregate.candidate_id.startswith("AGG-concepts-")
+    assert aggregate.type == "overview"
+    assert aggregate.related_candidates == ["C3", "C4"]
+    assert "source_digest_deferred_aggregation" in aggregate.resolution_hint
+    assert [item.candidate_id for item in capped.budget_deferred_candidates] == ["C3", "C4"]
+    assert all("represented_by_aggregation" in item.resolution_hint for item in capped.budget_deferred_candidates)
+    selected_aggregation = report["selected_deferred_aggregations"][0]
+    assert selected_aggregation["candidate_id"] == aggregate.candidate_id
+    assert selected_aggregation["represented_candidate_ids"] == ["C2", "C3", "C4"]
+    assert selected_aggregation["replaced_candidate_id"] == "C2"
+    projected, _ = pipeline_module.project_source_digest_for_merge_plan(
+        capped,
+        WikiMergePlanArtifact(
+            log_date="2026-06-06",
+            items=[
+                pipeline_module.WikiMergePlanItem(
+                    page_plan_id="PP-AGG",
+                    source_basis=SourceBasis(source_candidate_ids=[aggregate.candidate_id]),
+                    action="create",
+                    canonical_target_path="overviews/Overview_AGG.md",
+                    display_title=aggregate.suggested_page_title,
+                    page_type="overview",
+                    new_understanding="测试。",
+                    section_plans={"summary": "摘要"},
+                    reason="test",
+                )
+            ],
+        ),
+    )
+    projected_lookup = pipeline_module.source_digest_candidate_lookup(projected)
+    assert all(candidate_id in projected_lookup for candidate_id in aggregate.related_candidates)
+    assert report["selected_count"] == 2
+    assert report["deferred_count"] == 2
+    markdown = pipeline_module.render_source_digest_budget_report(report)
+    assert "## 本轮已选聚合候选" in markdown
+    assert aggregate.candidate_id in markdown
+
+    vault, _ = make_vault(tmp_path)
+    profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
+    resolution = pipeline_module.backfill_missing_candidate_resolution_items(
+        CandidateResolutionArtifact(items=[]),
+        capped,
+        profile,
+    )
+    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, resolution, capped)
+    aggregate_plan = [item for item in finalized.items if item.source_basis.source_candidate_ids == [aggregate.candidate_id]][0]
+    assert aggregate_plan.page_type == "overview"
+    assert aggregate_plan.candidate_target_path.startswith("overviews/Overview_")
+
+
+def test_source_digest_anchor_entities_are_added_before_page_budget() -> None:
+    def candidate(candidate_id: str, title: str, group_type: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type=group_type,
+            one_sentence_summary=f"{title} 摘要。",
+            why_matters=f"{title} 重要。",
+            wiki_value=f"{title} 可复用。",
+            suggested_page_title=title,
+        )
+
+    text = (
+        "---\n"
+        'title: "Scaling Managed Agents: 将大脑与双手解耦"\n'
+        'description: "介绍 Managed Agents 的架构设计。"\n'
+        "---\n\n"
+        "# Scaling Managed Agents: Decoupling the brain from the hands\n\n"
+        "Managed Agents is a meta-harness around Claude.\n\n"
+        "For example, Claude Code is an excellent harness that we use widely across tasks.\n"
+        "> 例如，**Claude Code** 是一个出色的 harness，我们在各种任务中广泛使用它。\n"
+    )
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/scaling.md",
+        summary="Managed Agents 架构摘要。",
+        entities=[
+            candidate("ent-001", "Harness（适配框架）", "entity"),
+            candidate("ent-002", "Session（会话）", "entity"),
+        ],
+        concepts=[
+            candidate("con-001", "大脑与双手解耦", "concept"),
+            candidate("con-002", "会话作为持久化上下文", "concept"),
+            candidate("con-003", "安全令牌隔离", "concept"),
+            candidate("con-004", "元适配框架", "concept"),
+        ],
+        designs=[
+            candidate("des-001", "Managed Agents 架构设计", "design"),
+            candidate("des-002", "大脑与双手交互接口设计", "design"),
+        ],
+        comparisons=[candidate("cmp-001", "耦合架构 vs 解耦架构", "comparison")],
+        open_questions=[
+            candidate("oq-001", "长期任务上下文管理", "open_question"),
+            candidate("oq-002", "窄范围作用域与智能增长", "open_question"),
+        ],
+    )
+
+    augmented = pipeline_module.augment_source_digest_anchor_entities(digest, text)
+    assert [item.suggested_page_title for item in augmented.entities[:2]] == ["Managed Agents", "Claude Code"]
+    assert augmented.entities[0].candidate_id == "auto-ent-managedagents"
+    assert augmented.entities[1].source_locator.startswith("L")
+    assert "deterministic_source_anchor_entity" in augmented.entities[1].resolution_hint
+
+    capped, report = pipeline_module.cap_source_digest_candidates(augmented, 12)
+
+    selected_titles = [item.suggested_page_title for item in capped.entities]
+    assert "Managed Agents" in selected_titles
+    assert "Claude Code" in selected_titles
+    deferred_titles = [item.suggested_page_title for item in capped.budget_deferred_candidates]
+    assert "Managed Agents" not in deferred_titles
+    assert "Claude Code" not in deferred_titles
+    assert "Session（会话）" in deferred_titles
+    assert report["total_formal_candidates_before_budget"] == 13
+    assert report["applied"] is True
+
+
+def test_source_digest_anchor_entities_do_not_duplicate_parenthetical_translation() -> None:
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/scaling.md",
+        summary="Managed Agents 架构摘要。",
+        entities=[
+            SourceDigestCandidate(
+                candidate_id="c001",
+                name="Managed Agents",
+                type="entity",
+                one_sentence_summary="Anthropic 的托管智能体平台，采用大脑与双手解耦的模块化架构。",
+                why_matters="它是材料中的核心实体。",
+                wiki_value="适合沉淀为实体页。",
+                suggested_page_title="Managed Agents（托管智能体）",
+            )
+        ],
+    )
+    text = (
+        "---\n"
+        'title: "Scaling Managed Agents: 将大脑与双手解耦"\n'
+        "---\n\n"
+        "# Scaling Managed Agents\n\n"
+        "Managed Agents is a meta-harness around Claude.\n"
+        "Managed Agents can host Claude Code as an excellent harness.\n"
+    )
+
+    augmented = pipeline_module.augment_source_digest_anchor_entities(digest, text)
+    capped, report = pipeline_module.cap_source_digest_candidates(augmented, 12)
+
+    assert [item.candidate_id for item in augmented.entities if item.suggested_page_title.startswith("Managed Agents")] == ["c001"]
+    assert [item.suggested_page_title for item in capped.entities] == ["Claude Code", "Managed Agents（托管智能体）"]
+    assert report["deduped_count"] == 0
+
+
+def test_source_digest_anchor_entities_ignore_weak_single_mentions() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/sample.md", summary="普通摘要。")
+    text = "这篇材料只是随口提了一次 Claude Code，没有说明产品、harness 或团队上下文。"
+
+    augmented = pipeline_module.augment_source_digest_anchor_entities(digest, text)
+
+    assert augmented.entities == []
+
+
+def test_source_digest_candidate_budget_promotes_multiple_topic_aggregations_without_cross_cluster() -> None:
+    def concept(candidate_id: str, title: str, summary: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="concept",
+            one_sentence_summary=summary,
+            why_matters=f"{summary} 重要。",
+            wiki_value=f"{summary} 适合沉淀为可复用知识。",
+            source_locator=f"section {candidate_id}",
+            suggested_page_title=title,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试延后候选按主题簇聚合。",
+        concepts=[
+            concept("C1", "产品品味校准", "团队用用户反馈和设计 critique 校准产品判断。"),
+            concept("C2", "客户场景研究", "团队从真实客户任务中提炼场景、约束和优先级。"),
+            concept("C3", "模型能力产品边界", "模型能力提升后，产品边界转向工作流、信任和可控性。"),
+            concept("C4", "AGI PM 协作边界", "AGI 后 PM 更关注问题判断、评估设计和组织协作。"),
+            concept("C5", "AGI PM 协作职责", "AGI 让产品组织重新分配发现问题、定义方案和交付验证的职责。"),
+            concept("C6", "AGI PM 协作评估", "AGI 后 PM 从写需求转向判断问题、组织评估和协调智能体执行。"),
+            concept("C7", "模型能力吞噬产品功能", "模型能力提升会把一部分产品功能变成提示词、评估和数据飞轮问题。"),
+            concept("C8", "模型替代产品功能后的边界", "模型直接完成任务后，产品功能边界转向工作流、信任和可控性。"),
+        ],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 4)
+
+    assert report["selected_count"] == 4
+    assert report["deferred_count"] == 4
+    assert [item.candidate_id for item in capped.concepts[:2]] == ["C1", "C2"]
+    aggregates = capped.concepts[2:]
+    assert len(aggregates) == 2
+    assert all(item.candidate_id.startswith("AGG-concepts-") for item in aggregates)
+    selected_aggregations = report["selected_deferred_aggregations"]
+    assert len(selected_aggregations) == 2
+    represented_sets = {
+        tuple(aggregation["represented_candidate_ids"])
+        for aggregation in selected_aggregations
+    }
+    assert represented_sets == {
+        ("C4", "C5", "C6"),
+        ("C3", "C7", "C8"),
+    }
+    assert {aggregation["replaced_candidate_id"] for aggregation in selected_aggregations} == {"C3", "C4"}
+    assert all(aggregation["cluster_terms"] for aggregation in selected_aggregations)
+    deferred_by_id = {item.candidate_id: item for item in capped.budget_deferred_candidates}
+    assert set(deferred_by_id) == {"C5", "C6", "C7", "C8"}
+    assert all("represented_by_aggregation" in item.resolution_hint for item in deferred_by_id.values())
+    assert len({item.resolution_hint.rsplit("`", 2)[1] for item in deferred_by_id.values()}) == 2
+
+
+def test_source_digest_deferred_aggregation_does_not_replace_unrelated_selected_core_page() -> None:
+    def concept(candidate_id: str, title: str, summary: str, tension: str = "") -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="concept",
+            one_sentence_summary=summary,
+            why_matters=f"{summary} 是重要 AI PM 知识。",
+            wiki_value=f"{title} 适合沉淀为可复用知识页。",
+            source_locator=f"section {candidate_id}",
+            suggested_page_title=title,
+            open_question_or_tension=tension,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/aipm.md",
+        summary="测试不相关 selected 核心页不被 deferred 聚合替换。",
+        concepts=[
+            concept("CON-001", "AI PM 角色分类", "AI PM 分为带 AI 功能的传统 PM 和 AI 原生 PM。"),
+            concept("CON-002", "概率性产品体验", "AI 产品输出是概率性的，会改变信任、错误容忍度和产品设计。"),
+            concept("CON-003", "AI 技术选择框架", "AI PM 需要在传统 ML、深度学习和 GenAI 之间做技术选择。"),
+            concept("CON-004", "RAG (检索增强生成)", "RAG 通过检索外部知识库为 LLM 提供上下文。", "RAG 与 fine-tuning 的适用边界是什么？"),
+            concept("CON-005", "AI Agent 架构", "Agent 是能自主感知环境、决策并采取行动的 AI 系统。", "Agent 的可靠性如何保证？"),
+            concept(
+                "CON-006",
+                "提示词工程与上下文工程",
+                "提示词工程设计输入，上下文工程选择和组织模型需要的信息。",
+                "上下文工程如何与 RAG 结合？",
+            ),
+        ],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 3)
+
+    assert [item.candidate_id for item in capped.concepts] == ["CON-001", "CON-002", "CON-003"]
+    assert report["selected_deferred_aggregations"] == []
+    assert [item.candidate_id for item in capped.budget_deferred_candidates] == ["CON-004", "CON-005", "CON-006"]
+    assert report["deferred_aggregations"][0]["candidate_ids"] == ["CON-004", "CON-005", "CON-006"]
+
+
+def test_deferred_topic_clusters_do_not_merge_on_single_broad_anchor() -> None:
+    def concept(candidate_id: str, title: str, summary: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="concept",
+            one_sentence_summary=summary,
+            why_matters=f"{summary} 重要。",
+            wiki_value=f"{summary} 可复用。",
+            suggested_page_title=title,
+        )
+
+    agi_org = concept("C1", "AGI 产品组织变化", "AGI 会改变产品组织的职责分配。")
+    agi_investment = concept("C2", "AGI 投资节奏", "AGI 会改变基础设施投入和资本节奏。")
+    model_eval = concept("C3", "模型评估方法", "模型评估需要离线指标和人工检查。")
+    model_boundary = concept("C4", "模型产品边界", "模型进入产品后会改变功能边界。")
+
+    assert pipeline_module.source_digest_candidate_topic_similarity("concepts", agi_org, agi_investment) == 0.0
+    assert pipeline_module.source_digest_candidate_topic_similarity("concepts", model_eval, model_boundary) == 0.0
+    assert pipeline_module.deferred_candidate_topic_clusters("concepts", [agi_org, agi_investment, model_eval, model_boundary]) == []
+
+
+def test_draft_source_excerpt_pack_expands_aggregation_child_candidate_cues() -> None:
+    agg = SourceDigestCandidate(
+        candidate_id="AGG-concepts-demo",
+        name="聚合候选",
+        type="overview",
+        one_sentence_summary="聚合候选摘要。",
+        why_matters="聚合候选重要。",
+        wiki_value="聚合候选可复用。",
+        suggested_page_title="聚合候选",
+        related_candidates=["C3", "C4"],
+    )
+    child = SourceDigestCandidate(
+        candidate_id="C3",
+        name="子候选 Alpha",
+        type="concept",
+        one_sentence_summary="子候选 Alpha 解释 evaluator harness 的可靠性。",
+        why_matters="子候选 Alpha 很重要。",
+        wiki_value="子候选 Alpha 可复用。",
+        source_locator="## 子候选 Alpha",
+        suggested_page_title="子候选 Alpha",
+    )
+    other_child = SourceDigestCandidate(
+        candidate_id="C4",
+        name="子候选 Beta",
+        type="concept",
+        one_sentence_summary="子候选 Beta 解释运行时边界。",
+        why_matters="子候选 Beta 很重要。",
+        wiki_value="子候选 Beta 可复用。",
+        source_locator="## 子候选 Beta",
+        suggested_page_title="子候选 Beta",
+    )
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试 source excerpt closure。",
+        concepts=[agg],
+        budget_deferred_candidates=[child, other_child],
+    )
+    merge_plan = WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-AGG",
+                source_basis=SourceBasis(source_candidate_ids=["AGG-concepts-demo"], source_locator="聚合"),
+                action="create",
+                canonical_target_path="overviews/Overview_AGG.md",
+                display_title="聚合候选",
+                page_type="overview",
+                new_understanding="测试。",
+                section_plans={"summary": "摘要"},
+                reason="test",
+            )
+        ],
+    )
+    text = (
+        "# 测试材料\n\n"
+        "开头内容。\n\n"
+        "## 子候选 Alpha\n\n"
+        "这里记录 evaluator harness 的可靠性和聚合页必须吸收的子候选 Alpha 细节。\n\n"
+        "## 子候选 Beta\n\n"
+        "这里记录运行时边界和子候选 Beta 细节。\n"
+    )
+
+    pack = pipeline_module.build_draft_source_excerpt_pack(text, digest, merge_plan, full_source_limit=10)
+
+    item = pack["items"][0]
+    assert item["expanded_source_candidate_ids"] == ["AGG-concepts-demo", "C3", "C4"]
+    assert {"## 子候选 Alpha", "## 子候选 Beta"} <= set(item["source_locators"])
+    assert "evaluator harness" in "\n".join(snippet["text"] for snippet in item["snippets"])
+
+
+def test_source_excerpt_packs_expand_prepared_discovered_budget_deferred_cues() -> None:
+    deferred = SourceDigestCandidate(
+        candidate_id="C005",
+        name="多脑多手架构",
+        type="concept",
+        one_sentence_summary="多脑多手架构把大脑与双手解耦。",
+        why_matters="它帮助理解 agent harness 的组织方式。",
+        wiki_value="可用于解释 managed agents。",
+        source_locator="## 多脑多手架构",
+        suggested_page_title="多脑多手架构",
+    )
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试 prepared discovered source pack。",
+        budget_deferred_candidates=[deferred],
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            CandidateResolutionItem(
+                page_plan_id="PP-C005",
+                source_basis=SourceBasis(prepared_discovered_candidates=["C005"], source_locator="prepared discovered"),
+                page_type="concept",
+                display_title="多脑多手架构",
+                candidate_target_path="concepts/Concept_多脑多手架构.md",
+                topic_summary="多脑多手架构摘要。",
+                why_this_page="值得记录。",
+                reason="prepared_discovered",
+            )
+        ]
+    )
+    merge_plan = WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-C005",
+                source_basis=SourceBasis(prepared_discovered_candidates=["C005"], source_locator="prepared discovered"),
+                action="create",
+                canonical_target_path="concepts/Concept_多脑多手架构.md",
+                display_title="多脑多手架构",
+                page_type="concept",
+                new_understanding="多脑多手架构摘要。",
+                section_plans={"summary": "摘要"},
+                reason="prepared_discovered",
+            )
+        ],
+    )
+    text = (
+        "# 测试材料\n\n"
+        + ("背景填充段落。\n" * 80)
+        + "\n## 多脑多手架构\n\n"
+        "这里描述多脑多手架构如何把大脑与双手解耦，并通过 agent harness 组织 managed agents。\n"
+    )
+
+    merge_pack = pipeline_module.build_merge_planning_context_pack(
+        approved_prepared_text=text + ("\n额外填充段落。\n" * 2000),
+        digest=digest,
+        resolution=resolution,
+        snapshot=pipeline_module.WikiContextSnapshot(log_date="2026-06-06", source_target_path="sources/Source_Test.md"),
+        candidate_contexts=pipeline_module.CandidateContextsArtifact(retrieval_backend="exact"),
+        snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
+    )
+    draft_pack = pipeline_module.build_draft_source_excerpt_pack(text, digest, merge_plan, full_source_limit=10)
+    merge_item = merge_pack["source_excerpt_pack"]["items"][0]
+    draft_item = draft_pack["items"][0]
+
+    assert merge_item["source_candidate_ids"] == []
+    assert merge_item["prepared_discovered_candidates"] == ["C005"]
+    assert merge_item["source_candidate_refs"] == ["C005"]
+    assert "## 多脑多手架构" in merge_item["source_locators"]
+    assert "agent harness" in "\n".join(snippet["text"] for snippet in merge_item["snippets"])
+    assert draft_item["source_candidate_ids"] == []
+    assert draft_item["prepared_discovered_candidates"] == ["C005"]
+    assert draft_item["source_candidate_refs"] == ["C005"]
+    assert "## 多脑多手架构" in draft_item["source_locators"]
+    assert "managed agents" in "\n".join(snippet["text"] for snippet in draft_item["snippets"])
+
+
+def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_deferred() -> None:
+    def concept(candidate_id: str, title: str, related: list[str] | None = None) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="concept",
+            one_sentence_summary=f"{title} 摘要。",
+            why_matters=f"{title} 重要。",
+            wiki_value=f"{title} 可复用。",
+            suggested_page_title=title,
+            related_candidates=related or [],
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试 draft rendering digest projection。",
+        concepts=[
+            concept("C1", "保留的普通候选"),
+            concept("AGG-concepts-demo", "聚合候选", related=["C3", "C4"]),
+            concept("C9", "无关候选"),
+        ],
+        designs=[concept("D1", "无关设计")],
+        budget_deferred_candidates=[
+            concept("C3", "聚合代表的 deferred 一"),
+            concept("C4", "聚合代表的 deferred 二"),
+            concept("C10", "无关 deferred"),
+        ],
+        weak_or_noise_items=[
+            pipeline_module.WeakOrNoiseItem(
+                candidate_id="noise-1",
+                name="噪声",
+                one_sentence_summary="不应进入 draft payload。",
+            )
+        ],
+    )
+    merge_plan = WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-C1",
+                source_basis=SourceBasis(source_candidate_ids=["C1"]),
+                action="create",
+                canonical_target_path="concepts/Concept_C1.md",
+                display_title="保留的普通候选",
+                page_type="concept",
+                new_understanding="测试。",
+                section_plans={"summary": "摘要"},
+                reason="test",
+            ),
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-AGG",
+                source_basis=SourceBasis(source_candidate_ids=["AGG-concepts-demo"]),
+                action="create",
+                canonical_target_path="overviews/Overview_AGG.md",
+                display_title="聚合候选",
+                page_type="overview",
+                new_understanding="测试。",
+                section_plans={"summary": "摘要"},
+                reason="test",
+            ),
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-NOOP",
+                source_basis=SourceBasis(source_candidate_ids=["D1"]),
+                action="noop",
+                canonical_target_path="designs/Design_D1.md",
+                display_title="无关设计",
+                page_type="design",
+                new_understanding="测试。",
+                section_plans={"summary": "摘要"},
+                reason="test",
+            ),
+        ],
+    )
+
+    projected, report = pipeline_module.project_source_digest_for_merge_plan(digest, merge_plan)
+
+    assert [candidate.candidate_id for candidate in projected.concepts] == ["C1", "AGG-concepts-demo"]
+    assert projected.designs == []
+    assert [candidate.candidate_id for candidate in projected.budget_deferred_candidates] == ["C3", "C4"]
+    assert projected.weak_or_noise_items == []
+    assert report["needed_candidate_ids"] == ["AGG-concepts-demo", "C1", "C3", "C4"]
+    assert report["unresolved_candidate_ids"] == []
+    assert report["removed_counts"]["concepts"] == 1
+    assert report["removed_counts"]["budget_deferred_candidates"] == 1
+    assert report["removed_counts"]["weak_or_noise_items"] == 1
+
+
+def test_draft_rendering_digest_projection_reports_unresolved_candidate_ids() -> None:
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试 unresolved projection。",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="C1",
+                name="已知候选",
+                type="concept",
+                one_sentence_summary="已知候选摘要。",
+                why_matters="重要。",
+                wiki_value="可复用。",
+                suggested_page_title="已知候选",
+            )
+        ],
+    )
+    merge_plan = WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-C1",
+                source_basis=SourceBasis(source_candidate_ids=["C1", "prepared-only-topic"]),
+                action="create",
+                canonical_target_path="concepts/Concept_C1.md",
+                display_title="已知候选",
+                page_type="concept",
+                new_understanding="测试。",
+                section_plans={"summary": "摘要"},
+                reason="test",
+            )
+        ],
+    )
+
+    _, report = pipeline_module.project_source_digest_for_merge_plan(digest, merge_plan)
+
+    assert report["needed_candidate_ids"] == ["C1", "prepared-only-topic"]
+    assert report["unresolved_candidate_ids"] == ["prepared-only-topic"]
+
+
+def test_source_digest_candidate_budget_semantically_dedupes_open_questions_before_budget() -> None:
+    def open_question(candidate_id: str, title: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="open_question",
+            one_sentence_summary=f"{title} 摘要。",
+            why_matters=f"{title} 重要。",
+            wiki_value=f"{title} 可复用。",
+            source_locator=f"section {candidate_id}",
+            suggested_page_title=title,
+            open_question_or_tension=title,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试去重。",
+        open_questions=[
+            open_question("O1", "AGI到来后PM角色会消失吗？"),
+            open_question("O2", "AGI后PM是否必要？"),
+            open_question("O3", "AGI到来后PM角色是否会消失？"),
+            open_question("O4", "AI 时代 PM 如何训练产品判断？"),
+        ],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 12)
+
+    assert [item.candidate_id for item in capped.open_questions] == ["O1", "O4"]
+    assert capped.open_questions[0].related_candidates == ["O2", "O3"]
+    assert "source_digest_semantic_dedupe" in capped.open_questions[0].resolution_hint
+    assert "section O2" in capped.open_questions[0].resolution_hint
+    assert report["total_formal_candidates_before_dedupe"] == 4
+    assert report["total_formal_candidates_before_budget"] == 2
+    assert report["deduped_count"] == 2
+    assert report["dedupe_applied"] is True
+    assert [item["merged_candidate_id"] for item in report["deduped_candidates"]] == ["O2", "O3"]
+    markdown = pipeline_module.render_source_digest_budget_report(report)
+    assert "## 语义去重候选" in markdown
+    assert "semantic:agi_pm_role_necessity" in markdown
+    assert "O2" in markdown
+
+
+def test_source_digest_open_question_dedupe_prefers_tension_over_generic_title() -> None:
+    def open_question(candidate_id: str, title: str, tension: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="open_question",
+            one_sentence_summary=f"{title} 摘要。",
+            why_matters=f"{title} 重要。",
+            wiki_value=f"{title} 可复用。",
+            source_locator=f"section {candidate_id}",
+            suggested_page_title=title,
+            open_question_or_tension=tension,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试去重。",
+        open_questions=[
+            open_question("O1", "PM 角色问题", "AGI到来后PM角色会消失吗？"),
+            open_question("O2", "AI 产品组织问题", "AGI后PM是否必要？"),
+        ],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 12)
+
+    assert [item.candidate_id for item in capped.open_questions] == ["O1"]
+    assert capped.open_questions[0].related_candidates == ["O2"]
+    assert report["deduped_count"] == 1
+    assert report["deduped_candidates"][0]["dedupe_key"] == "open_questions:semantic:agi_pm_role_necessity"
+
+
+def test_source_digest_candidate_budget_semantically_dedupes_similar_concepts_before_budget() -> None:
+    def concept(candidate_id: str, title: str, summary: str) -> SourceDigestCandidate:
+        return SourceDigestCandidate(
+            candidate_id=candidate_id,
+            name=title,
+            type="concept",
+            one_sentence_summary=summary,
+            why_matters=f"{summary} 对 AI PM 训练有复用价值。",
+            wiki_value=f"{summary} 可沉淀为能力判断框架。",
+            source_locator=f"section {candidate_id}",
+            suggested_page_title=title,
+        )
+
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="测试 concept 去重。",
+        concepts=[
+            concept("C1", "AI PM 能力模型", "AI PM 能力模型覆盖判断力、技术协作和面试准备。"),
+            concept("C2", "AI PM 能力框架", "AI PM 能力框架覆盖判断力、技术协作和面试准备。"),
+            concept("C3", "AI PM 商业模式", "AI PM 商业模式关注收入结构、定价和客户价值。"),
+        ],
+    )
+
+    capped, report = pipeline_module.cap_source_digest_candidates(digest, 12)
+
+    assert [item.candidate_id for item in capped.concepts] == ["C1", "C3"]
+    assert capped.concepts[0].related_candidates == ["C2"]
+    assert "source_digest_semantic_dedupe" in capped.concepts[0].resolution_hint
+    assert "section C2" in capped.concepts[0].resolution_hint
+    assert report["total_formal_candidates_before_dedupe"] == 3
+    assert report["total_formal_candidates_before_budget"] == 2
+    assert report["deduped_count"] == 1
+    assert report["deduped_candidates"][0]["group"] == "concepts"
+    assert report["deduped_candidates"][0]["merged_candidate_id"] == "C2"
+
+
+def test_draft_source_excerpt_pack_truncates_long_source_by_page_cues() -> None:
+    digest = SourceDigestArtifact.model_validate(read_json(FIXTURE_ROOT / "mock" / "source_digest.json"))
+    merge_plan = WikiMergePlanArtifact.model_validate(read_json(FIXTURE_ROOT / "mock" / "wiki_merge_planning.json"))
+    approved_text = (
+        "# 长文材料\n\n"
+        + ("背景填充段落，用来模拟很长的播客或论文转写。\n" * 240)
+        + "\n## 知识编译工程骨架\n\n"
+        "第一阶段先证明 CLI、状态机、artifact 和 validator 能跑通，避免只追求生成内容数量。\n"
+        + ("中间填充段落。\n" * 160)
+        + "\n## 简化 Ingest 草稿流程\n\n"
+        "简化 Ingest 不直接写入正式 wiki，而是先生成 source 和 concept 草稿，再通过 review/apply 进入知识库。\n"
+    )
+
+    pack = pipeline_module.build_draft_source_excerpt_pack(
+        approved_text,
+        digest,
+        merge_plan,
+        full_source_limit=1_000,
+        total_limit=1_400,
+        per_page_limit=420,
+        global_limit=180,
+    )
+
+    assert pack["full_source_in_payload"] is False
+    assert pack["truncated_for_payload"] is True
+    assert pack["original_char_count"] > pack["included_char_count"]
+    assert pack["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
+    by_title = {item["display_title"]: item for item in pack["items"]}
+    first_snippets = "\n".join(snippet["text"] for snippet in by_title["知识编译工程骨架"]["snippets"])
+    second_snippets = "\n".join(snippet["text"] for snippet in by_title["简化 Ingest 草稿流程"]["snippets"])
+    assert "CLI、状态机、artifact 和 validator" in first_snippets
+    assert "review/apply" in second_snippets
+
+    markdown = pipeline_module.render_draft_source_excerpt_pack_markdown(pack)
+    assert "## 页面摘录索引" in markdown
+    assert "## 分页摘录" in markdown
+    assert "知识编译工程骨架" in markdown
+
+
+def test_source_snippets_match_nfkc_parenthetical_title_variants() -> None:
+    text = (
+        "# Cat Wu 访谈\n\n"
+        + ("开头填充段落。\n" * 80)
+        + "归根结底还是产品品味（Product Taste）。当代码越来越廉价时，决定写什么更有价值。\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        ["产品品味 (Product Taste)"],
+        max_chars=240,
+    )
+
+    assert snippets
+    assert snippets[0]["cue"] != "fallback_start"
+    assert "产品品味" in snippets[0]["text"]
+    assert pipeline_module.find_source_cue(text, "产品品味 (Product Taste)") >= 0
+
+
+def test_source_snippets_use_locator_heading_instead_of_start_fallback() -> None:
+    text = (
+        "# Cat Wu 访谈\n\n"
+        + ("开头填充段落。\n" * 80)
+        + "### 为什么95%自动化不够\n\n"
+        "如果自动化不是100%有效，它真的不是自动化。95%的自动化真的没什么价值。\n\n"
+        "### 构建你每天使用的应用，而不是原型\n\n"
+        "后续小节内容。\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        ["自动化100%价值 (Value of 100% Automation)", "访谈‘为什么95%自动化不够’部分"],
+        max_chars=260,
+    )
+
+    assert snippets
+    assert snippets[0]["cue"] != "fallback_start"
+    assert "为什么95%自动化不够" in snippets[0]["text"]
+    assert "95%的自动化真的没什么价值" in snippets[0]["text"]
+    assert "开头填充段落" not in snippets[0]["text"]
+
+
+def test_source_snippets_rank_specific_window_over_generic_frontmatter() -> None:
+    text = (
+        "---\n"
+        "title: Cat Wu at Anthropic\n"
+        "description: Anthropic 的 Claude Code 和 Cowork 访谈。\n"
+        "---\n\n"
+        "## 访谈全文\n\n"
+        + ("开头背景段落。\n" * 60)
+        + "### 为什么构建Eval被低估了\n\n"
+        "所以我认为Eval是被低估的东西，更多的PM和工程师应该做这个。"
+        "仅仅构建10个出色的Eval，对于帮助团队量化目标是什么、他们离目标进展如何、以及缺少什么，就很重要。"
+        "团队会更精确地理解Claude Code行为，以及最大的改进领域是什么。\n\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        [
+            "评估（Eval）",
+            "评估在AI产品开发中被低估，它帮助量化成功、指导模型改进。",
+            "阐述评估在Anthropic中的应用：如何编写评估、以及评估如何辅助产品决策。",
+        ],
+        max_chars=360,
+    )
+
+    assert snippets
+    snippet_text = "\n".join(snippet["text"] for snippet in snippets)
+    assert "为什么构建Eval被低估了" in snippet_text
+    assert "量化目标" in snippet_text
+    assert "title: Cat Wu" not in snippet_text
+
+
+def test_source_snippets_use_semantic_fallback_when_exact_cue_is_not_contiguous() -> None:
+    text = (
+        "# 偏好学习笔记\n\n"
+        + ("开头背景段落，不包含目标知识。\n\n" * 45)
+        + "训练偏好系统时，人类反馈会先被整理成比较数据。随后团队训练奖励模型，"
+        "让模型学习哪些回答更符合人类偏好，并把这种偏好信号用于后续对齐。\n\n"
+        + ("结尾填充段落。\n" * 20)
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        ["人类反馈训练奖励模型可以改善偏好对齐"],
+        max_chars=280,
+    )
+
+    assert snippets
+    assert snippets[0]["cue"].startswith("fallback_semantic:")
+    assert "人类反馈" in snippets[0]["text"]
+    assert "奖励模型" in snippets[0]["text"]
+    assert "开头背景段落" not in snippets[0]["text"]
+
+
+def test_source_snippets_semantic_fallback_ignores_generic_cues() -> None:
+    text = (
+        "# 普通材料\n\n"
+        + ("开头背景段落，用来模拟很长的输入。\n" * 40)
+        + "\n\n这里讨论一个具体实现，但没有足够的候选主题词。\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        ["为什么这个问题重要", "来源定位：讨论部分"],
+        max_chars=220,
+    )
+
+    assert snippets
+    assert snippets[0]["cue"] == "fallback_start"
 
 
 def test_raw_link_cleanup_normalizes_only_obsidian_text_wikilinks(tmp_path: Path) -> None:
@@ -277,6 +1456,8 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert prepared_decision["review_mode"] == "auto_stub"
     assert prepared_decision["auto_approved"] is True
     assert (run_dir / "source_digest" / "source_digest.json").exists()
+    assert (run_dir / "source_digest" / "source_digest_budget_report.json").exists()
+    assert (run_dir / "source_digest" / "source_digest_budget_report.md").exists()
     assert (run_dir / "source_digest_review" / "approved_digest.json").exists()
     digest_decision = read_json(run_dir / "source_digest_review" / "review_decision.json")
     assert digest_decision["decision"] == "approved"
@@ -323,6 +1504,7 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "raw_preparation.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
     assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
     assert "source_digest.v2" in [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"]
+    assert "source_digest_budget_report.v1" in [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"]
     assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[3].outputs if ref.kind == "json"]
     assert [ref.schema_version for ref in loaded.steps[4].outputs if ref.relative_path.endswith("approved_digest.json")] == [
         "source_digest.v2"
@@ -354,6 +1536,11 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "resolved cache path" in contexts_markdown
     assert "query count" in contexts_markdown
     assert "编码页面数" in contexts_markdown
+    assert "排序说明" in contexts_markdown
+    assert "Score Bucket" in contexts_markdown
+    assert "Sort Key" in contexts_markdown
+    assert "title_distance" in contexts_markdown
+    assert "lexical_expansion" in contexts_markdown
     assert (run_dir / "wiki_merge_planning" / "merge_decision_report.md").exists()
     snapshot = read_json(run_dir / "wiki_context_snapshot" / "wiki_context_snapshot.json")
     assert snapshot["schema_version"] == "wiki_context_snapshot.v2"
@@ -377,6 +1564,25 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert metrics["steps"][0]["attempts"] == 1
     assert metrics["steps"][0]["last_duration_ms"] is not None
     assert metrics["steps"][0]["provider"] == "local"
+    assert metrics["current_attempt_duration_ms"] >= metrics["steps"][0]["last_duration_ms"]
+    assert metrics["current_model_duration_ms"] >= 0
+    assert metrics["archived_model_duration_ms"] == 0
+    assert metrics["total_model_duration_ms"] == metrics["current_model_duration_ms"]
+    assert metrics["internal_model_payload_char_count"] > 0
+    assert metrics["archived_internal_model_payload_char_count"] == 0
+    assert metrics["total_internal_model_payload_char_count"] == metrics["internal_model_payload_char_count"]
+    assert metrics["payload_by_step"]
+    assert metrics["largest_payload_step"]
+    assert metrics["largest_payload_char_count"] > 0
+    assert any(step.get("payload_char_count", 0) > 0 for step in metrics["steps"])
+    metrics_markdown = (run_dir / "run_metrics.md").read_text(encoding="utf-8")
+    assert "## Payload By Step" in metrics_markdown
+    assert metrics["largest_payload_step"] in metrics_markdown
+    assert metrics["candidate_page_budget"] == 12
+    assert metrics["candidate_count_before_dedupe"] >= metrics["candidate_count_before_budget"]
+    assert metrics["candidate_selected_count"] == metrics["candidate_count_before_budget"]
+    assert metrics["candidate_deferred_count"] == 0
+    assert metrics["candidate_deduped_count"] >= 0
     assert metrics["cleaned_link_count"] == 0
     events = read_jsonl(run_dir / "events.jsonl")
     assert {event["event"] for event in events} <= {"started", "completed", "failed"}
@@ -590,6 +1796,764 @@ def test_model_artifacts_are_redacted(tmp_path: Path, monkeypatch: pytest.Monkey
             assert secret not in path.read_text(encoding="utf-8")
 
 
+def test_raw_prepare_fast_path_skips_live_provider_for_clean_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    called_tasks: list[str] = []
+
+    def fake_generate_raw(self, task, payload, output_model):
+        called_tasks.append(task)
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="raw-fast-path")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    assert "raw_prepare" not in called_tasks
+    assert {"source_digest", "candidate_resolution", "draft_rendering"} <= set(called_tasks)
+    assert "wiki_merge_planning" not in called_tasks
+    preparation = read_json(run_dir / "raw_prepare" / "raw_preparation.json")
+    assert preparation["operations_applied"] == ["deterministic_markdown_passthrough"]
+    assert preparation["prepared_markdown"].strip() == raw.read_text(encoding="utf-8").strip()
+    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
+    assert fast_path["eligible"] is True
+    assert fast_path["reasons"] == []
+    assert not (run_dir / "raw_prepare" / "structured_repair_report.json").exists()
+    metrics = read_json(run_dir / "run_metrics.json")
+    raw_prepare_step = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
+    assert raw_prepare_step["local_fast_path"] is True
+    assert raw_prepare_step["provider"] == "local:raw_prepare_fast_path"
+    assert "internal_model_call_count" not in raw_prepare_step
+    assert metrics["internal_model_call_count"] == 3
+
+
+def test_raw_prepare_fast_path_truncates_long_reference_section(tmp_path: Path) -> None:
+    raw = tmp_path / "paper.md"
+    body = "# Paper\n\n" + "\n\n".join(
+        f"Main argument paragraph {index}. " + ("agent evaluation evidence " * 8) for index in range(90)
+    )
+    references = "## References\n\n" + "\n".join(
+        f"[{index}] Reference title {index}. Conference proceedings and arXiv metadata."
+        for index in range(90)
+    )
+    raw.write_text(body + "\n\n" + references + "\n", encoding="utf-8")
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/paper.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/paper.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert preparation.operations_applied == [
+        "deterministic_markdown_passthrough",
+        "deterministic_reference_section_truncation",
+    ]
+    assert preparation.omission_policy == "reference_section_omitted_from_prepared_markdown_raw_retained"
+    assert "Main argument paragraph 89" in preparation.prepared_markdown
+    assert "## References" in preparation.prepared_markdown
+    assert "Reference section omitted from prepared markdown" in preparation.prepared_markdown
+    assert "Reference title 89" not in preparation.prepared_markdown
+    assert "original raw retains the full reference list" in preparation.review_notes
+    assert report["reference_truncation"]["truncated"] is True
+    assert report["reference_truncation"]["omitted_char_count"] > 1_500
+
+
+def test_raw_prepare_fast_path_omits_references_before_appendix(tmp_path: Path) -> None:
+    raw = tmp_path / "paper-with-appendix.md"
+    body = "# Paper\n\n" + "\n\n".join(
+        f"Main body paragraph {index}. " + ("memory benchmark method " * 8) for index in range(75)
+    )
+    references = "## References\n\n" + "\n".join(
+        f"[{index}] Reference title {index}. Conference proceedings and arXiv metadata."
+        for index in range(120)
+    )
+    appendix = "## Appendix A Case Studies\n\n" + "\n\n".join(
+        f"Appendix example {index}. User relation graph evidence." for index in range(30)
+    )
+    raw.write_text(body + "\n\n" + references + "\n\n" + appendix + "\n", encoding="utf-8")
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/paper-with-appendix.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/paper-with-appendix.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert "Main body paragraph 74" in preparation.prepared_markdown
+    assert "Reference section omitted from prepared markdown" in preparation.prepared_markdown
+    assert "Reference title 119" not in preparation.prepared_markdown
+    assert "## Appendix A Case Studies" in preparation.prepared_markdown
+    assert "Appendix example 29" in preparation.prepared_markdown
+    assert report["reference_truncation"]["truncated"] is True
+    assert report["reference_truncation"]["preserved_following_appendix"] is True
+    assert report["reference_truncation"]["omitted_char_count"] > 1_500
+
+
+def test_raw_prepare_fast_path_compacts_paper_appendix_sections(tmp_path: Path) -> None:
+    raw = tmp_path / "arxiv-paper-with-appendix.md"
+    body = (
+        "# Long Paper\n\n"
+        "Imported from: http://arxiv.org/abs/2500.00000v1\n\n"
+        "###### Abstract\n\n"
+        + ("This paper studies agent memory benchmarks and evaluation. " * 120)
+        + "\n\n## 1 Introduction\n\n"
+        + ("The introduction explains the durable contribution and method. " * 220)
+        + "\n\n## 2 Method\n\n"
+        + ("The method section defines the evaluation setting and metrics. " * 220)
+        + "\n\n## 3 Experiments\n\n"
+        + ("Experiments compare memory mechanisms across scenarios. " * 220)
+        + "\n\n## 4 Conclusion\n\n"
+        + ("Conclusion summarizes the main contribution. " * 120)
+    )
+    references = "## References\n\n" + "\n".join(
+        f"[{index}] Reference title {index}. Conference proceedings and arXiv metadata."
+        for index in range(120)
+    )
+    appendix_sections = []
+    for index in range(1, 8):
+        appendix_sections.append(
+            f"### A.{index} Long Appendix Section\n\n"
+            + (f"Appendix section {index} contains generated examples, prompts, tables, and long case data. " * 90)
+        )
+    appendix = "## Appendix A Case Studies\n\n" + "\n\n".join(appendix_sections)
+    raw.write_text(body + "\n\n" + references + "\n\n" + appendix + "\n", encoding="utf-8")
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/arxiv-paper-with-appendix.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/arxiv-paper-with-appendix.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert preparation.document_kind == "article"
+    assert preparation.operations_applied == [
+        "deterministic_markdown_passthrough",
+        "deterministic_reference_section_truncation",
+        "deterministic_appendix_section_compaction",
+    ]
+    assert preparation.omission_policy == "reference_section_omitted_and_appendix_compacted_from_prepared_markdown_raw_retained"
+    assert "Reference title 119" not in preparation.prepared_markdown
+    assert "## Appendix A Case Studies" in preparation.prepared_markdown
+    assert "### A.1 Long Appendix Section" in preparation.prepared_markdown
+    assert "Appendix section compacted in prepared markdown" in preparation.prepared_markdown
+    assert "Appendix section 7 contains generated examples" in preparation.prepared_markdown
+    assert len(preparation.prepared_markdown) < len(raw.read_text(encoding="utf-8")) - 8_000
+    assert report["appendix_compaction"]["compacted"] is True
+    assert report["appendix_compaction"]["omitted_char_count"] > 4_000
+    _, report_md = pipeline_module.write_raw_prepare_fast_path_report(tmp_path, report)
+    report_text = report_md.read_text(encoding="utf-8")
+    assert "## Appendix 压缩" in report_text
+    assert "compacted_section_count" in report_text
+
+
+def test_raw_prepare_fast_path_allows_arxiv_paper_with_dialogue_examples(tmp_path: Path) -> None:
+    raw = tmp_path / "membench.md"
+    sections = []
+    for heading in [
+        "Abstract",
+        "Introduction",
+        "Related Work",
+        "Method",
+        "Experiments",
+        "Evaluation",
+        "Results",
+        "Discussion",
+        "Conclusion",
+    ]:
+        sections.append(
+            f"## {heading}\n\n"
+            + "\n".join(
+                f"{heading} paragraph {index} explains LLM agent memory evaluation and benchmark design."
+                for index in range(1, 25)
+            )
+        )
+    dialogue_examples = "\n".join(
+        f"User: synthetic memory example {index}\nAssistant: synthetic assistant response {index}\n"
+        f"Question: benchmark question {index}\nAnswer: benchmark answer {index}"
+        for index in range(1, 9)
+    )
+    raw.write_text(
+        "# MemBench Paper\n\n"
+        "Imported from: https://arxiv.org/abs/2506.21605v1\n"
+        "Fetched URL: https://arxiv.org/html/2506.21605v1\n\n"
+        + "\n\n".join(sections)
+        + "\n\nTable 1: Dataset comparison.\nFigure 1: Dialogue generation example.\nTable 2: Memory results.\n\n"
+        + dialogue_examples
+        + "\n\n## References\n\n[1] Memory benchmark paper.\n",
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/membench.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/membench.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert report["eligible"] is True
+    assert report["noise_profile"]["speaker_turn_count"] >= 20
+    assert report["noise_profile"]["paper_like_marker"] is True
+    assert pipeline_module.raw_prepare_speaker_turn_transcript_noise(report["noise_profile"]) is False
+    assert preparation.document_kind == "article"
+    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
+
+
+def test_raw_prepare_fast_path_skips_live_provider_for_structured_interview_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    sections = []
+    for index in range(1, 8):
+        sections.append(
+            f"### 小节 {index}\n\n"
+            + "\n".join(f"这是结构化访谈正文第 {index}-{line} 段，没有时间戳或说话人标签。" for line in range(1, 7))
+        )
+    raw.write_text(
+        "---\ntitle: Structured Interview\n---\n\n"
+        "## 访谈全文\n\n"
+        + "\n\n".join(sections),
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    called_tasks: list[str] = []
+
+    def fake_generate_raw(self, task, payload, output_model):
+        called_tasks.append(task)
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="structured-raw-fast-path")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    assert "raw_prepare" not in called_tasks
+    assert {"source_digest", "candidate_resolution", "draft_rendering"} <= set(called_tasks)
+    assert "wiki_merge_planning" not in called_tasks
+    preparation = read_json(run_dir / "raw_prepare" / "raw_preparation.json")
+    assert preparation["document_kind"] == "transcript"
+    assert preparation["operations_applied"] == ["deterministic_structured_markdown_passthrough"]
+    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
+    assert fast_path["eligible"] is True
+    assert fast_path["fast_path_mode"] == "structured_markdown_passthrough"
+    assert set(fast_path["allowed_soft_markers"]) == {"interview_transcript_marker"}
+    raw_prepare_step = [step for step in read_json(run_dir / "run_metrics.json")["steps"] if step["name"] == "raw_prepare"][0]
+    assert raw_prepare_step["local_fast_path"] is True
+    assert "internal_model_call_count" not in raw_prepare_step
+
+
+def test_raw_prepare_fast_path_keeps_translated_podcast_markdown_on_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    sections = []
+    for index in range(1, 8):
+        sections.append(
+            f"### 访谈主题 {index}\n\n"
+            + "\n".join(f"这是播客翻译稿第 {index}-{line} 段，有完整句读但仍需要清洗。" for line in range(1, 7))
+        )
+    raw.write_text(
+        "---\n"
+        "title: Translated Podcast\n"
+        "source: https://www.youtube.com/watch?v=test\n"
+        "author:\n"
+        "  - \"Lenny's Podcast\"\n"
+        "tags:\n"
+        "  - 翻译\n"
+        "---\n\n"
+        "![](https://www.youtube.com/watch?v=test)\n\n"
+        "## 访谈全文\n\n"
+        + "\n\n".join(sections),
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    called_tasks: list[str] = []
+
+    def fake_generate_raw(self, task, payload, output_model):
+        called_tasks.append(task)
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="translated-podcast")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    assert "raw_prepare" in called_tasks
+    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
+    assert fast_path["eligible"] is False
+    assert "structured markdown looks like noisy ASR or translated transcript" in fast_path["reasons"]
+    assert fast_path["noise_profile"]["transcript_provenance_risk"] is True
+    assert fast_path["noise_profile"]["structured_markdown_quality_risk"] is True
+
+
+def test_raw_prepare_skip_prepare_overrides_translated_podcast_guard(tmp_path: Path) -> None:
+    raw = tmp_path / "translated-podcast.md"
+    raw.write_text(
+        "---\n"
+        "title: Translated Podcast\n"
+        "source: https://www.youtube.com/watch?v=test\n"
+        "tags:\n"
+        "  - 翻译\n"
+        "---\n\n"
+        "![](https://www.youtube.com/watch?v=test)\n\n"
+        "## 访谈全文\n\n"
+        + "\n\n".join(
+            f"### 访谈主题 {index}\n\n"
+            + "\n".join(f"这是播客翻译稿第 {index}-{line} 段，有完整句读但用户确认无需模型清洗。" for line in range(1, 7))
+            for index in range(1, 8)
+        ),
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/translated-podcast.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/translated-podcast.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+
+    assert preparation is not None
+    assert report["raw_prepare_policy"] == "skip-model"
+    assert report["eligible"] is True
+    assert report["fast_path_mode"] == "user_skip_model_passthrough"
+    assert "user_skip_prepare" in report["allowed_soft_markers"]
+    assert "structured markdown looks like noisy ASR or translated transcript" in report["policy_suppressed_reasons"]
+    assert preparation.operations_applied == ["user_skip_model_markdown_passthrough"]
+    assert preparation.risk_level == "medium"
+    assert preparation.requires_human_review is True
+
+
+def test_raw_prepare_noise_profile_does_not_count_url_scheme_as_speaker_turn() -> None:
+    noise = pipeline_module.raw_prepare_noise_profile(
+        "Imported source https://www.youtube.com/watch?v=test\n"
+        "Speaker: this is a real transcript turn.\n"
+    )
+
+    assert noise["speaker_turn_count"] == 1
+
+
+def test_raw_prepare_skip_prepare_records_local_provider(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=FIXTURE_ROOT / "mock",
+        slug="skip-prepare-provider",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    loaded = status(vault, manifest.operation_id)
+    raw_prepare_step = [step for step in loaded.steps if step.name == "raw_prepare"][0]
+    metrics = read_json(run_dir / "run_metrics.json")
+    raw_prepare_metrics = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
+
+    assert raw_prepare_step.attempts[-1].provider_spec is None
+    assert raw_prepare_metrics["provider"] == "local:skip_prepare"
+    assert "raw_prepare" not in manifest.provider_contexts[0].providers
+
+
+def test_raw_prepare_skip_prepare_does_not_require_raw_prepare_fixture(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "mock-without-raw-prepare"
+    fixture_dir.mkdir()
+    for name in ["source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        write_json(fixture_dir / name, read_json(FIXTURE_ROOT / "mock" / name))
+
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=fixture_dir,
+        slug="skip-prepare-no-raw-fixture",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    metrics = read_json(run_dir / "run_metrics.json")
+    raw_prepare_metrics = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
+
+    assert "raw_prepare" not in manifest.provider_contexts[0].providers
+    assert raw_prepare_metrics["provider"] == "local:skip_prepare"
+    assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
+
+
+def test_raw_prepare_skip_prepare_hard_blocker_keeps_model_provider_label(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text("", encoding="utf-8")
+
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=FIXTURE_ROOT / "mock",
+        slug="skip-prepare-empty",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    loaded = status(vault, manifest.operation_id)
+    raw_prepare_step = [step for step in loaded.steps if step.name == "raw_prepare"][0]
+    metrics = read_json(run_dir / "run_metrics.json")
+    raw_prepare_metrics = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
+    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
+
+    assert fast_path["eligible"] is False
+    assert fast_path["reasons"] == ["raw text is empty"]
+    assert raw_prepare_step.attempts[-1].provider_spec == "mock:fixture"
+    assert raw_prepare_metrics["provider"] == "mock:fixture"
+
+
+def test_prepared_raw_review_surfaces_skip_prepare_risk(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text(
+        "# Cat Wu 访谈（中文翻译）\n\n"
+        "source https://www.youtube.com/watch?v=demo\n\n"
+        "![cover](cover.png)\n\n"
+        "## 访谈全文\n\n"
+        + "\n\n".join(
+            f"### 访谈主题 {index}\n\n"
+            + "\n".join(f"这是播客翻译稿第 {index}-{line} 段，有完整句读但用户确认无需模型清洗。" for line in range(1, 7))
+            for index in range(1, 8)
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=FIXTURE_ROOT / "mock",
+        slug="skip-prepare-risk-review",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    prompt = (run_dir / "prepared_raw_review" / "review_prompt.md").read_text(encoding="utf-8")
+    decision = read_json(run_dir / "prepared_raw_review" / "review_decision.json")
+
+    assert "Skip Prepare 风险提示" in prompt
+    assert "policy_suppressed" not in prompt
+    assert "structured markdown looks like noisy ASR or translated transcript" in prompt
+    assert "--skip-prepare 覆盖" in decision["notes"]
+
+
+def test_raw_prepare_force_prepare_disables_clean_markdown_fast_path(tmp_path: Path) -> None:
+    raw = tmp_path / "clean.md"
+    raw.write_text("# Clean\n\n这是一篇人工整理过的短文。\n", encoding="utf-8")
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/clean.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/clean.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+        raw_prepare_policy=RawPreparePolicy.force_model,
+    )
+
+    assert preparation is None
+    assert report["raw_prepare_policy"] == "force-model"
+    assert report["eligible"] is False
+    assert report["reasons"] == ["raw_prepare policy forces model cleaning"]
+
+
+def test_raw_prepare_fast_path_allows_audited_text_wikilink_cleanup(tmp_path: Path) -> None:
+    raw = tmp_path / "structured-interview-cleaned.md"
+    raw.write_text(
+        "---\n"
+        "title: Structured Interview\n"
+        "author:\n"
+        "  - \"Lenny's Podcast\"\n"
+        "---\n\n"
+        "## 产品访谈整理\n\n"
+        + "\n\n".join(
+            f"### 小节 {index}\n\n"
+            + "\n".join(f"这是结构化访谈正文第 {index}-{line} 段，没有时间戳或说话人标签。" for line in range(1, 7))
+            for index in range(1, 8)
+        ),
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/structured-interview-cleaned.md",
+        changed=True,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+        cleaned_link_count=1,
+        preserved_media_embed_count=0,
+        links=[
+            pipeline_module.RawLinkCleanupLink(
+                link_id="L001",
+                link_kind="wikilink",
+                label="Lenny's Podcast",
+                target="Lenny's Podcast",
+                cleanup_action="unwrap_text",
+                cleanup_context="frontmatter",
+                line_number=4,
+                original_line_hash="hash",
+                line_excerpt="- \"[[Lenny's Podcast]]\"",
+            )
+        ],
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/structured-interview-cleaned.md",
+        input_raw_sha256="post",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is not None
+    assert report["eligible"] is True
+    assert report["raw_link_cleanup_fast_path_compatible"] is True
+    assert "raw_link_cleanup_text_unwrap" in report["allowed_soft_markers"]
+    assert "Raw link cleanup only unwrapped Obsidian text wikilinks" in preparation.review_notes
+    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
+
+
+def test_raw_prepare_fast_path_keeps_timestamped_transcript_on_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text(
+        "\n".join(f"[00:{index:02d}] Speaker: transcript line {index}" for index in range(12)),
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    called_tasks: list[str] = []
+
+    def fake_generate_raw(self, task, payload, output_model):
+        called_tasks.append(task)
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="raw-transcript")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    assert "raw_prepare" in called_tasks
+    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
+    assert fast_path["eligible"] is False
+    assert "raw looks like a timestamped transcript" in fast_path["reasons"]
+    raw_prepare_step = [step for step in read_json(run_dir / "run_metrics.json")["steps"] if step["name"] == "raw_prepare"][0]
+    assert raw_prepare_step["local_fast_path"] is False
+    assert raw_prepare_step["internal_model_call_count"] == 1
+
+
+def test_raw_prepare_fast_path_rejects_structured_markdown_with_asr_chunking(tmp_path: Path) -> None:
+    raw = tmp_path / "chunked-asr.md"
+    sections = []
+    for index in range(1, 8):
+        sections.append(
+            f"### 小节 {index}\n\n"
+            + "\n".join(f"这个地方 可能 是 识别 错误 {index} {line}" for line in range(1, 7))
+        )
+    raw.write_text("---\ntitle: Chunked ASR\n---\n\n" + "\n\n".join(sections), encoding="utf-8")
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/chunked-asr.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/chunked-asr.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is None
+    assert report["eligible"] is False
+    assert "structured markdown looks like noisy ASR or translated transcript" in report["reasons"]
+    assert report["noise_profile"]["low_punctuation_body_line_ratio"] >= 0.40
+    assert report["noise_profile"]["structured_markdown_quality_risk"] is True
+
+
+def test_raw_prepare_fast_path_rejects_sparse_speaker_turn_transcript(tmp_path: Path) -> None:
+    raw = tmp_path / "speaker-turn.md"
+    sections = []
+    for index in range(1, 7):
+        sections.append(
+            f"### Section {index}\n\n"
+            f"Speaker: transcript turn {index}\n\n"
+            + "\n\n".join(f"Regular paragraph {index}-{line}." for line in range(1, 7))
+        )
+    raw.write_text("\n\n".join(sections), encoding="utf-8")
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/speaker-turn.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/speaker-turn.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is None
+    assert report["eligible"] is False
+    assert "raw looks like a speaker-turn transcript" in report["reasons"]
+
+
+def test_raw_prepare_fast_path_rejects_interview_markdown_media(tmp_path: Path) -> None:
+    raw = tmp_path / "interview.md"
+    raw.write_text(
+        "---\ntitle: Interview\n---\n\n![](https://www.youtube.com/watch?v=test)\n\n## 访谈全文\n\n这里是访谈正文。",
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/interview.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/interview.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is None
+    assert report["eligible"] is False
+    assert "raw contains markdown media embeds" in report["reasons"]
+    assert "raw contains interview/transcript section markers" in report["reasons"]
+
+
+def test_raw_prepare_fast_path_rejects_structured_markdown_interview_with_media(tmp_path: Path) -> None:
+    raw = tmp_path / "structured-interview.md"
+    sections = []
+    for index in range(1, 8):
+        sections.append(
+            f"### 小节 {index}\n\n"
+            + "\n".join(f"这是结构化访谈正文第 {index}-{line} 段，没有时间戳或说话人标签。" for line in range(1, 7))
+        )
+    raw.write_text(
+        "---\ntitle: Structured Interview\n---\n\n"
+        "![](https://www.youtube.com/watch?v=test)\n\n"
+        "## 访谈全文\n\n"
+        + "\n\n".join(sections),
+        encoding="utf-8",
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/structured-interview.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    preparation, report = pipeline_module.build_raw_prepare_fast_path(
+        raw_path=raw,
+        raw_rel="raw/structured-interview.md",
+        input_raw_sha256="hash",
+        cleanup=cleanup,
+        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
+    )
+
+    assert preparation is None
+    assert report["eligible"] is False
+    assert "structured markdown looks like noisy ASR or translated transcript" in report["reasons"]
+    assert "raw contains markdown media embeds" in report["reasons"]
+    assert "raw contains interview/transcript section markers" in report["reasons"]
+    assert report["noise_profile"]["transcript_provenance_risk"] is True
+    assert report["noise_profile"]["heading_count"] >= 8
+
+
 def test_source_digest_provider_payload_omits_formal_candidate_suggested_action(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -619,7 +2583,601 @@ def test_source_digest_provider_payload_omits_formal_candidate_suggested_action(
     source_payload = captured_payloads["source_digest"]
     assert "suggested_action" not in source_payload["contract"]["candidate_fields"]
     assert "suggested_action" in source_payload["contract"]["weak_or_noise_fields"]
+    assert source_payload["language_contract"]["vault_language"] == "zh-CN"
+    assert "summary" in source_payload["language_contract"]["fields_must_be_chinese"]
+    assert "Do not answer source_digest in English" in source_payload["language_contract"]["hard_requirement"]
+    assert "Claude Code" in source_payload["language_contract"]["stable_terms_may_remain_english"]
     assert "candidate_coverage_required_ids" in captured_payloads["candidate_resolution"]
+
+
+def test_source_digest_source_map_triggers_for_long_structured_interview() -> None:
+    sections = []
+    for index in range(1, 34):
+        sections.append(
+            f"### 访谈主题 {index}\n\n"
+            + (f"这是一段关于 AI 原生产品、PM 工作方式、发布流程和团队协作的访谈内容 {index}。 " * 38)
+        )
+    text = "---\ntitle: Long Interview\n---\n\n## 访谈全文\n\n" + "\n\n".join(sections)
+
+    source_map = pipeline_module.build_source_digest_source_map(
+        text,
+        approved_prepared_ref="prepared_raw_review/approved_prepared.md",
+    )
+
+    assert len(text) > pipeline_module.SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT
+    assert source_map["full_source_in_payload"] is False
+    assert source_map["included_char_count"] < source_map["original_char_count"]
+    assert source_map["section_excerpt_limit"] >= pipeline_module.SOURCE_DIGEST_SOURCE_MAP_MIN_SECTION_EXCERPT_LIMIT
+    assert any(section["heading"] == "访谈主题 20" for section in source_map["sections"])
+
+
+def test_source_digest_payload_uses_source_map_for_long_prepared_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text(
+        "# Long Research Note\n\n"
+        "###### Abstract\n\n"
+        + ("This note studies agent memory evaluation and durable wiki candidates. " * 120)
+        + "\n\n## 1 Introduction\n\n"
+        + ("The introduction explains the motivation, benchmark gap, and reusable concepts. " * 260)
+        + "\n\n## 2 Method\n\n"
+        + ("The method section describes dataset construction, scenarios, metrics, and comparisons. " * 260)
+        + "\n\n## 3 Experiments\n\n"
+        + ("Table 1: Accuracy and memory capacity across mechanisms.\n" * 40)
+        + ("The experiments compare retrieval memory, reflective memory, and factual memory. " * 260)
+        + "\n\n## 4 Conclusion\n\n"
+        + ("The conclusion summarizes reusable implications for agent memory systems. " * 120),
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    captured_payloads: dict[str, dict] = {}
+
+    def fake_generate_raw(self, task, payload, output_model):
+        captured_payloads[task] = payload
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="source-digest-map")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    payload = captured_payloads["source_digest"]
+    source_map = payload["source_digest_source_map"]
+    assert payload["approved_prepared_markdown"] == ""
+    assert payload["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
+    assert source_map["schema_version"] == "source_digest_source_map_payload.v1"
+    assert source_map["full_source_map_ref"] == "source_digest/source_digest_source_map.json"
+    assert source_map["full_source_in_payload"] is False
+    assert source_map["original_char_count"] > pipeline_module.SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT
+    assert source_map["included_char_count"] < source_map["original_char_count"]
+    assert any(section["heading"] == "2 Method" for section in source_map["sections"])
+    assert source_map["captions"]
+    assert "source_digest_source_map" in " ".join(payload["contract"]["rules"])
+
+    sidecar = read_json(run_dir / "source_digest" / "source_digest_source_map.json")
+    assert sidecar["schema_version"] == "source_digest_source_map.v1"
+    payload_sidecar = read_json(run_dir / "source_digest" / "source_digest_source_map_payload.json")
+    assert payload_sidecar["schema_version"] == "source_digest_source_map_payload.v1"
+    assert (run_dir / "source_digest" / "source_digest_source_map.md").exists()
+    digest_step = [step for step in manifest.steps if step.name == "source_digest"][0]
+    source_map_ref = [
+        ref
+        for ref in digest_step.outputs
+        if ref.relative_path == "source_digest/source_digest_source_map.json"
+    ][0]
+    assert source_map_ref.schema_version == "source_digest_source_map.v1"
+
+
+def test_candidate_resolution_payload_uses_excerpt_pack_for_long_prepared_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text(
+        raw.read_text(encoding="utf-8")
+        + "\n\n"
+        + ("长文填充段落，用来模拟论文或播客正文。\n" * 1_200)
+        + "\n## 知识编译工程骨架\n\nCLI、状态机、artifact 和 validator 是第一阶段要验证的骨架。\n",
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    captured_payloads: dict[str, dict] = {}
+
+    def fake_generate_raw(self, task, payload, output_model):
+        captured_payloads[task] = payload
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="candidate-resolution-pack")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    payload = captured_payloads["candidate_resolution"]
+    assert payload["approved_prepared_markdown"] == ""
+    assert payload["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
+    assert payload["source_excerpt_pack"]["schema_version"] == "candidate_resolution_source_excerpt_pack.v1"
+    assert payload["source_excerpt_pack"]["full_source_in_payload"] is False
+    assert payload["source_excerpt_pack"]["original_char_count"] > pipeline_module.CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT
+    assert payload["source_excerpt_pack"]["included_char_count"] < payload["source_excerpt_pack"]["original_char_count"]
+    assert "source_excerpt_pack" in " ".join(payload["contract"]["rules"])
+
+    sidecar = read_json(run_dir / "candidate_resolution" / "candidate_resolution_source_excerpt_pack.json")
+    assert sidecar["schema_version"] == "candidate_resolution_source_excerpt_pack.v1"
+    assert (run_dir / "candidate_resolution" / "candidate_resolution_source_excerpt_pack.md").exists()
+    candidate_step = [step for step in manifest.steps if step.name == "candidate_resolution"][0]
+    source_pack_ref = [
+        ref
+        for ref in candidate_step.outputs
+        if ref.relative_path == "candidate_resolution/candidate_resolution_source_excerpt_pack.json"
+    ][0]
+    assert source_pack_ref.schema_version == "candidate_resolution_source_excerpt_pack.v1"
+
+
+def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text(
+        raw.read_text(encoding="utf-8")
+        + "\n\n"
+        + ("长文填充段落，用来模拟论文摘录和产品分析材料的冗长上下文。\n" * 1_200)
+        + "\n## 知识编译工程骨架\n\nCLI、状态机、artifact 和 validator 是第一阶段要验证的骨架。\n",
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    captured_payloads: dict[str, dict] = {}
+
+    def fake_generate_raw(self, task, payload, output_model):
+        captured_payloads[task] = payload
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="long-draft-payload")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    payload = captured_payloads["draft_rendering"]
+    assert payload["approved_prepared_markdown"] == ""
+    assert payload["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
+    assert payload["approved_digest_ref"] == "source_digest_review/approved_digest.json"
+    assert "approved_digest_projection_report" not in payload
+    assert "approved_merge_plan_projection_report" not in payload
+    assert "wiki_context_snapshot_projection_report" not in payload
+    assert payload["approved_merge_plan_ref"] == "merge_plan_review/approved_merge_plan.json"
+    assert payload["approved_merge_plan"]["schema_version"] == "draft_merge_plan_projection.v1"
+    assert payload["required_page_plan_ids"]
+    assert payload["required_target_paths"]
+    assert "exactly required_page_plan_ids" in " ".join(payload["contract"]["rules"])
+    assert payload["wiki_context_snapshot"]["schema_version"] == "wiki_context_snapshot_projection.v1"
+    assert "candidate_contexts" not in payload["wiki_context_snapshot"]
+    assert all("content" not in entry for entry in payload["wiki_context_snapshot"]["entries"])
+    assert payload["source_excerpt_pack"]["full_source_in_payload"] is False
+    assert payload["source_excerpt_pack"]["original_char_count"] > pipeline_module.DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT
+    assert payload["source_excerpt_pack"]["included_char_count"] < payload["source_excerpt_pack"]["original_char_count"]
+    contract_rules = " ".join(payload["contract"]["rules"])
+    grounding_risk_rules = " ".join(payload["contract"]["grounding_risk_rules"])
+    assert "source_excerpt_pack" in contract_rules
+    assert "satisfy update_preservation_pack in the first draft" in contract_rules
+    assert "matching section body" in contract_rules
+    assert "change_summary may summarize retention but does not satisfy the obligation" in contract_rules
+    assert "Do not wrap paraphrases" in contract_rules
+    assert "Do not wrap paraphrases" in grounding_risk_rules
+    assert "translated transcript source text" in grounding_risk_rules
+    assert "speaker-like Chinese wording as paraphrase" in grounding_risk_rules
+    assert "external-backing/adoption phrases" in grounding_risk_rules
+    assert "被广泛应用" in grounding_risk_rules
+    assert "High-risk causal/scope terms" in grounding_risk_rules
+    assert "same sentence or clearly adjacent explicit support" in grounding_risk_rules
+    assert "approved_prepared_markdown" in grounding_risk_rules
+    assert "可能伴随" in grounding_risk_rules
+    assert "translate or paraphrase English raw examples into Chinese" in contract_rules
+    assert "Stable English product/protocol terms" in contract_rules
+
+    sidecar = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
+    assert sidecar["schema_version"] == "draft_source_excerpt_pack.v1"
+    assert (run_dir / "draft_rendering" / "draft_source_excerpt_pack.md").exists()
+    digest_projection_report = read_json(run_dir / "draft_rendering" / "draft_digest_projection_report.json")
+    assert digest_projection_report["schema_version"] == "source_digest_projection_report.v1"
+    assert digest_projection_report["projection"] == "draft_rendering_batch"
+    assert digest_projection_report["original_counts"]["total_ingest_candidates"] >= digest_projection_report["projected_counts"][
+        "total_ingest_candidates"
+    ]
+    assert (run_dir / "draft_rendering" / "draft_digest_projection_report.md").exists()
+    merge_projection_report = read_json(run_dir / "draft_rendering" / "draft_merge_plan_projection_report.json")
+    assert merge_projection_report["schema_version"] == "draft_merge_plan_projection_report.v1"
+    assert merge_projection_report["projected_json_chars"] <= merge_projection_report["original_json_chars"]
+    assert len(payload["approved_merge_plan"]["items"]) == merge_projection_report["projected_item_count"]
+    assert (run_dir / "draft_rendering" / "draft_merge_plan_projection_report.md").exists()
+    context_projection_report = read_json(run_dir / "draft_rendering" / "draft_context_projection_report.json")
+    assert context_projection_report["schema_version"] == "draft_context_projection_report.v1"
+    assert context_projection_report["projected_json_chars"] <= context_projection_report["original_json_chars"]
+    assert (run_dir / "draft_rendering" / "draft_context_projection_report.md").exists()
+    draft_step = [step for step in manifest.steps if step.name == "draft_rendering"][0]
+    excerpt_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/draft_source_excerpt_pack.json"
+    ][0]
+    assert excerpt_ref.schema_version == "draft_source_excerpt_pack.v1"
+    digest_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/draft_digest_projection_report.json"
+    ][0]
+    assert digest_ref.schema_version == "source_digest_projection_report.v1"
+    merge_projection_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/draft_merge_plan_projection_report.json"
+    ][0]
+    assert merge_projection_ref.schema_version == "draft_merge_plan_projection_report.v1"
+    context_projection_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/draft_context_projection_report.json"
+    ][0]
+    assert context_projection_ref.schema_version == "draft_context_projection_report.v1"
+
+
+def test_draft_context_projection_keeps_create_neighbors_metadata_only() -> None:
+    update_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["C001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        matched_page="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试 draft context projection。",
+    )
+    create_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CREATE",
+        source_basis=SourceBasis(source_candidate_ids=["C002"]),
+        action="create",
+        canonical_target_path="concepts/Concept_New.md",
+        display_title="New Concept",
+        page_type="concept",
+        new_understanding="新增概念。",
+        section_plans={"detail": "详情"},
+        related_pages=[
+            pipeline_module.RelatedPageRef(
+                target_path="entities/Entity_Managed Agents.md",
+                display_title="Managed Agents",
+                source="wiki_context",
+                reason="相关旧页。",
+            )
+        ],
+        inspected_context_paths=["concepts/Concept_大脑与双手解耦.md"],
+        reason="测试 create 邻居只保留 metadata。",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old-claude",
+                content="# Claude Code\n\n旧页 Managed Agents / harness 架构视角。\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Managed Agents.md",
+                expected_state="present",
+                preimage_sha256="old-managed",
+                content="# Managed Agents\n\n" + ("相关旧页正文不应进入 create draft payload。\n" * 40),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_大脑与双手解耦.md",
+                expected_state="present",
+                preimage_sha256="old-brain",
+                content="# 大脑与双手解耦\n\n" + ("inspected context 正文也不应进入 create draft payload。\n" * 40),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_New.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            ),
+        ],
+    )
+    metadata_paths, content_paths = pipeline_module.draft_rendering_relevant_wiki_paths(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, create_item])
+    )
+    projection, report = pipeline_module.compact_snapshot_for_draft_rendering(
+        snapshot,
+        metadata_paths,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+        content_paths=content_paths,
+    )
+    entries = {entry["path"]: entry for entry in projection["entries"]}
+
+    assert "wiki/entities/Entity_Claude Code.md" in report["content_paths"]
+    assert entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"]
+    assert entries["wiki/entities/Entity_Claude Code.md"]["content_role"] == "draft_context"
+    assert entries["wiki/entities/Entity_Managed Agents.md"]["content_excerpt"] == ""
+    assert entries["wiki/entities/Entity_Managed Agents.md"]["content_role"] == "metadata_only"
+    assert entries["wiki/concepts/Concept_大脑与双手解耦.md"]["content_excerpt"] == ""
+    assert report["projected_content_entry_count"] == 1
+    assert projection["included_content_entry_count"] == 1
+    assert projection["included_entry_content_chars"] == len(entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"])
+
+
+def test_wiki_merge_planning_payload_uses_compact_context_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.write_text(
+        raw.read_text(encoding="utf-8")
+        + "\n\n"
+        + ("长文填充段落，用来模拟需要规划合并的长 raw。\n" * 1_000)
+        + "\n## 知识编译工程骨架\n\nCLI、状态机、artifact 和 validator 是第一阶段要验证的骨架。\n",
+        encoding="utf-8",
+    )
+    config_json = read_json(vault / ".llmwiki" / "config.json")
+    config_json["embedding_retrieval"]["backend"] = "exact"
+    write_json(vault / ".llmwiki" / "config.json", config_json)
+    existing = vault / "wiki" / "concepts" / "Concept_Existing_Runtime.md"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Existing Runtime\n"
+        "aliases:\n"
+        "  - 知识编译工程骨架\n"
+        "summary: Existing runtime page that mentions CLI, 状态机, artifact, validator, and ingest planning.\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# Existing Runtime\n\n"
+        + ("CLI、状态机、artifact、validator 和 ingest planning 需要稳定的工程骨架。\n" * 80),
+        encoding="utf-8",
+    )
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    captured_payloads: dict[str, dict] = {}
+
+    def fake_generate_raw(self, task, payload, output_model):
+        captured_payloads[task] = payload
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="planning-projection")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    payload = captured_payloads["wiki_merge_planning"]
+    assert payload["approved_prepared_markdown"] == ""
+    assert payload["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
+    assert payload["approved_digest_ref"] == "source_digest_review/approved_digest.json"
+    assert payload["candidate_resolution_ref"] == "candidate_resolution/candidate_resolution.json"
+    assert payload["approved_digest"]["schema_version"] == "source_digest.v2"
+    assert payload["candidate_resolution"]["schema_version"] == "candidate_resolution.v3"
+    assert "approved_digest_projection" not in payload
+    assert "candidate_resolution_projection" not in payload
+    assert "source_excerpt_pack" not in payload["merge_planning_context_pack"]
+    assert "wiki_context_projection" not in payload["merge_planning_context_pack"]
+    assert "candidate_contexts_projection" not in payload["merge_planning_context_pack"]
+    assert payload["source_excerpt_pack"]["full_source_in_payload"] is False
+    projection = payload["wiki_context_snapshot"]
+    assert projection["schema_version"] == "wiki_context_snapshot_projection.v1"
+    assert "candidate_contexts" not in projection
+    assert projection["included_entry_count"] <= projection["full_entry_count"]
+    assert projection["included_entry_content_chars"] < sum(
+        len(entry["content"]) for entry in read_json(run_dir / "wiki_context_snapshot" / "wiki_context_snapshot.json")["entries"]
+    )
+    contexts = payload["candidate_contexts"]
+    assert contexts["schema_version"] == "candidate_contexts_projection.v1"
+    assert contexts["query_limit"] == pipeline_module.MERGE_PLANNING_CONTEXT_QUERY_LIMIT
+    assert contexts["hit_excerpt_limit"] == pipeline_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+    assert contexts["weak_hit_excerpt_limit"] == pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+    assert contexts["weak_hit_excerpt_max_rank"] == pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
+    assert contexts["hit_excerpt_role"] == "match_preview"
+    assert contexts["content_evidence_ref"] == "wiki_context_projection.entries"
+    assert any(hit["path"] == "concepts/Concept_Existing_Runtime.md" for item in contexts["items"] for hit in item["hits"])
+    projected_hit = next(hit for item in contexts["items"] for hit in item["hits"])
+    assert isinstance(projected_hit["score_bucket"], int)
+    assert "bucket=" in projected_hit["sort_explanation"]
+    assert all(len(item["query"]) <= pipeline_module.MERGE_PLANNING_CONTEXT_QUERY_LIMIT for item in contexts["items"])
+    assert all(
+        len(hit["excerpt"]) <= pipeline_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+        for item in contexts["items"]
+        for hit in item["hits"]
+    )
+    assert all(
+        len(hit["excerpt"]) <= pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+        for item in contexts["items"]
+        for hit in item["hits"]
+        if hit["strength"] == "weak" and not hit["forced"]
+    )
+    assert all(
+        hit["excerpt_limit"]
+        == (
+            0
+            if hit["strength"] == "weak"
+            and not hit["forced"]
+            and hit["rank"] > pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
+            else (
+                pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+                if hit["strength"] == "weak" and not hit["forced"]
+                else pipeline_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+            )
+        )
+        for item in contexts["items"]
+        for hit in item["hits"]
+    )
+    assert all(
+        hit["excerpt"] == ""
+        for item in contexts["items"]
+        for hit in item["hits"]
+        if hit["strength"] == "weak" and not hit["forced"] and hit["rank"] > pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
+    )
+
+    sidecar = read_json(run_dir / "wiki_merge_planning" / "merge_planning_context_pack.json")
+    assert sidecar["schema_version"] == "merge_planning_context_pack.v1"
+    assert sidecar["original_counts"]["candidate_contexts_json_chars"] > sidecar["projected_counts"]["candidate_contexts_projection_json_chars"]
+    assert sidecar["original_counts"]["approved_digest_json_chars"] == pipeline_module.json_char_count(
+        read_json(run_dir / "source_digest_review" / "approved_digest.json")
+    )
+    assert sidecar["original_counts"]["candidate_resolution_json_chars"] == pipeline_module.json_char_count(
+        read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
+    )
+    assert (run_dir / "wiki_merge_planning" / "merge_planning_context_pack.md").exists()
+    planning_step = [step for step in manifest.steps if step.name == "wiki_merge_planning"][0]
+    pack_ref = [
+        ref
+        for ref in planning_step.outputs
+        if ref.relative_path == "wiki_merge_planning/merge_planning_context_pack.json"
+    ][0]
+    assert pack_ref.schema_version == "merge_planning_context_pack.v1"
+
+
+def test_wiki_merge_planning_skips_model_for_empty_vault_all_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+    calls: list[str] = []
+
+    def tracking_generate_raw(self, task, payload, output_model):
+        if task == "wiki_merge_planning":
+            raise AssertionError("wiki_merge_planning should use the empty-vault local shortcut")
+        calls.append(task)
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", tracking_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="empty-plan-shortcut")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+
+    assert "source_digest" in calls
+    assert "candidate_resolution" in calls
+    assert "draft_rendering" in calls
+    assert "wiki_merge_planning" not in calls
+    assert not (run_dir / "wiki_merge_planning" / "provider_result.json").exists()
+    shortcut = read_json(run_dir / "wiki_merge_planning" / "merge_planning_shortcut_report.json")
+    assert shortcut["used"] is True
+    assert shortcut["shortcut"] == "empty_vault_all_create"
+    assert shortcut["knowledge_metadata_pool_count"] == 0
+    assert shortcut["candidate_context_hit_count"] == 0
+    plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
+    assert {item["action"] for item in plan["items"]} == {"create"}
+    metrics = read_json(run_dir / "run_metrics.json")
+    planning_row = next(row for row in metrics["steps"] if row["name"] == "wiki_merge_planning")
+    assert planning_row["local_shortcut"] is True
+    assert planning_row["local_shortcut_rule"] == "empty_vault_all_create"
+    assert "payload_char_count" not in planning_row
+
+
+def test_empty_vault_merge_shortcut_accepts_prepared_discovered_candidate_refs() -> None:
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        budget_deferred_candidates=[
+            SourceDigestCandidate(
+                candidate_id="C005",
+                name="多脑多手架构",
+                type="concept",
+                one_sentence_summary="多脑多手架构摘要。",
+                why_matters="它是来源中发现的架构主题。",
+                wiki_value="应成为概念页。",
+                suggested_page_title="多脑多手架构",
+            )
+        ],
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            CandidateResolutionItem(
+                page_plan_id="PP-C005",
+                source_basis=SourceBasis(prepared_discovered_candidates=["C005"], source_locator="S010-S011"),
+                page_type="concept",
+                display_title="多脑多手架构",
+                candidate_target_path="concepts/Concept_多脑多手架构.md",
+                topic_summary="多脑多手架构摘要。",
+                why_this_page="值得记录。",
+                reason="prepared_discovered",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_多脑多手架构.md",
+                expected_state="missing",
+            )
+        ],
+    )
+    contexts = pipeline_module.CandidateContextsArtifact(
+        retrieval_backend="sentence_transformers",
+        items=[],
+    )
+
+    report = pipeline_module.empty_vault_create_merge_planning_shortcut_report(digest, resolution, snapshot, contexts)
+    plan = pipeline_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-06")
+
+    assert report["used"] is True
+    assert report["blocking_conditions"] == []
+    assert plan.items[0].action == "create"
+    assert plan.items[0].display_title == "多脑多手架构"
+    assert plan.items[0].source_basis.prepared_discovered_candidates == ["C005"]
+    assert report["missing_source_candidate_page_plan_count"] == 0
+    assert report["unknown_source_candidate_id_count"] == 0
 
 
 def test_candidate_resolution_backfills_missed_open_question_candidates(tmp_path: Path) -> None:
@@ -705,6 +3263,111 @@ def test_resume_from_deletes_downstream_step_dirs(tmp_path: Path) -> None:
     assert digest_step.attempts[0].duration_ms is not None
     assert list((run_dir / "attempt_archive" / "source_digest").glob("*"))
     assert digest_step.attempts[-1].outputs
+    metrics = read_json(run_dir / "run_metrics.json")
+    assert metrics["internal_model_call_count"] == 5
+    assert metrics["archived_internal_model_call_count"] == 4
+    assert metrics["total_internal_model_call_count"] == 9
+    assert metrics["current_attempt_duration_ms"] >= 0
+    assert metrics["current_model_duration_ms"] >= 0
+    assert metrics["archived_model_duration_ms"] >= 0
+    assert metrics["total_model_duration_ms"] == metrics["current_model_duration_ms"] + metrics["archived_model_duration_ms"]
+    assert metrics["internal_model_payload_char_count"] > 0
+    assert metrics["archived_internal_model_payload_char_count"] > 0
+    assert metrics["total_internal_model_payload_char_count"] == (
+        metrics["internal_model_payload_char_count"] + metrics["archived_internal_model_payload_char_count"]
+    )
+    digest_metrics = [step for step in metrics["steps"] if step["name"] == "source_digest"][0]
+    assert digest_metrics["internal_model_call_count"] == 1
+    assert digest_metrics["archived_internal_model_call_count"] == 1
+    assert digest_metrics["total_internal_model_call_count"] == 2
+    assert digest_metrics["payload_char_count"] > 0
+    assert digest_metrics["archived_payload_char_count"] > 0
+    assert digest_metrics["total_payload_char_count"] == digest_metrics["payload_char_count"] + digest_metrics["archived_payload_char_count"]
+
+
+def test_resume_can_force_mock_fixture_over_live_config(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="resume-force-mock")
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:should-not-be-used",
+            "endpoint": "https://example.invalid/v1/chat/completions",
+            "api_key": "sk-should-not-be-used",
+        }
+    }
+    write_yaml(config_path, config)
+
+    resumed = resume_ingest(
+        vault=vault,
+        operation_id=manifest.operation_id,
+        from_step="draft_rendering",
+        mock_fixture_dir=FIXTURE_ROOT / "mock",
+    )
+
+    context = resumed.provider_contexts[-1]
+    assert context.from_step == "draft_rendering"
+    assert set(context.providers) == {"draft_rendering"}
+    assert context.providers["draft_rendering"].spec == "mock:fixture"
+    assert context.providers["draft_rendering"].fixture_dir == (FIXTURE_ROOT / "mock").resolve().as_posix()
+
+
+def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+
+    def write_report(step_dir: Path, attempt_count: int) -> None:
+        step_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(1, attempt_count + 1):
+            nested_result = step_dir / f"model_batches/batch-{index:03d}/provider_result.json"
+            nested_result.parent.mkdir(parents=True, exist_ok=True)
+            write_json(
+                nested_result,
+                {
+                    "task": "draft_rendering",
+                    "payload_char_count": index * 100,
+                    "json_repair_applied": index % 2 == 0,
+                },
+            )
+        write_json(
+            step_dir / "structured_repair_report.json",
+            {
+                "schema_version": "structured_repair_report.v1",
+                "task": "draft_rendering",
+                "provider": "batched:mock",
+                "attempt_count": attempt_count,
+                "repair_count": 0,
+                "duration_ms": attempt_count * 10,
+                "attempts": [
+                    {
+                        "attempt": index,
+                        "provider_result_ref": f"model_batches/batch-{index:03d}/provider_result.json",
+                        "issues": [],
+                        "parse_success": True,
+                        "schema_valid": True,
+                    }
+                    for index in range(1, attempt_count + 1)
+                ],
+                "final_provider_result_ref": "provider_result.json",
+            },
+        )
+        write_json(step_dir / "provider_result.json", {"task": "draft_rendering"})
+
+    write_report(run_dir / "draft_rendering", 2)
+    write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000001Z" / "draft_rendering", 4)
+    write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000002Z" / "draft_rendering", 3)
+
+    current = pipeline_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=False)
+    total = pipeline_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=True)
+
+    assert current["attempt_count"] == 2
+    assert current["provider_result_count"] == 2
+    assert current["payload_char_count"] == 300
+    assert current["json_repair_count"] == 1
+    assert total["attempt_count"] == 9
+    assert total["provider_result_count"] == 9
+    assert total["payload_char_count"] == 1900
+    assert total["json_repair_count"] == 4
 
 
 def test_resume_invalid_provider_config_does_not_delete_outputs(tmp_path: Path) -> None:
@@ -1113,7 +3776,7 @@ def test_wiki_merge_planning_rejects_source_graph_links_in_merge_fields(tmp_path
         run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="source-graph")
 
 
-def test_m3_update_target_stops_at_draft_review_without_apply_preview(tmp_path: Path) -> None:
+def test_m3_update_target_auto_approves_when_no_review_risks(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1129,12 +3792,18 @@ def test_m3_update_target_stops_at_draft_review_without_apply_preview(tmp_path: 
     assert update_items[0]["action"] == "update"
     assert update_items[0]["matched_page"] == "concepts/Concept_知识编译工程骨架.md"
     manifest = status(vault, manifest.operation_id)
-    assert manifest.status == OperationStatus.awaiting_review
-    awaiting_step = [step for step in manifest.steps if step.status == StepStatus.awaiting_review][0]
-    assert awaiting_step.name == "draft_review"
+    assert manifest.status == OperationStatus.drafted
+    assert not [step for step in manifest.steps if step.status == StepStatus.awaiting_review]
     assert (run_dir / "draft_rendering" / "draft_write_manifest.json").exists()
-    assert (run_dir / "draft_review" / "pending_write_manifest.json").exists()
-    assert not (run_dir / "apply_preview").exists()
+    assert (run_dir / "draft_review" / "approved_write_manifest.json").exists()
+    approval = read_json(run_dir / "draft_review" / "draft_approval.json")
+    assert approval["decision"] == "approved"
+    assert approval["auto_approved"] is True
+    assert "update operation 未发现" in approval["notes"]
+    assert (run_dir / "apply_preview").exists()
+    preview = read_json(run_dir / "apply_preview" / "apply_preview.json")
+    assert preview["has_updates"] is True
+    assert preview["requires_draft_review"] is False
     draft_step = [step for step in manifest.steps if step.name == "draft_rendering"][0]
     diff_refs = [ref for ref in draft_step.outputs if ref.relative_path.endswith(".diff")]
     assert diff_refs
@@ -1195,22 +3864,1542 @@ def test_update_preserves_and_reports_existing_summary_detail_and_index_title(tm
     draft_path = run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md"
     draft_text = draft_path.read_text(encoding="utf-8")
     update_report = read_json(run_dir / "draft_rendering" / "update_merge_report.json")
+    reinforcement_report = read_json(run_dir / "draft_rendering" / "update_preservation_reinforcement_report.json")
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
     report_markdown = (run_dir / "draft_rendering" / "update_merge_report.md").read_text(encoding="utf-8")
+    review_prompt = (run_dir / "draft_review" / "review_prompt.md").read_text(encoding="utf-8")
     index_text = (run_dir / "draft_rendering" / "draft_pages" / "index.md").read_text(encoding="utf-8")
 
     assert "# 旧工程骨架标题" in draft_text
-    assert "旧摘要正文应该参与 update 审计。" not in draft_text
+    assert "旧页保留观察" not in draft_text
+    assert "与旧页架构视角相衔接" in draft_text
+    assert "旧摘要正文应该参与 update 审计。" in draft_text
     assert "知识编译工程骨架强调" in draft_text
-    assert "旧详情正文应该参与 update 审计。" not in draft_text
+    assert "旧详情正文应该参与 update 审计。" in draft_text
     assert "这个判断把 MVP 的重点" in draft_text
     sections = {section["section_key"]: section for section in update_report["pages"][0]["sections"]}
-    assert "旧摘要正文应该参与 update 审计。" in sections["summary"]["removed"]
+    assert "旧摘要正文应该参与 update 审计。" in sections["summary"]["retained"]
+    assert sections["summary"]["preserved_old"] == []
+    assert sections["summary"]["needs_manual_resolution"] is False
+    assert sections["summary"]["removed"] == []
     assert any("知识编译工程骨架强调" in item for item in sections["summary"]["added"])
-    assert "旧详情正文应该参与 update 审计。" in sections["detail"]["removed"]
+    assert any("与旧页架构视角相衔接" in item for item in sections["summary"]["added"])
+    assert "旧详情正文应该参与 update 审计。" in sections["detail"]["retained"]
+    assert sections["detail"]["preserved_old"] == []
+    assert sections["detail"]["needs_manual_resolution"] is False
+    assert sections["detail"]["removed"] == []
     assert any("这个判断把 MVP 的重点" in item for item in sections["detail"]["added"])
-    assert "| 段落 | 保留 | 新增 | 删除 | 删除原因 |" in report_markdown
+    assert any("与旧页架构视角相衔接" in item for item in sections["detail"]["added"])
+    assert reinforcement_report["changed"] is True
+    assert reinforcement_report["reinforced_section_count"] == 2
+    assert repair_report["final_outcome"] == "success"
+    assert repair_report["repair_attempted"] is True
+    attempt_issue_codes = {
+        issue["issue_code"]
+        for attempt in repair_report["attempts"]
+        for issue in attempt["issues"]
+    }
+    assert "old_knowledge_not_absorbed" in attempt_issue_codes
+    previews = [
+        section["reinforcement_preview"]
+        for page in reinforcement_report["pages"]
+        for section in page["sections"]
+    ]
+    assert any("旧摘要正文应该参与 update 审计。" in preview for preview in previews)
+    assert any("旧详情正文应该参与 update 审计。" in preview for preview in previews)
+    assert "| 段落 | 保留 | 新增 | 删除 | 旧页保留观察 | 需人工消化 | 原因 |" in report_markdown
+    assert "模型完整重写后未显式吸收该旧段落" not in report_markdown
     assert "Removal Reason" not in report_markdown
+    assert "旧页保留观察需人工消化：否" in review_prompt
+    assert "本地旧知识补强已执行：是（2 段旧页知识已由系统本地补强并记录）" in review_prompt
+    assert "## 本地旧知识补强提示" in review_prompt
+    assert "## 旧页保留观察警示" not in review_prompt
+    manifest = status(vault, manifest.operation_id)
+    assert not [step for step in manifest.steps if step.status == StepStatus.awaiting_review]
+    approval = read_json(run_dir / "draft_review" / "draft_approval.json")
+    assert approval["decision"] == "approved"
+    assert approval["auto_approved"] is True
+    assert "本地旧知识补强已写入审计报告" in approval["notes"]
+    assert (run_dir / "draft_rendering" / "update_preservation_pack.json").exists()
+    assert (run_dir / "draft_rendering" / "update_preservation_pack.md").exists()
+    assert (run_dir / "draft_rendering" / "update_preservation_reinforcement_report.json").exists()
+    assert (run_dir / "draft_rendering" / "update_preservation_reinforcement_report.md").exists()
+    preservation_pack = read_json(run_dir / "draft_rendering" / "update_preservation_pack.json")
+    assert preservation_pack["schema_version"] == "update_preservation_pack.v1"
+    assert preservation_pack["pages"][0]["sections"]
+    draft_step = [step for step in manifest.steps if step.name == "draft_rendering"][0]
+    preservation_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/update_preservation_pack.json"
+    ][0]
+    assert preservation_ref.schema_version == "update_preservation_pack.v1"
+    reinforcement_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/update_preservation_reinforcement_report.json"
+    ][0]
+    assert reinforcement_ref.schema_version == "update_preservation_reinforcement_report.v1"
     assert "| 旧工程骨架标题 | [[concepts/Concept_知识编译工程骨架]] |" in index_text
+
+
+def test_merge_update_section_semantic_absorption_avoids_old_observation() -> None:
+    old = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
+    new = "新版页面补充产品视角，同时保留 Managed Agents、harness、安全边界、隔离容器、工具权限和会话对象这些架构约束。"
+
+    merged, change = pipeline_module.merge_update_section("detail", old, new)
+
+    assert "旧页保留观察" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == []
+    assert change.needs_manual_resolution is False
+    assert "关键短语" in change.removal_reason
+
+
+def test_merge_update_section_cross_section_absorption_avoids_old_observation() -> None:
+    old = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
+    new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
+    new_detail = (
+        "详情保留旧页架构判断：Claude Code 仍处在 Managed Agents / harness 视角中，"
+        "模型负责推理和规划，工具执行通过工具权限、隔离容器和会话对象来承接。"
+    )
+
+    merged, change = pipeline_module.merge_update_section(
+        "summary",
+        old,
+        new_summary,
+        absorption_context=f"{new_summary}\n\n{new_detail}",
+    )
+
+    assert "旧页保留观察" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == []
+    assert change.needs_manual_resolution is False
+    assert "其他章节吸收旧段落" in change.removal_reason
+
+
+def test_merge_update_section_absorbs_live_brain_hands_summary_across_sections() -> None:
+    old = (
+        "Claude Code is useful because it shows how a Managed Agents system can separate the model "
+        "brain from execution hands while preserving a focused coding experience."
+    )
+    new_summary = (
+        "Claude Code 是 Anthropic 推出的编程辅助产品，最初作为 Managed Agents 框架下的适配层"
+        "（harness）提供工具权限、沙盒执行、仓库上下文和持久会话状态。"
+    )
+    new_detail = (
+        "从原有 Managed Agents 适配框架视角看，Claude Code 不仅是聊天界面，而是一个通过"
+        "工具权限、沙盒执行、仓库上下文和持久会话状态来路由模型意图的适配层（harness）。"
+    )
+
+    concepts = pipeline_module.update_preservation_concepts(old)
+    concept_names = {str(concept["name"]) for concept in concepts}
+    merged, change = pipeline_module.merge_update_section(
+        "summary",
+        old,
+        new_summary,
+        absorption_context=f"{new_summary}\n\n{new_detail}",
+    )
+
+    assert {"managed_agents", "brain_hands_decoupling"} <= concept_names
+    assert "旧页保留观察" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == []
+    assert change.needs_manual_resolution is False
+    assert "Managed Agents / 托管智能体" in change.removal_reason
+    assert "大脑与双手解耦" in change.removal_reason
+
+
+def test_merge_update_section_cross_section_absorption_still_requires_core_concepts() -> None:
+    old = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
+    new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
+    shallow_context = "新版详情只顺带提到 Managed Agents 和 harness。"
+
+    merged, change = pipeline_module.merge_update_section(
+        "summary",
+        old,
+        new_summary,
+        absorption_context=f"{new_summary}\n\n{shallow_context}",
+    )
+
+    assert "旧页保留观察" in merged
+    assert old in change.preserved_old
+    assert change.needs_manual_resolution is True
+
+
+def test_merge_update_section_live_brain_hands_summary_rejects_shallow_context() -> None:
+    old = (
+        "Claude Code is useful because it shows how a Managed Agents system can separate the model "
+        "brain from execution hands while preserving a focused coding experience."
+    )
+    new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
+    shallow_context = "新版详情只顺带提到 Managed Agents、harness 和模型意图。"
+
+    merged, change = pipeline_module.merge_update_section(
+        "summary",
+        old,
+        new_summary,
+        absorption_context=f"{new_summary}\n\n{shallow_context}",
+    )
+
+    assert "旧页保留观察" in merged
+    assert old in change.preserved_old
+    assert change.needs_manual_resolution is True
+
+
+def test_merge_update_section_live_brain_hands_summary_rejects_broad_intent_phrase() -> None:
+    old = (
+        "Claude Code is useful because it shows how a Managed Agents system can separate the model "
+        "brain from execution hands while preserving a focused coding experience."
+    )
+    new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
+    broad_context = "新版详情提到 Managed Agents 中模型意图通过更清晰的产品界面表达。"
+
+    merged, change = pipeline_module.merge_update_section(
+        "summary",
+        old,
+        new_summary,
+        absorption_context=f"{new_summary}\n\n{broad_context}",
+    )
+
+    assert "旧页保留观察" in merged
+    assert old in change.preserved_old
+    assert change.needs_manual_resolution is True
+
+
+def test_merge_update_section_requires_old_concept_obligations_not_shallow_terms() -> None:
+    old = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
+    new = "新版页面补充产品视角，只顺带提到 Managed Agents 和 harness。"
+
+    merged, change = pipeline_module.merge_update_section("detail", old, new)
+
+    assert "旧页保留观察" in merged
+    assert old in change.preserved_old
+    assert change.needs_manual_resolution is True
+
+
+def test_merge_update_section_does_not_preserve_non_core_old_section() -> None:
+    old = "来源在文章末尾提及：Claude Code is an excellent harness。"
+    new = "新版例子讨论 CLI、桌面版和 Cowork 的使用场景。"
+
+    merged, change = pipeline_module.merge_update_section("examples", old, new)
+
+    assert "旧页保留观察" not in merged
+    assert change.retained == []
+    assert change.removed == [old]
+    assert change.preserved_old == []
+    assert change.needs_manual_resolution is False
+    assert "不属于 update preservation 核心义务" in change.removal_reason
+
+
+def test_merge_update_section_does_not_cross_absorb_non_core_old_section() -> None:
+    old = "旧例子强调 harness 检查工具权限，并把命令交给隔离容器执行。"
+    new = "新版例子讨论 CLI、桌面版和 Cowork 的使用场景。"
+    context = "详情保留 harness、工具权限和隔离容器等架构视角。"
+
+    merged, change = pipeline_module.merge_update_section(
+        "examples",
+        old,
+        new,
+        absorption_context=f"{new}\n\n{context}",
+    )
+
+    assert "旧页保留观察" not in merged
+    assert change.retained == []
+    assert change.removed == [old]
+    assert change.preserved_old == []
+    assert change.needs_manual_resolution is False
+
+
+def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-TYPO",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="entities/Entity_Cat Wu.md",
+        display_title="Cat Wu",
+        page_type="entity",
+        new_understanding="测试。",
+        section_plans={"detail": "详情"},
+        reason="测试 typo 修正。",
+        related_pages=[
+            pipeline_module.RelatedPageRef(
+                target_path="entities/Entity_Claude Code.md",
+                display_title="Claude Code",
+                source="source_digest",
+                reason="Cat Wu 是 Clade Code 产品负责人。",
+            )
+        ],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-TYPO",
+                action="create",
+                canonical_target_path="entities/Entity_Cat Wu.md",
+                section_bodies={"summary": "Cat Wu 负责 Clade Code，任职于 Anropinic，并与 Borris Cherny 协作。"},
+                change_summary="创建 Borris 相关页面。",
+                source_coverage_notes="Borris 与 Cat Wu 的访谈。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Cat Wu.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    finalized = pipeline_module.finalize_draft_rendering(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+    related = pipeline_module.render_related_pages(
+        item,
+        known_paths={"entities/Entity_Claude Code.md"},
+    )
+
+    assert "Claude Code" in finalized.pages[0].section_bodies["summary"]
+    assert "Anthropic" in finalized.pages[0].section_bodies["summary"]
+    assert "Boris Cherny" in finalized.pages[0].section_bodies["summary"]
+    assert "Clade Code" not in finalized.pages[0].section_bodies["summary"]
+    assert "Borris" not in finalized.pages[0].section_bodies["summary"]
+    assert finalized.pages[0].change_summary == "创建 Boris 相关页面。"
+    assert finalized.pages[0].source_coverage_notes == "Boris 与 Cat Wu 的访谈。"
+    assert "Cat Wu 是 Claude Code 产品负责人" in related
+    assert pipeline_module.normalize_stable_brand_typos("Borrison builds Clade Codebase tools") == "Borrison builds Clade Codebase tools"
+
+
+def test_validate_draft_rendering_rejects_model_self_talk() -> None:
+    plan = pipeline_module.WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-SELF-TALK",
+                source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                action="create",
+                canonical_target_path="concepts/Concept_静态基准评估.md",
+                display_title="静态基准评估",
+                page_type="concept",
+                new_understanding="静态基准可能高估智能体表现。",
+                section_plans={"detail": "详情"},
+                reason="测试 draft 自我推理污染。",
+            )
+        ],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-SELF-TALK",
+                action="create",
+                canonical_target_path="concepts/Concept_静态基准评估.md",
+                section_bodies={
+                    "summary": "静态基准可能高估智能体表现。",
+                    "detail": "静态基准会受污染影响。检查原文后我会修正数字方向，这里需要谨慎。",
+                    "examples": "例如，静态结果可能高于实时结果。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+    issues = pipeline_module.draft_self_talk_issues(draft)
+
+    assert [issue.issue_code for issue in issues] == ["model_self_talk_leak"]
+    assert issues[0].field_path == "pages.PP-SELF-TALK.detail"
+    assert "检查原文" in issues[0].message
+
+
+def test_validate_draft_rendering_rejects_wiki_state_leak() -> None:
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-STATE-LEAK",
+                action="create",
+                canonical_target_path="entities/Entity_Cowork.md",
+                section_bodies={
+                    "summary": "Cowork 是知识工作协作者产品。",
+                    "detail": "Cowork 用于综合信息和创建文档。",
+                    "additional_notes": "目前 wiki 中无此页面，创建后可与 Claude Code、Cat Wu 等页面互链。",
+                },
+                change_summary="创建 Cowork 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    issues = pipeline_module.draft_self_talk_issues(draft)
+
+    assert [issue.issue_code for issue in issues] == ["model_self_talk_leak"]
+    assert issues[0].field_path == "pages.PP-STATE-LEAK.additional_notes"
+    assert "目前wiki中无此页面" in issues[0].message
+
+
+def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
+    plan = pipeline_module.WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-CAUTION",
+                source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                action="create",
+                canonical_target_path="concepts/Concept_高风险部署.md",
+                display_title="高风险部署",
+                page_type="concept",
+                new_understanding="高风险部署需要额外审查。",
+                section_plans={"detail": "详情"},
+                reason="测试正常谨慎措辞。",
+            )
+        ],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CAUTION",
+                action="create",
+                canonical_target_path="concepts/Concept_高风险部署.md",
+                section_bodies={
+                    "summary": "高风险部署需要额外审查。",
+                    "detail": "高风险部署需要谨慎处理，尤其是在权限、用户数据和自动化执行边界不清楚时。",
+                    "examples": "例如，生产环境自动化执行前应先做人工审批。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+
+
+def test_update_preservation_issues_detect_missing_old_key_phrases() -> None:
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "Claude Code 是一个编码助手，本轮只补充产品功能。",
+                    "detail": "新材料讨论 PowerUp、TODO List 和发布速度。",
+                },
+                change_summary="补充产品视角。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    pack = {
+        "schema_version": "update_preservation_pack.v1",
+        "pages": [
+            {
+                "page_plan_id": "PP-UPDATE",
+                "target_path": "entities/Entity_Claude Code.md",
+                "sections": [
+                    {
+                        "section_key": "detail",
+                        "old_text": "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。",
+                        "key_phrases": ["Managed Agents / harness", "安全边界", "会话对象"],
+                        "min_required_matches": 2,
+                    }
+                ],
+            }
+        ],
+    }
+
+    issues = pipeline_module.update_preservation_issues(draft, pack)
+
+    assert [issue.issue_code for issue in issues] == ["old_knowledge_not_absorbed"]
+    assert issues[0].repairability == "repairable"
+    assert "Managed Agents / harness" in issues[0].message
+    assert "Required old concept obligations" in issues[0].message
+    assert "安全边界/权限限制" in issues[0].message
+
+
+def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None:
+    update_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        matched_page="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试 partial draft。",
+    )
+    missing_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MISSING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Missing.md",
+        display_title="Missing",
+        page_type="concept",
+        new_understanding="另一个待生成页面。",
+        section_plans={"detail": "详情"},
+        reason="测试 partial draft。",
+    )
+    partial = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "Claude Code 是一个编码助手，本轮只补充产品功能。",
+                    "detail": "新材料讨论 PowerUp、TODO List 和发布速度。",
+                },
+                change_summary="补充产品视角。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    pack = {
+        "schema_version": "update_preservation_pack.v1",
+        "pages": [
+            {
+                "page_plan_id": "PP-UPDATE",
+                "target_path": "entities/Entity_Claude Code.md",
+                "sections": [
+                    {
+                        "section_key": "detail",
+                        "old_text": "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。",
+                        "key_phrases": ["Managed Agents / harness", "安全边界", "会话对象"],
+                        "min_required_matches": 2,
+                    }
+                ],
+            }
+        ],
+    }
+
+    extracted = pipeline_module.extract_valid_partial_draft_rendering(
+        json.dumps(partial.model_dump(mode="json"), ensure_ascii=False),
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, missing_item]),
+        pipeline_module.WikiContextSnapshot(
+            log_date="2026-06-06",
+            source_target_path="sources/Source_Test.md",
+            entries=[],
+        ),
+        update_preservation_pack=pack,
+        approved_prepared_text="",
+        language="zh-CN",
+    )
+
+    assert extracted is None
+
+
+def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None:
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "Claude Code 是一个编码助手，本轮补充待办事项列表和发布速度。",
+                    "examples": "例如，待办事项列表用于帮助模型跟踪任务。",
+                },
+                change_summary="补充产品视角。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    pack = {
+        "schema_version": "update_preservation_pack.v1",
+        "pages": [
+            {
+                "page_plan_id": "PP-UPDATE",
+                "target_path": "entities/Entity_Claude Code.md",
+                "display_title": "Claude Code",
+                "sections": [
+                    {
+                        "section_key": "summary",
+                        "old_text": "旧页观点：Claude Code 在 Managed Agents 语境中不是单一聊天窗口，而是被 harness 调度的大脑；真正的执行手由隔离容器、工具权限和会话对象承担。",
+                        "key_phrases": ["Managed Agents", "harness", "隔离容器", "会话对象"],
+                        "min_required_matches": 2,
+                    },
+                    {
+                        "section_key": "examples",
+                        "old_text": "当 Claude Code 需要写文件时，旧页要求先经由 harness 检查路径和权限，再把命令交给隔离执行环境，而不是让模型直接拥有无限本机权限。",
+                        "key_phrases": ["harness 检查路径和权限", "隔离执行环境", "无限本机权限"],
+                        "min_required_matches": 2,
+                    },
+                ],
+            }
+        ],
+    }
+
+    reinforced, report = pipeline_module.reinforce_update_preservation(draft, pack)
+
+    assert report["changed"] is True
+    assert report["reinforced_section_count"] == 2
+    assert pipeline_module.update_preservation_issues(reinforced, pack) == []
+    page = reinforced.pages[0]
+    assert "从旧页保留的架构视角看" in page.section_bodies["summary"]
+    assert "从旧页保留的架构视角看" in page.section_bodies["examples"]
+
+
+def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_english_dump() -> None:
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "detail": "Claude Code 本轮补充产品发布速度和 PM 协作流程。",
+                },
+                change_summary="补充产品视角。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    old_text = (
+        "From the old Managed Agents / harness perspective, Claude Code is not just a chat interface. "
+        "It routes model intent through tool permissions, sandboxed execution, repository context, and session state."
+    )
+    pack = {
+        "schema_version": "update_preservation_pack.v1",
+        "pages": [
+            {
+                "page_plan_id": "PP-UPDATE",
+                "target_path": "entities/Entity_Claude Code.md",
+                "sections": [
+                    {
+                        "section_key": "detail",
+                        "old_text": old_text,
+                        "key_phrases": ["From the old Managed Agents / harness perspective", "sandboxed execution"],
+                        "min_required_matches": 0,
+                        "concept_obligations": [
+                            {"name": "managed_agents", "label": "Managed Agents / 托管智能体"},
+                            {"name": "harness", "label": "harness / 适配框架"},
+                            {"name": "session_context", "label": "会话/持久上下文"},
+                            {"name": "isolated_execution", "label": "隔离执行/容器"},
+                        ],
+                        "min_required_concept_matches": 3,
+                    }
+                ],
+            }
+        ],
+    }
+
+    reinforced, report = pipeline_module.reinforce_update_preservation(draft, pack)
+
+    body = reinforced.pages[0].section_bodies["detail"]
+    assert report["changed"] is True
+    assert pipeline_module.update_preservation_issues(reinforced, pack) == []
+    assert "从旧页保留的架构视角看" in body
+    assert "会话/持久上下文" in body
+    assert "隔离执行/容器" in body
+    assert "From the old Managed Agents" not in body
+    assert "sandboxed execution" not in body
+
+
+def test_update_preservation_reinforcement_single_concept_does_not_invent_other_concepts() -> None:
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={"detail": "Claude Code 本轮补充产品发布速度。"},
+                change_summary="补充产品视角。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    pack = {
+        "schema_version": "update_preservation_pack.v1",
+        "pages": [
+            {
+                "page_plan_id": "PP-UPDATE",
+                "target_path": "entities/Entity_Claude Code.md",
+                "sections": [
+                    {
+                        "section_key": "detail",
+                        "old_text": "旧页只要求保留 Managed Agents 这一系统定位。",
+                        "key_phrases": ["Managed Agents"],
+                        "min_required_matches": 0,
+                        "concept_obligations": [
+                            {"name": "managed_agents", "label": "Managed Agents / 托管智能体"},
+                        ],
+                        "min_required_concept_matches": 1,
+                    }
+                ],
+            }
+        ],
+    }
+
+    reinforced, _report = pipeline_module.reinforce_update_preservation(draft, pack)
+
+    body = reinforced.pages[0].section_bodies["detail"]
+    assert pipeline_module.update_preservation_issues(reinforced, pack) == []
+    assert "Managed Agents / 托管智能体" in body
+    assert "会话/持久上下文" not in body
+    assert "隔离执行环境" not in body
+    assert "隔离执行/容器" not in body
+
+
+def test_update_preservation_pack_records_concept_obligations() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n"
+                    "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in detail["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "harness / 适配框架" in labels
+    assert "安全边界/权限限制" in labels
+    assert detail["min_required_concept_matches"] >= 3
+    assert detail["min_required_matches"] == 0
+
+
+def test_update_preservation_concepts_do_not_match_bare_session_substrings() -> None:
+    concepts = pipeline_module.update_preservation_concepts(
+        "Possession of product context, user interview sessions, session stateless notes, "
+        "session contextual comments, session 和 state, session和state, session 与 context, "
+        "session & context, session. State, and session, state reveal product friction. "
+        "Managed. Agents is not a phrase."
+    )
+
+    labels = [concept["label"] for concept in concepts]
+    assert "会话/持久上下文" not in labels
+    assert "Managed Agents / 托管智能体" not in labels
+
+
+def test_update_preservation_concepts_match_brain_ampersand_hands_without_global_ampersand() -> None:
+    concepts = pipeline_module.update_preservation_concepts(
+        "Managed Agents decouple brain & hands in the execution architecture."
+    )
+
+    labels = [concept["label"] for concept in concepts]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "大脑与双手解耦" in labels
+
+    dirty_concepts = pipeline_module.update_preservation_concepts(
+        "session & context are discussed separately. brain && hands is dirty shorthand."
+    )
+    dirty_labels = [concept["label"] for concept in dirty_concepts]
+    assert "会话/持久上下文" not in dirty_labels
+    assert "大脑与双手解耦" not in dirty_labels
+
+
+def test_update_preservation_pack_does_not_turn_interview_sessions_into_context_obligation() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_User Research.md",
+        display_title="User Research",
+        page_type="entity",
+        new_understanding="补充研究视角。",
+        section_plans={"detail": "详情"},
+        reason="测试普通 sessions 不应变成持久上下文。",
+        matched_page="entities/Entity_User Research.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_User Research.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: User Research\nsummary: old.\n---\n\n"
+                    "# User Research\n\n"
+                    "## Detail\n\n"
+                    "Managed Agents user interview sessions reveal product friction in onboarding workflows.\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in detail["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "会话/持久上下文" not in labels
+
+
+def test_update_preservation_concepts_match_specific_session_terms() -> None:
+    concepts = pipeline_module.update_preservation_concepts(
+        "The harness keeps a session object with persistent-session state, session/context, "
+        "session_state, session-state, and a durable context."
+    )
+
+    session = next(concept for concept in concepts if concept["name"] == "session_context")
+    assert "session object" in session["matched_terms"]
+    assert "persistent session" in session["matched_terms"]
+    assert "durable context" in session["matched_terms"]
+    assert "session state" in session["matched_terms"]
+    assert "session context" in session["matched_terms"]
+
+
+def test_update_preservation_concepts_match_persistent_context_and_sandboxed_execution() -> None:
+    concepts = pipeline_module.update_preservation_concepts(
+        "Managed Agents use the session as a persistent context object inside sandboxed execution."
+    )
+
+    labels = [concept["label"] for concept in concepts]
+    assert "会话/持久上下文" in labels
+    assert "隔离执行/容器" in labels
+
+    morphology_concepts = pipeline_module.update_preservation_concepts(
+        "Harnesses run isolated containers, containerized execution, and sandboxes."
+    )
+    morphology_labels = [concept["label"] for concept in morphology_concepts]
+    assert "harness / 适配框架" in morphology_labels
+    assert "隔离执行/容器" in morphology_labels
+
+    sandboxing_concepts = pipeline_module.update_preservation_concepts("A sandboxing strategy is discussed.")
+    sandboxing_labels = [concept["label"] for concept in sandboxing_concepts]
+    assert "隔离执行/容器" not in sandboxing_labels
+
+
+def test_update_preservation_session_absorption_uses_token_boundaries() -> None:
+    section = {
+        "section_key": "detail",
+        "old_text": "Managed Agents keep session state as a persistent context.",
+        "key_phrases": [],
+        "min_required_matches": 0,
+        "concept_obligations": pipeline_module.update_preservation_concepts(
+            "Managed Agents keep session state as a persistent context."
+        ),
+        "min_required_concept_matches": 2,
+    }
+
+    absorption = pipeline_module.update_preservation_section_absorption(
+        section,
+        "Managed Agents are mentioned with session stateless notes, session contextual comments, "
+        "and session 与 context 分开介绍。",
+    )
+
+    assert "Managed Agents / 托管智能体" in absorption["matched_concepts"]
+    assert "会话/持久上下文" not in absorption["matched_concepts"]
+    assert "会话/持久上下文" in absorption["missing_concepts"]
+    assert absorption["absorbed"] is False
+
+
+def test_update_preservation_morphology_absorption_uses_explicit_variants() -> None:
+    section = {
+        "section_key": "detail",
+        "old_text": "Harnesses run isolated containers and sandboxes.",
+        "key_phrases": [],
+        "min_required_matches": 0,
+        "concept_obligations": pipeline_module.update_preservation_concepts(
+            "Harnesses run isolated containers and sandboxes."
+        ),
+        "min_required_concept_matches": 2,
+    }
+
+    absorption = pipeline_module.update_preservation_section_absorption(
+        section,
+        "The architecture still uses harnesses and containerized execution.",
+    )
+
+    assert "harness / 适配框架" in absorption["matched_concepts"]
+    assert "隔离执行/容器" in absorption["matched_concepts"]
+    assert absorption["absorbed"] is True
+
+
+def test_update_preservation_issues_detect_missing_persistent_context_obligation() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试 persistent context 旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: old.\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## Detail\n\n"
+                    "Managed Agents use the session as a persistent context object so execution state survives between turns.\n"
+                ),
+            )
+        ],
+    )
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={"detail": "Claude Code 延续 Managed Agents 产品视角，但这里只讨论发布速度。"},
+                change_summary="更新。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    section = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in section["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "会话/持久上下文" in labels
+    issues = pipeline_module.update_preservation_issues(draft, pack)
+
+    assert [issue.issue_code for issue in issues] == ["old_knowledge_not_absorbed"]
+    assert "会话/持久上下文" in issues[0].message
+
+
+def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligation() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试 brain & hands 旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: old.\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## Detail\n\n"
+                    "Managed Agents decouple brain & hands so model reasoning stays separate from execution.\n"
+                ),
+            )
+        ],
+    )
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+    section = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in section["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "大脑与双手解耦" in labels
+
+    absorbed = pipeline_module.update_preservation_section_absorption(
+        section,
+        "Claude Code keeps Managed Agents architecture and explicitly decouples brain & hands.",
+    )
+    assert absorbed["absorbed"] is True
+
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={"detail": "Claude Code 延续 Managed Agents 产品视角，但这里只讨论发布速度。"},
+                change_summary="更新。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    issues = pipeline_module.update_preservation_issues(draft, pack)
+
+    assert [issue.issue_code for issue in issues] == ["old_knowledge_not_absorbed"]
+    assert "大脑与双手解耦" in issues[0].message
+
+
+def test_update_preservation_pack_reads_english_section_headings() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试英文旧页标题。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: old.\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## summary\n\n"
+                    "Claude Code connects Managed Agents architecture to product practice.\n\n"
+                    "## DETAIL\n\n"
+                    "From the old Managed Agents / harness perspective, Claude Code routes model intent through sandboxed execution, tool permissions, and persistent session state.\n\n"
+                    "## Value points\n\n"
+                    "- Preserves the distinction between model reasoning and execution environment.\n"
+                    "- Connects session context to product workflows.\n\n"
+                    "## Open Questions\n\n"
+                    "- Open questions should stay outside preservation core obligations.\n\n"
+                    "## RELATED PAGES\n\n"
+                    "- [[entities/Entity_Other|Other]]: should not be swallowed by Detail.\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    sections = {section["section_key"]: section for section in pack["pages"][0]["sections"]}
+    assert set(sections) == {"detail"}
+    detail_labels = [concept["label"] for concept in sections["detail"]["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in detail_labels
+    assert "harness / 适配框架" in detail_labels
+    assert "会话/持久上下文" in detail_labels
+    assert "Related Pages" not in sections["detail"]["old_text"]
+    assert "Other" not in sections["detail"]["old_text"]
+    assert "Open questions" not in sections["detail"]["old_text"]
+
+
+def test_parse_existing_sections_ignores_noncanonical_english_headings() -> None:
+    sections = pipeline_module.parse_existing_sections(
+        "# Page\n\n"
+        "Summary is mentioned in body text but is not a section.\n\n"
+        "### Summary\n\n"
+        "This tertiary heading should not start a section.\n\n"
+        "## Product Summary\n\n"
+        "This noncanonical heading should not start a section.\n\n"
+        "## Detail\n\n"
+        "Actual detail text.\n"
+    )
+
+    assert sections == {"detail": "Actual detail text."}
+
+
+def test_parse_existing_sections_reads_casefold_english_headings() -> None:
+    sections = pipeline_module.parse_existing_sections(
+        "# Page\n\n"
+        "## summary\n\n"
+        "Lowercase summary.\n\n"
+        "## VALUE POINTS\n\n"
+        "Uppercase value points.\n\n"
+        "## detail\n\n"
+        "Lowercase detail.\n\n"
+        "## RELATED PAGES\n\n"
+        "Related text.\n"
+    )
+
+    assert sections == {
+        "summary": "Lowercase summary.",
+        "value_points": "Uppercase value points.",
+        "detail": "Lowercase detail.",
+        "related": "Related text.",
+    }
+
+
+def test_update_preservation_pack_keeps_mixed_placeholder_section_with_core_knowledge() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n"
+                    "待补来源：这句是旧页里的占位提醒。\n\n"
+                    "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in detail["concept_obligations"]]
+    assert detail["section_key"] == "detail"
+    assert "Managed Agents / 托管智能体" in labels
+    assert "待补来源" not in detail["old_text"]
+
+
+def test_update_preservation_pack_keeps_mixed_empty_placeholder_section_with_core_knowledge() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n"
+                    "暂无相关补充。\n\n"
+                    "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in detail["concept_obligations"]]
+    assert detail["section_key"] == "detail"
+    assert "Managed Agents / 托管智能体" in labels
+    assert "暂无相关补充" not in detail["old_text"]
+
+
+def test_update_preservation_pack_keeps_core_after_placeholder_prefix_colon() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n暂无相关：Managed Agents / harness 视角强调安全边界。\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in detail["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "暂无相关" not in detail["old_text"]
+
+
+@pytest.mark.parametrize("placeholder", ["暂无相关补充。", "没有相关补充。", "N/A"])
+def test_update_preservation_pack_skips_pure_placeholder_sections(placeholder: str) -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    f"## 详情\n\n{placeholder}\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    assert pack["pages"] == []
+
+
+def test_update_preservation_pack_skips_placeholder_even_when_it_mentions_known_concept() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n暂无 Managed Agents 相关补充。\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    assert pack["pages"] == []
+
+
+def test_update_preservation_pack_keeps_english_phrase_with_na_substring() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n"
+                    "A/B testing analysis pipeline preserves experiment insights for future product reviews.\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    assert "analysis pipeline" in detail["old_text"]
+    assert any("analysis pipeline" in phrase for phrase in detail["key_phrases"])
+
+
+def test_update_preservation_pack_does_not_use_placeholder_segment_concepts() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n"
+                    "暂无 Managed Agents 相关补充。\n\n"
+                    "A/B testing analysis pipeline preserves experiment insights for future product reviews.\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    labels = [concept["label"] for concept in detail["concept_obligations"]]
+    assert labels == []
+    assert "analysis pipeline" in detail["old_text"]
+    assert "Managed Agents" not in detail["old_text"]
+
+
+def test_update_preservation_pack_filters_mixed_ascii_placeholder_segment() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 详情\n\n"
+                    "N/A\n\n"
+                    "A/B testing analysis pipeline preserves experiment insights for future product reviews.\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    detail = pack["pages"][0]["sections"][0]
+    assert "analysis pipeline" in detail["old_text"]
+    assert "N/A" not in detail["old_text"]
+    assert any("analysis pipeline" in phrase for phrase in detail["key_phrases"])
+
+
+def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 摘要\n\n"
+                    "Claude Code 是 Managed Agents 生态中的具体 harness 实现。\n\n"
+                    "## 详情\n\n"
+                    "来源描述 Claude Code 为 excellent harness that we use widely across tasks，是 Managed Agents 元框架可容纳的多个 harness 之一。\n\n"
+                    "## 例子\n\n"
+                    "来源在文章末尾提及：Claude Code is an excellent harness。\n\n"
+                    "## 价值点\n\n"
+                    "展示了 Managed Agents 的开放设计。\n\n"
+                    "## 补充观察\n\n"
+                    "来源未提供 Claude Code 内部架构细节。\n\n"
+                    "## 矛盾与未决问题\n\n"
+                    "Claude Code 如何与会话接口集成？是否有特殊要求？（待补来源）\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    section_keys = [section["section_key"] for section in pack["pages"][0]["sections"]]
+    assert section_keys == ["detail"]
+    assert pack["pages"][0]["sections"][0]["min_required_matches"] == 0
+
+
+def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> None:
+    tail = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
+    old_detail = ("普通背景。" * 400) + tail
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试旧知识保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    f"## 详情\n\n{old_detail}\n"
+                ),
+            )
+        ],
+    )
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-UPDATE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={"detail": "新材料只讨论待办事项列表和发布速度。"},
+                change_summary="更新。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    section = pack["pages"][0]["sections"][0]
+    assert tail not in section["old_text"]
+    labels = [concept["label"] for concept in section["concept_obligations"]]
+    assert "安全边界/权限限制" in labels
+    issues = pipeline_module.update_preservation_issues(draft, pack)
+
+    assert issues
+    assert "安全边界/权限限制" in issues[0].message
 
 
 def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
@@ -1354,6 +5543,350 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
     assert any("MIT报告" in item["question"] for item in filtered)
 
 
+def test_index_open_questions_representative_prefers_high_signal_over_newer_source_gap() -> None:
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Product_Taste.md",
+                expected_state="present",
+                preimage_sha256="a",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_Product_Taste.md",
+                    llmwiki_type="concept",
+                    title="Product Taste",
+                    summary="产品品味摘要。",
+                    updated="2026-06-05",
+                ),
+                content="# Product Taste\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/designs/Design_AI_PM.md",
+                expected_state="present",
+                preimage_sha256="b",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="designs/Design_AI_PM.md",
+                    llmwiki_type="design",
+                    title="AI PM",
+                    summary="AI PM 摘要。",
+                    updated="2026-06-06",
+                ),
+                content="# AI PM\n\n## 矛盾与未决问题\n\n- 待补来源：产品品味能否通过系统化训练提升？\n",
+            ),
+        ],
+    )
+
+    rows, report = pipeline_module.build_open_question_rows_with_report(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        pipeline_module.DraftRenderingArtifact(pages=[]),
+        snapshot,
+    )
+
+    assert rows[0]["question"] == "产品品味能否通过系统化训练提升？"
+    kept = [item for item in report["items"] if item["decision"] == "kept"]
+    assert kept[0]["question"] == "产品品味能否通过系统化训练提升？"
+    assert kept[0]["occurrences"] == 2
+
+
+def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> None:
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_A.md",
+                expected_state="present",
+                preimage_sha256="a",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_A.md",
+                    llmwiki_type="concept",
+                    title="AI PM A",
+                    summary="A。",
+                    updated="2026-06-04",
+                ),
+                content="# AI PM A\n\n## 矛盾与未决问题\n\n- AGI到来后PM角色会消失吗？\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_B.md",
+                expected_state="present",
+                preimage_sha256="b",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_B.md",
+                    llmwiki_type="concept",
+                    title="AI PM B",
+                    summary="B。",
+                    updated="2026-06-05",
+                ),
+                content="# AI PM B\n\n## 矛盾与未决问题\n\n- AGI后PM是否必要？\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_C.md",
+                expected_state="present",
+                preimage_sha256="c",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_C.md",
+                    llmwiki_type="concept",
+                    title="模型能力",
+                    summary="C。",
+                    updated="2026-06-06",
+                ),
+                content="# 模型能力\n\n## 矛盾与未决问题\n\n- 模型能力吞噬产品功能后，产品边界在哪里？\n- 产品功能会被模型能力替代吗？\n",
+            ),
+        ],
+    )
+    rows, report = pipeline_module.build_open_question_rows_with_report(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        pipeline_module.DraftRenderingArtifact(pages=[]),
+        snapshot,
+    )
+
+    questions = [row["question"] for row in rows]
+    assert sum(1 for question in questions if "AGI" in question and "PM" in question) == 1
+    assert sum(1 for question in questions if "模型能力" in question and "产品" in question) == 1
+    keys = [item["normalized_key"] for item in report["items"]]
+    assert "semantic:agi_pm_role_necessity" in keys
+    assert "semantic:model_capability_product_function_boundary" in keys
+
+
+def test_index_open_questions_semantically_dedupes_product_judgement_training_variants() -> None:
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Taste.md",
+                expected_state="present",
+                preimage_sha256="a",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_Taste.md",
+                    llmwiki_type="concept",
+                    title="产品品味",
+                    summary="A。",
+                    updated="2026-06-04",
+                ),
+                content="# 产品品味\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Judgement.md",
+                expected_state="present",
+                preimage_sha256="b",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_Judgement.md",
+                    llmwiki_type="concept",
+                    title="产品判断",
+                    summary="B。",
+                    updated="2026-06-05",
+                ),
+                content="# 产品判断\n\n## 矛盾与未决问题\n\n- 产品判断可以被训练出来吗？\n",
+            ),
+        ],
+    )
+    rows, report = pipeline_module.build_open_question_rows_with_report(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        pipeline_module.DraftRenderingArtifact(pages=[]),
+        snapshot,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["question"] == "产品判断可以被训练出来吗？"
+    items = [item for item in report["items"] if item["decision"] == "kept"]
+    assert items[0]["normalized_key"] == "semantic:product_judgement_training"
+    assert items[0]["occurrences"] == 2
+
+
+def test_index_open_questions_keeps_pm_necessity_and_evolution_separate() -> None:
+    necessity = pipeline_module.open_question_key("AGI到来后PM角色会消失吗？")
+    evolution = pipeline_module.open_question_key("AI 时代 PM 角色会如何演变？")
+
+    assert necessity == "semantic:agi_pm_role_necessity"
+    assert evolution == "semantic:ai_pm_role_evolution"
+    assert necessity != evolution
+
+
+def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> None:
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude_Code.md",
+                expected_state="present",
+                preimage_sha256="a",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="entities/Entity_Claude_Code.md",
+                    llmwiki_type="entity",
+                    title="Claude Code",
+                    summary="Claude Code。",
+                    updated="2026-06-05",
+                ),
+                content=(
+                    "# Claude Code\n\n## 矛盾与未决问题\n\n"
+                    "- Claude Code 的产品体验提升，会不会掩盖 harness 安全边界的重要性？\n"
+                ),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fast_Iteration.md",
+                expected_state="present",
+                preimage_sha256="b",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="concepts/Concept_Fast_Iteration.md",
+                    llmwiki_type="concept",
+                    title="快速迭代",
+                    summary="快速迭代。",
+                    updated="2026-06-05",
+                ),
+                content=(
+                    "# 快速迭代\n\n## 矛盾与未决问题\n\n"
+                    "- 快速发布是否带来质量风险？如何平衡速度与安全？研究预览策略对长期产品一致性有何影响？\n"
+                ),
+            ),
+        ],
+    )
+    plan = pipeline_module.WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        context_snapshot_ref="x",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-CLAUDE",
+                source_basis=SourceBasis(source_candidate_ids=["C1"]),
+                action="update",
+                canonical_target_path="entities/Entity_Claude_Code.md",
+                display_title="Claude Code",
+                page_type="entity",
+                new_understanding="Claude Code 更新。",
+                section_plans={"open_questions": "问题"},
+                reason="测试。",
+            ),
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-ITERATION",
+                source_basis=SourceBasis(source_candidate_ids=["C2"]),
+                action="create",
+                canonical_target_path="concepts/Concept_AI产品快速迭代.md",
+                display_title="AI产品快速迭代",
+                page_type="concept",
+                new_understanding="快速迭代更新。",
+                section_plans={"open_questions": "问题"},
+                reason="测试。",
+            ),
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-EVAL",
+                source_basis=SourceBasis(source_candidate_ids=["C3"]),
+                action="create",
+                canonical_target_path="concepts/Concept_Eval.md",
+                display_title="Eval",
+                page_type="concept",
+                new_understanding="Eval。",
+                section_plans={"open_questions": "问题"},
+                reason="测试。",
+            ),
+        ],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CLAUDE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude_Code.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "open_questions": "Claude Code的产品体验提升会不会掩盖harness安全边界的重要性？Eval的设计如何避免过度拟合？",
+                },
+                change_summary="更新。",
+                source_coverage_notes="测试。",
+            ),
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-ITERATION",
+                action="create",
+                canonical_target_path="concepts/Concept_AI产品快速迭代.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "open_questions": "快速迭代是否可能牺牲长期质量或安全？研究预览策略如何管理用户预期？流程扩展到更大团队时是否仍有效？",
+                },
+                change_summary="创建。",
+                source_coverage_notes="测试。",
+            ),
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EVAL",
+                action="create",
+                canonical_target_path="concepts/Concept_Eval.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "open_questions": "1. Eval的维护成本是否随产品复杂度线性增长？",
+                },
+                change_summary="创建。",
+                source_coverage_notes="测试。",
+            ),
+        ]
+    )
+
+    rows, report = pipeline_module.build_open_question_rows_with_report(plan, draft, snapshot)
+    questions = [row["question"] for row in rows]
+
+    assert sum(1 for question in questions if "harness" in question and "安全边界" in question) == 1
+    assert sum(1 for question in questions if "研究预览" in question and "安全" in question) == 1
+    assert "Eval的维护成本是否随产品复杂度线性增长？" in questions
+    assert all(not question.startswith("1.") for question in questions)
+    assert report["deduped_count"] >= 2
+    keys = [item["normalized_key"] for item in report["items"]]
+    assert "semantic:claude_code_product_experience_harness_boundary" in keys
+    assert "semantic:rapid_iteration_quality_safety_research_preview" in keys
+
+
+def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_separate() -> None:
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Managed_Agents.md",
+                expected_state="present",
+                preimage_sha256="a",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="entities/Entity_Managed_Agents.md",
+                    llmwiki_type="entity",
+                    title="Managed Agents",
+                    summary="Managed Agents。",
+                    updated="2026-06-05",
+                ),
+                content=(
+                    "# Managed Agents\n\n## 矛盾与未决问题\n\n"
+                    "- 多大脑间如何高效传递双手（hand）？文中提及但未深入实现细节\n"
+                    "- 当多个大脑共享同一双手时，并发和状态同步如何保证？\n"
+                ),
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/designs/Design_Managed_Agents.md",
+                expected_state="present",
+                preimage_sha256="b",
+                metadata=pipeline_module.WikiPageMetadata(
+                    path="designs/Design_Managed_Agents.md",
+                    llmwiki_type="design",
+                    title="Managed Agents 架构",
+                    summary="Managed Agents 架构。",
+                    updated="2026-06-06",
+                ),
+                content=(
+                    "# Managed Agents 架构\n\n## 矛盾与未决问题\n\n"
+                    "- 大脑间传递 hand 的具体机制？仅提及“can pass hands”，无细节\n"
+                ),
+            ),
+        ],
+    )
+    rows, report = pipeline_module.build_open_question_rows_with_report(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        pipeline_module.DraftRenderingArtifact(pages=[]),
+        snapshot,
+    )
+
+    questions = [row["question"] for row in rows]
+    assert sum(1 for question in questions if "传递" in question and "hand" in question.lower()) == 1
+    assert any("并发和状态同步" in question for question in questions)
+    items = [item for item in report["items"] if item["normalized_key"] == "semantic:agent_hand_transfer_mechanism"]
+    assert len(items) == 1
+    assert items[0]["occurrences"] == 2
+
+
 def test_source_page_empty_unwritten_section_does_not_repeat_touched_pages() -> None:
     digest = SourceDigestArtifact(
         source_raw_path="raw/sample.md",
@@ -1386,6 +5919,66 @@ def test_source_page_empty_unwritten_section_does_not_repeat_touched_pages() -> 
     assert "concepts/Concept_A.md" not in section
 
 
+def test_source_page_unwritten_section_keeps_budget_deferred_candidates() -> None:
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="这是一篇用于测试 source 页预算延后摘要的材料。",
+        key_takeaways=["关键收获。"],
+        budget_deferred_candidates=[
+            SourceDigestCandidate(
+                candidate_id="C-DEFER",
+                name="延后概念",
+                type="concept",
+                one_sentence_summary="这是一个有价值但本轮不独立建页的概念。",
+                why_matters="它可以后续复用。",
+                wiki_value="保留为后续总览或对比页素材。",
+                suggested_page_title="延后概念",
+            ),
+            SourceDigestCandidate(
+                candidate_id="C-DEFER-2",
+                name="延后概念二",
+                type="concept",
+                one_sentence_summary="第二个延后概念可以与前一个聚合。",
+                why_matters="它和前一个概念同属一组。",
+                wiki_value="适合先放进概念总览。",
+                suggested_page_title="延后概念二",
+                resolution_hint="represented_by_aggregation: `AGG-concepts-demo` 已在本轮用聚合候选代表该候选的核心价值。",
+            ),
+        ],
+    )
+    cleanup = pipeline_module.RawLinkCleanupArtifact(
+        raw_path="raw/sample.md",
+        changed=False,
+        pre_cleanup_sha256="pre",
+        post_cleanup_sha256="post",
+    )
+
+    markdown = pipeline_module.render_source_page(
+        title="Source sample",
+        digest=digest,
+        operation_id="ING-TEST",
+        linked_pages=["concepts/Concept_A.md"],
+        touched_pages=["concepts/Concept_A.md"],
+        no_change_pages=[],
+        log_date="2026-06-06",
+        raw_hash="raw-hash",
+        prepared_hash="prepared-hash",
+        cleanup=cleanup,
+    )
+    section = markdown.split("## 未写入说明", 1)[1]
+
+    assert "### 预算延后候选（未独立建页）" in section
+    assert "### 延后候选聚合建议" in section
+    assert "C-DEFER" in section
+    assert "C-DEFER-2" in section
+    assert "保留为后续总览或对比页素材。" in section
+    assert "处理提示" in section
+    assert "represented_by_aggregation" in section
+    assert "concept_overview" in section
+    assert "延后概念 等 2 个延后概念聚合页" in section
+    assert "concepts/Concept_A.md" not in section
+
+
 def test_embedding_model_revision_falls_back_to_unknown() -> None:
     class FakeModel:
         model_card_data = "tags:\n- sentence-transformers\nvery long model card"
@@ -1411,10 +6004,15 @@ def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: 
 
     assert grounding["requires_review"] is True
     assert grounding["unsupported_new_facts"]
+    unsupported = grounding["unsupported_new_facts"][0]
+    assert unsupported["text"] == "该方案被多个社区引用。"
+    assert "被多个" in unsupported["reason"]
+    assert "删除该背书词" in unsupported["reason"]
     assert "# 草稿来源支撑审查" in grounding_markdown
     assert "unsupported new_fact" not in grounding_markdown
     assert "Draft Grounding Review" not in grounding_markdown
     assert repair_report["repair_count"] == 2
+    assert "触发文本：该方案被多个社区引用。" in repair_report["attempts"][0]["issues"][0]["message"]
     assert repair_report["attempts"][1]["repair_prompt_ref"] == "repair_prompts/attempt-2.json"
     assert (run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json").exists()
     manifest = status(vault, manifest.operation_id)
@@ -1429,6 +6027,60 @@ def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: 
     preview = read_json(run_dir / "apply_preview" / "apply_preview.json")
     assert resumed.status == OperationStatus.drafted
     assert preview["requires_draft_review"] is True
+
+
+def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="stale-grounding")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    draft_manifest_path = run_dir / "draft_rendering" / "draft_write_manifest.json"
+    stale_manifest = read_json(draft_manifest_path)
+    stale_manifest["requires_grounding_review"] = True
+    write_json(draft_manifest_path, stale_manifest)
+    write_json(
+        run_dir / "draft_rendering" / "draft_grounding_review.json",
+        {
+            "schema_version": "draft_grounding_review.v1",
+            "unsupported_new_facts": [
+                {
+                    "page_plan_id": "PP-001",
+                    "target_path": "concepts/Concept_Knowledge_Compilation.md",
+                    "section_key": "detail",
+                    "claim_type": "new_fact",
+                    "text": "过期误杀",
+                    "support": "unsupported",
+                    "action": "needs_review",
+                    "reason": "旧规则误判。",
+                }
+            ],
+            "claims": [],
+            "requires_review": True,
+        },
+    )
+
+    class Ctx:
+        pass
+
+    ctx = Ctx()
+    ctx.run_dir = run_dir
+    ctx.manifest = read_manifest(run_dir / "manifest.json")
+    refreshed = pipeline_module.refresh_current_draft_grounding_artifacts(
+        ctx,
+        pipeline_module.DraftWriteManifest.model_validate(stale_manifest),
+        draft_manifest_path,
+    )
+    grounding = read_json(run_dir / "draft_rendering" / "draft_grounding_review.json")
+    draft_step = [step for step in ctx.manifest.steps if step.name == "draft_rendering"][0]
+    write_manifest_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/draft_write_manifest.json"
+    ][0]
+
+    assert refreshed.requires_grounding_review is False
+    assert grounding["requires_review"] is False
+    assert read_json(draft_manifest_path)["requires_grounding_review"] is False
+    assert write_manifest_ref.sha256 == sha256_file(draft_manifest_path)
 
 
 def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts() -> None:
@@ -1477,6 +6129,2667 @@ def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts()
     assert {claim.claim_type for claim in review.claims} == {"inference"}
 
 
+def test_grounding_examples_hard_facts_still_require_support() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FACT-EXAMPLE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fact_Example.md",
+        display_title="事实例子",
+        page_type="concept",
+        new_understanding="事实例子需要来源支撑。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FACT-EXAMPLE",
+                action="create",
+                canonical_target_path="concepts/Concept_Fact_Example.md",
+                section_bodies={
+                    "summary": "事实例子。",
+                    "detail": "这个页面说明事实型例子需要来源。",
+                    "examples": "- “销量增长三倍”",
+                },
+                change_summary="创建事实例子页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fact_Example.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["销量增长三倍"]
+
+
+def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-STYLE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Style.md",
+        display_title="写作风格",
+        page_type="concept",
+        new_understanding="写作风格描述 AI 上下文文件中的表达方式。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-STYLE",
+                action="create",
+                canonical_target_path="concepts/Concept_Style.md",
+                section_bodies={
+                    "summary": "写作风格示例。",
+                    "detail": "解释性风格提供理由，如“因为性能原因，使用列表推导”；条件性风格指定条件，如“如果代码量超过 100 行，请拆分”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建写作风格页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Style.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["因为性能原因，使用列表推导", "如果代码量超过 100 行，请拆分"]
+    assert {claim.reason for claim in review.claims} == {"由如/例如/比如引出的通用示例句按 illustrative example 处理，不要求 raw exact match。"}
+
+
+def test_grounding_memory_example_questions_do_not_require_raw_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MEMORY",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_记忆评估示例.md",
+        display_title="记忆评估示例",
+        page_type="concept",
+        new_understanding="记忆评估常用短问句和偏好样例解释不同记忆层级。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding memory examples。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-MEMORY",
+                action="create",
+                canonical_target_path="concepts/Concept_记忆评估示例.md",
+                section_bodies={
+                    "summary": "MemBench 用短样例解释不同记忆任务。",
+                    "detail": "事实记忆的问题示例包括“用户哥哥的名字是什么？”，反思记忆示例包括“用户喜欢重口味”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建记忆评估示例页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_记忆评估示例.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["用户哥哥的名字是什么？", "用户喜欢重口味"]
+    assert {claim.reason for claim in review.claims} == {"记忆评估中的短问句/用户偏好/对话样例按 illustrative example 处理，不要求 raw exact match。"}
+
+
+def test_grounding_detail_memory_examples_do_not_require_raw_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MEM-DETAIL",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Memory_Detail.md",
+        display_title="事实记忆",
+        page_type="concept",
+        new_understanding="事实记忆包含不同评估子任务。",
+        section_plans={"detail": "详情"},
+        reason="测试 detail memory examples。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-MEM-DETAIL",
+                action="create",
+                canonical_target_path="concepts/Concept_Memory_Detail.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": (
+                        "事实记忆的子任务包括单跳（如“用户表哥的名字？”）和知识更新"
+                        "（如“用户修改了年龄后，现在多大？”）。在参与场景中，例如，用户说"
+                        "“我的表哥Ethan身高162cm”，智能体回应“明白了，Ethan身高162厘米”。"
+                    ),
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Memory_Detail.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [
+        "用户表哥的名字？",
+        "用户修改了年龄后，现在多大？",
+        "我的表哥Ethan身高162cm",
+        "明白了，Ethan身高162厘米",
+    ]
+    assert {claim.reason for claim in review.claims} == {"记忆评估中的短问句/用户偏好/对话样例按 illustrative example 处理，不要求 raw exact match。"}
+
+
+def test_grounding_short_concept_phrases_do_not_require_raw_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-SCALING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Scaling.md",
+        display_title="Scaling Managed Agents",
+        page_type="concept",
+        new_understanding="Scaling 讨论管理型 Agent 的协作边界。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding 短语。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-SCALING",
+                action="create",
+                canonical_target_path="concepts/Concept_Scaling.md",
+                section_bodies={
+                    "summary": "页面围绕“宠物 vs 牛”和“解耦大脑与双手”两个概念展开。",
+                    "detail": "还保留“会话作为持久上下文对象”这个标题式表达。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建 Scaling 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Scaling.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["宠物 vs 牛", "解耦大脑与双手", "会话作为持久上下文对象"]
+    assert {claim.claim_type for claim in review.claims} == {"inference"}
+
+
+def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-EVAL",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Eval.md",
+        display_title="评估（Eval）",
+        page_type="concept",
+        new_understanding="Eval 在产品开发中用于判断功能风险。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 外部背书。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EVAL",
+                action="create",
+                canonical_target_path="concepts/Concept_Eval.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "在Anthropic，评估被广泛使用于产品开发。Cat Wu指出，评估的重要性因功能而异。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Eval.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "Cat Wu指出，评估的重要性因功能而异。"
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["在Anthropic，评估被广泛使用于产品开发。"]
+    assert "被广泛使用" in review.unsupported_new_facts[0].reason
+    assert "删除该背书词" in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_external_backing_does_not_flag_internal_multiple_components() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MANY-HANDS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Many_Hands.md",
+        display_title="多脑多手扩展",
+        page_type="concept",
+        new_understanding="多脑多手扩展描述大脑和沙箱的组合方式。",
+        section_plans={"detail": "详情"},
+        reason="测试 `被多个` 不误伤内部组件关系。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-MANY-HANDS",
+                action="create",
+                canonical_target_path="concepts/Concept_Many_Hands.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "一个沙箱可以被多个适配框架共享以保持状态一致性。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Many_Hands.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_external_backing_still_flags_multiple_community_claim() -> None:
+    assert pipeline_module.unsupported_backing_marker("该方案被多个社区引用。") == "被多个"
+
+
+def test_grounding_flags_unsupported_scope_speculation() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-COWORK",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="entities/Entity_Cowork.md",
+        display_title="Cowork",
+        page_type="entity",
+        new_understanding="Cowork 是知识工作产品。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 范围推测。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-COWORK",
+                action="create",
+                canonical_target_path="entities/Entity_Cowork.md",
+                section_bodies={
+                    "summary": "Cowork 是知识工作产品。",
+                    "detail": "Cowork 用于综合信息和创建文档。",
+                    "additional_notes": "源代码泄露事件中，Cowork 的组件可能也受到影响，但访谈中未详细说明。",
+                },
+                change_summary="创建 Cowork 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Cowork.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "Claude Code 的源代码泄露被归因于人为错误。Cowork 是另一款知识工作产品。"
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [
+        "源代码泄露事件中，Cowork 的组件可能也受到影响，但访谈中未详细说明。"
+    ]
+    assert "受影响对象推测" in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_scope_speculation_allows_open_question() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-QUESTION",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_发布一致性.md",
+        display_title="发布一致性",
+        page_type="open_question",
+        new_understanding="快速发布有一致性问题。",
+        section_plans={"open_questions": "未决问题"},
+        reason="测试 grounding 未决问题。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QUESTION",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_发布一致性.md",
+                section_bodies={
+                    "summary": "快速发布和产品一致性之间存在张力。",
+                    "detail": "访谈提到团队追求快速发布。",
+                    "open_questions": "快速发布是否可能影响长期产品一致性？",
+                },
+                change_summary="创建未决问题页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_发布一致性.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "团队追求快速发布。",
+    )
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_external_backing_accepts_english_widely_used_anchor() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-NYU-CTF",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="entities/Entity_NYU CTF Bench.md",
+        display_title="NYU CTF Bench",
+        page_type="entity",
+        new_understanding="NYU CTF Bench 是静态 CTF benchmark。",
+        section_plans={"detail": "详情"},
+        reason="测试英文论文 backing marker。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-NYU-CTF",
+                action="create",
+                canonical_target_path="entities/Entity_NYU CTF Bench.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "NYU CTF Bench 被广泛用于评估 LLM 智能体在网络安全任务中的表现。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_NYU CTF Bench.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "To evaluate these agents, CTF benchmarks have become the de-facto standard. "
+        "These benchmarks have also been widely used in evaluating recent LLM models."
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_external_backing_accepts_widely_across_tasks_anchor() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CLAUDE-CODE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        matched_page="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="Claude Code 是 Managed Agents 生态中的 harness。",
+        section_plans={"detail": "详情"},
+        reason="测试英文 widely across tasks 支撑。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CLAUDE-CODE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "Claude Code 是 Anthropic 开发的 harness，在团队内部被广泛使用。",
+                    "detail": "Claude Code 作为 Managed Agents 的一个 harness 示例，被广泛用于多种任务。",
+                },
+                change_summary="更新页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content="",
+            )
+        ],
+    )
+    raw = "For example, Claude Code is an excellent harness that we use widely across tasks."
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_external_backing_accepts_retained_existing_fact_with_bridge_prefix() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CLAUDE-CODE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        matched_page="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="Cat Wu 访谈补充 Claude Code 产品管理细节。",
+        section_plans={"detail": "详情"},
+        reason="测试 update preservation 旧事实桥接前缀。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CLAUDE-CODE",
+                action="update",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "Claude Code 是 Anthropic 开发的一款编程助手产品。",
+                    "detail": "从 Managed Agents / 托管智能体 等旧页视角看，本材料将 Claude Code 描述为“出色的 harness”，在各种任务中广泛使用。",
+                },
+                change_summary="更新页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content="# Claude Code\n\n## 详细说明\n\n本材料将 Claude Code 描述为“出色的 harness”，在各种任务中广泛使用。\n",
+            )
+        ],
+    )
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "Cat Wu 访谈讨论 Claude Code 产品团队。",
+    )
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+    assert any(claim.claim_type == "retained_fact" and claim.support == "existing_wiki" for claim in review.claims)
+
+
+def test_grounding_external_backing_uses_same_line_pronoun_context() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-NYU-PRONOUN",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="entities/Entity_NYU CTF Bench.md",
+        display_title="NYU CTF Bench",
+        page_type="entity",
+        new_understanding="NYU CTF Bench 是静态 CTF benchmark。",
+        section_plans={"summary": "摘要"},
+        reason="测试英文论文 backing marker 的代词上下文。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-NYU-PRONOUN",
+                action="create",
+                canonical_target_path="entities/Entity_NYU CTF Bench.md",
+                section_bodies={
+                    "summary": "NYU CTF Bench 是用于评估 LLM 智能体的 CTF 基准。它被广泛使用，但存在数据污染风险。",
+                    "detail": "静态 CTF 基准可能高估模型表现，实时 CTF 可以降低公开题解带来的污染。",
+                    "examples": "例如，公开 write-up 会影响静态题库。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_NYU CTF Bench.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "NYU CTF Bench was the first benchmark to use CTF problems for evaluating cybersecurity agents. "
+        "These benchmarks have also been widely used in evaluating recent LLM models."
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_external_backing_requires_specific_anchor_not_only_generic_widely_used() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FAKE-BENCH",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="entities/Entity_FooBench.md",
+        display_title="FooBench",
+        page_type="entity",
+        new_understanding="FooBench 是一个评估基准。",
+        section_plans={"summary": "摘要"},
+        reason="测试英文 backing 不能只凭泛词放行。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FAKE-BENCH",
+                action="create",
+                canonical_target_path="entities/Entity_FooBench.md",
+                section_bodies={
+                    "summary": "FooBench 是用于评估 LLM 智能体的基准。它被广泛使用，但存在数据污染风险。",
+                    "detail": "静态基准可能高估模型表现。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_FooBench.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "These benchmarks have also been widely used in evaluating recent LLM models."
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["它被广泛使用，但存在数据污染风险。"]
+
+
+def test_grounding_quoted_conceptual_release_process_is_not_direct_quote() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-RESEARCH-PREVIEW",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="designs/Design_Research_Preview.md",
+        display_title="研究预览发布模式",
+        page_type="design",
+        new_understanding="研究预览是一种发布模式。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 发布流程概念短语。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-RESEARCH-PREVIEW",
+                action="create",
+                canonical_target_path="designs/Design_Research_Preview.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "该模式与“可重复发布流程”和“设定清晰目标”形成配套。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/designs/Design_Research_Preview.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["可重复发布流程", "设定清晰目标"]
+    assert {claim.claim_type for claim in review.claims} == {"inference"}
+
+
+def test_grounding_quoted_product_choice_label_context_is_not_direct_quote() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-PRODUCT-CHOICE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Claude_Code_Cowork_Choice.md",
+        display_title="Claude Code 与 Cowork 的产品选择",
+        page_type="concept",
+        new_understanding="产品选择标签不应被当成直接引用。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 产品选择标签。",
+    )
+    quote = "何时使用Claude Code与Cowork"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-PRODUCT-CHOICE",
+                action="create",
+                canonical_target_path="concepts/Concept_Claude_Code_Cowork_Choice.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"本概念源自访谈中关于“{quote}”的讨论。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Claude_Code_Cowork_Choice.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].claim_type == "inference"
+
+
+def test_grounding_concept_label_after_broad_mention_is_not_direct_quote() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-HARNESS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="Claude Code 是 harness 示例。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 宽泛提到短概念。",
+    )
+    quote = "优秀的适配框架"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-HARNESS",
+                action="create",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"文中提到它是“{quote}”，展示了元适配框架可以容纳不同类型的 harness。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].claim_type == "inference"
+
+
+def test_grounding_attributed_concept_label_is_not_dequoted_or_bypassed() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-ATTRIBUTED-LABEL",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Context_Object.md",
+        display_title="会话上下文对象",
+        page_type="concept",
+        new_understanding="会话可被理解成上下文对象。",
+        section_plans={"detail": "详情"},
+        reason="测试 attributed concept label。",
+    )
+    quote = "会话作为持久上下文对象"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-ATTRIBUTED-LABEL",
+                action="create",
+                canonical_target_path="concepts/Concept_Context_Object.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"文中称“{quote}”，因此该页面保留这个概念。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Context_Object.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is False
+    assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_attributed_concept_label_with_punctuation_is_not_bypassed() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-ATTRIBUTED-PUNCTUATION",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Context_Object.md",
+        display_title="会话上下文对象",
+        page_type="concept",
+        new_understanding="会话可被理解成上下文对象。",
+        section_plans={"detail": "详情"},
+        reason="测试 attributed punctuation。",
+    )
+    quote = "会话作为持久上下文对象"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-ATTRIBUTED-PUNCTUATION",
+                action="create",
+                canonical_target_path="concepts/Concept_Context_Object.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"文中称：“{quote}”，因此该页面保留这个概念。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Context_Object.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is False
+    assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_quoted_abstract_trend_label_context_is_not_direct_quote() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-PM-SKILLS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_AI_PM_Skills.md",
+        display_title="AI PM 技能变化",
+        page_type="open_question",
+        new_understanding="抽象趋势标签不应被当成直接引用。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 抽象趋势标签。",
+    )
+    quote = "技术壁垒正在降低"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-PM-SKILLS",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_AI_PM_Skills.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"本问题源自她提到的“{quote}”的趋势。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_AI_PM_Skills.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].claim_type == "inference"
+
+
+def test_grounding_explicit_direct_quote_still_requires_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-QUOTE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Quote.md",
+        display_title="直接引用",
+        page_type="concept",
+        new_understanding="直接引用需要来源支撑。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QUOTE",
+                action="create",
+                canonical_target_path="concepts/Concept_Quote.md",
+                section_bodies={
+                    "summary": "原文说“解耦大脑与双手”。",
+                    "detail": "暂无更多细节。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Quote.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is True
+    assert review.unsupported_new_facts[0].text == "解耦大脑与双手"
+
+
+def test_grounding_direct_quote_accepts_normalized_source_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-PAPER",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="designs/Design_Paper.md",
+        display_title="论文方法",
+        page_type="design",
+        new_understanding="论文方法句需要来源支撑。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 规范化 exact match。",
+    )
+    quote = "Based on MemEngine (Zhang et al., 2025), we implement seven memory mechanisms, using Qwen2.5-7B as the base model"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-PAPER",
+                action="create",
+                canonical_target_path="designs/Design_Paper.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"源摘录中提到“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/designs/Design_Paper.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "To eliminate other designs on results, we make no modifications to components."
+        "Based on MemEngine (Zhang et al., 2025 ), we implement seven memory mechanisms, "
+        "using Qwen2.5-7B as the base model for the agent applications on our benchmark."
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.claims[0].support == "raw"
+    assert review.claims[0].reason == "直接引用已在 raw 或已有 wiki 中规范化 exact match。"
+
+
+def test_grounding_direct_quote_accepts_time_range_transcript_variant() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-PM-ROLE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_PM角色演变.md",
+        display_title="PM角色演变",
+        page_type="concept",
+        new_understanding="PM负责从当前状态到长期愿景之间的路径。",
+        section_plans={"detail": "详情"},
+        reason="测试 transcript 数字范围近似直引。",
+    )
+    quote = "弄清楚从今天到3-6个月后愿景之间的路径"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-PM-ROLE",
+                action="create",
+                canonical_target_path="concepts/Concept_PM角色演变.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"Cat Wu提到，PM的工作是“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_PM角色演变.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "Boris 非常擅长设定方向，比如这就是产品在3个月、6个月后需要成为的样子。"
+        "而我的很多职责是弄清楚从今天到那个3到6个月后的愿景之间的路径是什么。"
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.claims[0].support == "raw"
+    assert review.claims[0].reason == "直接引用已在 raw 或已有 wiki 中规范化 exact match。"
+
+
+def test_grounding_direct_quote_accepts_paired_month_enumeration_as_range() -> None:
+    quote = "产品在3-6个月后需要成为的样子"
+    raw = "Boris 非常擅长设定方向，比如这就是产品在3个月、6个月后需要成为的样子。"
+
+    assert pipeline_module.quote_supported_by_text(quote, raw) is True
+
+
+def test_grounding_direct_quote_paired_month_enumeration_requires_same_numbers() -> None:
+    quote = "产品在3-9个月后需要成为的样子"
+    raw = "Boris 非常擅长设定方向，比如这就是产品在3个月、6个月后需要成为的样子。"
+
+    assert pipeline_module.quote_supported_by_text(quote, raw) is False
+
+
+def test_grounding_direct_quote_does_not_collapse_three_item_timeline() -> None:
+    quote = "产品在3-6个月后需要成为的样子"
+    raw = "路线图分别记录产品在3个月、6个月、9个月后需要成为的样子。"
+
+    assert pipeline_module.quote_supported_by_text(quote, raw) is False
+
+
+def test_grounding_direct_quote_range_does_not_match_partial_numeric_token() -> None:
+    quote = "产品在3-6个月后需要成为的样子"
+    raw = "Boris 讨论的是产品在13个月、6个月后需要成为的样子。"
+
+    assert pipeline_module.quote_supported_by_text(quote, raw) is False
+
+
+def test_grounding_direct_quote_time_range_variant_requires_same_numbers() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-PM-ROLE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_PM角色演变.md",
+        display_title="PM角色演变",
+        page_type="concept",
+        new_understanding="PM负责从当前状态到长期愿景之间的路径。",
+        section_plans={"detail": "详情"},
+        reason="测试 transcript 数字范围不能误配。",
+    )
+    quote = "弄清楚从今天到3-9个月后愿景之间的路径"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-PM-ROLE",
+                action="create",
+                canonical_target_path="concepts/Concept_PM角色演变.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"Cat Wu提到，PM的工作是“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_PM角色演变.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "我的职责是弄清楚从今天到那个3到6个月后的愿景之间的路径是什么。"
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_short_domain_quote_accepts_normalized_source_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CLAUDE-CODE",
+        source_basis=SourceBasis(source_candidate_ids=["auto-ent-claudecode"]),
+        action="create",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="Claude Code 是 Managed Agents 生态中的 harness。",
+        section_plans={"detail": "详情"},
+        reason="测试短 domain quote 的规范化 exact match。",
+    )
+    quote = "出色的 harness"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CLAUDE-CODE",
+                action="create",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"源材料在正文中提到，Claude Code 已经作为“{quote}”被集成到 Managed Agents 架构中。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "例如，**Claude Code** 是一个出色的 **harness（适配框架）**，我们在各种任务中广泛使用它。"
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.claims[0].text == quote
+    assert review.claims[0].support == "raw"
+
+
+def test_grounding_domain_quote_accepts_source_match_with_parenthetical_translation() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CLAUDE-CODE-LONG",
+        source_basis=SourceBasis(source_candidate_ids=["auto-ent-claudecode"]),
+        action="create",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="Claude Code 是 Managed Agents 生态中的 harness。",
+        section_plans={"detail": "详情"},
+        reason="测试 domain quote 可省略英文术语后的中文括注。",
+    )
+    quote = "一个出色的 harness，我们在各种任务中广泛使用它"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CLAUDE-CODE-LONG",
+                action="create",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"原文提到“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "例如，**Claude Code** 是一个出色的 **harness（适配框架）**，我们在各种任务中广泛使用它。"
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.claims[0].text == quote
+    assert review.claims[0].support == "raw"
+
+
+def test_grounding_short_numeric_quote_accepts_exact_numeric_source_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-BORIS",
+        source_basis=SourceBasis(source_candidate_ids=["E002"]),
+        action="create",
+        canonical_target_path="entities/Entity_Boris Cherny.md",
+        display_title="Boris Cherny",
+        page_type="entity",
+        new_understanding="Boris 与 Cat Wu 的协作模式。",
+        section_plans={"detail": "详情"},
+        reason="测试短数字 quote 的规范化 exact match。",
+    )
+    quote = "80% 是心灵融合"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-BORIS",
+                action="create",
+                canonical_target_path="entities/Entity_Boris Cherny.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"Cat 形容他们的合作“{quote}”，剩余 20% 由各自在意的事情驱动。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Boris Cherny.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = '我觉得我们大概80%是心灵融合，然后有20%的事情我更在意，我就多推动那些。'
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert review.claims[0].text == quote
+    assert review.claims[0].support == "raw"
+
+
+def test_grounding_short_numeric_quote_does_not_match_decimal_collapse() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-BORIS",
+        source_basis=SourceBasis(source_candidate_ids=["E002"]),
+        action="create",
+        canonical_target_path="entities/Entity_Boris Cherny.md",
+        display_title="Boris Cherny",
+        page_type="entity",
+        new_understanding="Boris 与 Cat Wu 的协作模式。",
+        section_plans={"detail": "详情"},
+        reason="测试短数字 quote 不把小数错配成整数百分比。",
+    )
+    quote = "9.5% 是心灵融合"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-BORIS",
+                action="create",
+                canonical_target_path="entities/Entity_Boris Cherny.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"Cat 形容他们的合作“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Boris Cherny.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "我觉得我们大概95%是心灵融合。"
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_ascii_closing_quote_is_not_treated_as_new_quote_start() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-PETS-CATTLE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Pets_Cattle.md",
+        display_title="Pets vs Cattle",
+        page_type="concept",
+        new_understanding="容器失败应像 cattle 一样被自动替换。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 半角引号边界。",
+    )
+    quote = (
+        "If the container died, the harness caught the failure as a tool-call error "
+        "and passed it back to Claude."
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-PETS-CATTLE",
+                action="create",
+                canonical_target_path="concepts/Concept_Pets_Cattle.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": (
+                        '解耦后，container 变成"牲畜"——如果它死了，harness 将失败捕获为工具调用错误，'
+                        f'传回 Claude。原文描述："{quote}"'
+                    ),
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Pets_Cattle.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        quote,
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].support == "raw"
+
+
+def test_grounding_quoted_evaluation_question_template_is_not_direct_quote() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-EVAL-QUESTION",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_Eval.md",
+        display_title="概率性 AI 产品评估",
+        page_type="open_question",
+        new_understanding="评估问题模板不是直接事实引用。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 评估问句模板。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EVAL-QUESTION",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_Eval.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": "不是“是否回答正确”，而是“在多少比例下用户满意”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_Eval.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["是否回答正确", "在多少比例下用户满意"]
+    assert {claim.claim_type for claim in review.claims} == {"inference"}
+
+
+def test_grounding_quoted_compact_paraphrase_uses_nearby_source_support() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FAST-ITERATION",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fast_Iteration.md",
+        display_title="快速迭代流程",
+        page_type="concept",
+        new_understanding="清晰目标帮助团队快速迭代。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 压缩概括。",
+    )
+    quote = "核心用户是专业开发者，主要问题是权限提示疲劳"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FAST-ITERATION",
+                action="create",
+                canonical_target_path="concepts/Concept_Fast_Iteration.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"设定清晰目标（如“{quote}”）可以减少 LLM 通用性带来的模糊。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fast_Iteration.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "所以我认为一个优秀的PM能够说：好的，我们的核心用户是专业开发者。"
+        "我们这个功能要解决的主要问题可能是权限提示太多了，人们感到疲劳。"
+        "我们的用例是：我们希望企业里的专业开发者能够安全地实现零权限提示。"
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].claim_type == "inference"
+    assert review.claims[0].support == "raw"
+    assert "压缩概括" in review.claims[0].reason
+
+
+def test_grounding_quoted_method_goal_paraphrase_uses_nearby_source_support() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FAST-SHIPPING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fast_Shipping.md",
+        display_title="快速交付方法",
+        page_type="concept",
+        new_understanding="团队用目标短语总结快速交付方法。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 方法目标短语。",
+    )
+    quote = "找到最快将功能交到用户手中的方法"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FAST-SHIPPING",
+                action="create",
+                canonical_target_path="concepts/Concept_Fast_Shipping.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"PM 关注的是“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fast_Shipping.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "我们怎样才能找到最快把东西推出去的方法？"
+        "我们怎样才能创建一个产品套件的概念角落，让工程师或 PM 有一个想法，"
+        "到周末就能把功能交到用户手中。"
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].claim_type == "inference"
+    assert review.claims[0].support == "raw"
+    assert "压缩概括" in review.claims[0].reason
+
+
+def test_grounding_quoted_method_goal_paraphrase_still_requires_nearby_support() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FAST-SHIPPING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fast_Shipping.md",
+        display_title="快速交付方法",
+        page_type="concept",
+        new_understanding="团队用目标短语总结快速交付方法。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 方法目标短语。",
+    )
+    quote = "找到最快将功能交到用户手中的方法"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FAST-SHIPPING",
+                action="create",
+                canonical_target_path="concepts/Concept_Fast_Shipping.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"PM 关注的是“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fast_Shipping.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "我们怎样才能找到最快把东西推出去的方法？这里没有说明最终交付给谁。"
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_numeric_reliability_paraphrase_rewrites_to_source_sentence() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-AUTOMATION-RELIABILITY",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_AI自动化可靠性.md",
+        display_title="AI自动化可靠性",
+        page_type="concept",
+        new_understanding="100%可靠性原则来自访谈。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 百分比 paraphrase 改写。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-AUTOMATION-RELIABILITY",
+                action="create",
+                canonical_target_path="concepts/Concept_AI自动化可靠性.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": "100%可靠性原则也适用于AI产品自身的质量，正如Cat Wu所说“95%对AI来说就是失败”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    raw = "如果自动化不是100%有效，它真的不是自动化。95%的自动化真的没什么价值。"
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_AI自动化可靠性.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, raw)
+    body = rewritten.pages[0].section_bodies["additional_notes"]
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert report["changed"] is True
+    assert report["rewrite_count"] == 1
+    assert "95%对AI来说就是失败" not in body
+    assert "正如Cat Wu所说，95%的自动化真的没什么价值。" in body
+    assert review.requires_review is False
+
+
+def test_grounding_numeric_reliability_paraphrase_requires_source_sentence() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-AUTOMATION-RELIABILITY",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_AI自动化可靠性.md",
+        display_title="AI自动化可靠性",
+        page_type="concept",
+        new_understanding="100%可靠性原则来自访谈。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 百分比 paraphrase 改写。",
+    )
+    quote = "95%对AI来说就是失败"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-AUTOMATION-RELIABILITY",
+                action="create",
+                canonical_target_path="concepts/Concept_AI自动化可靠性.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"正如Cat Wu所说“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_AI自动化可靠性.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "AI工具需要继续提升可靠性。")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "AI工具需要继续提升可靠性。",
+    )
+
+    assert report["changed"] is False
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_rewrite_translates_known_english_harness_quote() -> None:
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CLAUDE-CODE",
+                action="create",
+                canonical_target_path="entities/Entity_Claude Code.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "Claude Code 被描述为“an excellent harness that provides a focused coding experience”，可接入 Managed Agents。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    body = rewritten.pages[0].section_bodies["detail"]
+
+    assert report["changed"] is True
+    assert "an excellent harness" not in body
+    assert "被描述为一种优秀的 harness，提供聚焦的编码体验" in body
+
+
+def test_grounding_rewrite_dequotes_internal_digest_paraphrase() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-SECURITY",
+        source_basis=SourceBasis(source_candidate_ids=["D001"]),
+        action="create",
+        canonical_target_path="designs/Design_Security.md",
+        display_title="安全令牌隔离",
+        page_type="design",
+        new_understanding="安全令牌隔离减少凭证暴露。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试内部 artifact paraphrase 去引号。",
+    )
+    quote = "在耦合架构中，sandbox 与凭证共存，攻击者可通过提示注入窃取令牌；此设计从结构上消除了该风险。"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-SECURITY",
+                action="create",
+                canonical_target_path="designs/Design_Security.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"该设计对应 approved_digest 中 D001 的 why_matters 描述：“{quote}”",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/designs/Design_Security.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    body = rewritten.pages[0].section_bodies["additional_notes"]
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is True
+    assert "approved_digest" not in body
+    assert f"“{quote}”" not in body
+    assert "对应的来源要点是：" in body
+    assert review.requires_review is False
+
+
+def test_grounding_rewrite_dequotes_non_explicit_scope_paraphrase() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CONTEXT",
+        source_basis=SourceBasis(source_candidate_ids=["Q001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_Context.md",
+        display_title="长时上下文管理",
+        page_type="open_question",
+        new_understanding="长时上下文管理仍有开放问题。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 scope paraphrase 去引号。",
+    )
+    quote = "文章仅提出会话作为持久化存储，但未深入讨论智能压缩、索引或预取"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CONTEXT",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_Context.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"本材料中提到“{quote}”，这正是该问题的来源。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_Context.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is True
+    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["additional_notes"]
+    assert review.requires_review is False
+
+
+def test_grounding_rewrite_dequotes_long_non_explicit_paraphrase_with_fact_markers() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-MANY-HANDS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Many_Hands.md",
+        display_title="多大脑多手",
+        page_type="concept",
+        new_understanding="多大脑多手来自大脑与双手解耦。",
+        section_plans={"detail": "详情"},
+        reason="测试长 paraphrase 去引号。",
+    )
+    quote = (
+        "将大脑与双手解耦解决了我们最早的客户投诉之一。当团队希望 Claude 使用他们自己 VPC 中的资源时，"
+        "唯一的路径是将他们的网络与我们的做对等互连，因为持有 harness 的容器假定每个资源都在它旁边。"
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-MANY-HANDS",
+                action="create",
+                canonical_target_path="concepts/Concept_Many_Hands.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"材料指出：“{quote}”解耦后，资源可以位于任何位置。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Many_Hands.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is True
+    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["detail"]
+    assert review.requires_review is False
+
+
+def test_grounding_rewrite_dequotes_open_question_quote_with_growth_marker() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-LOG-GROWTH",
+        source_basis=SourceBasis(source_candidate_ids=["Q001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_Log_Growth.md",
+        display_title="会话日志增长管理",
+        page_type="open_question",
+        new_understanding="会话日志增长管理仍待设计。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试开放问题问句去引号。",
+    )
+    quote = "日志大小增长如何管理？是否需要引入日志压缩或归档策略？"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-LOG-GROWTH",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_Log_Growth.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"该开放问题来自来源材料中明确提到的“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_Log_Growth.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is True
+    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["additional_notes"]
+    assert review.requires_review is False
+
+
+def test_grounding_rewrite_dequotes_source_local_context_window_paraphrase() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CONTEXT-WINDOW",
+        source_basis=SourceBasis(source_candidate_ids=["Q001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_Context_Window.md",
+        display_title="未来上下文工程不可预测性",
+        page_type="open_question",
+        new_understanding="会话和上下文窗口的边界可能变化。",
+        section_plans={"examples": "例子"},
+        reason="测试 source-local concept paraphrase 去引号。",
+    )
+    quote = "会话不是 Claude 的上下文窗口"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-CONTEXT-WINDOW",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_Context_Window.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "暂无更多细节。",
+                    "examples": f"原文提到“{quote}”，但未说明未来原生长上下文是否会改变当前架构。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_Context_Window.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = pipeline_module.build_draft_grounding_review(
+        rewritten,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert report["changed"] is True
+    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["examples"]
+    assert review.requires_review is False
+
+
+def test_grounding_rewrite_dequotes_short_slogan_label() -> None:
+    quote = "快速行动，打破常规"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-META-CULTURE",
+                action="create",
+                canonical_target_path="comparisons/Comparison_Meta_Culture.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"Meta 速度实验驱动：推崇“{quote}”，产品决策依赖 A/B 测试和快速迭代。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(
+        draft,
+        "Meta 的文化是速度驱动的。Move fast and break things。你不需要完美的文档。",
+    )
+
+    assert report["changed"] is True
+    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["detail"]
+    assert "推崇快速行动，打破常规" in rewritten.pages[0].section_bodies["detail"]
+
+
+def test_grounding_rewrite_does_not_dequote_short_hard_fact_label() -> None:
+    quote = "用户增长，收入下降"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-HARD-FACT",
+                action="create",
+                canonical_target_path="concepts/Concept_Hard_Fact.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"报告称“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "源材料没有这句话。")
+
+    assert report["changed"] is False
+    assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
+
+
+def test_grounding_numeric_reliability_rewrite_does_not_match_decimal_percent() -> None:
+    quote = "9.5%对AI来说就是失败"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-AUTOMATION-RELIABILITY",
+                action="create",
+                canonical_target_path="concepts/Concept_AI自动化可靠性.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"正如Cat Wu所说“{quote}”。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(
+        draft,
+        "95%的自动化真的没什么价值。",
+    )
+
+    assert report["changed"] is False
+    assert rewritten.pages[0].section_bodies["additional_notes"] == draft.pages[0].section_bodies["additional_notes"]
+
+
+def test_grounding_attributed_paraphrase_still_requires_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FAST-SHIPPING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fast_Shipping.md",
+        display_title="快速交付方法",
+        page_type="concept",
+        new_understanding="团队用目标短语总结快速交付方法。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 人物归因短语。",
+    )
+    quote = "找到最快将功能交到用户手中的方法"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FAST-SHIPPING",
+                action="create",
+                canonical_target_path="concepts/Concept_Fast_Shipping.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"Cat Wu指出“{quote}”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fast_Shipping.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = (
+        "我们怎样才能找到最快把东西推出去的方法？"
+        "让工程师或 PM 有一个想法，到周末就能把功能交到用户手中。"
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, raw)
+
+    assert report["changed"] is False
+    assert rewritten.pages[0].section_bodies["detail"] == draft.pages[0].section_bodies["detail"]
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_named_tool_concept_label_with_digits_is_not_direct_quote() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-AGENT",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_AI_Agent.md",
+        display_title="AI Agent 架构",
+        page_type="concept",
+        new_understanding="Agent 和工作流适用场景不同。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试 grounding 工具标题标签。",
+    )
+    quote = "N8N工作流与Agent构建对比"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-AGENT",
+                action="create",
+                canonical_target_path="concepts/Concept_AI_Agent.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"本页可与设计模式“{quote}”联动阅读。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_AI_Agent.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == [quote]
+    assert review.claims[0].claim_type == "inference"
+
+
+def test_grounding_named_tool_label_with_numeric_fact_still_requires_support() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-AGENT-FACT",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_AI_Agent.md",
+        display_title="AI Agent 架构",
+        page_type="concept",
+        new_understanding="Agent 系统包含多个步骤。",
+        section_plans={"additional_notes": "补充观察"},
+        reason="测试带数字的短事实不能伪装成概念标题。",
+    )
+    quote = "Agent系统有3个步骤"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-AGENT-FACT",
+                action="create",
+                canonical_target_path="concepts/Concept_AI_Agent.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "additional_notes": f"本页暂以“{quote}”作为结构提示。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_AI_Agent.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_quoted_compact_paraphrase_still_requires_support_for_each_part() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FAST-ITERATION",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fast_Iteration.md",
+        display_title="快速迭代流程",
+        page_type="concept",
+        new_understanding="清晰目标帮助团队快速迭代。",
+        section_plans={"detail": "详情"},
+        reason="测试 grounding 压缩概括。",
+    )
+    quote = "核心用户是专业开发者，主要问题是权限提示疲劳"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FAST-ITERATION",
+                action="create",
+                canonical_target_path="concepts/Concept_Fast_Iteration.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"设定清晰目标（如“{quote}”）可以减少 LLM 通用性带来的模糊。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fast_Iteration.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    raw = "团队原则中写到，核心用户是专业开发者。"
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+
+
+def test_grounding_short_fact_phrases_still_require_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-FACT",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Fact.md",
+        display_title="短事实",
+        page_type="concept",
+        new_understanding="短事实需要来源支撑。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-FACT",
+                action="create",
+                canonical_target_path="concepts/Concept_Fact.md",
+                section_bodies={
+                    "summary": "结果包括例如“销量增长三倍”、“裁撤一半团队”和“预算超过百万”。",
+                    "detail": "暂无更多细节。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Fact.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["销量增长三倍", "裁撤一半团队", "预算超过百万"]
+
+
+def test_grounding_quoted_release_event_still_requires_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-RELEASE-FACT",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Release_Fact.md",
+        display_title="发布事实",
+        page_type="concept",
+        new_understanding="发布事件需要来源支撑。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding 发布事实。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-RELEASE-FACT",
+                action="create",
+                canonical_target_path="concepts/Concept_Release_Fact.md",
+                section_bodies={
+                    "summary": "团队“发布了重大功能”。",
+                    "detail": "暂无更多细节。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Release_Fact.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["发布了重大功能"]
+
+
+def test_draft_page_item_coerces_quality_risks_string_to_list() -> None:
+    page = pipeline_module.DraftPageItem(
+        page_plan_id="PP-RISK",
+        action="create",
+        canonical_target_path="concepts/Concept_Risk.md",
+        section_bodies={"summary": "摘要"},
+        change_summary="创建页面。",
+        source_coverage_notes="测试。",
+        quality_risks="样本范围有限；需要后续验证",
+    )
+
+    assert page.quality_risks == ["样本范围有限；需要后续验证"]
+
+
 def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "draft-repair-fixture"
@@ -1502,7 +8815,246 @@ def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path:
     assert any(ref.relative_path.endswith("repair_prompts/attempt-2.json") for ref in draft_step.outputs)
 
 
-def test_candidate_resolution_repairs_weak_noise_formal_item(tmp_path: Path) -> None:
+def test_draft_rendering_create_change_summary_is_filled_without_repair(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "draft-change-summary-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "draft_rendering.json":
+            data["pages"][0]["change_summary"] = ""
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-change-summary")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
+    draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
+
+    assert manifest.status == OperationStatus.drafted
+    assert repair_report["repair_count"] == 0
+    assert draft["pages"][0]["change_summary"] == "创建 知识编译工程骨架 页面。"
+
+
+def test_draft_rendering_create_english_change_summary_is_filled_without_repair(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "draft-english-change-summary-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "draft_rendering.json":
+            data["pages"][0]["change_summary"] = (
+                "Create a new page about knowledge compilation scaffolding from the approved source and explain why the project matters."
+            )
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-english-change-summary")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
+    draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
+
+    assert manifest.status == OperationStatus.drafted
+    assert repair_report["repair_count"] == 0
+    assert draft["pages"][0]["change_summary"] == "创建 知识编译工程骨架 页面。"
+
+
+def test_draft_rendering_create_english_source_coverage_notes_is_filled_without_repair(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "draft-english-source-coverage-fixture"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "draft_rendering.json":
+            data["pages"][0]["source_coverage_notes"] = (
+                "Based on global excerpt and snippets from source material; covers introduction and methodology sections."
+            )
+        write_json(fixture_dir / name, data)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-english-source-coverage")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
+    draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
+
+    assert manifest.status == OperationStatus.drafted
+    assert repair_report["repair_count"] == 0
+    assert draft["pages"][0]["source_coverage_notes"].startswith("依据本轮来源摘录中与")
+    assert "Based on" not in draft["pages"][0]["source_coverage_notes"]
+
+
+def test_draft_rendering_batch_parallelism_is_provider_scoped() -> None:
+    assert pipeline_module.draft_rendering_batch_parallelism("mock:fixture", 3) == 1
+    assert pipeline_module.draft_rendering_batch_parallelism("human", 3) == 1
+    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 1) == 1
+    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 2) == 2
+    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 3) == 3
+    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 4) == 3
+
+
+def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    fixture_dir = tmp_path / "draft-batch-fixture"
+    fixture_dir.mkdir()
+    write_json(fixture_dir / "raw_prepare.json", read_json(FIXTURE_ROOT / "mock" / "raw_prepare.json"))
+    digest = read_json(FIXTURE_ROOT / "mock" / "source_digest.json")
+    resolution = read_json(FIXTURE_ROOT / "mock" / "candidate_resolution.json")
+    merge = read_json(FIXTURE_ROOT / "mock" / "wiki_merge_planning.json")
+    draft = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")
+    concept_template = digest["concepts"][0]
+    resolution_template = resolution["items"][0]
+    merge_template = merge["items"][0]
+    draft_template = draft["pages"][0]
+    digest["concepts"] = []
+    digest["designs"] = []
+    resolution["items"] = []
+    merge["items"] = []
+    draft_pages = []
+    titles = [
+        "队列编排 Alpha",
+        "运行时沙箱 Bravo",
+        "证据账本 Charlie",
+        "审核路由 Delta",
+        "漂移哨兵 Echo",
+        "写入回执 Foxtrot",
+        "上下文裁剪 Golf",
+    ]
+    summaries = [
+        "队列编排 Alpha 协调待处理入库任务穿过确定性门禁。",
+        "运行时沙箱 Bravo 隔离 provider 执行与本地 artifact 组装。",
+        "证据账本 Charlie 在知识页生成前记录有来源支撑的主张。",
+        "审核路由 Delta 把高风险草稿送到合适的人类检查点。",
+        "漂移哨兵 Echo 在过期计划 apply 前发现 wiki 变化。",
+        "写入回执 Foxtrot 把写入凭证保存在临时 run artifact 之外。",
+        "上下文裁剪 Golf 在保留 validator 证据时压缩模型 payload。",
+    ]
+    for index, (title, summary) in enumerate(zip(titles, summaries), start=1):
+        candidate_id = f"CAND-BATCH-{index:03d}"
+        source_basis = {
+            "source_candidate_ids": [candidate_id],
+            "prepared_discovered_candidates": [],
+            "source_locator": f"测试 / 第 {index} 段",
+        }
+        page_plan_id = pipeline_module.stable_page_plan_id(
+            "concept",
+            title,
+            pipeline_module.source_basis_fingerprint(SourceBasis.model_validate(source_basis)),
+        )
+        target_path = f"concepts/Concept_{title}.md"
+        candidate = json.loads(json.dumps(concept_template))
+        candidate.update(
+            {
+                "candidate_id": candidate_id,
+                "name": title,
+                "suggested_page_title": title,
+                "one_sentence_summary": summary,
+                "why_matters": f"{title} 代表一个独立的分批渲染测试主题。",
+                "wiki_value": f"{title} 让测试页面与相邻主题保持语义区分。",
+                "source_locator": f"测试 / 第 {index} 段",
+            }
+        )
+        digest["concepts"].append(candidate)
+        resolution_item = json.loads(json.dumps(resolution_template))
+        resolution_item["page_plan_id"] = ""
+        resolution_item["source_basis"] = source_basis
+        resolution_item["display_title"] = title
+        resolution_item["topic_summary"] = candidate["one_sentence_summary"]
+        resolution["items"].append(resolution_item)
+        merge_item = json.loads(json.dumps(merge_template))
+        merge_item["page_plan_id"] = page_plan_id
+        merge_item["source_basis"] = source_basis
+        merge_item["canonical_target_path"] = target_path
+        merge_item["display_title"] = title
+        merge_item["new_understanding"] = candidate["one_sentence_summary"]
+        merge_item["related_pages"] = []
+        merge["items"].append(merge_item)
+        draft_page = json.loads(json.dumps(draft_template))
+        draft_page["page_plan_id"] = page_plan_id
+        draft_page["canonical_target_path"] = target_path
+        draft_page["section_bodies"]["summary"] = candidate["one_sentence_summary"]
+        draft_page["section_bodies"]["detail"] = f"{title} 的详情来自测试源材料。"
+        draft_page["change_summary"] = f"创建 {title}。"
+        draft_page["source_coverage_notes"] = f"覆盖 {candidate_id}。"
+        draft_pages.append(draft_page)
+    write_json(fixture_dir / "source_digest.json", digest)
+    write_json(fixture_dir / "candidate_resolution.json", resolution)
+    write_json(fixture_dir / "wiki_merge_planning.json", merge)
+    write_json(fixture_dir / "draft_rendering.1.json", {"schema_version": "draft_rendering.v3", "pages": draft_pages[:4]})
+    bad_second_batch = {"schema_version": "draft_rendering.v3", "pages": json.loads(json.dumps(draft_pages[4:6]))}
+    write_json(fixture_dir / "draft_rendering.2.json", bad_second_batch)
+    write_json(fixture_dir / "draft_rendering.3.json", {"schema_version": "draft_rendering.v3", "pages": draft_pages[4:]})
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-batch")
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    batch_report = read_json(run_dir / "draft_rendering" / "draft_rendering_batch_report.json")
+    draft_artifact = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
+    repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
+    metrics = read_json(run_dir / "run_metrics.json")
+
+    assert manifest.status == OperationStatus.drafted
+    assert batch_report["parallel"] is False
+    assert batch_report["max_parallel_batches"] == 1
+    assert batch_report["batch_count"] == 2
+    assert batch_report["page_count"] == 7
+    assert [batch["attempt_count"] for batch in batch_report["batches"]] == [1, 2]
+    assert [batch["repair_count"] for batch in batch_report["batches"]] == [0, 1]
+    assert batch_report["model_duration_ms"] == batch_report["duration_ms"]
+    assert batch_report["wall_duration_ms"] >= 0
+    assert batch_report["payload_char_count"] > 0
+    assert batch_report["max_batch_payload_char_count"] > 0
+    assert batch_report["avg_batch_payload_char_count"] > 0
+    assert all(batch["payload_char_count"] > 0 for batch in batch_report["batches"])
+    top_source_pack = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
+    first_batch_source_pack = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_source_excerpt_pack.json")
+    second_batch_source_pack = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_source_excerpt_pack.json")
+    assert top_source_pack["force_excerpt"] is True
+    assert top_source_pack["full_source_in_payload"] is False
+    assert first_batch_source_pack["force_excerpt"] is True
+    assert first_batch_source_pack["full_source_in_payload"] is False
+    assert second_batch_source_pack["force_excerpt"] is True
+    assert second_batch_source_pack["full_source_in_payload"] is False
+    batch_report_markdown = (run_dir / "draft_rendering" / "draft_rendering_batch_report.md").read_text(encoding="utf-8")
+    assert "Payload Chars" in batch_report_markdown
+    assert "墙钟耗时" in batch_report_markdown
+    assert "最大单批 payload" in batch_report_markdown
+    assert len(draft_artifact["pages"]) == 7
+    assert (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
+    assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "provider_result.json").exists()
+    assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "provider_result.json").exists()
+    assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_digest_projection_report.json").exists()
+    assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_digest_projection_report.json").exists()
+    assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json").exists()
+    repair_prompt = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json")
+    assert repair_prompt["repair_contract"]["mode"] == "missing_page_completion"
+    assert repair_prompt["repair_contract"]["missing_page_plan_ids"] == [draft_pages[6]["page_plan_id"]]
+    assert [page["page_plan_id"] for page in repair_prompt["accepted_partial_pages"]] == [
+        draft_pages[4]["page_plan_id"],
+        draft_pages[5]["page_plan_id"],
+    ]
+    assert repair_prompt["missing_page_payload"]["required_page_plan_ids"] == [draft_pages[6]["page_plan_id"]]
+    assert repair_report["provider"] == "batched:mock"
+    assert repair_report["attempt_count"] == 3
+    assert repair_report["repair_count"] == 1
+    assert repair_report["attempts"][1]["provider_result_ref"] == "model_batches/batch-002/provider_results/attempt-1.json"
+    assert repair_report["attempts"][2]["repair_prompt_ref"] == "model_batches/batch-002/repair_prompts/attempt-2.json"
+    draft_step = next(step for step in manifest.steps if step.name == "draft_rendering")
+    assert "draft_rendering_batch_report.v1" in [ref.schema_version for ref in draft_step.outputs]
+    assert any(ref.relative_path.endswith("model_batches/batch-001/provider_result.json") for ref in draft_step.outputs)
+    assert any(
+        ref.relative_path.endswith("model_batches/batch-001/draft_digest_projection_report.json")
+        and ref.schema_version == "source_digest_projection_report.v1"
+        for ref in draft_step.outputs
+    )
+    assert any(ref.relative_path.endswith("model_batches/batch-002/structured_repair_report.json") for ref in draft_step.outputs)
+    assert any(
+        ref.relative_path.endswith("model_batches/batch-002/repair_prompts/attempt-2.json") and not ref.required_for_resume
+        for ref in draft_step.outputs
+    )
+    draft_metrics = next(step for step in metrics["steps"] if step["name"] == "draft_rendering")
+    assert draft_metrics["internal_model_call_count"] == 3
+    assert draft_metrics["repair_count"] == 1
+    assert draft_metrics["provider_result_count"] == 3
+    assert draft_metrics["payload_char_count"] > 0
+
+
+def test_candidate_resolution_sanitizes_weak_noise_formal_item_without_repair(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "candidate-noise-repair"
     fixture_dir.mkdir()
@@ -1525,7 +9077,11 @@ def test_candidate_resolution_repairs_weak_noise_formal_item(tmp_path: Path) -> 
     bad_resolution["items"].append(
         {
             "page_plan_id": "",
-            "source_basis": {"source_candidate_ids": ["noise-1"], "prepared_discovered_candidates": [], "source_locator": "noise"},
+            "source_basis": {
+                "source_candidate_ids": ["noise-1"],
+                "prepared_discovered_candidates": ["模型声称从噪声里发现的新主题"],
+                "source_locator": "noise",
+            },
             "page_type": "noise",
             "display_title": "噪声片段",
             "path_stem": "",
@@ -1545,15 +9101,232 @@ def test_candidate_resolution_repairs_weak_noise_formal_item(tmp_path: Path) -> 
     repair_report = read_json(run_dir / "candidate_resolution" / "structured_repair_report.json")
     resolution = read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
 
-    assert repair_report["repair_count"] == 1
-    issue_codes = {issue["issue_code"] for issue in repair_report["attempts"][0]["issues"]}
-    assert {"unknown_page_type", "weak_noise_candidate_reference", "ignore_as_formal_item"} & issue_codes
+    assert repair_report["repair_count"] == 0
+    assert repair_report["attempts"][0]["issues"] == []
     assert all(item["page_type"] != "noise" for item in resolution["items"])
     assert "noise-1" not in {
         candidate_id
         for item in resolution["items"]
         for candidate_id in item["source_basis"]["source_candidate_ids"]
     }
+    assert any("dropped because it only referenced weak/noise candidates" in note for note in resolution["missed_candidate_risks"])
+
+
+def test_candidate_resolution_moves_prepared_discovered_unknown_ids_out_of_source_ids(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND001",
+                name="Known candidate",
+                type="concept",
+                one_sentence_summary="Known candidate summary.",
+                why_matters="It matters.",
+                wiki_value="It belongs in the wiki.",
+                suggested_page_title="Known candidate",
+            )
+        ],
+    )
+    artifact = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_Known.md",
+                display_title="Known candidate",
+            ),
+            CandidateResolutionItem(
+                source_basis=SourceBasis(
+                    source_candidate_ids=["concept-ai-pm-foundation"],
+                    prepared_discovered_candidates=["concept-ai-pm-foundation"],
+                    source_locator="第四步",
+                ),
+                page_type="concept",
+                display_title="AI PM基础",
+                topic_summary="通用产品管理基础对 AI PM 仍然重要。",
+                why_this_page="这是 prepared raw 中出现但 source_digest 漏掉的主题。",
+                reason="new",
+            ),
+        ]
+    )
+
+    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    pipeline_module.validate_candidate_resolution(digest, finalized)
+    discovered = [item for item in finalized.items if item.display_title == "AI PM基础"][0]
+
+    assert discovered.source_basis.source_candidate_ids == []
+    assert discovered.source_basis.prepared_discovered_candidates == ["concept-ai-pm-foundation"]
+    assert "非 source_digest candidate id" in discovered.coverage_notes
+    assert any("moved unknown candidate refs" in note for note in finalized.missed_candidate_risks)
+
+
+def test_candidate_resolution_moves_unknown_only_source_ids_to_prepared_discovered(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND001",
+                name="Known candidate",
+                type="concept",
+                one_sentence_summary="Known candidate summary.",
+                why_matters="It matters.",
+                wiki_value="It belongs in the wiki.",
+                suggested_page_title="Known candidate",
+            )
+        ],
+    )
+    artifact = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_Known.md",
+                display_title="Known candidate",
+            ),
+            CandidateResolutionItem(
+                source_basis=SourceBasis(source_candidate_ids=["new-topic-from-prepared"], source_locator="第五步"),
+                page_type="concept",
+                display_title="Prepared 新主题",
+                topic_summary="prepared raw 中出现的新主题。",
+                why_this_page="这是 prepared raw 中出现但 source_digest 漏掉的主题。",
+                reason="new",
+            )
+        ]
+    )
+
+    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    pipeline_module.validate_candidate_resolution(digest, finalized)
+    item = [item for item in finalized.items if item.display_title == "Prepared 新主题"][0]
+
+    assert item.source_basis.source_candidate_ids == []
+    assert item.source_basis.prepared_discovered_candidates == ["new-topic-from-prepared"]
+    assert "非 source_digest candidate id" in item.coverage_notes
+    assert any("moved unknown-only candidate refs" in note for note in finalized.missed_candidate_risks)
+
+
+def test_candidate_resolution_moves_budget_deferred_source_ids_to_prepared_discovered(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND001",
+                name="Known candidate",
+                type="concept",
+                one_sentence_summary="Known candidate summary.",
+                why_matters="It matters.",
+                wiki_value="It belongs in the wiki.",
+                suggested_page_title="Known candidate",
+            )
+        ],
+        budget_deferred_candidates=[
+            SourceDigestCandidate(
+                candidate_id="C005",
+                name="Deferred candidate",
+                type="concept",
+                one_sentence_summary="Deferred candidate summary.",
+                why_matters="It matters later.",
+                wiki_value="It may belong in the wiki.",
+                suggested_page_title="Deferred candidate",
+            )
+        ],
+    )
+    artifact = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_Known.md",
+                display_title="Known candidate",
+            ),
+            CandidateResolutionItem(
+                source_basis=SourceBasis(source_candidate_ids=["C005"], source_locator="延后候选"),
+                page_type="concept",
+                display_title="Deferred candidate",
+                topic_summary="延后候选现在被复用。",
+                why_this_page="模型误把 budget-deferred id 放进 source_candidate_ids。",
+                reason="prepared_discovered",
+            ),
+        ]
+    )
+
+    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    pipeline_module.validate_candidate_resolution(digest, finalized)
+    item = [item for item in finalized.items if item.display_title == "Deferred candidate"][0]
+
+    assert item.source_basis.source_candidate_ids == []
+    assert item.source_basis.prepared_discovered_candidates == ["C005"]
+    assert "非 source_digest candidate id" in item.coverage_notes
+
+
+def test_candidate_resolution_moves_deferred_source_ids_when_no_selected_candidates(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        budget_deferred_candidates=[
+            SourceDigestCandidate(
+                candidate_id="C005",
+                name="Deferred candidate",
+                type="concept",
+                one_sentence_summary="Deferred candidate summary.",
+                why_matters="It matters later.",
+                wiki_value="It may belong in the wiki.",
+                suggested_page_title="Deferred candidate",
+            )
+        ],
+    )
+    artifact = CandidateResolutionArtifact(
+        items=[
+            CandidateResolutionItem(
+                source_basis=SourceBasis(source_candidate_ids=["C005"], source_locator="延后候选"),
+                page_type="concept",
+                display_title="Deferred candidate",
+                topic_summary="延后候选现在被复用。",
+                why_this_page="模型误把 budget-deferred id 放进 source_candidate_ids。",
+                reason="prepared_discovered",
+            ),
+        ]
+    )
+
+    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    pipeline_module.validate_candidate_resolution(digest, finalized)
+    item = finalized.items[0]
+
+    assert item.source_basis.source_candidate_ids == []
+    assert item.source_basis.prepared_discovered_candidates == ["C005"]
+    assert "非 source_digest candidate id" in item.coverage_notes
+
+
+def test_candidate_resolution_markdown_shows_prepared_discovered_candidates() -> None:
+    artifact = CandidateResolutionArtifact(
+        items=[
+            CandidateResolutionItem(
+                page_plan_id="PP-DISCOVERED",
+                source_basis=SourceBasis(prepared_discovered_candidates=["new-topic"]),
+                page_type="concept",
+                display_title="Prepared 新主题",
+                candidate_target_path="concepts/Concept_Prepared_新主题.md",
+                topic_summary="prepared raw 中出现的新主题。",
+                why_this_page="值得记录。",
+                reason="new",
+            )
+        ]
+    )
+
+    rendered = pipeline_module.render_candidate_resolution_markdown(artifact)
+
+    assert "Prepared 发现候选" in rendered
+    assert "new-topic" in rendered
 
 
 def test_wiki_merge_planning_normalizes_model_wiki_prefix_on_update_target(tmp_path: Path) -> None:
@@ -1579,8 +9352,10 @@ def test_wiki_merge_planning_normalizes_model_wiki_prefix_on_update_target(tmp_p
     assert first["action"] == "update"
     assert first["canonical_target_path"] == "concepts/Concept_知识编译工程骨架.md"
     assert first["matched_page"] == "concepts/Concept_知识编译工程骨架.md"
-    assert manifest.status == OperationStatus.awaiting_review
-    assert [step for step in manifest.steps if step.status == StepStatus.awaiting_review][0].name == "draft_review"
+    assert manifest.status == OperationStatus.drafted
+    assert not [step for step in manifest.steps if step.status == StepStatus.awaiting_review]
+    assert (run_dir / "draft_review" / "approved_write_manifest.json").exists()
+    assert (run_dir / "apply_preview" / "apply_preview.json").exists()
 
 
 def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> None:
@@ -1834,9 +9609,29 @@ def test_resume_cannot_skip_awaiting_draft_review(tmp_path: Path, from_step: str
     vault, raw = make_vault(tmp_path)
     target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("existing knowledge\n", encoding="utf-8")
+    target.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: 知识编译工程骨架\n"
+        "aliases: []\n"
+        "summary: 已有摘要。\n"
+        "created: 2026-01-01\n"
+        "updated: 2026-01-02\n"
+        "---\n\n"
+        "# 知识编译工程骨架\n\n"
+        "## 详情\n\n"
+        "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。\n",
+        encoding="utf-8",
+    )
+    fixture_dir = tmp_path / f"grounding-fixture-{from_step}"
+    fixture_dir.mkdir()
+    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "draft_rendering.json":
+            data["pages"][0]["section_bodies"]["detail"] += "\n\n该方案被多个社区引用。"
+        write_json(fixture_dir / name, data)
 
-    run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug=f"skip-{from_step}")
+    run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug=f"skip-{from_step}")
     operation_id = latest_operation(vault)
     assert operation_id is not None
     before = read_json(RunStore(vault).manifest_path(operation_id))
@@ -2278,6 +10073,76 @@ def test_related_pages_resolve_deterministically_from_candidates_and_snapshot(tm
     assert all(item.target_path != first.canonical_target_path for item in first.related_pages)
 
 
+def test_related_pages_resolve_prepared_discovered_candidate_refs() -> None:
+    digest = SourceDigestArtifact(
+        source_raw_path="raw/sample.md",
+        summary="Digest summary.",
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="C001",
+                name="主候选",
+                type="concept",
+                one_sentence_summary="主候选摘要。",
+                why_matters="它是主主题。",
+                wiki_value="应成为概念页。",
+                suggested_page_title="主候选",
+                related_candidates=["C005"],
+            )
+        ],
+        budget_deferred_candidates=[
+            SourceDigestCandidate(
+                candidate_id="C005",
+                name="延后候选",
+                type="concept",
+                one_sentence_summary="延后候选摘要。",
+                why_matters="它是相关主题。",
+                wiki_value="应成为概念页。",
+                suggested_page_title="延后候选",
+            )
+        ],
+    )
+    resolution = CandidateResolutionArtifact(
+        items=[
+            CandidateResolutionItem(
+                page_plan_id="PP-C001",
+                source_basis=SourceBasis(source_candidate_ids=["C001"]),
+                page_type="concept",
+                display_title="主候选",
+                candidate_target_path="concepts/Concept_主候选.md",
+                topic_summary="主候选摘要。",
+                why_this_page="值得记录。",
+                reason="new",
+            ),
+            CandidateResolutionItem(
+                page_plan_id="PP-C005",
+                source_basis=SourceBasis(prepared_discovered_candidates=["C005"]),
+                page_type="concept",
+                display_title="延后候选",
+                candidate_target_path="concepts/Concept_延后候选.md",
+                topic_summary="延后候选摘要。",
+                why_this_page="值得记录。",
+                reason="prepared_discovered",
+            ),
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_主候选.md", expected_state="missing"),
+            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_延后候选.md", expected_state="missing"),
+        ],
+    )
+
+    plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-06")
+    first = plan.items[0]
+
+    assert [(item.target_path, item.display_title, item.source) for item in first.related_pages] == [
+        ("concepts/Concept_延后候选.md", "延后候选", "source_digest")
+    ]
+    assert first.related_unresolved == []
+
+
 def test_wiki_context_snapshot_writes_candidate_contexts_and_metadata_poor_fallback(tmp_path: Path) -> None:
     vault, _ = make_vault(tmp_path)
     hand_written = vault / "wiki" / "concepts" / "Concept_Handwritten_Agent.md"
@@ -2432,9 +10297,14 @@ def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path:
     assert plan.items[0].action == "needs_human_decision"
     assert plan.items[0].apply_eligibility == "blocked"
     assert "理由不充分" in plan.items[0].blocked_reason
+    report = pipeline_module.render_merge_decision_report(plan, snapshot)
+    assert "## Create/Update 风险摘要" in report
+    assert "Concept_AI_PM_Career.md" in report
+    assert "未提供" in report
+    assert "理由不充分" in report
 
 
-def test_wiki_merge_planning_repairs_missing_why_not_update_with_model(tmp_path: Path) -> None:
+def test_wiki_merge_planning_locally_fills_missing_medium_create_reason(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     existing = vault / "wiki" / "concepts" / "Concept_知识编译.md"
     existing.parent.mkdir(parents=True, exist_ok=True)
@@ -2456,18 +10326,19 @@ def test_wiki_merge_planning_repairs_missing_why_not_update_with_model(tmp_path:
     initial_plan = read_json(FIXTURE_ROOT / "mock" / "wiki_merge_planning.json")
     initial_plan["items"][0].pop("why_not_update", None)
     write_json(fixture_dir / "wiki_merge_planning.json", initial_plan)
-    repaired_plan = read_json(FIXTURE_ROOT / "mock" / "wiki_merge_planning.json")
-    repaired_plan["items"][0]["why_not_update"] = "已有页只覆盖知识编译概念本身；本页聚焦 llmwiki-engine 的工程骨架，边界不同。"
-    write_json(fixture_dir / "wiki_merge_planning.repair.json", repaired_plan)
 
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="repair-why")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
 
     repair_report = read_json(run_dir / "wiki_merge_planning" / "structured_repair_report.json")
-    assert repair_report["repair_count"] == 1
-    assert len(list((run_dir / "wiki_merge_planning" / "provider_results").glob("attempt-*.json"))) == 2
-    assert plan["items"][0]["why_not_update"] == "已有页只覆盖知识编译概念本身；本页聚焦 llmwiki-engine 的工程骨架，边界不同。"
+    assert repair_report["repair_count"] == 0
+    assert len(list((run_dir / "wiki_merge_planning" / "provider_results").glob("attempt-*.json"))) == 1
+    assert plan["items"][0]["why_not_update"].startswith("本地补充：scope_delta")
+    assert "source_delta" in plan["items"][0]["why_not_update"]
+    assert "why_update_not_enough" in plan["items"][0]["why_not_update"]
+    assert "why_related_link_not_enough" in plan["items"][0]["why_not_update"]
+    assert "本地补充结构化 create/update 对比理由" in plan["items"][0]["finalization_reason"]
     assert read_manifest(RunStore(vault).manifest_path(manifest.operation_id)).steps[8].status == StepStatus.completed
     assert manifest.status == OperationStatus.awaiting_review
 
