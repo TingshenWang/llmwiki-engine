@@ -2668,6 +2668,142 @@ def test_source_digest_provider_payload_omits_formal_candidate_suggested_action(
     assert "candidate_coverage_required_ids" in captured_payloads["candidate_resolution"]
 
 
+def test_source_digest_payload_includes_readme_source_kind_hints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    raw.rename(vault / "raw" / "README.md")
+    raw = vault / "raw" / "README.md"
+    raw.write_text(
+        "# Hello-Agents\n\n"
+        "![GitHub stars](https://img.shields.io/github/stars/datawhalechina/Hello-Agents)\n"
+        "[GitHub Project](https://github.com/datawhalechina/Hello-Agents)\n"
+        "[PDF 下载](https://github.com/datawhalechina/hello-agents/releases/latest/)\n\n"
+        "## 内容导航\n\n"
+        + "\n".join(
+            f"| [第{index}章](./docs/chapter{index}/第{index}章.md) | 智能体教程章节 {index} | ✅ |"
+            for index in range(1, 13)
+        )
+        + "\n\n## 🙏 致谢\n\n"
+        "- 陈思州 - 项目负责人，全文写作和校对。\n"
+        "- 孙韬 - 联合发起者。\n",
+        encoding="utf-8",
+    )
+    captured_payloads: dict[str, dict] = {}
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(config_path, config)
+
+    def fake_generate_raw(self, task, payload, output_model):
+        captured_payloads[task] = payload
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        if task == "source_digest":
+            data["source_raw_path"] = "raw/README.md"
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        slug="readme-kind-hints",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    hints = captured_payloads["source_digest"]["source_kind_hints"]
+    rules = "\n".join(captured_payloads["source_digest"]["contract"]["rules"])
+
+    assert hints["github_url_present"] is True
+    assert hints["repository_readme"] is True
+    assert hints["tutorial_index"] is True
+    assert hints["navigation_heavy"] is True
+    assert hints["contributor_section_present"] is True
+    assert hints["badge_or_download_heavy"] is True
+    assert hints["counts"]["toc_link_count"] >= 12
+    assert "do not create formal candidates for badges" in rules
+    assert "contributor/acknowledgement people" in rules
+    assert (run_dir / "source_digest" / "source_kind_hints.json").exists()
+    assert (run_dir / "source_digest" / "source_kind_hints.md").exists()
+    source_step = [step for step in manifest.steps if step.name == "source_digest"][0]
+    assert "source_kind_hints.v1" in [ref.schema_version for ref in source_step.outputs if ref.kind == "json"]
+
+
+def test_source_kind_hints_do_not_mark_article_with_single_github_link_as_readme() -> None:
+    text = (
+        "# Building Effective Agents\n\n"
+        "这篇文章解释如何组合工作流、工具调用和评估。"
+        "代码示例放在 [example repo](https://github.com/example/agent-demo) 里，"
+        "但主体讨论的是设计原则、权衡和失败模式。\n\n"
+        "## 何时使用工作流\n\n"
+        "固定路径适合确定性高的任务，Agent 适合开放任务。\n"
+    )
+
+    hints = pipeline_module.build_source_kind_hints(text, "raw/building-effective-agents.md")
+
+    assert hints["github_url_present"] is True
+    assert hints["repository_readme"] is False
+    assert hints["tutorial_index"] is False
+    assert hints["navigation_heavy"] is False
+
+
+def test_source_kind_hints_do_not_mark_article_quickstart_heading_as_tutorial_index() -> None:
+    text = (
+        "# Agent 设计笔记\n\n"
+        "这篇文章先讨论为什么简单工作流经常比复杂 Agent 更可靠。\n\n"
+        "## 快速开始\n\n"
+        "先定义任务边界，再接入一个工具调用示例。"
+        "完整代码见 [repo](https://github.com/example/agent-note)。\n"
+    )
+
+    hints = pipeline_module.build_source_kind_hints(text, "raw/agent-design-note.md")
+
+    assert hints["github_url_present"] is True
+    assert hints["tutorial_index"] is False
+    assert hints["repository_readme"] is False
+
+
+def test_source_kind_hints_do_not_mark_reference_heavy_article_as_navigation_index() -> None:
+    links = "\n".join(f"- [参考资料 {index}](https://example.com/ref-{index})" for index in range(1, 27))
+    text = (
+        "# Agent 评估综述\n\n"
+        "这篇文章比较多个评估框架的适用场景、失败模式和落地成本。\n\n"
+        "## 参考资料\n\n"
+        f"{links}\n"
+    )
+
+    hints = pipeline_module.build_source_kind_hints(text, "raw/agent-evaluation-review.md")
+
+    assert hints["counts"]["markdown_link_count"] >= 24
+    assert hints["tutorial_index"] is False
+    assert hints["navigation_heavy"] is False
+    assert hints["repository_readme"] is False
+
+
+def test_source_kind_hints_do_not_mark_deep_dive_related_docs_as_tutorial_index() -> None:
+    links = "\n".join(f"- [相关实现 {index}](./docs/pattern-{index}.md)" for index in range(1, 10))
+    text = (
+        "# 上下文工程深度分析\n\n"
+        "正文讨论上下文压缩、记忆选择、工具调用边界和评估设计。\n\n"
+        "## 更多阅读\n\n"
+        f"{links}\n"
+    )
+
+    hints = pipeline_module.build_source_kind_hints(text, "raw/context-engineering-deep-dive.md")
+
+    assert hints["counts"]["toc_link_count"] >= 6
+    assert hints["tutorial_index"] is False
+    assert hints["navigation_heavy"] is False
+    assert hints["repository_readme"] is False
+
+
 def test_source_digest_source_map_triggers_for_long_structured_interview() -> None:
     sections = []
     for index in range(1, 34):

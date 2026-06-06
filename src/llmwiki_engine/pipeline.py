@@ -2416,6 +2416,109 @@ def project_source_digest_source_map_for_payload(source_map: dict[str, Any], *, 
     }
 
 
+def build_source_kind_hints(text: str, raw_rel: str) -> dict[str, Any]:
+    lowered_path = raw_rel.lower()
+    lowered_text = text.lower()
+    readme_path = lowered_path.endswith("readme.md")
+    toc_link_count = len(re.findall(r"\]\((?:\./)?(?:docs|chapter|chapters|extra-chapter|co-creation-projects)/", text, flags=re.IGNORECASE))
+    markdown_link_count = len(re.findall(r"\[[^\]\n]+\]\([^)]+\)", text))
+    badge_count = len(re.findall(r"shields\.io|badge|trendshift|github stars|github forks", lowered_text))
+    download_marker_count = len(re.findall(r"下载|download|releases/latest|pdf", lowered_text))
+    github_url_count = len(re.findall(r"https?://(?:www\.)?github\.com/|github\.com[:/]", lowered_text))
+    heading_decoration = r"(?:[^\w\u4e00-\u9fff#\n]+)?\s*"
+    contributor_heading_count = len(
+        re.findall(
+            rf"(?im)^\s{{0,3}}#{{1,6}}\s*{heading_decoration}(?:核心贡献者|贡献者|致谢|contributors?|acknowledg)",
+            text,
+        )
+    )
+    tutorial_heading_count = len(
+        re.findall(
+            rf"(?im)^\s{{0,3}}#{{1,6}}\s*{heading_decoration}(?:内容导航|目录|学习路线|快速开始|如何学习|课程|教程|chapters?|curriculum)",
+            text,
+        )
+    )
+    contributor_section_present = contributor_heading_count > 0
+    badge_or_download_heavy = badge_count >= 3 or download_marker_count >= 3
+    github_url_present = github_url_count > 0
+    index_heading_present = tutorial_heading_count > 0
+    tutorial_index = (toc_link_count >= 6 and (readme_path or index_heading_present)) or (
+        index_heading_present and (readme_path or toc_link_count >= 3 or markdown_link_count >= 8)
+    )
+    navigation_heavy = (toc_link_count >= 8 and (readme_path or index_heading_present)) or (
+        markdown_link_count >= 24 and (readme_path or index_heading_present or contributor_section_present or badge_or_download_heavy)
+    )
+    repository_readme = readme_path or (
+        github_url_present
+        and (badge_count > 0 or contributor_section_present)
+        and (tutorial_index or markdown_link_count >= 12 or download_marker_count > 0)
+    )
+    flags = [
+        name
+        for name, enabled in [
+            ("github_url_present", github_url_present),
+            ("repository_readme", repository_readme),
+            ("tutorial_index", tutorial_index),
+            ("navigation_heavy", navigation_heavy),
+            ("contributor_section_present", contributor_section_present),
+            ("badge_or_download_heavy", badge_or_download_heavy),
+        ]
+        if enabled
+    ]
+    return {
+        "schema_version": "source_kind_hints.v1",
+        "source_raw_path": raw_rel,
+        "flags": flags,
+        "github_url_present": github_url_present,
+        "repository_readme": repository_readme,
+        "tutorial_index": tutorial_index,
+        "navigation_heavy": navigation_heavy,
+        "contributor_section_present": contributor_section_present,
+        "badge_or_download_heavy": badge_or_download_heavy,
+        "counts": {
+            "toc_link_count": toc_link_count,
+            "markdown_link_count": markdown_link_count,
+            "badge_count": badge_count,
+            "download_marker_count": download_marker_count,
+            "github_url_count": github_url_count,
+            "contributor_heading_count": contributor_heading_count,
+            "tutorial_heading_count": tutorial_heading_count,
+        },
+        "guidance": [
+            "README/index sources are entry pages; avoid turning badges, downloads, contributor lists, and TOC-only rows into formal pages.",
+            "Keep formal candidates for durable project/framework entities, distinctive concepts, reusable designs, and comparisons with substantive source context.",
+            "Move contributor/acknowledgement people to weak_or_noise_items unless the body gives reusable context beyond a name in a list.",
+        ],
+    }
+
+
+def render_source_kind_hints_markdown(hints: dict[str, Any]) -> str:
+    rows = [
+        [name, str(bool(hints.get(name, False))).lower()]
+        for name in [
+            "repository_readme",
+            "github_url_present",
+            "tutorial_index",
+            "navigation_heavy",
+            "contributor_section_present",
+            "badge_or_download_heavy",
+        ]
+    ]
+    count_rows = [[key, value] for key, value in hints.get("counts", {}).items()]
+    guidance_rows = [[item] for item in hints.get("guidance", [])]
+    return (
+        "# Source Kind Hints\n\n"
+        f"- source：`{hints.get('source_raw_path', '')}`\n"
+        f"- flags：{', '.join(f'`{item}`' for item in hints.get('flags', [])) or '无'}\n\n"
+        "## Flags\n\n"
+        f"{format_markdown_table(['flag', 'enabled'], rows)}\n\n"
+        "## Counts\n\n"
+        f"{format_markdown_table(['count', 'value'], count_rows)}\n\n"
+        "## Guidance\n\n"
+        f"{format_markdown_table(['rule'], guidance_rows)}\n"
+    )
+
+
 def _run_source_digest(ctx: StepRunContext) -> None:
     step_name = "source_digest"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -2434,11 +2537,17 @@ def _run_source_digest(ctx: StepRunContext) -> None:
     )
     source_map_payload_path = step_root / "source_digest_source_map_payload.json"
     write_json(source_map_payload_path, source_map_payload)
+    source_kind_hints = build_source_kind_hints(approved_prepared_text, raw_rel)
+    source_kind_hints_path = step_root / "source_kind_hints.json"
+    source_kind_hints_md = step_root / "source_kind_hints.md"
+    write_json(source_kind_hints_path, source_kind_hints)
+    source_kind_hints_md.write_text(render_source_kind_hints_markdown(source_kind_hints), encoding="utf-8")
     payload = {
         "source_raw_path": raw_rel,
         "approved_prepared_markdown": approved_prepared_text if source_map["full_source_in_payload"] else "",
         "approved_prepared_ref": approved_prepared_ref,
         "source_digest_source_map": source_map_payload,
+        "source_kind_hints": source_kind_hints,
         "profile": ctx.profile.model_dump(mode="json"),
         "language_contract": source_digest_language_contract(ctx.manifest.vault_config_snapshot),
         "contract": {
@@ -2464,6 +2573,10 @@ def _run_source_digest(ctx: StepRunContext) -> None:
                 "If approved_prepared_markdown is empty, use source_digest_source_map sections, outline, captions, and approved_prepared_ref instead of assuming source content is absent.",
                 "For long source-map payloads, choose durable candidates visible across the outline and section excerpts; do not create candidates from bibliography or appendix-only noise.",
                 "Use section headings, line_start, and source_map section_id values as source_locator review handles when exact full source text is not in the payload.",
+                "If source_kind_hints suggests a repository README, tutorial index, or navigation-heavy source, treat the file as an entry page rather than a chapter-by-chapter source.",
+                "For README/index sources, do not create formal candidates for badges, status counters, install/download links, release links, table-of-contents rows, or chapter headings that only navigate elsewhere.",
+                "For README/index sources, omit contributor/acknowledgement people or place them in weak_or_noise_items unless the person is central to the material and the body provides substantive reusable context beyond a contributor list.",
+                "For README/index sources, prefer at most a few durable candidates: the core project/framework/entity, distinctive concepts, reusable designs, and comparisons with source-backed explanations.",
             ],
         },
     }
@@ -2491,6 +2604,8 @@ def _run_source_digest(ctx: StepRunContext) -> None:
         _ref(ctx.run_dir, source_map_path, step_name, "json", "source_digest_source_map.v1"),
         _ref(ctx.run_dir, source_map_md, step_name, "markdown"),
         _ref(ctx.run_dir, source_map_payload_path, step_name, "json", "source_digest_source_map_payload.v1"),
+        _ref(ctx.run_dir, source_kind_hints_path, step_name, "json", "source_kind_hints.v1"),
+        _ref(ctx.run_dir, source_kind_hints_md, step_name, "markdown"),
         _ref(ctx.run_dir, out, step_name, "json", "source_digest.v2"),
         _ref(ctx.run_dir, digest_md, step_name, "markdown"),
         _ref(ctx.run_dir, budget_report_path, step_name, "json", "source_digest_budget_report.v1"),
