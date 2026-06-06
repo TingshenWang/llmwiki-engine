@@ -12937,7 +12937,8 @@ def examples_query_template_quote(body: str, normalized: str, original: str = ""
     ]
     lowered_original = original.lower()
     return any(marker in normalized for marker in query_template_markers) or any(
-        marker in lowered_original for marker in ["how to", "install", "setup", "configure", "query", "search"]
+        marker in lowered_original
+        for marker in ["how to", "install", "setup", "configure", "config", "configuration", "query", "search"]
     )
 
 
@@ -13141,7 +13142,10 @@ def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str
 
 def examples_english_sensitive_user_data_query(lowered_original: str) -> bool:
     user_markers = r"user|users|user's|customer|customers|customer's|person|person's|personal"
-    sensitive_objects = r"ip\s+address|address|name|birthday|birth\s*date|birthdate|profile|location"
+    sensitive_objects = (
+        r"ip\s+address|ip|addresses|address|names|name|birthdays|birthday|birth\s*date|"
+        r"birthdate|profiles|profile|locations|location"
+    )
     return bool(
         re.search(rf"\b(?:{user_markers})\b.{{0,32}}\b(?:{sensitive_objects})\b", lowered_original)
         or re.search(rf"\b(?:{sensitive_objects})\b.{{0,32}}\b(?:{user_markers})\b", lowered_original)
