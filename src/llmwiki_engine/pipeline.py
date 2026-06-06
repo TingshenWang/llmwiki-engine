@@ -11108,15 +11108,42 @@ def collect_grounding_claims(
                 looks_like_concept_phrase(quote)
                 or looks_like_abstract_trend_label(re.sub(r"\s+", "", quote.strip()))
             ) and not supported and not strict_direct_quote_context(body, quote_start=quote_start) and not attributed_quote_context(body, quote_start=quote_start)
+            if section_key == "examples" and is_concept_label_quote and examples_quote_has_concrete_marker(normalized_quote, quote):
+                is_concept_label_quote = False
             section_example_hard_fact = section_key == "examples" and (
                 contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote)
             )
+            is_abstract_placeholder_example = (
+                section_key == "examples"
+                and not supported
+                and not is_explicit_quote
+                and not strict_direct_quote_context(body, quote_start=quote_start)
+                and not attributed_quote_context(body, quote_start=quote_start)
+                and examples_abstract_placeholder_quote(normalized_quote, quote)
+            )
+            is_generic_prompt_example = (
+                section_key == "examples"
+                and not supported
+                and not is_explicit_quote
+                and not strict_direct_quote_context(body, quote_start=quote_start)
+                and not attributed_quote_context(body, quote_start=quote_start)
+                and examples_generic_prompt_quote(normalized_quote, quote)
+            )
             if (
                 not is_explicit_quote
-                and ((section_key == "examples" and not section_example_hard_fact) or is_illustrative_example or is_memory_example)
+                and (
+                    is_illustrative_example
+                    or is_memory_example
+                    or is_abstract_placeholder_example
+                    or is_generic_prompt_example
+                )
             ) or is_concept_label_quote:
                 reason = "短标题/概念短语按概念标签处理，不要求 raw exact match。"
-                if section_key == "examples":
+                if is_abstract_placeholder_example:
+                    reason = "例子区的抽象占位符示例按 illustrative example 处理，不要求 raw exact match。"
+                elif is_generic_prompt_example:
+                    reason = "例子区的通用问题/指令示例按 illustrative example 处理，不要求 raw exact match。"
+                elif section_key == "examples":
                     reason = "例子区的通用示例句按 illustrative example 处理，不要求 raw exact match。"
                 elif is_illustrative_example:
                     reason = "由如/例如/比如引出的通用示例句按 illustrative example 处理，不要求 raw exact match。"
@@ -11632,6 +11659,99 @@ def memory_example_user_preference(normalized: str) -> bool:
 def memory_example_utterance(normalized: str) -> bool:
     return any(marker in normalized.lower() for marker in ["用户", "我", "我的", "表哥", "表弟", "cousin", "ethan", "assistant", "智能体"])
 
+
+def examples_abstract_placeholder_quote(normalized: str, original: str = "") -> bool:
+    if not normalized:
+        return False
+    placeholder_markers = [
+        "某家店",
+        "某家门店",
+        "某家餐厅",
+        "某个地点",
+        "某类产品",
+        "某种产品",
+        "某种饮品",
+        "某类内容",
+        "某项任务",
+        "某次交互",
+        "某段记忆",
+        "某条记忆",
+        "某种偏好",
+        "某些偏好",
+        "用户偏好X",
+        "user_id",
+        "memory",
+    ]
+    lowered_original = original.lower()
+    has_placeholder = any(marker in normalized for marker in placeholder_markers) or any(
+        marker in lowered_original for marker in ["user_id", "memory"]
+    )
+    if not has_placeholder:
+        return False
+    if examples_quote_has_concrete_marker(normalized, original):
+        return False
+    return True
+
+
+def examples_generic_prompt_quote(normalized: str, original: str = "") -> bool:
+    if not normalized:
+        return False
+    if examples_quote_has_concrete_marker(normalized, original):
+        return False
+    if memory_example_question(normalized):
+        return True
+    if looks_like_instructional_example(normalized, "示例"):
+        return True
+    generic_question_markers = ["什么", "如何", "是否", "哪", "何时", "为什么", "吗"]
+    if normalized.endswith(("?", "？")) and any(marker in normalized for marker in generic_question_markers):
+        return True
+    generic_instruction_markers = ["你是一位", "请", "回答", "说明", "解释", "写一段", "生成"]
+    return any(marker in normalized for marker in generic_instruction_markers)
+
+
+def examples_quote_has_concrete_marker(normalized: str, original: str = "") -> bool:
+    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
+        return True
+    lowered_original = original.lower()
+    if re.search(r"\b(?:build|order|ticket|issue|status|success|failed|error|token|api[_-]?key|password)\b", lowered_original):
+        return True
+    if re.search(r"`[^`]*(?:--|=|/|\\|\d)[^`]*`", original):
+        return True
+    placeholder_safe_original = re.sub(r"用户偏好\s*X", "用户偏好", original, flags=re.IGNORECASE)
+    if re.search(r"\b[A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*)*\b", placeholder_safe_original):
+        return True
+    concrete_markers = [
+        "蓝色",
+        "红色",
+        "绿色",
+        "黄色",
+        "科幻电影",
+        "笔记本电脑",
+        "型号",
+        "星巴克",
+        "华为",
+        "小米",
+        "苹果手机",
+        "北京",
+        "南京",
+        "上海",
+        "深圳",
+        "广州",
+        "MacBook",
+        "XPS",
+        "iPhone",
+        "OpenAI",
+        "Anthropic",
+        "Claude",
+        "Alice",
+        "Bob",
+        "张三",
+        "李四",
+        "王五",
+    ]
+    return any(marker.lower() in lowered_original for marker in concrete_markers) or any(
+        marker in normalized for marker in ["购买了华为", "北京门店", "星巴克"]
+    )
 
 def contains_hard_fact_marker(normalized: str) -> bool:
     if re.search(r"\d|[0-9]+(?:%|％)?", normalized):

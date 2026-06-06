@@ -6348,6 +6348,97 @@ def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts()
     assert {claim.claim_type for claim in review.claims} == {"inference"}
 
 
+def build_examples_grounding_review(examples: str) -> pipeline_module.DraftGroundingReview:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-EXAMPLES",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Examples.md",
+        display_title="例子页",
+        page_type="concept",
+        new_understanding="例子页用于测试 grounding。",
+        section_plans={"examples": "例子"},
+        reason="测试 grounding examples。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                section_bodies={
+                    "summary": "例子页。",
+                    "detail": "这个页面说明例子 grounding。",
+                    "examples": examples,
+                },
+                change_summary="创建例子页。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Examples.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    return pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+
+def test_grounding_examples_allow_abstract_placeholder_quotes() -> None:
+    review = build_examples_grounding_review("- “某个用户曾在某家店消费过”\n- “该用户表示喜欢某类产品”")
+
+    assert review.requires_review is False
+    assert {claim.support for claim in review.claims} == {"inference"}
+    assert all("抽象占位符示例" in claim.reason for claim in review.claims)
+
+
+def test_grounding_examples_allow_user_preference_placeholder() -> None:
+    review = build_examples_grounding_review("- “用户偏好 X”")
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["用户偏好 X"]
+
+
+@pytest.mark.parametrize(
+    "examples",
+    [
+        "- “该用户喜欢蓝色”",
+        "- “Alice 在 2026 年 3 月购买了 MacBook。”",
+        "- “Build number 1234 completed with status success”",
+        "- 原文称：“某个用户曾在某家店消费过”",
+        "- “Alice uses MacBook”",
+        "- “Alice likes coffee”",
+        "- “MacBook syncs memory”",
+        "- “某个用户在星巴克消费过”",
+        "- “某个用户购买了华为手机”",
+        "- “某个用户在北京门店消费过”",
+        "- “某个用户购买了小米手机”",
+        "- “某个用户在南京门店消费过”",
+        "- “某个用户喜欢黄色”",
+        "- “某个用户购买了OPPO手机”",
+        "- “某个用户在成都门店消费过”",
+        "- “某个用户喜欢紫色”",
+    ],
+)
+def test_grounding_examples_placeholder_bypass_keeps_concrete_or_attributed_quotes_strict(examples: str) -> None:
+    review = build_examples_grounding_review(examples)
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
 def test_grounding_examples_hard_facts_still_require_support() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-FACT-EXAMPLE",
