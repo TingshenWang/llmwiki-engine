@@ -4670,6 +4670,67 @@ def test_merge_update_section_does_not_cross_absorb_non_core_old_section() -> No
     assert change.needs_manual_resolution is False
 
 
+def test_merge_update_section_open_questions_unions_old_questions() -> None:
+    old = (
+        "- 如何量化记忆召回的置信度？Agent Memory API 是否提供？\n"
+        "- 是否存在记忆回滚或修正机制以应对错误记忆？"
+    )
+    new = "- 如何设计用户确认交互？"
+
+    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+
+    assert merged.splitlines() == [
+        "- 如何设计用户确认交互？",
+        "- 如何量化记忆召回的置信度？Agent Memory API 是否提供？",
+        "- 是否存在记忆回滚或修正机制以应对错误记忆？",
+    ]
+    assert change.retained == [
+        "如何量化记忆召回的置信度？Agent Memory API 是否提供？",
+        "是否存在记忆回滚或修正机制以应对错误记忆？",
+    ]
+    assert change.removed == []
+    assert change.preserved_old == []
+    assert change.needs_manual_resolution is False
+    assert "union/dedupe" in change.removal_reason
+
+
+def test_merge_update_section_open_questions_dedupes_semantic_repeats() -> None:
+    old = "- AGI后PM是否必要？\n- 记忆回滚机制如何设计？"
+    new = "- AGI到来后PM角色是否会消失？"
+
+    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+
+    assert "AGI后PM是否必要" not in merged
+    assert "AGI到来后PM角色是否会消失" in merged
+    assert "记忆回滚机制如何设计" in merged
+    assert change.retained == ["记忆回滚机制如何设计？"]
+
+
+def test_merge_update_section_open_questions_filters_placeholders_and_low_signal_old_questions() -> None:
+    old = "- 暂无矛盾与未决问题记录。\n- 待补来源：需要继续确认。"
+    new = "- 如何设计用户确认交互？"
+
+    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+
+    assert merged == "- 如何设计用户确认交互？"
+    assert change.retained == []
+    assert change.removed == []
+    assert change.needs_manual_resolution is False
+
+
+@pytest.mark.parametrize("new", ["", "暂无矛盾与未决问题记录。"])
+def test_merge_update_section_open_questions_does_not_fallback_to_low_signal_old(new: str) -> None:
+    old = "- 待补来源：需要继续确认。"
+
+    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+
+    assert merged == "暂无矛盾与未决问题记录。"
+    assert "待补来源：需要继续确认" not in merged
+    assert change.retained == []
+    assert change.removed == []
+    assert change.needs_manual_resolution is False
+
+
 def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-TYPO",

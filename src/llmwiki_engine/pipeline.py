@@ -11164,6 +11164,8 @@ def merge_update_section(
 ) -> tuple[str, SectionMergeChange]:
     old = old.strip()
     new = new.strip()
+    if section_key == "open_questions":
+        return merge_update_open_questions_section(old, new)
     retained: list[str] = []
     added: list[str] = []
     removed: list[str] = []
@@ -11213,6 +11215,42 @@ def merge_update_section(
             preserved_old=preserved_old,
             needs_manual_resolution=needs_manual_resolution,
             removal_reason=removal_reason,
+        ),
+    )
+
+
+def merge_update_open_questions_section(old: str, new: str) -> tuple[str, SectionMergeChange]:
+    old_questions = [
+        question
+        for question in meaningful_open_question_lines(old)
+        if not is_low_signal_open_question(question)
+    ]
+    new_questions = meaningful_open_question_lines(new)
+    seen_keys = {open_question_key(question) for question in new_questions}
+    retained_old_questions: list[str] = []
+    for question in old_questions:
+        key = open_question_key(question)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        retained_old_questions.append(question)
+    merged_questions = [*new_questions, *retained_old_questions]
+    merged = "\n".join(f"- {question}" for question in merged_questions).strip()
+    if not merged:
+        merged = new if not is_empty_placeholder(new) else "暂无矛盾与未决问题记录。"
+    reason = ""
+    if old_questions:
+        reason = "旧 open_questions 默认按问题粒度 union/dedupe 保留；占位/低信号问题不机械保留。"
+    return (
+        merged,
+        SectionMergeChange(
+            section_key="open_questions",
+            retained=retained_old_questions,
+            added=new_questions,
+            removed=[],
+            preserved_old=[],
+            needs_manual_resolution=False,
+            removal_reason=reason,
         ),
     )
 
