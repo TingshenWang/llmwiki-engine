@@ -4630,6 +4630,155 @@ def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
     pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
 
 
+def qwen_related_block_plan() -> pipeline_module.WikiMergePlanArtifact:
+    return pipeline_module.WikiMergePlanArtifact(
+        log_date="2026-06-06",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-QWEN",
+                source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                action="create",
+                canonical_target_path="entities/Entity_Qwen-Agent.md",
+                display_title="Qwen-Agent",
+                page_type="entity",
+                new_understanding="Qwen-Agent 是 Agent 开发框架。",
+                section_plans={"detail": "详情"},
+                reason="测试 related block 泄漏。",
+            )
+        ],
+    )
+
+
+def qwen_related_block_draft(additional_notes: str) -> pipeline_module.DraftRenderingArtifact:
+    return pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QWEN",
+                action="create",
+                canonical_target_path="entities/Entity_Qwen-Agent.md",
+                section_bodies={
+                    "summary": "Qwen-Agent 是 Agent 开发框架。",
+                    "detail": "Qwen-Agent 支持工具使用、规划和记忆能力。",
+                    "examples": "例如，开发者可以用它把 LLM、工具和智能体抽象组合成一个可运行助手。",
+                    "additional_notes": additional_notes,
+                },
+                change_summary="创建 Qwen-Agent 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+
+def test_validate_draft_rendering_rejects_related_block_inside_content() -> None:
+    draft = qwen_related_block_draft(
+        "相关页面：\n"
+        "- [[concepts/Concept_Agent 开发框架（Qwen-Agent）.md]]\n"
+        "- [[concepts/Concept_代码解释器（Qwen-Agent）.md]]"
+    )
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
+    assert exc_info.value.issues[0].field_path == "pages.PP-QWEN.section_bodies.additional_notes"
+
+
+def test_validate_draft_rendering_rejects_decorated_related_markdown_links_inside_content() -> None:
+    draft = qwen_related_block_draft(
+        "- **相关页面**：建议参见 [Agent 开发框架](concepts/Concept_Agent 开发框架（Qwen-Agent）.md)"
+    )
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
+
+
+def test_validate_draft_rendering_rejects_related_markdown_link_bullets_inside_content() -> None:
+    draft = qwen_related_block_draft(
+        "**Related Pages**\n"
+        "- [Agent framework](concepts/Concept_Agent framework.md)\n"
+        "- [Code interpreter](concepts/Concept_Code interpreter.md)"
+    )
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
+
+
+def test_validate_draft_rendering_rejects_self_wikilink_inside_content() -> None:
+    draft = qwen_related_block_draft("可与 [[entities/Entity_Qwen-Agent.md|Qwen-Agent]] 页面保持一致。")
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
+
+
+def test_validate_draft_rendering_rejects_basename_self_wikilink_inside_content() -> None:
+    draft = qwen_related_block_draft("可与 [[Entity_Qwen-Agent.md|Qwen-Agent]] 页面保持一致。")
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
+
+
+def test_validate_draft_rendering_rejects_display_title_self_wikilink_inside_content() -> None:
+    draft = qwen_related_block_draft("可与 [[Qwen-Agent|Qwen-Agent]] 页面保持一致。")
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
+
+
+def test_validate_draft_rendering_allows_external_markdown_link_with_display_title() -> None:
+    draft = qwen_related_block_draft(
+        "项目仓库可以写作 [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent)，"
+        "这里它只是外部参考链接，不是指向当前 wiki 页面的自链。"
+    )
+
+    pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+
+def test_validate_draft_rendering_allows_related_word_without_link_block() -> None:
+    draft = qwen_related_block_draft(
+        "Related work 这个英文短语只作为普通说明出现，没有相关页面列表。"
+        "这里补充说明框架适合用来观察工具调用、规划和记忆抽象之间的边界。"
+    )
+
+    pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+
+def test_validate_draft_rendering_allows_tilde_fenced_related_markdown_example() -> None:
+    draft = qwen_related_block_draft(
+        "下面只是一个 Markdown 示例，不代表页面正文关系。\n"
+        "   ~~~md\n"
+        "相关页面：\n"
+        "- [[concepts/Concept_Agent 开发框架（Qwen-Agent）.md]]\n"
+        "   ~~~~\n"
+        "示例外的正文继续说明 Qwen-Agent 的页面内容边界。"
+    )
+
+    pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+
+def test_stray_related_links_issue_is_page_scoped_repairable() -> None:
+    issues = [
+        pipeline_module.StructuredIssue(
+            issue_code="stray_related_links_in_content",
+            field_path="pages.PP-QWEN.section_bodies.additional_notes",
+            validator_id="validate_draft_rendering",
+            message="stray related links",
+            repairability="repairable",
+        )
+    ]
+
+    assert pipeline_module.draft_repair_page_plan_ids_from_issues(issues, qwen_related_block_plan()) == {"PP-QWEN"}
+
+
 def test_update_preservation_issues_detect_missing_old_key_phrases() -> None:
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[

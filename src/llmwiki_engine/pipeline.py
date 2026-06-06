@@ -4914,7 +4914,7 @@ def chunks(items: list[WikiMergePlanItem], size: int) -> list[list[WikiMergePlan
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-PAGE_SCOPED_DRAFT_REPAIR_ISSUE_CODES = {"unsupported_new_fact", "model_self_talk_leak"}
+PAGE_SCOPED_DRAFT_REPAIR_ISSUE_CODES = {"unsupported_new_fact", "model_self_talk_leak", "stray_related_links_in_content"}
 
 
 def build_draft_rendering_missing_page_repair_payload(
@@ -5356,6 +5356,7 @@ def build_draft_rendering_payload(
                 "section_bodies must use only these exact keys: summary, detail, examples, value_points, additional_notes, open_questions.",
                 "Each section_bodies value must be one Markdown string; for bullet lists, write bullets inside that string instead of returning JSON arrays.",
                 "Use additional_notes for free-form observations or custom subtopics; do not invent custom top-level section keys.",
+                "Do not put `相关页面`/`Related Pages` blocks or self wikilinks inside section_bodies; the system renders official related pages separately.",
                 "approved_digest is a projection for this draft batch; the full reviewed digest is available by approved_digest_ref for local audit artifacts, not for model access.",
                 "approved_merge_plan and wiki_context_snapshot are compact projections for this draft batch; full reviewed artifacts are fixed by their *_ref fields for local audit and validators.",
                 "For updates, read existing page excerpts from wiki_context_snapshot and update_preservation_pack, then produce a complete replacement draft at the section-body level.",
@@ -10455,6 +10456,8 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
     if extra:
         raise_draft_issue("unknown_page_plan_reference", f"draft_rendering contains unexpected page_plan_id(s): {sorted(extra)}", field_path="pages")
     for page in artifact.pages:
+        plan_item = plan_by_id.get(page.page_plan_id)
+        display_title = plan_item.display_title if plan_item is not None else ""
         if not page.canonical_target_path.strip():
             raise_draft_issue("missing_field", f"{page.page_plan_id} canonical_target_path must not be empty", field_path="canonical_target_path")
         if not page.section_bodies:
@@ -10491,6 +10494,15 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
                     f"{page.page_plan_id} section body contains forbidden page-level markdown",
                     field_path=f"section_bodies.{section_key}",
                 )
+            if section_contains_stray_related_links(body, page.canonical_target_path, display_title=display_title):
+                raise_draft_issue(
+                    "stray_related_links_in_content",
+                    (
+                        f"{page.page_plan_id} section {section_key} contains a related-page block or self wikilink; "
+                        "remove body-level related links because the system renders official related pages separately."
+                    ),
+                    field_path=f"pages.{page.page_plan_id}.section_bodies.{section_key}",
+                )
             if language == "zh-CN" and looks_like_untranslated_english(body):
                 raise_draft_issue(
                     "zh_cn_untranslated_user_text",
@@ -10509,7 +10521,6 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
                 f"{page.page_plan_id} source_coverage_notes must be Chinese for zh-CN vault",
                 field_path="source_coverage_notes",
             )
-        plan_item = plan_by_id.get(page.page_plan_id)
         if plan_item is not None:
             validate_digestive_quality(page, plan_item)
 
@@ -10611,6 +10622,126 @@ def raise_draft_issue(issue_code: str, message: str, *, field_path: str = "", re
 
 def contains_source_graph_link(text: str) -> bool:
     return text_contains_source_graph_link(text)
+
+
+def section_contains_stray_related_links(text: str, canonical_target_path: str, *, display_title: str = "") -> bool:
+    stripped = strip_fenced_code_blocks(text)
+    return section_contains_self_wikilink(stripped, canonical_target_path, display_title=display_title) or section_contains_related_link_block(stripped)
+
+
+def strip_fenced_code_blocks(text: str) -> str:
+    kept_lines: list[str] = []
+    fence_char = ""
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        stripped_newline = line.rstrip("\r\n")
+        if fence_char:
+            if closing_fence_line(stripped_newline, fence_char, fence_length):
+                fence_char = ""
+                fence_length = 0
+            continue
+        if match := opening_fence_line(stripped_newline):
+            marker = match.group("marker")
+            fence_char = marker[0]
+            fence_length = len(marker)
+            continue
+        kept_lines.append(line)
+    return "".join(kept_lines)
+
+
+def opening_fence_line(line: str) -> re.Match[str] | None:
+    return re.match(r"^ {0,3}(?P<marker>`{3,}|~{3,})[^\n]*$", line)
+
+
+def closing_fence_line(line: str, fence_char: str, fence_length: int) -> bool:
+    escaped = re.escape(fence_char)
+    return re.match(rf"^ {{0,3}}{escaped}{{{fence_length},}}\s*$", line) is not None
+
+
+def section_contains_self_wikilink(text: str, canonical_target_path: str, *, display_title: str = "") -> bool:
+    canonical = normalize_related_candidate_path(canonical_target_path)
+    if canonical is None:
+        return False
+    canonical_aliases = normalized_path_self_aliases(canonical)
+    canonical_aliases |= normalized_title_self_aliases(display_title)
+    for raw_target in section_link_targets(text):
+        if link_target_is_external_or_anchor(raw_target):
+            continue
+        target = normalize_related_candidate_path(raw_target)
+        if target is not None and normalized_path_self_aliases(target) & canonical_aliases:
+            return True
+    return False
+
+
+def section_link_targets(text: str) -> list[str]:
+    targets: list[str] = []
+    for match in re.finditer(r"\[\[([^\]]+)\]\]", text):
+        targets.append(match.group(1).split("|", 1)[0])
+    for match in re.finditer(r"\[[^\]\n]+\]\(([^)]+)\)", text):
+        targets.append(match.group(1))
+    return targets
+
+
+def link_target_is_external_or_anchor(value: str) -> bool:
+    text = value.strip()
+    return text.startswith(("#", "//")) or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", text) is not None
+
+
+def normalized_path_self_aliases(path: str) -> set[str]:
+    posix = Path(path).as_posix()
+    stemless = Path(path).with_suffix("").as_posix()
+    return {
+        posix,
+        stemless,
+        Path(posix).name,
+        Path(stemless).name,
+    }
+
+
+def normalized_title_self_aliases(title: str) -> set[str]:
+    stripped = title.strip()
+    if not stripped:
+        return set()
+    aliases = {stripped}
+    if not stripped.endswith(".md"):
+        aliases.add(f"{stripped}.md")
+    if (title_path := normalize_related_candidate_path(stripped)) is not None:
+        aliases |= normalized_path_self_aliases(title_path)
+    return aliases
+
+
+def line_contains_section_link(line: str) -> bool:
+    return bool(section_link_targets(line))
+
+
+def section_contains_related_link_block(text: str) -> bool:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not related_label_line(line):
+            continue
+        if line_contains_section_link(line):
+            return True
+        for follower in lines[index + 1 : index + 6]:
+            stripped = follower.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                break
+            if line_contains_section_link(stripped):
+                return True
+            if not stripped.startswith(("-", "*", "+")):
+                break
+    return False
+
+
+def related_label_line(line: str) -> bool:
+    return bool(
+        re.match(
+            r"^\s{0,3}(?:[-*+]\s*)?(?:#{1,6}\s*)?(?:\*\*|__)?(?:相关页面|related(?:\s+pages)?)(?:\*\*|__)?\s*(?:[:：]|$)",
+            line,
+            re.IGNORECASE,
+        )
+    )
 
 
 def snapshot_entry(snapshot: WikiContextSnapshot, path: str) -> WikiContextEntry:
