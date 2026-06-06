@@ -8470,7 +8470,8 @@ def test_grounding_examples_allow_short_query_template_quotes() -> None:
     review = build_examples_grounding_review(
         "一个问答代理经常被问及“Redis 的安装方法”。\n"
         "用户如果用“怎么安装Redis”询问，语义缓存可命中。\n"
-        "类似“查询某个用户的记忆片段”的请求可以作为模板。"
+        "类似“查询某个用户的记忆片段”的请求可以作为模板。\n"
+        "用户如果用“Redis 连接地址配置方法”询问，也是在描述技术主题。"
     )
 
     assert review.requires_review is False
@@ -8478,8 +8479,11 @@ def test_grounding_examples_allow_short_query_template_quotes() -> None:
         "Redis 的安装方法",
         "怎么安装Redis",
         "查询某个用户的记忆片段",
+        "Redis 连接地址配置方法",
     ]
-    assert {claim.reason for claim in review.claims} == {"例子区的短查询/请求模板按 illustrative example 处理，不要求 raw exact match。"}
+    reasons = {claim.text: claim.reason for claim in review.claims}
+    assert reasons["Redis 的安装方法"] == "例子区的短查询/请求模板按 illustrative example 处理，不要求 raw exact match。"
+    assert reasons["怎么安装Redis"] == "例子区的短查询/请求模板按 illustrative example 处理，不要求 raw exact match。"
 
 
 def test_grounding_examples_query_template_requires_local_context() -> None:
@@ -8504,9 +8508,30 @@ def test_grounding_examples_query_template_direct_quote_still_requires_support()
         "类似“Alice uses MacBook in 2026”的请求",
         "类似“Alice uses MacBook”的请求",
         "类似“用户使用华为手机”的请求",
+        "类似“查询王小明的记忆片段”的请求",
+        "类似“查询某个用户的手机号”的请求",
+        "类似“查询某个用户的邮箱地址”的请求",
+        "类似“查询用户登录记录”的请求",
+        "类似“query a user's email address”的请求",
     ],
 )
 def test_grounding_examples_query_template_keeps_fact_like_quotes_strict(examples: str) -> None:
+    review = build_examples_grounding_review(examples)
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+@pytest.mark.parametrize(
+    "examples",
+    [
+        "- “权限配置方法”",
+        "例如“权限配置方法”",
+        "例如“payment setup guide”",
+        "类似“payment setup guide”的请求",
+    ],
+)
+def test_grounding_examples_sensitive_quotes_do_not_use_bypass_paths(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
     assert review.requires_review is True

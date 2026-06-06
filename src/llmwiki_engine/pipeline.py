@@ -12238,12 +12238,21 @@ def collect_grounding_claims(
             raw_supported = quote_supported_by_text(quote, approved_raw_text)
             existing_supported = quote_supported_by_text(quote, existing_entry.content)
             supported = raw_supported or existing_supported
+            examples_unsafe_bypass_quote = (
+                section_key == "examples"
+                and not supported
+                and examples_quote_has_unsafe_marker_for_bypass(normalized_quote, quote)
+            )
             is_concept_label_quote = (
                 looks_like_concept_phrase(quote)
                 or looks_like_abstract_trend_label(re.sub(r"\s+", "", quote.strip()))
             ) and not supported and not strict_direct_quote_context(body, quote_start=quote_start) and not attributed_quote_context(body, quote_start=quote_start)
-            if section_key == "examples" and is_concept_label_quote and examples_quote_has_concrete_marker(normalized_quote, quote):
+            if section_key == "examples" and is_concept_label_quote and (
+                examples_quote_has_concrete_marker(normalized_quote, quote) or examples_unsafe_bypass_quote
+            ):
                 is_concept_label_quote = False
+            if examples_unsafe_bypass_quote:
+                is_illustrative_example = False
             section_example_hard_fact = section_key == "examples" and (
                 contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote)
             )
@@ -12253,6 +12262,7 @@ def collect_grounding_claims(
                 and not is_explicit_quote
                 and not strict_direct_quote_context(body, quote_start=quote_start)
                 and not attributed_quote_context(body, quote_start=quote_start)
+                and not examples_unsafe_bypass_quote
                 and examples_abstract_placeholder_quote(normalized_quote, quote)
             )
             is_generic_prompt_example = (
@@ -12261,6 +12271,7 @@ def collect_grounding_claims(
                 and not is_explicit_quote
                 and not strict_direct_quote_context(body, quote_start=quote_start)
                 and not attributed_quote_context(body, quote_start=quote_start)
+                and not examples_unsafe_bypass_quote
                 and examples_generic_prompt_quote(normalized_quote, quote)
             )
             is_memory_query_example = (
@@ -12269,6 +12280,7 @@ def collect_grounding_claims(
                 and not is_explicit_quote
                 and not strict_direct_quote_context(body, quote_start=quote_start)
                 and not attributed_quote_context(body, quote_start=quote_start)
+                and not examples_unsafe_bypass_quote
                 and examples_memory_query_quote(body, normalized_quote, quote, quote_start=quote_start)
             )
             is_query_template_example = (
@@ -12277,6 +12289,7 @@ def collect_grounding_claims(
                 and not is_explicit_quote
                 and not strict_direct_quote_context(body, quote_start=quote_start)
                 and not attributed_quote_context(body, quote_start=quote_start)
+                and not examples_unsafe_bypass_quote
                 and examples_query_template_quote(body, normalized_quote, quote, quote_start=quote_start)
             )
             if (
@@ -12937,6 +12950,8 @@ def examples_query_template_local_context(body: str, quote_start: int, original:
 
 
 def examples_query_template_has_unsafe_marker(normalized: str, original: str = "") -> bool:
+    if examples_quote_has_unsafe_marker_for_bypass(normalized, original):
+        return True
     if looks_like_mixed_unsupported_example_fact(normalized):
         return True
     if looks_like_user_id_literal(normalized):
@@ -12995,6 +13010,104 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
     return bool(re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original))
 
 
+def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
+    if looks_like_user_id_literal(normalized):
+        return True
+    if examples_quote_has_personal_name_reference(normalized, original):
+        return True
+    if examples_quote_has_sensitive_user_data_marker(normalized, original):
+        return True
+    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
+        return True
+    return False
+
+
+def examples_quote_has_personal_name_reference(normalized: str, original: str = "") -> bool:
+    if any(marker in normalized for marker in ["某个用户", "某位用户", "该用户", "用户", "客户"]):
+        abstracted = (
+            normalized.replace("某个用户", "")
+            .replace("某位用户", "")
+            .replace("该用户", "")
+            .replace("用户", "")
+            .replace("客户", "")
+        )
+    else:
+        abstracted = normalized
+    if re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original):
+        return True
+    surnames = (
+        "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜谢邹喻柏"
+        "水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费廉岑薛雷贺倪"
+        "汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛"
+        "汪祁毛禹狄米贝明臧计伏成戴谈宋庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强"
+        "贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田胡凌霍虞万支柯昝管卢莫经"
+        "房裘缪干解应宗丁宣邓郁单杭洪包诸左石崔吉龚程邢裴陆荣翁荀羊惠甄"
+        "曲家封芮羿储靳汲邴糜松井段富巫乌焦巴弓牧隗山谷车侯蓬全班秋仲伊"
+        "宫宁仇栾甘厉戎祖武符刘詹束龙叶幸司韶郜黎蓟薄印宿白怀蒲邰从鄂索"
+        "咸籍赖卓蔺屠蒙池乔胥苍双闻党翟谭贡劳姬申冉雍桑桂牛寿边扈燕冀浦"
+        "尚农温别庄晏柴瞿阎充慕连茹习艾鱼容向古易戈廖终居衡步都耿满弘匡"
+        "国文寇广禄东欧沃利蔚越师巩聂晁辛阚那简饶曾沙养鞠丰关相查荆游竺权益桓公"
+    )
+    person_objects = (
+        "记忆|片段|对话|摘要|工单|订单|偏好|账户|账号|手机号|手机号码|电话|邮箱|"
+        "邮件|登录|记录|地址|住址|凭证|密码|密钥|权限|身份证|证件|银行卡|信用卡"
+    )
+    direct_person_objects = (
+        "记忆|片段|对话|摘要|工单|订单|偏好|账户|账号|手机号|手机号码|电话|邮箱|"
+        "邮件|登录|记录|凭证|密码|密钥|权限|身份证|证件|银行卡|信用卡"
+    )
+    return bool(
+        re.search(rf"[{surnames}][\u4e00-\u9fff]{{1,2}}的(?:{person_objects})", abstracted)
+        or re.search(rf"(?:查询|搜索|查看|读取|获取)[{surnames}][\u4e00-\u9fff]{{1,2}}(?:{direct_person_objects})", abstracted)
+    )
+
+
+def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str = "") -> bool:
+    lowered_original = original.lower()
+    if re.search(
+        r"\b(?:payment|refund|credential|credentials|account|permission|password|passwd|secret|"
+        r"api[_-]?key|token|session|cookie|email|phone|login)\b",
+        lowered_original,
+    ):
+        return True
+    sensitive_markers = [
+        "手机号",
+        "手机号码",
+        "电话号码",
+        "电话",
+        "邮箱",
+        "邮件地址",
+        "电子邮件",
+        "登录记录",
+        "登录日志",
+        "登录",
+        "身份证",
+        "证件",
+        "银行卡",
+        "信用卡",
+        "凭证",
+        "密码",
+        "密钥",
+        "令牌",
+        "账户",
+        "账号",
+        "权限",
+        "订单",
+        "交易",
+        "付款",
+        "支付",
+        "退款",
+    ]
+    if any(marker in normalized for marker in sensitive_markers):
+        return True
+    personal_address_patterns = [
+        r"(?:家庭地址|收货地址|通信地址|联系地址|住址)",
+        r"(?:用户|客户|个人|某个用户|某个客户|该用户|该客户).{0,6}地址",
+        r"地址.{0,6}(?:用户|客户|个人)",
+    ]
+    return any(re.search(pattern, normalized) for pattern in personal_address_patterns)
+
+
 def memory_query_call_argument_context(body: str, quote_start: int | None) -> bool:
     if quote_start is None or quote_start < 0:
         return False
@@ -13003,10 +13116,16 @@ def memory_query_call_argument_context(body: str, quote_start: int | None) -> bo
 
 
 def examples_quote_has_concrete_marker(normalized: str, original: str = "") -> bool:
+    if examples_quote_has_sensitive_user_data_marker(normalized, original):
+        return True
     if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
         return True
     lowered_original = original.lower()
-    if re.search(r"\b(?:build|order|ticket|issue|status|success|failed|error|token|api[_-]?key|password)\b", lowered_original):
+    if re.search(
+        r"\b(?:build|order|ticket|issue|status|success|failed|error|token|api[_-]?key|password|"
+        r"payment|refund|credential|credentials|account|permission|session|cookie|email|phone|login)\b",
+        lowered_original,
+    ):
         return True
     if re.search(r"`[^`]*(?:--|=|/|\\|\d)[^`]*`", original):
         return True
