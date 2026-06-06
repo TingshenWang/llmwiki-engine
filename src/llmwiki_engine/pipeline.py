@@ -12978,7 +12978,9 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
     lowered_original = original.lower()
     unsafe_word_pattern = (
         r"\b(?:order|ticket|issue|status|success|failed|failure|error|token|api[_-]?key|password|"
-        r"passwd|secret|credential|account|permission|payment|refund|delete|deleted|revenue)\b"
+        r"passwd|secret|credential|account|permission|payment|refund|delete|deleted|revenue|"
+        r"support|supports|supported|improve|improves|improved|best|better|recommend|recommended|recommends|"
+        r"prove|proves|proved|cause|causes|caused|release|released|releases|launch|launched|launches)\b"
     )
     if re.search(unsafe_word_pattern, lowered_original):
         return True
@@ -13096,7 +13098,7 @@ def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str
     lowered_original = original.lower()
     if re.search(
         r"\b(?:payment|refund|credential|credentials|account|permission|password|passwd|secret|"
-        r"api[_-]?key|token|session|cookie|email|phone|login)\b",
+        r"api[_-]?key|token|tokens|session|cookie|cookies|email|emails|phone|login|passwords)\b",
         lowered_original,
     ):
         return True
@@ -13141,10 +13143,15 @@ def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str
 
 
 def examples_english_sensitive_user_data_query(lowered_original: str) -> bool:
-    user_markers = r"user|users|user's|customer|customers|customer's|person|person's|personal"
+    user_markers = (
+        r"users'|user's|users|user|customers'|customer's|customers|customer|people's|people|"
+        r"persons'|person's|persons|person|personal"
+    )
     sensitive_objects = (
-        r"ip\s+address|ip|addresses|address|names|name|birthdays|birthday|birth\s*date|"
-        r"birthdate|profiles|profile|locations|location"
+        r"ip\s+address|ips|ip|email\s+address|email|emails|addresses|address|names|name|birthdays|birthday|"
+        r"birth\s*date|birthdate|profiles|profile|locations|location|ids|id|credit\s+cards|credit\s+card|"
+        r"cards|card|tokens|token|sessions|session|passwords|password|credentials|credential|"
+        r"accounts|account|permissions|permission|cookies|cookie"
     )
     return bool(
         re.search(rf"\b(?:{user_markers})\b.{{0,32}}\b(?:{sensitive_objects})\b", lowered_original)
