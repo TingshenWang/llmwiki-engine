@@ -1299,6 +1299,129 @@ def test_source_snippets_rank_specific_window_over_generic_frontmatter() -> None
     assert "title: Cat Wu" not in snippet_text
 
 
+def test_source_semantic_match_terms_preserve_api_terms_with_translated_cues() -> None:
+    cues = [
+        "对比通过 ingest() 自动从对话提取记忆与通过 remember() 让模型直接存储已知记忆的优劣",
+        "讨论提示中要求模型将 recall 召回记忆视为有用上下文而非绝对真相",
+        "S010-S011",
+        "帮助开发者根据场景选择合适的记忆写入方式",
+        "团队内部技术方案评审",
+        "用户体验敏感的场景设计",
+    ]
+
+    terms = pipeline_module.source_semantic_match_terms(cues)
+
+    assert {"ingest", "remember", "recall"} <= set(terms)
+    assert "s010s011" not in terms
+    assert any("记忆写入" in term for term in terms)
+
+
+def test_source_snippets_resolve_multiple_section_locators_without_start_fallback() -> None:
+    text = (
+        "# Cloudflare Agent Memory: Get started\n\n"
+        "Documentation chrome that should not be selected.\n\n"
+        "## How agent memory works\n\n"
+        "Use recall when the model needs relevant memory.\n\n"
+        "## Extract memories from conversation\n\n"
+        "Use ingest when you have conversation messages and want Agent Memory to extract durable memories automatically.\n\n"
+        "## Store explicit memories when needed\n\n"
+        "Use remember when your agent already knows the exact memory to store.\n\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(text, ["S003, S004"], max_chars=360)
+
+    snippet_text = "\n".join(snippet["text"] for snippet in snippets)
+    assert snippets
+    assert snippets[0]["cue"].startswith("source_locator:S003")
+    assert "Extract memories from conversation" in snippet_text
+    assert "Store explicit memories when needed" in snippet_text
+    assert "Documentation chrome" not in snippet_text
+
+
+def test_source_snippets_resolve_section_locator_ranges_and_labels() -> None:
+    text = (
+        "# Memory docs\n\n"
+        "Intro chrome.\n\n"
+        "## Add memory recall as a tool\n\n"
+        "The MEMORY_CONTEXT prompt tells the model to treat recalled memories as useful context, not absolute truth.\n\n"
+        "## Extract memories from conversation\n\n"
+        "Use ingest after idle windows rather than after every model turn.\n\n"
+    )
+
+    label_snippets = pipeline_module.source_snippets_for_cues(text, ["S002 MEMORY_CONTEXT 提示"], max_chars=260)
+    range_snippets = pipeline_module.source_snippets_for_cues(text, ["S002-S003"], max_chars=360)
+
+    assert "MEMORY_CONTEXT prompt" in "\n".join(snippet["text"] for snippet in label_snippets)
+    range_text = "\n".join(snippet["text"] for snippet in range_snippets)
+    assert "Add memory recall as a tool" in range_text
+    assert "Extract memories from conversation" in range_text
+
+
+def test_source_snippets_distribute_tight_budget_across_three_section_locators() -> None:
+    text = (
+        "# Memory docs\n\n"
+        "Intro chrome.\n\n"
+        "## Alpha locator section\n\n"
+        "Alpha key evidence appears immediately. " + ("Alpha filler. " * 25) + "\n\n"
+        "## Beta locator section\n\n"
+        "Beta key evidence appears immediately. " + ("Beta filler. " * 25) + "\n\n"
+        "## Gamma locator section\n\n"
+        "Gamma key evidence appears immediately. " + ("Gamma filler. " * 25) + "\n\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(text, ["S002, S003, S004"], max_chars=480)
+
+    snippet_text = "\n".join(snippet["text"] for snippet in snippets)
+    assert "Alpha key evidence" in snippet_text
+    assert "Beta key evidence" in snippet_text
+    assert "Gamma key evidence" in snippet_text
+    assert sum(len(snippet["text"]) for snippet in snippets) <= 480
+
+
+def test_source_snippets_stale_section_locator_does_not_suppress_semantic_fallback() -> None:
+    text = (
+        "# Memory docs\n\n"
+        "Documentation chrome that mentions setup but not the target API terms.\n\n"
+        "## Extract memories from conversation\n\n"
+        "Use `ingest()` when you have conversation messages and want Agent Memory to extract durable memories automatically. "
+        "Use `remember()` only when the agent already knows the exact memory to store.\n\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        ["S001", "自动摄取通过 ingest() 提取对话记忆，并用 remember() 保存明确记忆"],
+        max_chars=300,
+    )
+
+    snippet_text = "\n".join(snippet["text"] for snippet in snippets)
+    assert snippets[0]["cue"].startswith("fallback_semantic:")
+    assert "Use `ingest()`" in snippet_text
+    assert "Use `ingest()`" in snippets[0]["text"]
+    assert "Documentation chrome" not in snippets[0]["text"]
+    assert sum(len(snippet["text"]) for snippet in snippets) <= 300
+
+
+def test_source_snippets_correct_section_locator_dedupes_semantic_fallback() -> None:
+    text = (
+        "# Memory docs\n\n"
+        "Intro chrome.\n\n"
+        "## Extract memories from conversation\n\n"
+        "Use `ingest()` when you have conversation messages and want Agent Memory to extract durable memories automatically. "
+        "Use `remember()` only when the agent already knows the exact memory to store.\n\n"
+    )
+
+    snippets = pipeline_module.source_snippets_for_cues(
+        text,
+        ["S002", "自动摄取通过 ingest() 提取对话记忆，并用 remember() 保存明确记忆"],
+        max_chars=300,
+    )
+
+    assert snippets[0]["cue"].startswith("source_locator:S002")
+    assert len(snippets) == 1
+    assert "Extract memories from conversation" in snippets[0]["text"]
+    assert sum(len(snippet["text"]) for snippet in snippets) <= 300
+
+
 def test_source_snippets_use_semantic_fallback_when_exact_cue_is_not_contiguous() -> None:
     text = (
         "# 偏好学习笔记\n\n"

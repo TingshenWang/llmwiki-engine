@@ -3730,6 +3730,12 @@ def source_snippets_for_cues(text: str, cues: list[str], *, max_chars: int) -> l
     semantic_terms = source_semantic_match_terms(cues)
     window_candidates: list[tuple[int, int, str, int]] = []
     seen_positions: set[int] = set()
+    locator_windows = source_section_locator_windows(text, cues, max_chars=max_chars, semantic_terms=semantic_terms)
+    for start, end, cue, score in locator_windows:
+        if any(abs(start - existing) < source_excerpt_start_tolerance(cue) for existing in seen_positions):
+            continue
+        seen_positions.add(start)
+        window_candidates.append((start, end, cue, score))
     for cue in source_excerpt_cues(cues):
         position = find_source_cue(text, cue)
         if position < 0:
@@ -3748,17 +3754,33 @@ def source_snippets_for_cues(text: str, cues: list[str], *, max_chars: int) -> l
             end = min(len(text), center + len(cue) + after_chars)
             start = adjust_window_start(text, start)
             end = adjust_window_end(text, end)
-        if any(abs(start - existing) < 120 for existing in seen_positions):
-            continue
-        seen_positions.add(start)
         window_text = text[start:end]
         score = source_excerpt_window_score(window_text, cue, semantic_terms)
         if source_excerpt_low_signal_cue(cue) and score < 28:
             continue
+        if any(abs(start - existing) < source_excerpt_start_tolerance(cue) for existing in seen_positions):
+            continue
+        seen_positions.add(start)
         window_candidates.append((start, end, cue, score))
+    if locator_windows:
+        semantic_window = source_semantic_fallback_window(text, cues, max_chars=max_chars)
+        if semantic_window is not None:
+            start, end, cue = semantic_window
+            if not any(abs(start - existing) < source_excerpt_start_tolerance(cue) for existing in seen_positions):
+                seen_positions.add(start)
+                window_candidates.append((start, end, cue, 88))
     windows: list[tuple[int, int, str]] = []
     for start, end, cue, _score in sorted(window_candidates, key=lambda item: (-item[3], item[0])):
-        if any(ranges_overlap(start, end, existing_start, existing_end, tolerance=120) for existing_start, existing_end, _ in windows):
+        if any(
+            ranges_overlap(
+                start,
+                end,
+                existing_start,
+                existing_end,
+                tolerance=source_excerpt_overlap_tolerance(cue, existing_cue),
+            )
+            for existing_start, existing_end, existing_cue in windows
+        ):
             continue
         windows.append((start, end, cue))
         if sum(existing_end - existing_start for existing_start, existing_end, _ in windows) >= max_chars:
@@ -3786,6 +3808,79 @@ def source_snippets_for_cues(text: str, cues: list[str], *, max_chars: int) -> l
         snippets.append({"cue": cue, "start": start, "end": end, "text": snippet})
         remaining -= len(snippet)
     return snippets
+
+
+def source_excerpt_start_tolerance(cue: str) -> int:
+    return 1 if cue.startswith(("source_locator:", "fallback_semantic:")) else 120
+
+
+def source_excerpt_overlap_tolerance(cue: str, existing_cue: str) -> int:
+    if cue.startswith("source_locator:") or existing_cue.startswith("source_locator:"):
+        return 0
+    return 120
+
+
+SOURCE_SECTION_LOCATOR_RE = re.compile(r"\bS(?P<start>\d{3})(?:\s*[-–—~至到]\s*S?(?P<end>\d{3}))?\b", re.IGNORECASE)
+
+
+def source_section_locator_windows(
+    text: str,
+    cues: list[str],
+    *,
+    max_chars: int,
+    semantic_terms: list[str] | None = None,
+) -> list[tuple[int, int, str, int]]:
+    section_ids = source_section_locator_ids(cues)
+    if not section_ids:
+        return []
+    sections = {
+        section["section_id"]: section
+        for section in markdown_sections_for_source_map(text, max_sections=SOURCE_DIGEST_SOURCE_MAP_MAX_SECTIONS)
+    }
+    if not sections:
+        return []
+    per_locator_limit = min(max_chars, max(160, max_chars // max(1, min(len(section_ids), 3))))
+    windows: list[tuple[int, int, str, int]] = []
+    for section_id in section_ids:
+        section = sections.get(section_id)
+        if section is None:
+            continue
+        start = int(section.get("char_start", 0))
+        section_end = int(section.get("char_end", start))
+        end = min(section_end, start + per_locator_limit)
+        if end <= start:
+            continue
+        heading = str(section.get("heading", "")).strip()
+        window_text = text[start:end]
+        score = source_section_locator_window_score(window_text, semantic_terms or [])
+        windows.append((start, end, f"source_locator:{section_id}:{heading}", score))
+    return windows
+
+
+def source_section_locator_window_score(window_text: str, semantic_terms: list[str]) -> int:
+    if not semantic_terms:
+        return 96
+    normalized_window = normalized_source_match_text(window_text)
+    hits = [term for term in semantic_terms if len(term) >= 4 and term in normalized_window]
+    if not hits:
+        return 64
+    return 96 + min(16, sum(min(8, len(term)) for term in hits[:4]))
+
+
+def source_section_locator_ids(cues: list[str]) -> list[str]:
+    section_ids: list[str] = []
+    for cue in cues:
+        for match in SOURCE_SECTION_LOCATOR_RE.finditer(cue or ""):
+            start = int(match.group("start"))
+            end_text = match.group("end")
+            end = int(end_text) if end_text else start
+            if end < start:
+                continue
+            for number in range(start, min(end, start + 7) + 1):
+                section_id = f"S{number:03d}"
+                if section_id not in section_ids:
+                    section_ids.append(section_id)
+    return section_ids
 
 
 SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES = {
@@ -3990,18 +4085,25 @@ def source_semantic_block_score(block_text: str, terms: list[str]) -> tuple[int,
 
 
 def source_semantic_match_terms(cues: list[str]) -> list[str]:
-    terms: set[str] = set()
+    ascii_terms: set[str] = set()
+    cjk_terms: set[str] = set()
     english_stopwords = {
         "and",
         "are",
+        "approved",
+        "digest",
         "for",
         "from",
         "how",
+        "page",
+        "section",
+        "source",
         "into",
         "that",
         "the",
         "this",
         "with",
+        "wiki",
         "why",
     }
     cjk_stop_terms = {
@@ -4022,8 +4124,11 @@ def source_semantic_match_terms(cues: list[str]) -> list[str]:
     for cue in source_excerpt_cues(cues):
         normalized = unicodedata.normalize("NFKC", cue).lower()
         for token in re.findall(r"[a-z][a-z0-9+#./-]{2,}", normalized):
-            if token not in english_stopwords:
-                terms.add(normalized_source_match_text(token))
+            if token in english_stopwords or source_section_locator_token(token):
+                continue
+            normalized_token = normalized_source_match_text(token)
+            if len(normalized_token) >= 3:
+                ascii_terms.add(normalized_token)
         for segment in re.findall(r"[\u4e00-\u9fff]{3,}", normalized):
             if segment in cjk_stop_terms:
                 continue
@@ -4032,8 +4137,24 @@ def source_semantic_match_terms(cues: list[str]) -> list[str]:
                 for index in range(0, len(segment) - size + 1):
                     term = segment[index : index + size]
                     if term not in cjk_stop_terms:
-                        terms.add(normalized_source_match_text(term))
-    return sorted((term for term in terms if len(term) >= 3), key=lambda value: (-len(value), value))[:80]
+                        normalized_term = normalized_source_match_text(term)
+                        if len(normalized_term) >= 3:
+                            cjk_terms.add(normalized_term)
+    ascii_sorted = sorted(ascii_terms, key=lambda value: (-len(value), value))
+    cjk_sorted = sorted(cjk_terms, key=lambda value: (-len(value), value))
+    total_limit = 80
+    ascii_limit = 32
+    cjk_min_limit = 24
+    selected = ascii_sorted[:ascii_limit]
+    cjk_limit = max(cjk_min_limit, total_limit - len(selected))
+    selected.extend(cjk_sorted[:cjk_limit])
+    if len(selected) < total_limit:
+        selected.extend(ascii_sorted[ascii_limit : ascii_limit + total_limit - len(selected)])
+    return selected[:total_limit]
+
+
+def source_section_locator_token(token: str) -> bool:
+    return bool(re.fullmatch(r"s\d{3}(?:[-–—~至到/]s?\d{3})?", token.strip().lower()))
 
 
 def meaningful_match_terms(text: str) -> set[str]:
