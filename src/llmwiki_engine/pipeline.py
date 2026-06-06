@@ -13059,23 +13059,36 @@ def examples_quote_has_personal_name_reference(normalized: str, original: str = 
         "记忆|片段|对话|摘要|工单|订单|偏好|账户|账号|手机号|手机号码|电话|邮箱|"
         "邮件|登录|记录|凭证|密码|密钥|权限|身份证|证件|银行卡|信用卡"
     )
+    person_query_verbs = "查询|搜索|查看|读取|获取|查找|检索"
     chinese_person_ref = bool(
         re.search(rf"[{surnames}][\u4e00-\u9fff]{{1,2}}的(?:{person_objects})", abstracted)
         or re.search(
-            rf"(?:查询|搜索|查看|读取|获取)[{surnames}][\u4e00-\u9fff]{{1,2}}(?:{direct_person_objects})",
+            rf"(?:{person_query_verbs})[{surnames}][\u4e00-\u9fff]{{1,2}}(?:{direct_person_objects})",
             abstracted,
         )
     )
     if chinese_person_ref:
         return True
-    latin_person = r"[A-Z][A-Za-z]{1,31}"
+    latin_person = r"[A-Za-z][A-Za-z]{1,31}"
     english_person_objects = r"memory|memories|ticket|order|account|phone|email|login|session|cookie|credential|credentials"
-    return bool(
-        re.search(rf"{latin_person}的(?:{person_objects})", original)
-        or re.search(rf"(?:查询|搜索|查看|读取|获取){latin_person}(?:的)?(?:{direct_person_objects})", original)
-        or re.search(rf"\b(?:query|search|lookup|find|get)\s+{latin_person}\s+(?:{english_person_objects})\b", original, re.IGNORECASE)
-        or re.search(rf"\b{latin_person}(?:'s|’s)\s+(?:{english_person_objects})\b", original, re.IGNORECASE)
-    )
+    latin_patterns = [
+        rf"({latin_person})的({person_objects})",
+        rf"(?:{person_query_verbs})({latin_person})(?:的)?({direct_person_objects})",
+        rf"\b(?:query|search|lookup|find|get)\s+({latin_person})\s+({english_person_objects})\b",
+        rf"\b({latin_person})(?:'s|’s)\s+({english_person_objects})\b",
+    ]
+    for pattern in latin_patterns:
+        for match in re.finditer(pattern, original, re.IGNORECASE):
+            if examples_latin_token_is_technical_memory_topic(match.group(1), match.group(2)):
+                continue
+            return True
+    return False
+
+
+def examples_latin_token_is_technical_memory_topic(token: str, object_name: str) -> bool:
+    technical_tokens = {"redis", "mem0", "qwen", "openai", "anthropic", "claude", "mcp", "oauth", "api", "sdk"}
+    memory_objects = {"memory", "memories", "记忆"}
+    return token.lower() in technical_tokens and object_name.lower() in memory_objects
 
 
 def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str = "") -> bool:
@@ -13085,6 +13098,8 @@ def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str
         r"api[_-]?key|token|session|cookie|email|phone|login)\b",
         lowered_original,
     ):
+        return True
+    if examples_english_sensitive_user_data_query(lowered_original):
         return True
     sensitive_markers = [
         "手机号",
@@ -13122,6 +13137,15 @@ def examples_quote_has_sensitive_user_data_marker(normalized: str, original: str
         r"地址.{0,6}(?:用户|客户|个人)",
     ]
     return any(re.search(pattern, normalized) for pattern in personal_address_patterns)
+
+
+def examples_english_sensitive_user_data_query(lowered_original: str) -> bool:
+    user_markers = r"user|users|user's|customer|customers|customer's|person|person's|personal"
+    sensitive_objects = r"ip\s+address|address|name|birthday|birth\s*date|birthdate|profile|location"
+    return bool(
+        re.search(rf"\b(?:{user_markers})\b.{{0,32}}\b(?:{sensitive_objects})\b", lowered_original)
+        or re.search(rf"\b(?:{sensitive_objects})\b.{{0,32}}\b(?:{user_markers})\b", lowered_original)
+    )
 
 
 def memory_query_call_argument_context(body: str, quote_start: int | None) -> bool:

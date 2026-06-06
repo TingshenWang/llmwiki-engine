@@ -8506,6 +8506,9 @@ def test_grounding_examples_query_template_direct_quote_still_requires_support()
         "类似“查询某个用户的记忆片段”的请求",
         "类似“查询某个用户的记忆片段”的请求可以作为模板。",
         "类似“Redis setup guide”的请求",
+        "类似“query Redis memory”的请求",
+        "类似“query redis memory”的请求",
+        "类似“查询Redis记忆”的请求",
     ],
 )
 def test_grounding_examples_allow_isolated_query_template_contexts(examples: str) -> None:
@@ -8529,6 +8532,17 @@ def test_grounding_examples_allow_isolated_query_template_contexts(examples: str
         "类似“query a user's email address”的请求",
         "类似“查询Alice的记忆片段”的请求",
         "类似“查询Charlie的记忆片段”的请求",
+        "类似“查询alice的记忆片段”的请求",
+        "类似“查询alice的对话摘要”的请求",
+        "类似“查找Alice记忆片段”的请求",
+        "类似“查找王小明记忆片段”的请求",
+        "类似“query a user's address”的请求",
+        "类似“query user's address”的请求",
+        "类似“query customer address”的请求",
+        "类似“query user IP address”的请求",
+        "类似“query a user's birthday”的请求",
+        "类似“query a user's name”的请求",
+        "类似“query person profile”的请求",
     ],
 )
 def test_grounding_examples_query_template_keeps_fact_like_quotes_strict(examples: str) -> None:
