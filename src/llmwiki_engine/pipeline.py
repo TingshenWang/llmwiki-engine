@@ -11375,18 +11375,25 @@ def old_additional_note_boundary_paraphrase_absorbed(note: str, target: str) -> 
 
 
 def old_additional_note_target_has_user_confirmation_boundary(target_norm: str) -> bool:
-    if "用户确认" not in target_norm:
-        return False
-    return any(marker in target_norm for marker in ["重要决定", "重要决策", "重大决策", "决定", "决策"])
+    decision_markers = ("重要决定", "重要决策", "重大决策", "决定", "决策")
+    positive_markers = ("需要", "仍需", "仍需要", "应由", "必须", "由用户确认")
+    negative_markers = ("不需要", "无需", "不必", "不再需要", "免于")
+    for clause in old_additional_note_supersession_clauses(target_norm):
+        if "用户确认" not in clause or not any(marker in clause for marker in decision_markers):
+            continue
+        if any(re.search(rf"{marker}.{{0,8}}用户确认|用户确认.{{0,8}}{marker}", clause) for marker in negative_markers):
+            continue
+        if any(marker in clause for marker in positive_markers):
+            return True
+    return False
 
 
 def old_additional_note_target_has_memory_context_boundary(target_norm: str) -> bool:
-    if not re.search(r"召回的?记忆|记忆召回", target_norm):
-        return False
-    return any(
-        marker in target_norm
-        for marker in ["辅助上下文", "有帮助的上下文", "作为上下文", "只能作为", "不能只依赖", "不能依赖", "不是绝对真实", "非绝对真实"]
-    )
+    boundary_markers = ("辅助上下文", "有帮助的上下文", "作为上下文", "只能作为", "不能只依赖", "不能依赖", "不是绝对真实", "非绝对真实")
+    for clause in old_additional_note_supersession_clauses(target_norm):
+        if re.search(r"召回的?记忆|记忆召回", clause) and any(marker in clause for marker in boundary_markers):
+            return True
+    return False
 
 
 def old_additional_note_superseded(note: str, target: str) -> bool:
@@ -11462,7 +11469,7 @@ def old_additional_note_clause_is_capability_change(clause: str, anchor: str) ->
 
 def old_additional_note_clause_supersedes_anchor(clause: str, anchor: str) -> bool:
     escaped = re.escape(anchor)
-    strong_markers = ("不再需要", "不再依赖", "不适用", "deprecated", "废弃", "已废弃")
+    strong_markers = ("不再需要", "不需要", "无需", "不必", "不再依赖", "不适用", "免于", "deprecated", "废弃", "已废弃")
     if any(re.search(rf"{marker}.{{0,8}}{escaped}|{escaped}.{{0,8}}{marker}", clause) for marker in strong_markers):
         return True
     if re.search(rf"{escaped}.{{0,12}}(?:已)?改为|(?:已)?改为.{{0,12}}{escaped}", clause):
