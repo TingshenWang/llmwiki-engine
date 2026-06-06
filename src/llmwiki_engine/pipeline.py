@@ -11185,7 +11185,24 @@ def merge_update_section(
     if new and not is_empty_placeholder(new):
         added.append(new)
     if old and not retained and old != new and not is_empty_placeholder(old):
-        if update_merge_should_preserve_old_section(section_key, old):
+        if section_key == "additional_notes":
+            preserved_notes, removed_notes = split_high_signal_old_additional_notes(
+                old,
+                new,
+                absorption_context=absorption_context or "",
+            )
+            if preserved_notes:
+                new = merge_markdown_blocks(new, preserved_old_additional_notes_block(preserved_notes))
+                retained.extend(preserved_notes)
+                preserved_old.extend(preserved_notes)
+                removed.extend(removed_notes)
+                removal_reason = (
+                    "高信号旧补充观察已自动追加；低信号或已覆盖的旧补充观察不机械保留。"
+                )
+            else:
+                removed.append(old)
+                removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
+        elif update_merge_should_preserve_old_section(section_key, old):
             preserved = preserved_old_section_block(old)
             new = merge_markdown_blocks(new, preserved)
             retained.append(old)
@@ -11217,6 +11234,110 @@ def merge_update_section(
             removal_reason=removal_reason,
         ),
     )
+
+
+def split_high_signal_old_additional_notes(
+    old: str,
+    new: str,
+    *,
+    absorption_context: str,
+) -> tuple[list[str], list[str]]:
+    preserved: list[str] = []
+    removed: list[str] = []
+    for note in old_additional_note_units(old):
+        if not old_additional_note_is_high_signal_boundary(note):
+            removed.append(note)
+            continue
+        if old_additional_note_absorbed(note, new) or old_additional_note_absorbed(note, absorption_context):
+            continue
+        preserved.append(note)
+    return _dedupe_strings(preserved), _dedupe_strings(removed)
+
+
+def old_additional_note_units(text: str) -> list[str]:
+    units: list[str] = []
+    paragraph: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            if paragraph:
+                units.append(" ".join(paragraph).strip())
+                paragraph = []
+            continue
+        bullet = re.match(r"^(?:[-*+]|\d+[.)、])\s+(?P<body>.+)$", stripped)
+        if bullet:
+            if paragraph:
+                units.append(" ".join(paragraph).strip())
+                paragraph = []
+            units.append(bullet.group("body").strip())
+            continue
+        paragraph.append(stripped)
+    if paragraph:
+        units.append(" ".join(paragraph).strip())
+    return [unit for unit in _dedupe_strings(units) if unit and not is_empty_placeholder(unit)]
+
+
+def old_additional_note_is_high_signal_boundary(note: str) -> bool:
+    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note))
+    if len(normalized) < 12:
+        return False
+    if re.search(r"[?？]$", normalized) or normalized.startswith(("如何", "是否", "为什么", "能否", "有没有")):
+        return False
+    if any(marker in normalized for marker in ["暂无", "没有明确", "可与", "关联阅读", "后续可以继续补充"]):
+        return False
+    strong_markers = (
+        "应视为",
+        "不能视为",
+        "不可视为",
+        "并非绝对真实",
+        "不是绝对真实",
+        "用户确认",
+        "需要确认",
+        "必须确认",
+        "重要决定",
+        "重大决策",
+        "不可逆",
+        "不应",
+        "必须",
+        "安全风险",
+        "可靠性风险",
+        "隐私风险",
+        "成本约束",
+        "权限边界",
+        "隔离边界",
+    )
+    if any(marker in normalized for marker in strong_markers):
+        return True
+    risk_or_boundary = any(marker in normalized for marker in ["风险", "边界", "限制", "约束"])
+    domain_signal = any(
+        marker in normalized
+        for marker in ["安全", "可靠性", "准确性", "一致性", "成本", "权限", "隔离", "隐私", "审计", "确认"]
+    )
+    modal_signal = any(marker in normalized for marker in ["需要", "应该", "应当", "不能", "不应", "必须"])
+    return risk_or_boundary and domain_signal and modal_signal
+
+
+def old_additional_note_absorbed(note: str, target: str) -> bool:
+    if not note.strip() or not target.strip():
+        return False
+    absorbed, matched, _ = update_section_absorption(note, target)
+    if absorbed and matched:
+        return True
+    note_key = open_question_key(note)
+    if note_key:
+        target_question_keys = {open_question_key(question) for question in meaningful_open_question_lines(target)}
+        if note_key in target_question_keys:
+            return True
+    normalized_note = normalized_source_match_text(note)
+    normalized_target = normalized_source_match_text(target)
+    return bool(normalized_note and normalized_note in normalized_target)
+
+
+def preserved_old_additional_notes_block(notes: list[str]) -> str:
+    if len(notes) == 1:
+        return f"旧页补充观察：{notes[0]}"
+    lines = "\n".join(f"- {note}" for note in notes)
+    return f"旧页补充观察：\n{lines}"
 
 
 def merge_update_open_questions_section(old: str, new: str) -> tuple[str, SectionMergeChange]:

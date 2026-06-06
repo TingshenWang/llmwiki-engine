@@ -4731,6 +4731,77 @@ def test_merge_update_section_open_questions_does_not_fallback_to_low_signal_old
     assert change.needs_manual_resolution is False
 
 
+def test_merge_update_section_additional_notes_preserves_high_signal_boundary_note() -> None:
+    old = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
+    new = "本页面补充 Redis 等实现方式。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert "旧页补充观察" in merged
+    assert old in merged
+    assert change.retained == [old]
+    assert change.preserved_old == [old]
+    assert change.removed == []
+    assert change.needs_manual_resolution is False
+    assert "高信号旧补充观察" in change.removal_reason
+
+
+def test_merge_update_section_additional_notes_keeps_only_high_signal_units() -> None:
+    high = "重要决定必须由用户确认，不能只依赖召回记忆。"
+    low = "本页面可与 Redis 页面联动阅读。"
+    old = f"- {low}\n- {high}"
+    new = "本页面补充通用记忆架构。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert high in merged
+    assert low not in merged
+    assert change.retained == [high]
+    assert change.preserved_old == [high]
+    assert change.removed == [low]
+    assert change.needs_manual_resolution is False
+
+
+def test_merge_update_section_additional_notes_does_not_preserve_low_signal_note() -> None:
+    old = "本页面从通用概念出发，可与 Redis 页面联动阅读。"
+    new = "本页面补充通用记忆架构。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert change.retained == []
+    assert change.preserved_old == []
+    assert change.removed == [old]
+    assert change.needs_manual_resolution is False
+    assert "不属于 update preservation 核心义务" in change.removal_reason
+
+
+def test_merge_update_section_additional_notes_does_not_duplicate_absorbed_note() -> None:
+    old = "重要决定需要用户确认，不能只依赖召回记忆。"
+    new = "召回记忆可作为上下文，但重要决定需要用户确认。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert "旧页补充观察" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == []
+    assert change.removed == []
+
+
+def test_merge_update_section_additional_notes_does_not_keep_question_like_note() -> None:
+    old = "是否需要为召回记忆设计用户确认机制？"
+    new = "本页面补充通用记忆架构。"
+
+    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+
+    assert merged == new
+    assert change.retained == []
+    assert change.preserved_old == []
+    assert change.removed == [old]
+    assert change.needs_manual_resolution is False
+
+
 def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-TYPO",
