@@ -12850,15 +12850,23 @@ def cleanup_open_question_unsupported_scope_claims(
 
 
 def open_question_scope_cleanup_claim(claim: GroundingClaim, item: WikiMergePlanItem | None) -> bool:
+    marker = open_question_scope_cleanup_reason_marker(claim.reason)
     return bool(
         item is not None
         and item.page_type == "open_question"
         and claim.support == "unsupported"
         and claim.action == "needs_review"
         and claim.section_key in OPEN_QUESTION_SCOPE_CLEANUP_SECTIONS
-        and claim.reason.startswith(OPEN_QUESTION_SCOPE_CLEANUP_REASON_PREFIX)
-        and unsupported_scope_speculation_marker(claim.text)
+        and marker
+        and marker in claim.text
     )
+
+
+def open_question_scope_cleanup_reason_marker(reason: str) -> str:
+    if not reason.startswith(OPEN_QUESTION_SCOPE_CLEANUP_REASON_PREFIX):
+        return ""
+    match = re.match(rf"^{re.escape(OPEN_QUESTION_SCOPE_CLEANUP_REASON_PREFIX)} `([^`]+)`", reason)
+    return match.group(1).strip() if match else ""
 
 
 def remove_grounding_claim_exact_once(body: str, text: str) -> tuple[str, str]:

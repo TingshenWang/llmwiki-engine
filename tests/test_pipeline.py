@@ -5748,6 +5748,83 @@ def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
 
 
+def test_cleanup_open_question_scope_claim_uses_reason_marker_after_sentence_split() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-OQ",
+        source_basis=SourceBasis(source_candidate_ids=["O001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+        display_title="记忆准确性",
+        page_type="open_question",
+        new_understanding="讨论记忆准确性。",
+        section_plans={"summary": "摘要", "examples": "例子", "open_questions": "问题"},
+        reason="test",
+    )
+    plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[item])
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[pipeline_module.WikiContextEntry(path="wiki/open_questions/Open_Question_记忆准确性.md", expected_state="missing")],
+    )
+    unsupported_sentence = "正确的做法是使用抽象占位符描述模式：模型应通过工具搜索记忆，然后在涉及重要决策时向用户提问。"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-OQ",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+                section_bodies={
+                    "summary": "讨论记忆准确性。",
+                    "examples": f"模型可能需要确认记忆。{unsupported_sentence}",
+                    "open_questions": "- 如何确认召回结果？",
+                },
+                change_summary="创建开放问题。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "记忆召回结果需要确认。")
+    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+        draft,
+        plan,
+        snapshot,
+        "记忆召回结果需要确认。",
+    )
+
+    assert review_before.unsupported_new_facts[0].text == unsupported_sentence
+    assert report["changed"] is True
+    assert unsupported_sentence not in cleaned.pages[0].section_bodies["examples"]
+    assert "待补来源：" in cleaned.pages[0].section_bodies["open_questions"]
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
+
+
+def test_open_question_scope_cleanup_claim_requires_reason_marker_in_text() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-OQ",
+        source_basis=SourceBasis(source_candidate_ids=["O001"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_记忆准确性.md",
+        display_title="记忆准确性",
+        page_type="open_question",
+        new_understanding="讨论记忆准确性。",
+        section_plans={"summary": "摘要"},
+        reason="test",
+    )
+    claim = pipeline_module.GroundingClaim(
+        page_plan_id="PP-OQ",
+        target_path="open_questions/Open_Question_记忆准确性.md",
+        section_key="examples",
+        claim_type="new_fact",
+        text="这句话不包含被 reason 标出的词。",
+        support="unsupported",
+        action="needs_review",
+        reason="新增影响范围/受影响对象推测 `涉及` 未被 raw 或 inspected wiki 同句级支撑；请删除该推测。",
+    )
+
+    assert not pipeline_module.open_question_scope_cleanup_claim(claim, item)
+
+
 def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-CONCEPT",
