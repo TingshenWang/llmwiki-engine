@@ -8289,6 +8289,24 @@ def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder()
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
+def test_cleanup_unsupported_example_literals_replaces_user_id_leaf_placeholder() -> None:
+    draft, plan, snapshot = build_examples_grounding_case('- 示例用户参数可以写成 “user123”。')
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert report["changed"] is True
+    assert report["replacements"][0]["replacement"] == "`<user_id>`"
+    assert "`<user_id>`" in cleaned.pages[0].section_bodies["examples"]
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+
+
 def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() -> None:
     draft, plan, snapshot = build_examples_grounding_case('- `recall("张三的工单 1234")`')
     review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
@@ -8411,6 +8429,9 @@ def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> Non
         "user-123 purchased MacBook in 2025",
         "用户 1234 删除了凭证",
         "客户 user123 喜欢蓝色并删除了密码",
+        "Alice uses MacBook in 2026",
+        "Alice visited Beijing in 2025",
+        "张三在2025年使用MacBook",
     ],
 )
 def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal: str) -> None:

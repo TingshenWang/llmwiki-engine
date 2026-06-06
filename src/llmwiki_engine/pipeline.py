@@ -13409,7 +13409,7 @@ def unsupported_example_literal_placeholder(
         return "", "skipped_mixed_fact_literal"
     if memory_query_call_argument_context(body, quote_start):
         return example_angle_placeholder("memory_query", quoted=True), "memory_query_argument_placeholder"
-    if re.search(r"\b(?:user|uid|customer|account)[-_ ]?\d+\b", lowered) or re.search(r"用户\s*\d+", normalized):
+    if looks_like_user_id_literal(normalized):
         return example_angle_placeholder("user_id", quoted=inside_inline_code), "user_id_placeholder"
     if re.search(r"\b(?:api[_-]?key|password|passwd|secret|token)\b", lowered) or any(marker in compact for marker in ["密钥", "密码", "令牌", "凭证"]):
         return example_angle_placeholder("api_key", quoted=inside_inline_code), "secret_placeholder"
@@ -13457,6 +13457,10 @@ def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
         "异常",
         "购买",
         "买了",
+        "使用",
+        "访问",
+        "消费",
+        "下单",
         "删除",
         "退款",
         "付款",
@@ -13475,6 +13479,10 @@ def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
         "敏感",
         "purchased",
         "bought",
+        "uses",
+        "used",
+        "visited",
+        "visit",
         "deleted",
         "delete",
         "completed",
@@ -13497,21 +13505,33 @@ def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def looks_like_user_id_literal(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    return bool(
+        re.fullmatch(r"(?:user|uid|customer|account)[-_ ]?\d+", normalized, re.IGNORECASE)
+        or re.fullmatch(r"(?:用户|客户|账户|账号)\s*\d+", normalized)
+        or re.fullmatch(r"(?:客户|用户)\s+(?:user|uid)[-_ ]?\d+", normalized, re.IGNORECASE)
+    )
+
+
 def looks_like_time_period_literal(text: str) -> bool:
     normalized = unicodedata.normalize("NFKC", text)
+    compact = re.sub(r"\s+", "", normalized)
     return bool(
-        re.search(r"\b(?:19|20)\d{2}\b", normalized)
-        or re.search(r"(?:第?[一二三四1234]季度|Q[1-4]|quarter|季度|上半年|下半年|月份|\d{1,2}月|\d{1,2}日)", normalized, re.IGNORECASE)
+        re.fullmatch(r"(?:19|20)\d{2}(?:年)?", compact)
+        or re.fullmatch(r"(?:19|20)\d{2}年(?:第?[一二三四1234]季度|[一二三四1234]季度|上半年|下半年|\d{1,2}月(?:\d{1,2}日)?)", compact)
+        or re.fullmatch(r"(?:第?[一二三四1234]季度|[一二三四1234]季度|Q[1-4]|上半年|下半年|\d{1,2}月(?:\d{1,2}日)?)", compact, re.IGNORECASE)
+        or re.fullmatch(r"(?:Q[1-4]|quarter\s*[1-4])\s*(?:19|20)\d{2}", normalized, re.IGNORECASE)
+        or re.fullmatch(r"(?:19|20)\d{2}\s*(?:Q[1-4]|quarter\s*[1-4])", normalized, re.IGNORECASE)
     )
 
 
 def looks_like_example_identifier_literal(text: str) -> bool:
     normalized = unicodedata.normalize("NFKC", text)
-    lowered = normalized.lower()
     return bool(
-        re.search(r"\b[A-Z]{2,}[-_]?\d+[A-Z0-9_-]*\b", normalized)
-        or re.search(r"\b(?:order|ticket|issue|build|case|status)[-_ #:]?\d+\b", lowered)
-        or re.search(r"(?:订单|工单|编号|流水|交易|构建|版本|状态)\s*[A-Za-z0-9_-]*\d+", normalized)
+        re.fullmatch(r"[A-Z]{2,}[-_]?\d+[A-Z0-9_-]*", normalized)
+        or re.fullmatch(r"(?:ticket|issue|case)[-_ #:]?\d+", normalized, re.IGNORECASE)
+        or re.fullmatch(r"(?:编号|工单)\s*[A-Za-z0-9_-]*\d+", normalized)
     )
 
 
