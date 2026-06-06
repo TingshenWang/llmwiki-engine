@@ -6271,6 +6271,51 @@ def test_draft_rendering_batch_refs_include_open_question_cleanup_schema(tmp_pat
     assert cleanup_ref.schema_version == "open_question_grounding_cleanup_report.v1"
 
 
+def test_draft_rendering_refs_include_example_cleanup_schema(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    step_root = run_dir / "draft_rendering"
+    report_path = step_root / "example_concrete_cleanup_report.json"
+    report_path.parent.mkdir(parents=True)
+    write_json(
+        report_path,
+        {
+            "schema_version": "example_concrete_cleanup_report.v1",
+            "changed": False,
+            "replacement_count": 0,
+            "skipped_count": 0,
+            "replacements": [],
+            "skipped": [],
+        },
+    )
+
+    ref = pipeline_module._draft_rendering_ref(run_dir, report_path, "draft_rendering")
+
+    assert ref.schema_version == "example_concrete_cleanup_report.v1"
+
+
+def test_draft_rendering_batch_refs_include_example_cleanup_schema(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    step_root = run_dir / "draft_rendering"
+    report_path = step_root / "model_batches" / "batch-001" / "example_concrete_cleanup_report.json"
+    report_path.parent.mkdir(parents=True)
+    write_json(
+        report_path,
+        {
+            "schema_version": "example_concrete_cleanup_report.v1",
+            "changed": False,
+            "replacement_count": 0,
+            "skipped_count": 0,
+            "replacements": [],
+            "skipped": [],
+        },
+    )
+
+    refs = pipeline_module.draft_rendering_model_batch_refs(run_dir, step_root, "draft_rendering")
+    cleanup_ref = next(ref for ref in refs if ref.relative_path.endswith("example_concrete_cleanup_report.json"))
+
+    assert cleanup_ref.schema_version == "example_concrete_cleanup_report.v1"
+
+
 def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> None:
     merge_plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
@@ -8060,7 +8105,11 @@ def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts()
     assert {claim.claim_type for claim in review.claims} == {"inference"}
 
 
-def build_examples_grounding_review(examples: str) -> pipeline_module.DraftGroundingReview:
+def build_examples_grounding_case(
+    examples: str,
+    *,
+    detail: str = "这个页面说明例子 grounding。",
+) -> tuple[pipeline_module.DraftRenderingArtifact, pipeline_module.WikiMergePlanArtifact, pipeline_module.WikiContextSnapshot]:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-EXAMPLES",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -8080,7 +8129,7 @@ def build_examples_grounding_review(examples: str) -> pipeline_module.DraftGroun
                 canonical_target_path="concepts/Concept_Examples.md",
                 section_bodies={
                     "summary": "例子页。",
-                    "detail": "这个页面说明例子 grounding。",
+                    "detail": detail,
                     "examples": examples,
                 },
                 change_summary="创建例子页。",
@@ -8100,9 +8149,15 @@ def build_examples_grounding_review(examples: str) -> pipeline_module.DraftGroun
             )
         ],
     )
+    plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item])
+    return draft, plan, snapshot
+
+
+def build_examples_grounding_review(examples: str) -> pipeline_module.DraftGroundingReview:
+    draft, plan, snapshot = build_examples_grounding_case(examples)
     return pipeline_module.build_draft_grounding_review(
         draft,
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        plan,
         snapshot,
         "",
     )
@@ -8117,10 +8172,142 @@ def test_grounding_examples_allow_abstract_placeholder_quotes() -> None:
 
 
 def test_grounding_examples_allow_user_preference_placeholder() -> None:
-    review = build_examples_grounding_review("- “用户偏好 X”")
+    review = build_examples_grounding_review("- “用户偏好 X”\n- “<example_id>”\n- “<time_period>”")
 
     assert review.requires_review is False
-    assert [claim.text for claim in review.claims] == ["用户偏好 X"]
+    assert [claim.text for claim in review.claims] == ["用户偏好 X", "<example_id>", "<time_period>"]
+
+
+def test_cleanup_unsupported_example_literals_replaces_identifier_placeholder() -> None:
+    draft, plan, snapshot = build_examples_grounding_case("- 例如可以用 “ABC123” 表示一个构建编号。")
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
+
+    assert review_before.requires_review is True
+    assert [claim.text for claim in review_before.unsupported_new_facts] == ["ABC123"]
+    assert report["changed"] is True
+    assert report["replacement_count"] == 1
+    assert report["replacements"][0]["replacement"] == "`<example_id>`"
+    assert "`<example_id>`" in cleaned.pages[0].section_bodies["examples"]
+    assert not review_after.requires_review
+
+
+def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder() -> None:
+    draft, plan, snapshot = build_examples_grounding_case("- 例子里的时间可以写成 “2025年第三季度”。")
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert report["changed"] is True
+    assert report["replacements"][0]["replacement"] == "`<time_period>`"
+    assert "`<time_period>`" in cleaned.pages[0].section_bodies["examples"]
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+
+
+def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() -> None:
+    draft, plan, snapshot = build_examples_grounding_case('- `recall("张三的工单 1234")`')
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert report["changed"] is True
+    assert report["replacements"][0]["replacement"] == '"<memory_query>"'
+    assert '`recall("<memory_query>")`' in cleaned.pages[0].section_bodies["examples"]
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+
+
+def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
+    draft, plan, snapshot = build_examples_grounding_case(
+        "- 例子区没有具体值。",
+        detail="详情里出现 “ABC123” 时仍应交给 grounding review。",
+    )
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["skipped_count"] == 0
+    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+
+
+def test_cleanup_unsupported_example_literals_keeps_source_supported_literal() -> None:
+    draft, plan, snapshot = build_examples_grounding_case("- 来源里的构建编号是 “ABC123”。")
+    approved_raw = "本段来源明确提到构建编号 ABC123。"
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        approved_raw,
+        review=review_before,
+    )
+
+    assert review_before.requires_review is False
+    assert cleaned == draft
+    assert report["changed"] is False
+
+
+def test_cleanup_unsupported_example_literals_skips_repeated_literals() -> None:
+    draft, plan, snapshot = build_examples_grounding_case("- “ABC123” 和 “ABC123” 都是具体构建编号。")
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert {item["reason"] for item in report["skipped"]} == {"skipped_ambiguous_repeated_quoted_literal"}
+
+
+def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> None:
+    draft, plan, snapshot = build_examples_grounding_case("- “销量增长三倍” 不是安全的示例占位符。")
+    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+        draft,
+        plan,
+        snapshot,
+        "",
+        review=review_before,
+    )
+
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["skipped"][0]["reason"] == "skipped_metric_or_outcome_fact"
+    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 def test_grounding_examples_allow_abstract_memory_query_literals() -> None:

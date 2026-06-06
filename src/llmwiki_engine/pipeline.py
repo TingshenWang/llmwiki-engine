@@ -4909,6 +4909,59 @@ def render_open_question_grounding_cleanup_report(report: dict[str, Any]) -> str
     return "\n".join(sections)
 
 
+def render_example_concrete_cleanup_report(report: dict[str, Any]) -> str:
+    replacement_rows: list[list[Any]] = []
+    skipped_rows: list[list[Any]] = []
+    for item in report.get("replacements", []):
+        if not isinstance(item, dict):
+            continue
+        replacement_rows.append(
+            [
+                item.get("page_plan_id", ""),
+                item.get("target_path", ""),
+                item.get("original", ""),
+                item.get("replacement", ""),
+                item.get("reason", ""),
+            ]
+        )
+    for item in report.get("skipped", []):
+        if not isinstance(item, dict):
+            continue
+        skipped_rows.append(
+            [
+                item.get("page_plan_id", ""),
+                item.get("target_path", ""),
+                item.get("text", ""),
+                item.get("reason", ""),
+            ]
+        )
+    sections = [
+        "# Example Concrete Cleanup Report",
+        "",
+        f"- Changed: `{str(bool(report.get('changed'))).lower()}`",
+        f"- Replacements: `{report.get('replacement_count', 0)}`",
+        f"- Skipped: `{report.get('skipped_count', 0)}`",
+        "",
+        "## Replacements",
+        "",
+        (
+            format_markdown_table(["页面计划", "目标", "原具体值", "替换为", "原因"], replacement_rows)
+            if replacement_rows
+            else "_无需替换。_"
+        ),
+        "",
+        "## Skipped",
+        "",
+        (
+            format_markdown_table(["页面计划", "目标", "文本", "跳过原因"], skipped_rows)
+            if skipped_rows
+            else "_无跳过项。_"
+        ),
+        "",
+    ]
+    return "\n".join(sections)
+
+
 def render_update_preservation_pack_markdown(pack: dict[str, Any]) -> str:
     rows: list[list[Any]] = []
     for page in pack.get("pages", []):
@@ -5018,6 +5071,8 @@ def run_draft_rendering_model(
         reinforcement_report = read_json(reinforcement_path) if reinforcement_path.exists() else {}
         grounding_rewrite_path = job["batch_dir"] / "grounding_paraphrase_rewrite_report.json"
         grounding_rewrite_report = read_json(grounding_rewrite_path) if grounding_rewrite_path.exists() else {}
+        example_cleanup_path = job["batch_dir"] / "example_concrete_cleanup_report.json"
+        example_cleanup_report = read_json(example_cleanup_path) if example_cleanup_path.exists() else {}
         batch_payload_char_count = provider_results_payload_char_count(
             [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
         )
@@ -5054,6 +5109,12 @@ def run_draft_rendering_model(
                     else ""
                 ),
                 "grounding_rewrite_count": int(grounding_rewrite_report.get("rewrite_count", 0)),
+                "example_concrete_cleanup_report_ref": (
+                    f"model_batches/{batch_id}/example_concrete_cleanup_report.json"
+                    if example_cleanup_path.exists()
+                    else ""
+                ),
+                "example_concrete_replacement_count": int(example_cleanup_report.get("replacement_count", 0)),
                 "schema_valid": result.schema_valid,
             },
         }
@@ -5450,6 +5511,15 @@ def extract_valid_partial_draft_rendering(
         return None
     candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(candidate, approved_prepared_text)
     grounding_review = build_draft_grounding_review(candidate, partial_plan, snapshot, approved_prepared_text)
+    candidate, example_cleanup_report = cleanup_unsupported_example_literals(
+        candidate,
+        partial_plan,
+        snapshot,
+        approved_prepared_text,
+        review=grounding_review,
+    )
+    if example_cleanup_report.get("changed"):
+        grounding_review = build_draft_grounding_review(candidate, partial_plan, snapshot, approved_prepared_text)
     if grounding_review.requires_review:
         return None
     return candidate
@@ -5536,6 +5606,15 @@ def run_single_draft_rendering_model_call(
             approved_prepared_text,
         )
         grounding_review = build_draft_grounding_review(cleaned_candidate, merge_plan, snapshot, approved_prepared_text)
+        cleaned_candidate, _example_cleanup_report = cleanup_unsupported_example_literals(
+            cleaned_candidate,
+            merge_plan,
+            snapshot,
+            approved_prepared_text,
+            review=grounding_review,
+        )
+        if _example_cleanup_report.get("changed"):
+            grounding_review = build_draft_grounding_review(cleaned_candidate, merge_plan, snapshot, approved_prepared_text)
         if grounding_review.requires_review:
             repair_issues.extend(
                 [
@@ -5647,6 +5726,22 @@ def run_single_draft_rendering_model_call(
     write_json(open_question_cleanup_path, redacted_open_question_cleanup_report)
     open_question_cleanup_md.write_text(
         render_open_question_grounding_cleanup_report(redacted_open_question_cleanup_report),
+        encoding="utf-8",
+    )
+    grounding_review = build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
+    draft_artifact, example_cleanup_report = cleanup_unsupported_example_literals(
+        draft_artifact,
+        merge_plan,
+        snapshot,
+        approved_prepared_text,
+        review=grounding_review,
+    )
+    example_cleanup_path = output_dir / "example_concrete_cleanup_report.json"
+    example_cleanup_md = output_dir / "example_concrete_cleanup_report.md"
+    redacted_example_cleanup_report = ctx.execution_context.redactor.redact(example_cleanup_report)
+    write_json(example_cleanup_path, redacted_example_cleanup_report)
+    example_cleanup_md.write_text(
+        render_example_concrete_cleanup_report(redacted_example_cleanup_report),
         encoding="utf-8",
     )
     return draft_artifact
@@ -6259,6 +6354,7 @@ def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
             f"{int(batch.get('payload_char_count', 0)):,}",
             str(batch.get("reinforced_section_count", 0)),
             str(batch.get("grounding_rewrite_count", 0)),
+            str(batch.get("example_concrete_replacement_count", 0)),
         ]
         for batch in report["batches"]
     ]
@@ -6283,6 +6379,7 @@ def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
                 "Payload Chars",
                 "Reinforced Sections",
                 "Grounding Rewrites",
+                "Example Replacements",
             ],
             rows,
         )
@@ -6370,6 +6467,8 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         step_root / "grounding_paraphrase_rewrite_report.md",
         step_root / "open_question_grounding_cleanup_report.json",
         step_root / "open_question_grounding_cleanup_report.md",
+        step_root / "example_concrete_cleanup_report.json",
+        step_root / "example_concrete_cleanup_report.md",
     ]:
         if digest_projection_sidecar.exists():
             outputs.append(digest_projection_sidecar)
@@ -8904,6 +9003,8 @@ def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: 
             schema = "grounding_paraphrase_rewrite_report.v1"
         elif path.name == "open_question_grounding_cleanup_report.json":
             schema = "open_question_grounding_cleanup_report.v1"
+        elif path.name == "example_concrete_cleanup_report.json":
+            schema = "example_concrete_cleanup_report.v1"
         elif path.name == "draft_digest_projection_report.json":
             schema = "source_digest_projection_report.v1"
         elif path.name == "draft_merge_plan_projection_report.json":
@@ -8931,6 +9032,7 @@ def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactR
         "update_preservation_reinforcement_report.json": "update_preservation_reinforcement_report.v1",
         "grounding_paraphrase_rewrite_report.json": "grounding_paraphrase_rewrite_report.v1",
         "open_question_grounding_cleanup_report.json": "open_question_grounding_cleanup_report.v1",
+        "example_concrete_cleanup_report.json": "example_concrete_cleanup_report.v1",
         "draft_digest_projection_report.json": "source_digest_projection_report.v1",
         "draft_merge_plan_projection_report.json": "draft_merge_plan_projection_report.v1",
         "draft_context_projection_report.json": "draft_context_projection_report.v1",
@@ -12722,11 +12824,13 @@ def examples_abstract_placeholder_quote(normalized: str, original: str = "") -> 
         "某些偏好",
         "用户偏好X",
         "user_id",
+        "example_id",
+        "time_period",
         "memory",
     ]
     lowered_original = original.lower()
     has_placeholder = any(marker in normalized for marker in placeholder_markers) or any(
-        marker in lowered_original for marker in ["user_id", "memory"]
+        marker in lowered_original for marker in ["user_id", "example_id", "time_period", "memory"]
     )
     if not has_placeholder:
         return False
@@ -13162,6 +13266,266 @@ def cleanup_open_question_unsupported_scope_claims(
     if relocation_count == 0:
         return artifact, report
     return artifact.model_copy(update={"pages": rewritten_pages}), report
+
+
+def cleanup_unsupported_example_literals(
+    artifact: DraftRenderingArtifact,
+    plan: WikiMergePlanArtifact,
+    snapshot: WikiContextSnapshot,
+    approved_raw_text: str,
+    *,
+    review: DraftGroundingReview | None = None,
+) -> tuple[DraftRenderingArtifact, dict[str, Any]]:
+    active_review = review or build_draft_grounding_review(artifact, plan, snapshot, approved_raw_text)
+    claims_by_page_id: dict[str, list[GroundingClaim]] = {}
+    for claim in active_review.unsupported_new_facts:
+        if unsupported_example_literal_cleanup_claim(claim):
+            claims_by_page_id.setdefault(claim.page_plan_id, []).append(claim)
+
+    rewritten_pages: list[DraftPageItem] = []
+    replacements: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for page in artifact.pages:
+        page_claims = claims_by_page_id.get(page.page_plan_id)
+        if not page_claims:
+            rewritten_pages.append(page)
+            continue
+        section_bodies = dict(page.section_bodies)
+        examples_body = section_bodies.get("examples", "")
+        updated_body = examples_body
+        changed = False
+        for claim in page_claims:
+            updated_body, result = replace_unsupported_example_literal_once(updated_body, claim.text)
+            result.update(
+                {
+                    "page_plan_id": page.page_plan_id,
+                    "target_path": page.canonical_target_path,
+                    "section_key": "examples",
+                    "claim_reason": claim.reason,
+                }
+            )
+            if result.get("status") == "replaced":
+                changed = True
+                replacements.append(result)
+            else:
+                skipped.append(result)
+        if changed:
+            section_bodies["examples"] = updated_body
+            rewritten_pages.append(page.model_copy(update={"section_bodies": section_bodies}))
+        else:
+            rewritten_pages.append(page)
+    report = {
+        "schema_version": "example_concrete_cleanup_report.v1",
+        "changed": bool(replacements),
+        "replacement_count": len(replacements),
+        "skipped_count": len(skipped),
+        "replacements": replacements,
+        "skipped": skipped,
+    }
+    if not replacements:
+        return artifact, report
+    return artifact.model_copy(update={"pages": rewritten_pages}), report
+
+
+def unsupported_example_literal_cleanup_claim(claim: GroundingClaim) -> bool:
+    return bool(
+        claim.section_key == "examples"
+        and claim.support == "unsupported"
+        and claim.action == "needs_review"
+        and "直接引用必须在 raw 或已有 wiki 中 exact match" in claim.reason
+    )
+
+
+def replace_unsupported_example_literal_once(body: str, text: str) -> tuple[str, dict[str, Any]]:
+    if not text:
+        return body, example_literal_skip_result(text, "skipped_empty_text")
+    matches = grounding_quoted_literal_occurrences(body, text)
+    if not matches:
+        return body, example_literal_skip_result(text, "skipped_missing_exact_quoted_literal")
+    if len(matches) != 1:
+        return body, example_literal_skip_result(text, "skipped_ambiguous_repeated_quoted_literal")
+    quote_start, quoted_text = matches[0]
+    if strict_direct_quote_context(body, quote_start=quote_start) or attributed_quote_context(body, quote_start=quote_start):
+        return body, example_literal_skip_result(text, "skipped_attributed_or_direct_quote_context")
+    if position_inside_fenced_code_block(body, quote_start):
+        return body, example_literal_skip_result(text, "skipped_inside_fenced_code")
+    replacement, reason = unsupported_example_literal_placeholder(text, body, quote_start)
+    if not replacement:
+        return body, example_literal_skip_result(text, reason or "skipped_no_safe_placeholder")
+    updated = body[:quote_start] + replacement + body[quote_start + len(quoted_text) :]
+    return (
+        updated,
+        {
+            "status": "replaced",
+            "text": text,
+            "original": text,
+            "replacement": replacement,
+            "reason": reason,
+        },
+    )
+
+
+def grounding_quoted_literal_occurrences(body: str, quote: str) -> list[tuple[int, str]]:
+    matches: list[tuple[int, str]] = []
+    for quoted_text in [f"“{quote}”", f'"{quote}"']:
+        start = 0
+        while True:
+            found = body.find(quoted_text, start)
+            if found < 0:
+                break
+            matches.append((found, quoted_text))
+            start = found + len(quoted_text)
+    return sorted(matches, key=lambda item: item[0])
+
+
+def example_literal_skip_result(text: str, reason: str) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "text": text,
+        "original": text,
+        "replacement": "",
+        "reason": reason,
+    }
+
+
+def unsupported_example_literal_placeholder(text: str, body: str, quote_start: int) -> tuple[str, str]:
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    compact = re.sub(r"\s+", "", normalized)
+    lowered = normalized.lower()
+    if memory_query_call_argument_context(body, quote_start):
+        return '"<memory_query>"', "memory_query_argument_placeholder"
+    if re.search(r"\b(?:user|uid|customer|account)[-_ ]?\d+\b", lowered) or re.search(r"用户\s*\d+", normalized):
+        return "`<user_id>`", "user_id_placeholder"
+    if re.search(r"\b(?:api[_-]?key|password|passwd|secret|token)\b", lowered) or any(marker in compact for marker in ["密钥", "密码", "令牌", "凭证"]):
+        return "`<api_key>`", "secret_placeholder"
+    if looks_like_time_period_literal(normalized):
+        return "`<time_period>`", "time_period_placeholder"
+    if looks_like_example_identifier_literal(normalized):
+        return "`<example_id>`", "example_id_placeholder"
+    if looks_like_metric_or_outcome_literal(compact):
+        return "", "skipped_metric_or_outcome_fact"
+    if looks_like_user_preference_literal(normalized):
+        return "用户偏好 X", "user_preference_placeholder"
+    if looks_like_location_consumption_literal(normalized):
+        return "某个用户在某个地点消费过", "location_consumption_placeholder"
+    if looks_like_product_usage_literal(normalized):
+        return "某个用户使用某类产品", "product_usage_placeholder"
+    return "", "skipped_no_safe_placeholder"
+
+
+def looks_like_time_period_literal(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text)
+    return bool(
+        re.search(r"\b(?:19|20)\d{2}\b", normalized)
+        or re.search(r"(?:第?[一二三四1234]季度|Q[1-4]|quarter|季度|上半年|下半年|月份|\d{1,2}月|\d{1,2}日)", normalized, re.IGNORECASE)
+    )
+
+
+def looks_like_example_identifier_literal(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text)
+    lowered = normalized.lower()
+    return bool(
+        re.search(r"\b[A-Z]{2,}[-_]?\d+[A-Z0-9_-]*\b", normalized)
+        or re.search(r"\b(?:order|ticket|issue|build|case|status)[-_ #:]?\d+\b", lowered)
+        or re.search(r"(?:订单|工单|编号|流水|交易|构建|版本|状态)\s*[A-Za-z0-9_-]*\d+", normalized)
+    )
+
+
+def looks_like_metric_or_outcome_literal(compact: str) -> bool:
+    if not compact:
+        return False
+    metric_markers = [
+        "增长",
+        "下降",
+        "增加",
+        "减少",
+        "降低",
+        "提升",
+        "裁撤",
+        "裁员",
+        "超过",
+        "达到",
+        "销量",
+        "收入",
+        "预算",
+        "市场份额",
+        "三倍",
+        "两倍",
+        "一半",
+        "百万",
+        "千万",
+        "上亿",
+    ]
+    return any(marker in compact for marker in metric_markers)
+
+
+def looks_like_user_preference_literal(text: str) -> bool:
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    preference_markers = ["喜欢", "偏好", "喜好", "爱好", "likes", "prefers", "preference"]
+    concrete_preference_markers = [
+        "蓝色",
+        "红色",
+        "绿色",
+        "黄色",
+        "紫色",
+        "咖啡",
+        "电影",
+        "文章",
+        "coffee",
+        "movie",
+        "movies",
+        "article",
+        "articles",
+    ]
+    return any(marker in lowered for marker in preference_markers) and any(
+        marker in lowered for marker in concrete_preference_markers
+    )
+
+
+def looks_like_location_consumption_literal(text: str) -> bool:
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    location_markers = ["北京", "南京", "上海", "深圳", "广州", "成都", "门店", "星巴克", "starbucks"]
+    activity_markers = ["消费", "购买", "下单", "visited", "bought", "purchased"]
+    return any(marker in lowered for marker in location_markers) and any(marker in lowered for marker in activity_markers)
+
+
+def looks_like_product_usage_literal(text: str) -> bool:
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    product_markers = [
+        "macbook",
+        "iphone",
+        "xps",
+        "华为",
+        "小米",
+        "苹果",
+        "oppo",
+        "电脑",
+        "手机",
+        "产品",
+    ]
+    action_markers = ["购买", "使用", "买了", "uses", "bought", "purchased"]
+    return any(marker in lowered for marker in product_markers) and any(marker in lowered for marker in action_markers)
+
+
+def position_inside_fenced_code_block(text: str, position: int) -> bool:
+    fence_char = ""
+    fence_length = 0
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        line_end = cursor + len(line)
+        stripped_newline = line.rstrip("\r\n")
+        if position < line_end:
+            return bool(fence_char)
+        if fence_char:
+            if closing_fence_line(stripped_newline, fence_char, fence_length):
+                fence_char = ""
+                fence_length = 0
+        elif match := opening_fence_line(stripped_newline):
+            marker = match.group("marker")
+            fence_char = marker[0]
+            fence_length = len(marker)
+        cursor = line_end
+    return bool(fence_char and position >= cursor)
 
 
 def open_question_scope_cleanup_claim(claim: GroundingClaim, item: WikiMergePlanItem | None) -> bool:
