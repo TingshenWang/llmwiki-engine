@@ -8577,6 +8577,45 @@ def test_grounding_detail_memory_examples_sensitive_dynamic_queries_do_not_bypas
     assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "例如，在 AI 代理的客服场景中，用户反复询问与某个订单状态相关的相似问题时，语义缓存可识别语义相似性。",
+        "例如，在 Redis 语义缓存场景中，用户反复询问与某个订单状态相关的相似问题时，语义缓存可复用回答。",
+        "例如，Redis 语义缓存可以帮助客服处理用户想修改那个订单的地址的请求。",
+        "例如，客服排查用户登录问题时会查询登录状态。",
+        "例如，API 场景中用户反复询问某个订单状态。",
+        "例如，客服接口场景中用户想修改那个订单的地址。",
+        "例如，参数配置场景中客户查询订单信息。",
+        "例如，API 场景中用户查看某个订单状态。",
+        "例如，接口场景中客户获取订单信息。",
+        "例如，参数配置场景中用户搜索订单状态。",
+        "例如，客服 API 中客户申请订单退款。",
+        "In a Redis semantic cache scenario, a user asks about order status repeatedly.",
+        "In an API scenario, a user asks about order status repeatedly.",
+        "In an API scenario, a user checks order status.",
+        "In a support API scenario, a customer looks up order details.",
+        "场景：用户想修改那个订单的地址，代理需要关联长期记忆。",
+        "在连续对话场景中，假设用户先询问某个过去的订单信息，随后用户说修改那个订单的地址。",
+    ],
+)
+def test_grounding_detail_unquoted_dynamic_user_scenarios_require_review(detail: str) -> None:
+    draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert "无来源动态用户场景" in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_examples_unquoted_dynamic_user_scenario_requires_review() -> None:
+    review = build_examples_grounding_review("例如用户反复询问与某个订单状态相关的相似问题。")
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert "无来源动态用户场景" in review.unsupported_new_facts[0].reason
+
+
 def test_grounding_sensitive_dynamic_query_passes_when_source_supported() -> None:
     draft, plan, snapshot = build_examples_grounding_case(
         "暂无相关例子记录。",
@@ -8608,6 +8647,15 @@ def test_grounding_sensitive_dynamic_query_short_quote_passes_when_source_suppor
     assert any(claim.text == raw and claim.support == "raw" for claim in review.claims)
 
 
+def test_grounding_unquoted_dynamic_user_scenario_passes_when_source_supported() -> None:
+    detail = "例如，在 AI 代理的客服场景中，用户反复询问与某个订单状态相关的相似问题时，语义缓存可识别语义相似性。"
+    draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, detail)
+
+    assert review.requires_review is False
+    assert any(claim.text == detail and claim.support == "raw" for claim in review.claims)
+
+
 def test_grounding_examples_still_allow_safe_technical_query_template_after_sensitive_guard() -> None:
     review = build_examples_grounding_review("类似“Redis 地址配置方法”的请求")
 
@@ -8634,10 +8682,38 @@ def test_grounding_examples_still_allow_safe_technical_query_template_after_sens
         '技术排障示例可以写成"login configuration"。',
         '技术排障示例可以写成"sign-in configuration"。',
         '技术排障示例可以写成"log-in configuration"。',
+        "例如，Redis 配置问题可以通过文档排查。",
+        "订单状态字段用于排序。",
+        "订单状态 schema 示例用于说明字段。",
+        "服务会缓存订单状态字段。",
+        "订单状态 API 示例用于说明接口。",
+        "OAuth 回调接口说明包含订单状态参数。",
+        "Redis 数据库字段 order_status 用于缓存订单状态。",
+        "用户字段 API 参数说明包含 user_id。",
+        "API docs show order status lookup parameters.",
+        "payment API parameter describes refund status.",
     ],
 )
 def test_grounding_detail_allows_safe_technical_troubleshooting_queries(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+
+
+def test_grounding_unquoted_dynamic_scenario_scanner_ignores_quoted_claims() -> None:
+    review = build_examples_grounding_review("例如“查看某个用户的账户余额”这类问题。")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["查看某个用户的账户余额"]
+
+
+def test_grounding_unquoted_dynamic_scenario_scanner_ignores_open_questions_section() -> None:
+    draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    page = draft.pages[0]
+    section_bodies = dict(page.section_bodies)
+    section_bodies["open_questions"] = "- 待补来源：用户订单状态场景是否适合语义缓存？"
+    draft = draft.model_copy(update={"pages": [page.model_copy(update={"section_bodies": section_bodies})]})
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False

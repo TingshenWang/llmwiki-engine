@@ -5826,6 +5826,7 @@ def build_draft_rendering_payload(
                 "Across all section_bodies, do not fabricate example values such as `张三`, `Alice`, `user-123`, `user123`, concrete user preferences, dates, plans, metrics, credentials, or IDs unless exact source/wiki support exists; use placeholders such as `<user_id>`, `<memory_text>`, `<memory_query>`, `某个用户`, or `用户偏好 X`.",
                 "In section_bodies.examples, do not invent concrete user facts, user ids, preferences, dates, plans, metrics, credentials, or command arguments unless exact source text supports them; for generic explanation, use abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
                 "Do not invent sensitive or dynamic user-support query examples such as account balance, password reset, payment/refund, order/ticket status, login/session, credentials, API keys, tokens, cookies, phone, email, address, or profile lookups unless exact source/wiki support exists; use neutral placeholders such as `<dynamic_user_query>` or `<support_query>`, or use source-backed technical queries.",
+                "Do not evade sensitive/dynamic query checks by turning a rejected quoted query into an unquoted hypothetical user-support scenario about orders, payments, login, account data, credentials, or contact/profile data.",
                 "For CLI/API/code examples, Chinese surrounding explanation is fine, but command/API literal arguments are an explicit exception to the zh-CN translation rule: they must either copy exact source literals or use placeholders such as `<memory_text>`, `<user_id>`, or `<memory_query>`; do not translate a source literal into a new concrete preference, user id, query, path, or command argument.",
                 "When the source only states a recommendation or best practice, do not invent causal outcomes with terms such as `导致`, `造成`, `影响到`, or `用户会...`; either state the source-backed boundary without a new consequence, or move the consequence to open_questions as 待补来源.",
                 *DRAFT_RENDERING_GROUNDING_RISK_RULES,
@@ -12287,6 +12288,159 @@ def plausible_ascii_open_quote(body: str, quote_start: int) -> bool:
     return previous.isspace() or previous in "([{<（【《:：,，;；.。!！?？\n\r\t-—"
 
 
+UNQUOTED_DYNAMIC_SCENARIO_SECTIONS = {"detail", "examples", "additional_notes"}
+
+
+def unquoted_dynamic_sensitive_scenario_marker(text: str, *, section_key: str, page_type: str) -> str | None:
+    if section_key == "open_questions":
+        return None
+    if section_key not in UNQUOTED_DYNAMIC_SCENARIO_SECTIONS:
+        return None
+    scan_text = remove_grounding_quote_spans_for_scan(text)
+    if not unquoted_dynamic_scenario_context(scan_text, section_key=section_key, page_type=page_type):
+        return None
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", scan_text))
+    marker = dynamic_sensitive_query_marker_text(compact, scan_text)
+    if not marker:
+        marker = unquoted_dynamic_sensitive_extra_marker(compact, scan_text)
+    if not marker:
+        return None
+    if unquoted_dynamic_scenario_technical_field_context(scan_text) and not unquoted_dynamic_user_action_context(scan_text):
+        return None
+    return marker
+
+
+def remove_grounding_quote_spans_for_scan(text: str) -> str:
+    if not text:
+        return text
+    chars = list(text)
+    for quote, quote_start in iter_grounding_quote_spans(text):
+        quote_end = min(len(chars), quote_start + len(quote) + 2)
+        for index in range(max(0, quote_start), quote_end):
+            chars[index] = " "
+    return "".join(chars)
+
+
+def unquoted_dynamic_scenario_context(text: str, *, section_key: str, page_type: str) -> bool:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    context_markers = [
+        "例如",
+        "比如",
+        "示例",
+        "例子",
+        "场景",
+        "假设",
+        "用户",
+        "客户",
+        "客服",
+        "问题",
+        "查询",
+        "请求",
+        "询问",
+        "反复",
+    ]
+    if any(marker in compact for marker in context_markers):
+        return True
+    if page_type == "open_question" and section_key in {"detail", "examples"}:
+        if any(marker in compact for marker in ["如果", "是否", "如何"]):
+            return True
+    return bool(re.search(r"\b(?:example|scenario|user|customer|support|question|query|request|asks?|asked)\b", lowered))
+
+
+def unquoted_dynamic_scenario_technical_field_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    technical_markers = [
+        "字段",
+        "schema",
+        "Schema",
+        "表结构",
+        "数据表",
+        "列名",
+        "配置项",
+        "配置文件",
+        "配置问题",
+        "接口",
+        "端点",
+        "路由",
+        "参数",
+    ]
+    if any(marker in compact for marker in technical_markers):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:schema|field|column|config|configuration|api|endpoint|route|service account)\b",
+            lowered,
+        )
+    )
+
+
+def unquoted_dynamic_user_action_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    user_markers = ["用户", "客户", "客服", "某个用户", "某个客户"]
+    action_markers = [
+        "询问",
+        "查询",
+        "请求",
+        "修改",
+        "更改",
+        "更新",
+        "处理",
+        "反复",
+        "想",
+        "需要",
+        "查看",
+        "获取",
+        "读取",
+        "搜索",
+        "查找",
+        "检查",
+        "申请",
+        "取消",
+        "退款",
+        "支付",
+        "付款",
+    ]
+    if any(marker in compact for marker in user_markers) and any(marker in compact for marker in action_markers):
+        return True
+    return bool(
+        re.search(r"\b(?:user|customer|support)\b", lowered)
+        and re.search(
+            r"\b(?:asks?|asked|asking|quer(?:y|ies|ied|ying)|requests?|requested|requesting|"
+            r"changes?|changed|changing|updates?|updated|updating|modif(?:y|ies|ied|ying)|"
+            r"handles?|handled|handling|checks?|checked|checking|views?|viewed|viewing|"
+            r"looks?\s+up|looked\s+up|looking\s+up|lookups?|gets?|got|getting|"
+            r"finds?|found|finding|search(?:es|ed|ing)?|cancels?|cancelled|canceled|"
+            r"cancelling|canceling|refunds?|refunded|refunding|pays?|paid|paying|payment|repeatedly)\b",
+            lowered,
+        )
+    )
+
+
+def unquoted_dynamic_sensitive_extra_marker(compact: str, original: str = "") -> str | None:
+    patterns = [
+        r"(?:订单|工单|票据).{0,8}(?:信息|详情|内容|地址|收货地址)",
+        r"(?:修改|更改|更新).{0,8}(?:订单|工单|票据).{0,8}(?:地址|收货地址|信息|详情|内容)",
+        r"(?:用户|客户|某个用户|某个客户).{0,12}(?:订单|工单|票据).{0,8}(?:信息|详情|内容|地址|收货地址|状态|进度)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    lowered = unicodedata.normalize("NFKC", original).lower()
+    english_patterns = [
+        r"\b(?:order|ticket|issue)\s+(?:details?|info|information|address|addresses|status|progress)\b",
+        r"\b(?:change|update|modify)\s+(?:the\s+|a\s+)?(?:order|ticket|issue).{0,24}\b(?:address|info|information|details?)\b",
+    ]
+    for pattern in english_patterns:
+        match = re.search(pattern, lowered, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return None
+
+
 def collect_grounding_claims(
     *,
     item: WikiMergePlanItem,
@@ -12445,6 +12599,35 @@ def collect_grounding_claims(
             text = line.strip(" -*")
             if not text or len(text) < 8:
                 continue
+            unquoted_dynamic_marker = unquoted_dynamic_sensitive_scenario_marker(
+                text,
+                section_key=section_key,
+                page_type=item.page_type,
+            )
+            if unquoted_dynamic_marker:
+                unsupported_text = sentence_with_marker(text, unquoted_dynamic_marker)
+                raw_supported = quote_supported_by_text(unsupported_text, approved_raw_text)
+                existing_supported = quote_supported_by_text(unsupported_text, existing_entry.content)
+                supported = raw_supported or existing_supported
+                claims.append(
+                    GroundingClaim(
+                        page_plan_id=page.page_plan_id,
+                        target_path=item.canonical_target_path,
+                        section_key=section_key,
+                        claim_type="new_fact",
+                        text=unsupported_text,
+                        support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
+                        action="kept" if supported else "needs_review",
+                        reason=(
+                            "无引号动态用户场景已在 raw 或已有 wiki 中规范化 exact match。"
+                            if supported
+                            else (
+                                f"无来源动态用户场景 `{unquoted_dynamic_marker}` 未被 raw 或 inspected wiki 同句级支撑；"
+                                "请删除该场景，或改成 `<dynamic_user_query>`、`<support_query>` 这类中性占位符。"
+                            )
+                        ),
+                    )
+                )
             scope_marker = None if section_key == "open_questions" else unsupported_scope_speculation_marker(text)
             if scope_marker:
                 unsupported_text = sentence_with_marker(text, scope_marker)
@@ -13084,10 +13267,14 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
 
 
 def quote_has_dynamic_sensitive_query_marker(normalized: str, original: str = "") -> bool:
+    return dynamic_sensitive_query_marker_text(normalized, original) is not None
+
+
+def dynamic_sensitive_query_marker_text(normalized: str, original: str = "") -> str | None:
     compact = normalized or re.sub(r"\s+", "", original)
     lowered = unicodedata.normalize("NFKC", original).lower()
     if not compact and not lowered:
-        return False
+        return None
     chinese_patterns = [
         r"(?:账户|账号|银行卡|信用卡)?余额",
         r"(?:重置|找回|忘记|忘了|忘掉|修改|更改).{0,6}密码",
@@ -13106,8 +13293,10 @@ def quote_has_dynamic_sensitive_query_marker(normalized: str, original: str = ""
         r"(?:查询|查看|获取|读取|搜索).{0,6}(?:手机号|手机号码|电话号码|邮箱|邮件地址|住址|个人资料|用户资料|客户资料)",
         r"(?:用户|客户|个人|某个用户|某个客户).{0,8}(?:手机号|手机号码|电话号码|邮箱|邮件地址|住址|个人资料|用户资料|客户资料)",
     ]
-    if any(re.search(pattern, compact, re.IGNORECASE) for pattern in chinese_patterns):
-        return True
+    for pattern in chinese_patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match:
+            return match.group(0)
     login_verb_pattern = r"(?:login|log\s+in|log-in|signin|sign\s+in|sign-in)"
     login_outcome_pattern = r"(?:failed|failures?|errors?|issues?|problems?)"
     english_patterns = [
@@ -13123,7 +13312,11 @@ def quote_has_dynamic_sensitive_query_marker(normalized: str, original: str = ""
         r"\b(?:query|lookup|find|get|search)\s+(?:a\s+)?(?:user|users|user's|users'|customer|customers|customer's|customers'|person|persons|person's|persons'|people|people's).{0,24}\b(?:phones?|emails?|addresses?|profiles?)\b",
         r"\b(?:personal\s+data|user\s+data|customer\s+data)\b",
     ]
-    return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in english_patterns)
+    for pattern in english_patterns:
+        match = re.search(pattern, lowered, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return None
 
 
 def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
