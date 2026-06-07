@@ -20,6 +20,9 @@ from llmwiki_engine.manifest import read_manifest
 from llmwiki_engine.models import (
     CandidateResolutionArtifact,
     CandidateResolutionItem,
+    CandidateContextHit,
+    CandidateContextItem,
+    CandidateContextsArtifact,
     DraftRenderingArtifact,
     OperationStatus,
     RawPreparePolicy,
@@ -13534,6 +13537,147 @@ def test_all_create_medium_with_long_generic_reason_still_waits_for_review() -> 
     assert "理由不充分" in reason
 
 
+def test_all_create_medium_generic_old_title_scope_dismissal_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页《持久记忆（Agent Memory）》是 Cloudflare 平台特定页面；"
+            "新页是通用 Agent 记忆系统概念，直接更新旧页会失焦，Related 不够承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_pure_english_memory_old_title_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "The old page is Cloudflare platform-specific; the new page is a generic Agent Memory System concept. "
+            "Updating the old page would blur scope, and Related is not enough for the new structure."
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent Memory System",
+            "canonical_target_path": "concepts/Concept_Agent Memory System.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_Persistent Memory.md",
+                score=0.72,
+                reason="Top inspected context: Persistent Memory",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_rapid_memory_is_not_api_specific() -> None:
+    item = merge_review_create_item(
+        "PP-rapid-memory",
+        strength="medium",
+        why_not_update=(
+            "The old page is platform-specific; the new page is a generic Rapid Memory concept. "
+            "Updating the old page would blur scope, and Related is not enough for the new structure."
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Rapid Memory",
+            "canonical_target_path": "concepts/Concept_Rapid Memory.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_Rapid Memory.md",
+                score=0.72,
+                reason="Top inspected context: Rapid Memory",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_product_specific_old_title_can_auto_pass() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "新页范围是通用 AI Agent 记忆系统；旧页范围是 Mem0 多级记忆实现。"
+            "本轮来源增量来自 Redis 播客，直接更新旧页会让 Mem0 页面失焦，"
+            "只做 Related 不能承载新增例子和价值点。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 记忆系统",
+            "canonical_target_path": "concepts/Concept_AI Agent 记忆系统.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_Mem0 多级记忆实现.md",
+                score=0.70,
+                reason="Top inspected context: Mem0 多级记忆实现",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_agent_only_title_overlap_does_not_force_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-routing",
+        strength="medium",
+        why_not_update=(
+            "新页范围是通用 Agent 路由设计；旧页范围是 Agent 监控指标。"
+            "本轮来源增量来自调度材料，直接更新旧页会混淆指标与路由策略，"
+            "只做 Related 不能承载新增设计步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 路由设计",
+            "canonical_target_path": "designs/Design_Agent 路由设计.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_Agent 监控指标.md",
+                score=0.66,
+                reason="Top inspected context: Agent 监控指标",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
 def test_all_create_medium_with_locally_synthesized_reason_still_waits_for_review() -> None:
     item = merge_review_create_item(
         "PP-1",
@@ -13703,6 +13847,120 @@ def test_wiki_merge_planning_locally_fills_missing_medium_create_reason(tmp_path
     assert saved_manifest.steps[8].status == StepStatus.completed
     assert saved_manifest.steps[9].status == StepStatus.awaiting_review
     assert manifest.status == OperationStatus.awaiting_review
+
+
+def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
+    resolution = CandidateResolutionArtifact(
+        items=[
+            resolution_item(
+                "CAND001",
+                page_type="concept",
+                target_path="concepts/Concept_Agent 记忆系统.md",
+                display_title="Agent 记忆系统",
+            ),
+            resolution_item(
+                "CAND002",
+                page_type="concept",
+                target_path="concepts/Concept_已有更新.md",
+                display_title="已有更新",
+            ),
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-07",
+        source_target_path="sources/Source_Test.md",
+        candidate_contexts=CandidateContextsArtifact(
+            retrieval_backend="exact",
+            items=[
+                CandidateContextItem(
+                    page_plan_id="PP-CAND001",
+                    query="Agent 记忆系统",
+                    hits=[
+                        CandidateContextHit(
+                            page_plan_id="PP-CAND001",
+                            rank=1,
+                            path="concepts/Concept_持久记忆（Agent Memory）.md",
+                            display_title="持久记忆（Agent Memory）",
+                            score=0.72,
+                            score_bucket=72,
+                            strength="medium",
+                            match_basis="embedding",
+                            page_sha256="old-memory",
+                        )
+                    ],
+                ),
+                CandidateContextItem(page_plan_id="PP-CAND002", query="已有更新", hits=[]),
+            ],
+        ),
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Agent 记忆系统.md",
+                expected_state="missing",
+                content="",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_持久记忆（Agent Memory）.md",
+                expected_state="present",
+                preimage_sha256="old-memory",
+                content="# 持久记忆（Agent Memory）\n\n旧页已有通用 Agent memory 概念。\n",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_已有更新.md",
+                expected_state="present",
+                preimage_sha256="old-update",
+                content="# 已有更新\n\n旧页。\n",
+            ),
+        ],
+    )
+    plan = pipeline_module.WikiMergePlanArtifact(
+        log_date="2026-06-07",
+        context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
+        items=[
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-CAND001",
+                source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+                action="create",
+                canonical_target_path="concepts/Concept_Agent 记忆系统.md",
+                display_title="Agent 记忆系统",
+                page_type="concept",
+                why_not_update=(
+                    "旧页《持久记忆（Agent Memory）》是 Cloudflare 平台特定页面；"
+                    "新页是通用 Agent 记忆系统概念，直接更新旧页会失焦，Related 不够承载新增结构。"
+                ),
+                new_understanding="补充 Agent 记忆系统的通用视角。",
+                section_plans={"summary": "摘要。"},
+                reason="模型尝试新建。",
+            ),
+            pipeline_module.WikiMergePlanItem(
+                page_plan_id="PP-CAND002",
+                source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
+                action="update",
+                matched_page="concepts/Concept_已有更新.md",
+                canonical_target_path="concepts/Concept_已有更新.md",
+                display_title="已有更新",
+                page_type="concept",
+                why_create_or_update="补充已有页。",
+                new_understanding="补充已有页。",
+                section_plans={"summary": "摘要。"},
+                reason="模型更新已有页。",
+            ),
+        ],
+    )
+
+    finalized = pipeline_module.finalize_wiki_merge_plan(
+        plan,
+        resolution,
+        snapshot,
+        "wiki_context_snapshot/wiki_context_snapshot.json",
+    )
+
+    create_item = finalized.items[0]
+    assert create_item.action == "needs_human_decision"
+    assert create_item.apply_eligibility == "blocked"
+    assert "旧页标题《持久记忆（Agent Memory）》像通用概念页" in create_item.blocked_reason
+    assert finalized.items[1].action == "update"
+    report = pipeline_module.render_merge_decision_report(finalized, snapshot)
+    assert "旧页标题《持久记忆（Agent Memory）》像通用概念页" in report
 
 
 def test_source_type_plan_items_are_defensively_excluded_from_index_and_related(tmp_path: Path) -> None:

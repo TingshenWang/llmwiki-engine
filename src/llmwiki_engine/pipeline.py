@@ -10023,6 +10023,21 @@ def finalize_wiki_merge_plan(
                 finalization_notes.append("medium overlap create 的 why_not_update 不充分，被转为 needs_human_decision。")
             else:
                 finalization_notes.append("medium overlap create 的 why_not_update 不充分，已请求模型补充。")
+        generic_old_title_reason = medium_create_generic_old_title_review_reason(
+            item.model_copy(
+                update={
+                    "action": action,
+                    "canonical_target_path": canonical,
+                    "strongest_overlap": strongest_overlap,
+                }
+            ),
+            old_display_title=strongest_hit.display_title if strongest_hit is not None else "",
+        )
+        if action == "create" and generic_old_title_reason:
+            action = "needs_human_decision"
+            apply_eligibility = "blocked"
+            blocked_reason = blocked_reason or generic_old_title_reason
+            finalization_notes.append("medium overlap create 的旧页标题泛化风险，被转为 needs_human_decision。")
         if apply_eligibility == "blocked" and action != "needs_human_decision":
             action = "needs_human_decision"
             blocked_reason = blocked_reason or "模型将该项标记为 blocked，需要人工决策。"
@@ -10535,12 +10550,16 @@ def merge_plan_all_create_review_reason(
         item
         for item in merge_plan_create_overlap_risk_items(plan)
         if item.strongest_overlap.strength == "medium"
-        and (create_reason_needs_repair(item.why_not_update) or medium_create_reason_was_locally_synthesized(item))
+        and (
+            create_reason_needs_repair(item.why_not_update)
+            or medium_create_reason_was_locally_synthesized(item)
+            or medium_create_generic_old_title_review_reason(item)
+        )
     ]
     if not weak_reason_medium:
         return ""
     names = ", ".join(f"{item.page_plan_id}:medium" for item in weak_reason_medium[:8])
-    return f"合并计划全部为 create，但存在中等召回风险且 create 理由不充分或仅由本地补充（{names}）；请审核这些页面为什么不应 update 到已有知识页。"
+    return f"合并计划全部为 create，但存在中等召回风险且 create 理由不充分、仅由本地补充或旧页标题像通用概念页（{names}）；请审核这些页面为什么不应 update 到已有知识页。"
 
 
 def merge_plan_auto_create_review_limit(configured_candidate_budget: int) -> int:
@@ -10549,6 +10568,133 @@ def merge_plan_auto_create_review_limit(configured_candidate_budget: int) -> int
 
 def medium_create_reason_was_locally_synthesized(item: WikiMergePlanItem) -> bool:
     return item.why_not_update.startswith("本地补充：") or LOCAL_MEDIUM_CREATE_REASON_MARKER in item.finalization_reason
+
+
+def medium_create_generic_old_title_review_reason(item: WikiMergePlanItem, *, old_display_title: str = "") -> str:
+    if item.action != "create" or item.strongest_overlap.strength != "medium" or not item.strongest_overlap.path:
+        return ""
+    if create_reason_needs_repair(item.why_not_update):
+        return ""
+    old_label = merge_overlap_old_label(item, old_display_title=old_display_title)
+    new_label = f"{item.display_title} {item.canonical_target_path}"
+    if not merge_titles_share_specific_concept_terms(new_label, old_label):
+        return ""
+    if not merge_old_title_looks_source_neutral_generic(old_label):
+        return ""
+    if not merge_reason_dismisses_old_as_specific_or_new_as_generic(item.why_not_update):
+        return ""
+    old_display = old_display_title.strip() or clean_display_title(Path(item.strongest_overlap.path).stem)
+    return (
+        f"召回到中等相关旧页 `{item.strongest_overlap.path}`，旧页标题《{old_display}》像通用概念页，"
+        "但模型选择 create 的理由把旧页归为具体平台/产品/实现或把新页归为通用概念；"
+        "需要人工确认是否应 update 到已有知识页，或是否真的需要拆成独立页面。"
+    )
+
+
+def merge_overlap_old_label(item: WikiMergePlanItem, *, old_display_title: str = "") -> str:
+    path = item.strongest_overlap.path
+    path_stem = clean_display_title(Path(path).stem) if path else ""
+    return " ".join(part for part in [old_display_title.strip(), path, path_stem] if part)
+
+
+def merge_titles_share_specific_concept_terms(new_label: str, old_label: str) -> bool:
+    shared = merge_overlap_concept_terms(new_label) & merge_overlap_concept_terms(old_label)
+    if "memory" in shared:
+        return True
+    broad_only = {"agent", "ai", "system"}
+    return len(shared - broad_only) >= 2
+
+
+def merge_overlap_concept_terms(text: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", text).lower().replace("_", " ").replace("-", " ")
+    terms: set[str] = set()
+    if re.search(r"\bagents?\b", normalized) or "智能体" in normalized:
+        terms.add("agent")
+    if re.search(r"\b(?:memory|memories)\b", normalized) or "记忆" in normalized or "回忆" in normalized:
+        terms.add("memory")
+    if re.search(r"\bcontexts?\b", normalized) or "上下文" in normalized:
+        terms.add("context")
+    if re.search(r"\bworkflows?\b", normalized) or "工作流" in normalized:
+        terms.add("workflow")
+    if re.search(r"\bharness(?:es)?\b", normalized):
+        terms.add("harness")
+    if re.search(r"\brag\b", normalized):
+        terms.add("rag")
+    if re.search(r"\bevals?\b|\bevaluation\b", normalized) or "评估" in normalized:
+        terms.add("evaluation")
+    return terms
+
+
+def merge_old_title_looks_source_neutral_generic(old_label: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", old_label).lower()
+    if merge_label_has_source_specific_token(normalized):
+        return False
+    terms = merge_overlap_concept_terms(normalized)
+    return bool(terms & {"memory", "context", "workflow", "harness", "rag", "evaluation"})
+
+
+def merge_label_has_source_specific_token(normalized: str) -> bool:
+    ascii_tokens = {
+        "anthropic",
+        "cloudflare",
+        "claude",
+        "github",
+        "langchain",
+        "mem0",
+        "openai",
+        "qwen",
+        "redis",
+        "readme",
+        "api",
+        "sdk",
+    }
+    cjk_tokens = {
+        "平台",
+        "产品",
+        "实现",
+        "教程",
+        "官方",
+        "项目",
+        "案例",
+        "论文",
+        "访谈",
+        "播客",
+    }
+    if any(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", normalized) for token in ascii_tokens):
+        return True
+    return any(token in normalized for token in cjk_tokens)
+
+
+def merge_reason_dismisses_old_as_specific_or_new_as_generic(reason: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", reason).lower()
+    old_markers = ["旧页", "已有页", "最像旧页", "old page", "existing page"]
+    specific_markers = [
+        "平台",
+        "产品",
+        "实现",
+        "教程",
+        "官方",
+        "项目",
+        "案例",
+        "来源特定",
+        "source-specific",
+        "product-specific",
+        "platform-specific",
+        "implementation",
+        "cloudflare",
+        "mem0",
+        "redis",
+        "qwen",
+        "anthropic",
+    ]
+    generic_new_markers = ["通用", "泛化", "generic", "general", "概念页", "独立概念", "通用概念"]
+    old_called_specific = any(marker in normalized for marker in old_markers) and any(
+        marker in normalized for marker in specific_markers
+    )
+    new_called_generic = any(marker in normalized for marker in ["新页", "本轮", "new page"]) and any(
+        marker in normalized for marker in generic_new_markers
+    )
+    return old_called_specific or new_called_generic
 
 
 def merge_plan_create_overlap_risk_items(plan: WikiMergePlanArtifact) -> list[WikiMergePlanItem]:
