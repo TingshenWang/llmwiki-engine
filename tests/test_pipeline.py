@@ -4249,6 +4249,56 @@ def test_related_renderer_filters_and_caps_candidates() -> None:
     assert any(row.decision == "filtered" and row.reject_reason == "unknown_path" for row in report)
 
 
+def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-CURRENT",
+        source_basis=SourceBasis(source_candidate_ids=["C001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Current.md",
+        display_title="Current",
+        page_type="concept",
+        new_understanding="当前主题。",
+        section_plans={"summary": "Summary"},
+        related_pages=[
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_A.md",
+                display_title="A",
+                source="source_digest",
+                reason="来源摘要把 `E001` 标记为相关候选，本页与该候选属于同一材料中的互补主题。",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_B.md",
+                display_title="B",
+                source="source_digest",
+                reason="source digest says CON-001 is related.",
+            ),
+            pipeline_module.RelatedPageRef(
+                target_path="concepts/Concept_C.md",
+                display_title="C",
+                source="source_digest",
+                reason="AGG-concepts-demo 与候选页面 ent-001 互补。",
+            ),
+        ],
+        reason="test",
+    )
+
+    rendered = pipeline_module.render_related_pages(
+        item,
+        known_paths={"concepts/Concept_A.md", "concepts/Concept_B.md", "concepts/Concept_C.md"},
+    )
+
+    assert "[[concepts/Concept_A|A]]" in rendered
+    assert "[[concepts/Concept_B|B]]" in rendered
+    assert "[[concepts/Concept_C|C]]" in rendered
+    assert "同属本次材料中的互补主题" in rendered
+    assert "E001" not in rendered
+    assert "CON-001" not in rendered
+    assert "AGG-concepts-demo" not in rendered
+    assert "ent-001" not in rendered
+    assert "source digest" not in rendered
+    assert "候选页面" not in rendered
+
+
 def test_draft_rendering_normalizes_model_section_keys(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "draft-section-fixture"
@@ -8957,6 +9007,70 @@ def test_grounding_weak_technical_relationships_do_not_require_review(body_markd
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
+
+
+@pytest.mark.parametrize(
+    "body_markdown",
+    [
+        "### 导入流程\n\nLLM 读取源文档，提取关键信息，并更新或创建相关 wiki 页面。",
+        "### Wiki 层\n\nLLM 完全拥有这一层：创建、更新、删除页面，维护交叉引用，保持一致性。",
+        "### 摘要撰写\n\nLLM 在 wiki 中创建该源的摘要页面，记录来源信息及主要贡献。",
+        "### 查询流程\n\n当用户向 wiki 提出问题时，LLM 会搜索相关页面并合成答案。",
+    ],
+)
+def test_grounding_wiki_operation_create_and_question_flow_do_not_require_review(body_markdown: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="Wiki 操作流程不应该被严重事实关系误杀。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+@pytest.mark.parametrize(
+    "body_markdown, expected_marker",
+    [
+        ("### 方案归属\n\nKarpathy 提出 llm-wiki 方案。", "提出"),
+        ("### 产品归属\n\nOpenAI 创建了一个 Anthropic 竞品。", "创建"),
+    ],
+)
+def test_grounding_real_create_and_propose_relationships_still_require_review(
+    body_markdown: str,
+    expected_marker: str,
+) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="真实创建/提出关系仍需要来源支撑。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert review.unsupported_new_facts[0].action == "needs_review"
+    assert expected_marker in review.unsupported_new_facts[0].reason
 
 
 def test_grounding_quote_uses_sentence_context_for_high_risk_domain() -> None:

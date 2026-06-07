@@ -8156,7 +8156,7 @@ def resolve_related_pages(
                 target_path=other.candidate_target_path,
                 display_title=other.display_title,
                 source="source_digest",
-                reason=f"来源摘要把 `{raw}` 标记为相关候选，本页与该候选属于同一材料中的互补主题。",
+                reason=f"`{other.display_title}` 与本页同属本次材料中的互补主题，可帮助补足上下游理解。",
             )
         if resolved is None:
             metadata_matches = metadata_lookup.get(normalize_related_key(raw), [])
@@ -9901,6 +9901,40 @@ def _resolve_single_model_related(
 
 def chinese_related_reason(model_reason: str, fallback: str) -> str:
     return fallback if not model_reason.strip() or looks_like_untranslated_english(model_reason) else model_reason.strip()
+
+
+def public_related_reason(model_reason: str, fallback: str) -> str:
+    reason = chinese_related_reason(model_reason, fallback)
+    if related_reason_has_internal_reference(reason):
+        return fallback
+    return reason
+
+
+def related_reason_has_internal_reference(reason: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", reason)
+    return bool(
+        re.search(
+            r"\b(?:PP-[A-Za-z0-9_-]+|CAND[A-Za-z0-9_-]*|AGG-[A-Za-z0-9_-]+|auto-[A-Za-z0-9_-]+|"
+            r"(?:ENT|CON|DES|CMP|OQ|[ECDO])-?\d+[A-Za-z0-9_-]*|CMP\d{1,3})\b",
+            normalized,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:source[\s_-]?digest|page[\s_-]?plan|candidate|artifact|prepared[\s_-]?discovered)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+        or any(marker in normalized for marker in ["来源摘要把", "相关候选", "页面计划", "候选 id", "候选ID", "候选页面", "候选编号", "候选条目"])
+    )
+
+
+def related_public_fallback(source: str, title: str) -> str:
+    clean_title = clean_display_title(title)
+    if source == "wiki_context":
+        return f"`{clean_title}` 可作为当前主题的背景补充。"
+    if source == "existing_wiki":
+        return f"`{clean_title}` 是已有相关页面，保留作背景补充。"
+    return f"`{clean_title}` 与本页同属本次材料中的互补主题，可帮助补足上下游理解。"
 
 
 def _normalize_related_path(value: str) -> str | None:
@@ -12457,7 +12491,15 @@ def severe_relation_marker_meta_usage(compact: str, marker: str) -> bool:
             or re.search(r"(?:快速|持续|连续)发布", compact)
         )
     if marker == "创建":
-        return bool(re.search(r"创建(?:文档|页面|知识页|内容|文件|草稿|记录)", compact))
+        return bool(
+            re.search(
+                r"创建(?:、更新)?(?:、删除)?(?:相关)?(?:wiki|Wiki)?(?:文档|页面|知识页|内容|文件|草稿|记录|摘要页面|摘要页)",
+                compact,
+            )
+            or re.search(r"创建.{0,12}(?:文档|页面|知识页|内容|文件|草稿|记录|摘要页面|摘要页)", compact)
+        )
+    if marker == "提出":
+        return bool(re.search(r"提出(?:问题|请求|查询|疑问|检索需求|用户问题)", compact))
     if marker in {"推出", "宣布"}:
         return bool(re.search(rf"{marker}(?:计划|策略|流程|节奏|安排)", compact))
     return False
@@ -15805,7 +15847,10 @@ def render_related_pages(
             {
                 "target_path": _strip_wiki_prefix(related.target_path),
                 "display_title": related.display_title,
-                "reason": chinese_related_reason(related.reason, "该页面与当前主题存在明确内容互补关系。"),
+                "reason": public_related_reason(
+                    related.reason,
+                    related_public_fallback(related.source, related.display_title),
+                ),
                 "source": related.source,
                 "priority": related_candidate_priority(related.source),
                 "order": order,
@@ -15821,7 +15866,7 @@ def render_related_pages(
         path = normalize_related_candidate_path(candidate["target_path"])
         title = candidate["display_title"].strip() or clean_display_title(Path(candidate["target_path"]).stem)
         reason = normalize_stable_brand_typos(
-            chinese_related_reason(candidate["reason"], "该页面与当前主题存在明确内容互补关系。")
+            public_related_reason(candidate["reason"], related_public_fallback(str(candidate.get("source") or ""), title))
         )
         reject_reason = ""
         if path is None:
