@@ -3231,6 +3231,8 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "user-123" in contract_rules
     assert "do not invent concrete user facts" in contract_rules
     assert "用户偏好 X" in contract_rules
+    assert "sensitive or dynamic user-support query examples" in contract_rules
+    assert "<dynamic_user_query>" in contract_rules
     assert "CLI/API/code examples" in contract_rules
     assert "<memory_text>" in contract_rules
     assert "<user_id>" in contract_rules
@@ -8490,6 +8492,157 @@ def test_grounding_examples_allow_short_query_template_quotes() -> None:
     assert reasons["怎么安装Redis"] == "例子区的短查询/请求模板按 illustrative example 处理，不要求 raw exact match。"
 
 
+@pytest.mark.parametrize(
+    "examples",
+    [
+        "例如“某个用户的账户余额是多少？”",
+        "类似“查看某个用户的账户余额”的请求",
+        "例如“如何重置密码”",
+        "比如“忘记密码怎么办”",
+        "类似“query account balance”的请求",
+        "例如“reset password”",
+    ],
+)
+def test_grounding_examples_sensitive_dynamic_queries_do_not_bypass(examples: str) -> None:
+    review = build_examples_grounding_review(examples)
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+def test_grounding_detail_sensitive_dynamic_query_does_not_bypass_as_illustrative() -> None:
+    draft, plan, snapshot = build_examples_grounding_case(
+        "暂无相关例子记录。",
+        detail="语义缓存可以处理常见问题，例如“忘记密码怎么办”。",
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["忘记密码怎么办"]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "记忆评估问题“某个用户的账户余额是多少？”用于测试召回。",
+        "记忆评估问题“我的账户余额是多少？”用于测试召回。",
+        "记忆评估问句“查询某个用户的手机号”用于测试召回。",
+        "语义缓存可以处理常见问题，例如“密码忘了怎么办”。",
+        "语义缓存可以处理常见问题，例如“密码找不回怎么办”。",
+        "语义缓存可以处理常见问题，例如“forgot my password”。",
+        "语义缓存可以处理常见问题，例如“how to reset my password”。",
+        "语义缓存可以处理常见问题，例如“change my password”。",
+        "语义缓存可以处理常见问题，例如“cannot login”。",
+        "语义缓存可以处理常见问题，例如“登录失败怎么处理”。",
+        "语义缓存可以处理常见问题，例如“登录报错怎么处理”。",
+        "语义缓存可以处理常见问题，例如“登录问题”。",
+        "语义缓存可以处理常见问题，例如“账号问题”。",
+        "语义缓存可以处理常见问题，例如“账户问题”。",
+        "语义缓存可以处理常见问题，例如“账号登录问题”。",
+        "语义缓存可以处理常见问题，例如“login failed”。",
+        "语义缓存可以处理常见问题，例如“login error”。",
+        "语义缓存可以处理常见问题，例如“login problem”。",
+        "语义缓存可以处理常见问题，例如“sign in failed”。",
+        "语义缓存可以处理常见问题，例如“sign-in failed”。",
+        "语义缓存可以处理常见问题，例如“sign-in problem”。",
+        "语义缓存可以处理常见问题，例如“sign-in error”。",
+        "语义缓存可以处理常见问题，例如“failed login”。",
+        "语义缓存可以处理常见问题，例如“failed sign-in”。",
+        "语义缓存可以处理常见问题，例如“error log-in”。",
+        "语义缓存可以处理常见问题，例如“log-in failed”。",
+        "语义缓存可以处理常见问题，例如“log-in problem”。",
+        "语义缓存可以处理常见问题，例如“account login error”。",
+        "语义缓存可以处理常见问题，例如“account login problem”。",
+        "语义缓存可以处理常见问题，例如“user login problem”。",
+        "语义缓存可以处理常见问题，例如“account problems”。",
+        "语义缓存可以处理常见问题，例如“user account problems”。",
+        "技术排障示例可以写成“登不上账号”。",
+        "技术排障示例可以写成“登不上账户”。",
+        "技术排障示例可以写成“登不上后台”。",
+        '技术排障示例可以写成"登不上账号"。',
+        '技术排障示例可以写成"login failed"。',
+        '技术排障示例可以写成"login problem"。',
+        '技术排障示例可以写成"account problem"。',
+        "语义缓存可以处理常见问题，例如“query user emails”。",
+        "语义缓存可以处理常见问题，例如“query users emails”。",
+        "语义缓存可以处理常见问题，例如“query user addresses”。",
+        "语义缓存可以处理常见问题，例如“query user profiles”。",
+    ],
+)
+def test_grounding_detail_memory_examples_sensitive_dynamic_queries_do_not_bypass(detail: str) -> None:
+    draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+def test_grounding_sensitive_dynamic_query_passes_when_source_supported() -> None:
+    draft, plan, snapshot = build_examples_grounding_case(
+        "暂无相关例子记录。",
+        detail="客服文档原文示例是“忘记密码怎么办”。",
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "忘记密码怎么办")
+
+    assert review.requires_review is False
+    assert any(claim.text == "忘记密码怎么办" and claim.support == "raw" for claim in review.claims)
+
+
+@pytest.mark.parametrize(
+    ("detail", "raw"),
+    [
+        ('客服文档原文示例是"登不上账号"。', "登不上账号"),
+        ('客服文档原文示例是"login problem"。', "login problem"),
+        ('客服文档原文示例是"sign-in problem"。', "sign-in problem"),
+        ("客服文档原文示例是“账号问题”。", "账号问题"),
+    ],
+)
+def test_grounding_sensitive_dynamic_query_short_quote_passes_when_source_supported(detail: str, raw: str) -> None:
+    draft, plan, snapshot = build_examples_grounding_case(
+        "暂无相关例子记录。",
+        detail=detail,
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, raw)
+
+    assert review.requires_review is False
+    assert any(claim.text == raw and claim.support == "raw" for claim in review.claims)
+
+
+def test_grounding_examples_still_allow_safe_technical_query_template_after_sensitive_guard() -> None:
+    review = build_examples_grounding_review("类似“Redis 地址配置方法”的请求")
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["Redis 地址配置方法"]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "技术排障示例可以写成“无法连接 Redis”。",
+        "技术排障示例可以写成“不能安装 Redis”。",
+        "技术排障示例可以写成“打不开配置文件”。",
+        "技术排障示例可以写成“Redis 无法启动”。",
+        '技术排障示例可以写成"cache"。',
+        '技术排障示例可以写成"Redis config"。',
+        '技术排障示例可以写成"Redis problem"。',
+        '技术排障示例可以写成"config problem"。',
+        '技术排障示例可以写成"cache problem"。',
+        '技术排障示例可以写成"service account config"。',
+        '技术排障示例可以写成"service account issue"。',
+        '技术排障示例可以写成"service account error"。',
+        '技术排障示例可以写成"service account problems"。',
+        '技术排障示例可以写成"login configuration"。',
+        '技术排障示例可以写成"sign-in configuration"。',
+        '技术排障示例可以写成"log-in configuration"。',
+    ],
+)
+def test_grounding_detail_allows_safe_technical_troubleshooting_queries(detail: str) -> None:
+    draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+
+
 def test_grounding_examples_query_template_requires_local_context() -> None:
     review = build_examples_grounding_review("- “Redis 的安装方法”")
 
@@ -9052,6 +9205,27 @@ def test_grounding_external_backing_issue_message_neutralizes_open_question_prem
     assert "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提" in message
     assert "不要换成另一个外部背书词或权威词" in message
     assert "触发文本：目前是否存在公认的最佳融合策略？" in message
+
+
+def test_grounding_dynamic_sensitive_query_issue_message_names_neutral_placeholders() -> None:
+    claim = pipeline_module.GroundingClaim(
+        page_plan_id="PP-SEMANTIC-CACHE",
+        target_path="concepts/Concept_语义缓存（Semantic Caching）.md",
+        section_key="examples",
+        claim_type="new_fact",
+        text="某个用户的账户余额是多少？",
+        support="unsupported",
+        action="needs_review",
+        reason="直接引用必须在 raw 或已有 wiki 中 exact match。",
+    )
+
+    message = pipeline_module.grounding_issue_message(claim)
+
+    assert "账户余额、密码重置、支付/退款" in message
+    assert "<dynamic_user_query>" in message
+    assert "<support_query>" in message
+    assert "不要把被拒绝的具体偏好" in message
+    assert "触发文本：某个用户的账户余额是多少？" in message
 
 
 def test_grounding_external_backing_detects_adoption_and_best_practice_real_path() -> None:

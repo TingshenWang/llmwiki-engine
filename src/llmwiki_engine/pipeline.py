@@ -5825,6 +5825,7 @@ def build_draft_rendering_payload(
                 "Ground examples, value points, and reuse scenarios in source content.",
                 "Across all section_bodies, do not fabricate example values such as `张三`, `Alice`, `user-123`, `user123`, concrete user preferences, dates, plans, metrics, credentials, or IDs unless exact source/wiki support exists; use placeholders such as `<user_id>`, `<memory_text>`, `<memory_query>`, `某个用户`, or `用户偏好 X`.",
                 "In section_bodies.examples, do not invent concrete user facts, user ids, preferences, dates, plans, metrics, credentials, or command arguments unless exact source text supports them; for generic explanation, use abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
+                "Do not invent sensitive or dynamic user-support query examples such as account balance, password reset, payment/refund, order/ticket status, login/session, credentials, API keys, tokens, cookies, phone, email, address, or profile lookups unless exact source/wiki support exists; use neutral placeholders such as `<dynamic_user_query>` or `<support_query>`, or use source-backed technical queries.",
                 "For CLI/API/code examples, Chinese surrounding explanation is fine, but command/API literal arguments are an explicit exception to the zh-CN translation rule: they must either copy exact source literals or use placeholders such as `<memory_text>`, `<user_id>`, or `<memory_query>`; do not translate a source literal into a new concrete preference, user id, query, path, or command argument.",
                 "When the source only states a recommendation or best practice, do not invent causal outcomes with terms such as `导致`, `造成`, `影响到`, or `用户会...`; either state the source-backed boundary without a new consequence, or move the consequence to open_questions as 待补来源.",
                 *DRAFT_RENDERING_GROUNDING_RISK_RULES,
@@ -11663,6 +11664,13 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
             "如果是 CLI/API/code 示例，命令参数要么照抄来源 literal，要么改成 `<memory_text>`、`<user_id>`、`<memory_query>` 这类占位符；"
             "不要把被拒绝的具体偏好、用户 ID、查询或命令参数换成另一个具体值。"
         )
+    if grounding_dynamic_sensitive_query_issue(claim):
+        reason = (
+            f"{reason} 不要把账户余额、密码重置、支付/退款、订单/工单状态、登录/会话、凭证/API key/token/cookie、"
+            "电话/邮箱/地址/个人资料这类敏感或动态用户查询当作编造例子；"
+            "请删除该例子，或改成 `<dynamic_user_query>`、`<support_query>`、`如何 <action>` 这类中性占位符，"
+            "除非 raw/wiki 明确给出这个例子。"
+        )
     if grounding_external_backing_issue(claim):
         reason = (
             f"{reason} 不要换成另一个外部背书词或权威词；"
@@ -11696,6 +11704,14 @@ def grounding_external_backing_issue(claim: GroundingClaim) -> bool:
         claim.support == "unsupported"
         and claim.action == "needs_review"
         and "新增外部背书/强事实标记" in claim.reason
+    )
+
+
+def grounding_dynamic_sensitive_query_issue(claim: GroundingClaim) -> bool:
+    return (
+        claim.support == "unsupported"
+        and claim.action == "needs_review"
+        and quote_has_dynamic_sensitive_query_marker(re.sub(r"\s+", "", claim.text.strip()), claim.text)
     )
 
 
@@ -12222,21 +12238,40 @@ def compact_paraphrase_supported_by_context(text: str, approved_raw_text: str, e
 
 def iter_grounding_quote_spans(body: str) -> list[tuple[str, int]]:
     spans: list[tuple[str, int]] = []
-    for match in re.finditer(r"“([^“”\n]{6,})”", body):
-        spans.append((match.group(1), match.start()))
+    for match in re.finditer(r"“([^“”\n]{2,})”", body):
+        quote = match.group(1)
+        normalized_quote = re.sub(r"\s+", "", quote.strip())
+        if len(quote) >= 6 or quote_has_dynamic_sensitive_query_marker(normalized_quote, quote):
+            spans.append((quote, match.start()))
     index = 0
     while index < len(body):
         quote_start = body.find('"', index)
         if quote_start < 0:
             break
         if not plausible_ascii_open_quote(body, quote_start):
-            index = quote_start + 1
+            quote_end = body.find('"', quote_start + 1)
+            if quote_end < 0:
+                break
+            quote = body[quote_start + 1 : quote_end]
+            normalized_quote = re.sub(r"\s+", "", quote.strip())
+            if (
+                quote_has_dynamic_sensitive_query_marker(normalized_quote, quote)
+                and "\n" not in quote
+                and not any(char in quote for char in '“”"')
+            ):
+                spans.append((quote, quote_start))
+            index = quote_end + 1
             continue
         quote_end = body.find('"', quote_start + 1)
         if quote_end < 0:
             break
         quote = body[quote_start + 1 : quote_end]
-        if len(quote) >= 6 and "\n" not in quote and not any(char in quote for char in '“”"'):
+        normalized_quote = re.sub(r"\s+", "", quote.strip())
+        if (
+            (len(quote) >= 6 or quote_has_dynamic_sensitive_query_marker(normalized_quote, quote))
+            and "\n" not in quote
+            and not any(char in quote for char in '“”"')
+        ):
             spans.append((quote, quote_start))
         index = quote_end + 1
     return sorted(spans, key=lambda span: span[1])
@@ -12270,6 +12305,7 @@ def collect_grounding_claims(
             existing_supported = quote_supported_by_text(quote, existing_entry.content)
             supported = raw_supported or existing_supported
             quote_has_external_backing_marker = unsupported_backing_marker(quote) is not None
+            quote_has_dynamic_sensitive_query = quote_has_dynamic_sensitive_query_marker(normalized_quote, quote)
             examples_unsafe_bypass_quote = (
                 section_key == "examples"
                 and not supported
@@ -12281,6 +12317,7 @@ def collect_grounding_claims(
             ) and (
                 not supported
                 and not quote_has_external_backing_marker
+                and not quote_has_dynamic_sensitive_query
                 and not strict_direct_quote_context(body, quote_start=quote_start)
                 and not attributed_quote_context(body, quote_start=quote_start)
             )
@@ -12288,7 +12325,7 @@ def collect_grounding_claims(
                 examples_quote_has_concrete_marker(normalized_quote, quote) or examples_unsafe_bypass_quote
             ):
                 is_concept_label_quote = False
-            if examples_unsafe_bypass_quote:
+            if examples_unsafe_bypass_quote or (quote_has_dynamic_sensitive_query and not supported):
                 is_illustrative_example = False
                 is_memory_example = False
             section_example_hard_fact = section_key == "examples" and (
@@ -12817,6 +12854,8 @@ def illustrative_example_context(body: str, quote: str, *, quote_start: int | No
         return False
     if not any(marker in prefix for marker in ["如", "例如", "比如", "示例", "例子", "e.g.", "for example"]):
         return False
+    if quote_has_dynamic_sensitive_query_marker(normalized, quote):
+        return False
     if contains_short_fact_marker(normalized) and not looks_like_instructional_example(normalized, prefix):
         return False
     return True
@@ -12831,6 +12870,8 @@ def illustrative_memory_example_context(body: str, quote: str, *, quote_start: i
         return False
     prefix = body[max(0, index - 32) : index]
     if any(marker in prefix for marker in ["原文", "直接引用", "引用", "指出", "表示", "论文", "研究", "作者"]):
+        return False
+    if quote_has_dynamic_sensitive_query_marker(normalized, quote):
         return False
     if not any(marker in prefix for marker in ["如", "例如", "比如", "示例", "例子", "问题", "问句", "评估"]):
         return False
@@ -13042,8 +13083,53 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
     return bool(re.search(r"\b(?:Alice|Bob|Ethan|Zhang|Li|Wang)\b", original))
 
 
+def quote_has_dynamic_sensitive_query_marker(normalized: str, original: str = "") -> bool:
+    compact = normalized or re.sub(r"\s+", "", original)
+    lowered = unicodedata.normalize("NFKC", original).lower()
+    if not compact and not lowered:
+        return False
+    chinese_patterns = [
+        r"(?:账户|账号|银行卡|信用卡)?余额",
+        r"(?:重置|找回|忘记|忘了|忘掉|修改|更改).{0,6}密码",
+        r"密码.{0,8}(?:重置|找回|找不回|忘记|忘了|忘掉|修改|更改)",
+        r"(?:无法|不能).{0,6}(?:登录|登陆|登入|账号|账户)",
+        r"(?:登录|登陆|登入|账号|账户).{0,6}(?:无法|不能|失败|异常|出错|报错|打不开|登不上)",
+        r"(?:登录|登陆|登入)(?:问题|故障|异常)",
+        r"(?:用户|客户).{0,2}(?:登录|登陆|登入)(?:问题|故障|异常)",
+        r"(?:账号|账户)(?:有)?(?:问题|故障|异常)",
+        r"(?:账号|账户)(?:登录|登陆|登入)(?:问题|故障|异常)",
+        r"(?:登不上|登录不了|登陆不了|登入不了)",
+        r"(?:支付|付款|退款|扣款|转账|充值|提现)",
+        r"(?:订单|工单|票据).{0,6}(?:状态|进度|查询|查看|取消|退款)",
+        r"(?:登录|登陆).{0,6}(?:记录|日志|状态|会话|session)",
+        r"(?:凭证|密钥|令牌|token|cookie|api.?key)",
+        r"(?:查询|查看|获取|读取|搜索).{0,6}(?:手机号|手机号码|电话号码|邮箱|邮件地址|住址|个人资料|用户资料|客户资料)",
+        r"(?:用户|客户|个人|某个用户|某个客户).{0,8}(?:手机号|手机号码|电话号码|邮箱|邮件地址|住址|个人资料|用户资料|客户资料)",
+    ]
+    if any(re.search(pattern, compact, re.IGNORECASE) for pattern in chinese_patterns):
+        return True
+    login_verb_pattern = r"(?:login|log\s+in|log-in|signin|sign\s+in|sign-in)"
+    login_outcome_pattern = r"(?:failed|failures?|errors?|issues?|problems?)"
+    english_patterns = [
+        r"\baccount\s+balance\b",
+        r"\b(?:reset|forgot|change|update|recover)\s+(?:my|a|the|user|customer|account)?\s*password\b|\bpassword\s+(?:reset|recovery|change|update)\b",
+        rf"\b(?:cannot|can't|can not|unable to|failed to)\s+{login_verb_pattern}\b",
+        rf"\b(?:(?:user|customer|account)\s+)?{login_verb_pattern}\s+{login_outcome_pattern}\b|\b{login_outcome_pattern}\s+{login_verb_pattern}\b",
+        r"(?<!service\s)\b(?:account|user\s+account|customer\s+account)\s+(?:problems?|issues?|errors?)\b",
+        r"\b(?:payment|refund|charge|transfer|deposit|withdrawal)\b",
+        r"\b(?:order|ticket|issue)\s+(?:status|progress|lookup|query|refund|cancel)\b",
+        r"\b(?:login|signin|sign-in|session)\s+(?:record|log|status|history|cookie)\b",
+        r"\b(?:credential|credentials|api[_ -]?key|secret|token|cookie|cookies)\b",
+        r"\b(?:query|lookup|find|get|search)\s+(?:a\s+)?(?:user|users|user's|users'|customer|customers|customer's|customers'|person|persons|person's|persons'|people|people's).{0,24}\b(?:phones?|emails?|addresses?|profiles?)\b",
+        r"\b(?:personal\s+data|user\s+data|customer\s+data)\b",
+    ]
+    return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in english_patterns)
+
+
 def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
     if unsupported_backing_marker(original) or unsupported_backing_marker(normalized):
+        return True
+    if quote_has_dynamic_sensitive_query_marker(normalized, original):
         return True
     if looks_like_user_id_literal(normalized):
         return True
