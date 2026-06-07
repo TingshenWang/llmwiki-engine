@@ -10688,13 +10688,69 @@ def merge_reason_dismisses_old_as_specific_or_new_as_generic(reason: str) -> boo
         "anthropic",
     ]
     generic_new_markers = ["通用", "泛化", "generic", "general", "概念页", "独立概念", "通用概念"]
+    old_specific_negated = merge_reason_negates_old_specific_scope(normalized)
+    old_explicitly_generic = merge_reason_says_old_is_source_neutral_generic(normalized)
     old_called_specific = any(marker in normalized for marker in old_markers) and any(
         marker in normalized for marker in specific_markers
-    )
+    ) and not old_specific_negated
     new_called_generic = any(marker in normalized for marker in ["新页", "本轮", "new page"]) and any(
         marker in normalized for marker in generic_new_markers
-    )
+    ) and not old_explicitly_generic
     return old_called_specific or new_called_generic
+
+
+def merge_reason_negates_old_specific_scope(normalized: str) -> bool:
+    if merge_reason_reasserts_old_specific_after_negation(normalized):
+        return False
+    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
+    old_title_anchor = r"(?:旧页标题|已有页标题|old title|existing title)"
+    cn_specific = r"(?:平台|产品|实现|教程|官方|项目|案例|来源特定)"
+    en_specific = r"(?:source-specific|product-specific|platform-specific|implementation)"
+    patterns = [
+        rf"{old_anchor}[^。；;.\n]{{0,24}}(?:不是|并非|并不是|不属于|不应被视为)[^。；;.\n]{{0,18}}{cn_specific}",
+        rf"{old_anchor}[^。；;.\n]{{0,24}}(?:is not|isn't|should not be treated as)[^。；;.\n]{{0,18}}{en_specific}",
+        rf"{old_title_anchor}[^。；;.\n]{{0,24}}(?:没有|不含|未包含|无)[^。；;.\n]{{0,24}}(?:平台词|产品词|产品/平台词|platform token|product token|source token)",
+        rf"{old_title_anchor}[^。；;.\n]{{0,24}}(?:has no|does not contain|doesn't contain|lacks)[^。；;.\n]{{0,24}}(?:platform|product|source)[^。；;.\n]{{0,10}}token",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def merge_reason_reasserts_old_specific_after_negation(normalized: str) -> bool:
+    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
+    cn_specific = r"(?:cloudflare|mem0|redis|qwen|anthropic|平台|产品|实现|教程|官方|项目|案例|来源特定)"
+    en_specific = r"(?:cloudflare|mem0|redis|qwen|anthropic|source-specific|product-specific|platform-specific|implementation)"
+    patterns = [
+        rf"{old_anchor}[^。；;.\n]{{0,32}}(?:不是|并非|并不是|不只是)[^。；;.\n]{{0,24}}(?:而是|但其实|但仍是|但它是)[^。；;.\n]{{0,32}}{cn_specific}",
+        rf"{old_anchor}[^。\n]{{0,80}}(?:is not merely|isn't merely|is not just|isn't just|not ordinary)[^。\n]{{0,80}}(?:but|rather|however|it is|it remains)[^。\n]{{0,48}}{en_specific}",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def merge_reason_says_old_is_source_neutral_generic(normalized: str) -> bool:
+    if merge_reason_negates_old_generic_scope(normalized):
+        return False
+    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
+    old_title_anchor = r"(?:旧页标题|已有页标题|old title|existing title)"
+    cn_generic = r"(?:通用概念|通用页面|通用知识|source-neutral|泛化概念)"
+    en_generic = r"(?:source-neutral|generic|general concept|general knowledge)"
+    patterns = [
+        rf"{old_anchor}[^。；;.\n]{{0,24}}(?:本身)?(?:像|是|属于)[^。；;.\n]{{0,12}}{cn_generic}",
+        rf"{old_anchor}[^。；;.\n]{{0,24}}(?:is|looks|appears)[^。；;.\n]{{0,12}}{en_generic}",
+        rf"{old_title_anchor}[^。；;.\n]{{0,24}}(?:没有|不含|未包含|无)[^。；;.\n]{{0,24}}(?:平台词|产品词|产品/平台词|platform token|product token|source token)",
+        rf"{old_title_anchor}[^。；;.\n]{{0,24}}(?:has no|does not contain|doesn't contain|lacks)[^。；;.\n]{{0,24}}(?:platform|product|source)[^。；;.\n]{{0,10}}token",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def merge_reason_negates_old_generic_scope(normalized: str) -> bool:
+    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
+    cn_generic = r"(?:通用概念|通用页面|通用知识|泛化概念)"
+    en_generic = r"(?:source-neutral|generic|general concept|general knowledge)"
+    patterns = [
+        rf"{old_anchor}[^。；;，,.\n]{{0,24}}(?:不是|并非|并不是|不属于|不应被视为)[^。；;，,.\n]{{0,18}}{cn_generic}",
+        rf"{old_anchor}[^。；;，,.\n]{{0,24}}(?:is not|isn't|not a|not an|should not be treated as)[^。；;，,.\n]{{0,18}}{en_generic}",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 def merge_plan_create_overlap_risk_items(plan: WikiMergePlanArtifact) -> list[WikiMergePlanItem]:

@@ -13624,6 +13624,216 @@ def test_all_create_medium_rapid_memory_is_not_api_specific() -> None:
     assert "旧页标题像通用概念页" in reason
 
 
+def test_all_create_medium_old_specific_negation_with_generic_old_scope_does_not_force_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页不是平台特定页面，旧页本身像通用概念页；"
+            "新页范围是 Agent 记忆系统的写入策略，直接更新旧页会混淆持久记忆总览与写入策略，"
+            "只做 Related 不能承载新增步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统写入策略",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统写入策略.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_old_title_no_product_token_does_not_force_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页标题没有 Cloudflare/Mem0 平台词，本身像通用概念页；"
+            "新页范围是 Agent 记忆系统的淘汰策略，直接更新旧页会混淆总览与策略页，"
+            "只做 Related 不能承载新增策略步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统淘汰策略",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统淘汰策略.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_bare_negation_still_reviews_when_new_is_generic() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页不是平台特定页面；"
+            "新页是通用 Agent 记忆系统概念，直接更新旧页会失焦，Related 不够承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
+def test_all_create_medium_adversarial_negation_still_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页不是普通平台页，而是 Cloudflare 官方实现；"
+            "新页是通用 Agent 记忆系统概念，直接更新旧页会失焦，Related 不够承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
+def test_all_create_medium_adversarial_negation_without_new_generic_still_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页不是普通平台页，而是 Cloudflare 官方实现；"
+            "本轮来源增量来自 Redis 播客，直接更新旧页会失焦，Related 不够承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
+def test_all_create_medium_english_not_merely_specific_still_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "The old page is not merely platform-specific; it is a Cloudflare implementation. "
+            "The Redis source adds a separate scope, and Related is not enough for the new structure."
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent Memory System",
+            "canonical_target_path": "concepts/Concept_Agent Memory System.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_Persistent Memory.md",
+                score=0.72,
+                reason="Top inspected context: Persistent Memory",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
+def test_all_create_medium_old_not_generic_new_generic_still_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "旧页不是通用概念页；"
+            "新页是通用 Agent 记忆系统概念，直接更新旧页会失焦，Related 不够承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent 记忆系统",
+            "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.72,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
+def test_all_create_medium_english_old_not_generic_new_generic_still_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "The old page is not generic; the new page is a generic Agent Memory System concept. "
+            "Updating the old page would blur scope, and Related is not enough for the new structure."
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Agent Memory System",
+            "canonical_target_path": "concepts/Concept_Agent Memory System.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_Persistent Memory.md",
+                score=0.72,
+                reason="Top inspected context: Persistent Memory",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+
+
 def test_all_create_medium_product_specific_old_title_can_auto_pass() -> None:
     item = merge_review_create_item(
         "PP-agent-memory",
