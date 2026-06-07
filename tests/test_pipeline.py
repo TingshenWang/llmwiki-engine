@@ -13566,6 +13566,154 @@ def test_all_create_medium_generic_old_title_scope_dismissal_waits_for_review() 
     assert "旧页标题像通用概念页" in reason
 
 
+def test_all_create_medium_ai_agent_neicun_alias_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "现有页面「持久记忆（Agent Memory）」聚焦于 Cloudflare 的持久记忆服务，"
+            "而新页面需要覆盖更广泛的 AI Agent 内存概念，包括短期对话、摘要和长期事实的完整分类及设计权衡。"
+            "更新现有页面会导致其失去焦点，而仅通过相关链接不足以表达独立的概念体系。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 内存",
+            "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.7645,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_existing_knowledge_page_marker_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "现有知识页「持久记忆（Agent Memory）」聚焦于 Cloudflare 的持久记忆服务，"
+            "而新页面需要覆盖更广泛的 AI Agent 内存概念。"
+            "来源增量来自 Redis 播客，直接更新旧页会失焦，只做 Related 不能承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 内存",
+            "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.7645,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_old_title_comma_scope_predicate_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "现有页面「持久记忆（Agent Memory）」，聚焦于 Cloudflare 的持久记忆服务，"
+            "而新页面需要覆盖更广泛的 AI Agent 内存概念。"
+            "来源增量来自 Redis 播客，直接更新旧页会失焦，只做 Related 不能承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 内存",
+            "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.7645,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_added_page_marker_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "新增页面是通用 AI Agent 内存概念；来源增量来自 Redis 播客。"
+            "直接更新旧页会失焦，只做 Related 不能承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 内存",
+            "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.7645,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
+def test_all_create_medium_added_knowledge_page_marker_waits_for_review() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory",
+        strength="medium",
+        why_not_update=(
+            "新增知识页是通用 AI Agent 内存概念；来源增量来自 Redis 播客。"
+            "直接更新旧页会失焦，只做 Related 不能承载新增结构。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 内存",
+            "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.7645,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+
+    assert "中等召回风险" in reason
+    assert "旧页标题像通用概念页" in reason
+
+
 def test_all_create_medium_pure_english_memory_old_title_waits_for_review() -> None:
     item = merge_review_create_item(
         "PP-agent-memory",
@@ -13853,6 +14001,114 @@ def test_all_create_medium_product_specific_old_title_can_auto_pass() -> None:
                 path="concepts/Concept_Mem0 多级记忆实现.md",
                 score=0.70,
                 reason="Top inspected context: Mem0 多级记忆实现",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_source_specific_old_title_with_neicun_can_auto_pass() -> None:
+    item = merge_review_create_item(
+        "PP-redis-memory-architecture",
+        strength="medium",
+        why_not_update=(
+            "新页范围是基于 Redis 的 Agent 内存架构设计；旧页范围是 Cloudflare Agent Memory 产品实现。"
+            "本轮来源增量来自 Redis 播客中的向量搜索和语义缓存架构，"
+            "直接更新旧页会让 Cloudflare 页面失焦，只做 Related 不能承载 Redis 集成步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "基于 Redis 的 Agent 内存架构",
+            "canonical_target_path": "designs/Design_基于 Redis 的 Agent 内存架构.md",
+            "page_type": "design",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="entities/Entity_Cloudflare Agent Memory.md",
+                score=0.6379,
+                reason="Top inspected context: Cloudflare Agent Memory",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_runtime_neicun_does_not_become_agent_memory_review() -> None:
+    item = merge_review_create_item(
+        "PP-redis-runtime-memory",
+        strength="medium",
+        why_not_update=(
+            "新页范围是 Redis 运行时内存配置和 maxmemory 策略；旧页范围是 Agent 持久记忆概念。"
+            "本轮来源增量来自 Redis 配置文档，直接更新旧页会混淆运行时资源配置与 Agent 记忆能力，"
+            "只做 Related 不能承载配置步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Redis 内存配置",
+            "canonical_target_path": "concepts/Concept_Redis 内存配置.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.69,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_runtime_neicun_generic_wording_still_auto_passes() -> None:
+    item = merge_review_create_item(
+        "PP-redis-runtime-memory",
+        strength="medium",
+        why_not_update=(
+            "新页面是通用 Redis 内存配置概念；来源增量来自 Redis 配置文档。"
+            "直接更新旧页会混淆运行时资源配置与 Agent 记忆能力，只做 Related 不能承载配置步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "Redis 内存配置",
+            "canonical_target_path": "concepts/Concept_Redis 内存配置.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.69,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
+            ),
+        }
+    )
+    plan = merge_review_plan(item)
+
+    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+
+
+def test_all_create_medium_later_source_delta_does_not_make_old_page_specific() -> None:
+    item = merge_review_create_item(
+        "PP-agent-memory-policy",
+        strength="medium",
+        why_not_update=(
+            "旧页范围是 Agent 持久记忆总览，本轮来源增量来自 Redis 播客；"
+            "新页范围是 AI Agent 内存写入策略，直接更新旧页会混淆总览与策略，"
+            "只做 Related 不能承载写入策略步骤。"
+        ),
+    ).model_copy(
+        update={
+            "display_title": "AI Agent 内存写入策略",
+            "canonical_target_path": "concepts/Concept_AI Agent 内存写入策略.md",
+            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+                strength="medium",
+                match_basis="embedding",
+                path="concepts/Concept_持久记忆（Agent Memory）.md",
+                score=0.70,
+                reason="Top inspected context: 持久记忆（Agent Memory）",
             ),
         }
     )

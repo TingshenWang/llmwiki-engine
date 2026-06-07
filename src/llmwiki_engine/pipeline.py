@@ -10610,7 +10610,16 @@ def merge_overlap_concept_terms(text: str) -> set[str]:
     terms: set[str] = set()
     if re.search(r"\bagents?\b", normalized) or "智能体" in normalized:
         terms.add("agent")
-    if re.search(r"\b(?:memory|memories)\b", normalized) or "记忆" in normalized or "回忆" in normalized:
+    has_neicun_agent_context = (
+        "内存" in normalized
+        and (re.search(r"\b(?:ai|agents?)\b", normalized) or "智能体" in normalized)
+    )
+    if (
+        re.search(r"\b(?:memory|memories)\b", normalized)
+        or "记忆" in normalized
+        or "回忆" in normalized
+        or has_neicun_agent_context
+    ):
         terms.add("memory")
     if re.search(r"\bcontexts?\b", normalized) or "上下文" in normalized:
         terms.add("context")
@@ -10667,43 +10676,44 @@ def merge_label_has_source_specific_token(normalized: str) -> bool:
 
 def merge_reason_dismisses_old_as_specific_or_new_as_generic(reason: str) -> bool:
     normalized = unicodedata.normalize("NFKC", reason).lower()
-    old_markers = ["旧页", "已有页", "最像旧页", "old page", "existing page"]
-    specific_markers = [
-        "平台",
-        "产品",
-        "实现",
-        "教程",
-        "官方",
-        "项目",
-        "案例",
-        "来源特定",
-        "source-specific",
-        "product-specific",
-        "platform-specific",
-        "implementation",
-        "cloudflare",
-        "mem0",
-        "redis",
-        "qwen",
-        "anthropic",
-    ]
     generic_new_markers = ["通用", "泛化", "generic", "general", "概念页", "独立概念", "通用概念"]
     old_specific_negated = merge_reason_negates_old_specific_scope(normalized)
     old_explicitly_generic = merge_reason_says_old_is_source_neutral_generic(normalized)
-    old_called_specific = any(marker in normalized for marker in old_markers) and any(
-        marker in normalized for marker in specific_markers
-    ) and not old_specific_negated
-    new_called_generic = any(marker in normalized for marker in ["新页", "本轮", "new page"]) and any(
-        marker in normalized for marker in generic_new_markers
-    ) and not old_explicitly_generic
+    old_called_specific = merge_reason_old_scope_called_specific(normalized) and not old_specific_negated
+    new_called_generic = any(
+        marker in normalized
+        for marker in ["新页", "新页面", "新增页", "新增页面", "新增知识页", "本轮", "new page", "new knowledge page"]
+    ) and any(marker in normalized for marker in generic_new_markers) and not old_explicitly_generic
     return old_called_specific or new_called_generic
+
+
+def merge_reason_old_scope_called_specific(normalized: str) -> bool:
+    if merge_reason_reasserts_old_specific_after_negation(normalized):
+        return True
+    old_anchor = (
+        r"(?:旧页|已有页|已有知识页|现有页|现有页面|现有知识页|最像旧页|旧页面|"
+        r"old page|existing page|existing knowledge page)"
+    )
+    cn_specific = r"(?:cloudflare|mem0|redis|qwen|anthropic|平台|产品|实现|教程|官方|项目|案例|来源特定)"
+    en_specific = r"(?:cloudflare|mem0|redis|qwen|anthropic|source-specific|product-specific|platform-specific|implementation)"
+    scope_predicate = r"(?:聚焦|侧重|面向|围绕|范围|主要|focus(?:es|ed)? on|center(?:s|ed)? on|centred on|centered on)"
+    patterns = [
+        rf"{old_anchor}[^。；;，,.\n]{{0,64}}{cn_specific}",
+        rf"{old_anchor}[^。；;，,.\n]{{0,96}}{en_specific}",
+        rf"{old_anchor}[^。；;.\n]{{0,48}}[，,]\s*[^。；;，,.\n]{{0,16}}{scope_predicate}[^。；;，,.\n]{{0,64}}{cn_specific}",
+        rf"{old_anchor}[^。；;.\n]{{0,64}}[，,]\s*[^。；;，,.\n]{{0,24}}{scope_predicate}[^。；;，,.\n]{{0,96}}{en_specific}",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 def merge_reason_negates_old_specific_scope(normalized: str) -> bool:
     if merge_reason_reasserts_old_specific_after_negation(normalized):
         return False
-    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
-    old_title_anchor = r"(?:旧页标题|已有页标题|old title|existing title)"
+    old_anchor = (
+        r"(?:旧页|已有页|已有知识页|现有页|现有页面|现有知识页|最像旧页|旧页面|"
+        r"old page|existing page|existing knowledge page)"
+    )
+    old_title_anchor = r"(?:旧页标题|已有页标题|已有知识页标题|现有页标题|现有页面标题|现有知识页标题|old title|existing title)"
     cn_specific = r"(?:平台|产品|实现|教程|官方|项目|案例|来源特定)"
     en_specific = r"(?:source-specific|product-specific|platform-specific|implementation)"
     patterns = [
@@ -10716,7 +10726,10 @@ def merge_reason_negates_old_specific_scope(normalized: str) -> bool:
 
 
 def merge_reason_reasserts_old_specific_after_negation(normalized: str) -> bool:
-    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
+    old_anchor = (
+        r"(?:旧页|已有页|已有知识页|现有页|现有页面|现有知识页|最像旧页|旧页面|"
+        r"old page|existing page|existing knowledge page)"
+    )
     cn_specific = r"(?:cloudflare|mem0|redis|qwen|anthropic|平台|产品|实现|教程|官方|项目|案例|来源特定)"
     en_specific = r"(?:cloudflare|mem0|redis|qwen|anthropic|source-specific|product-specific|platform-specific|implementation)"
     patterns = [
@@ -10729,8 +10742,11 @@ def merge_reason_reasserts_old_specific_after_negation(normalized: str) -> bool:
 def merge_reason_says_old_is_source_neutral_generic(normalized: str) -> bool:
     if merge_reason_negates_old_generic_scope(normalized):
         return False
-    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
-    old_title_anchor = r"(?:旧页标题|已有页标题|old title|existing title)"
+    old_anchor = (
+        r"(?:旧页|已有页|已有知识页|现有页|现有页面|现有知识页|最像旧页|旧页面|"
+        r"old page|existing page|existing knowledge page)"
+    )
+    old_title_anchor = r"(?:旧页标题|已有页标题|已有知识页标题|现有页标题|现有页面标题|现有知识页标题|old title|existing title)"
     cn_generic = r"(?:通用概念|通用页面|通用知识|source-neutral|泛化概念)"
     en_generic = r"(?:source-neutral|generic|general concept|general knowledge)"
     patterns = [
@@ -10743,7 +10759,10 @@ def merge_reason_says_old_is_source_neutral_generic(normalized: str) -> bool:
 
 
 def merge_reason_negates_old_generic_scope(normalized: str) -> bool:
-    old_anchor = r"(?:旧页|已有页|最像旧页|旧页面|old page|existing page)"
+    old_anchor = (
+        r"(?:旧页|已有页|已有知识页|现有页|现有页面|现有知识页|最像旧页|旧页面|"
+        r"old page|existing page|existing knowledge page)"
+    )
     cn_generic = r"(?:通用概念|通用页面|通用知识|泛化概念)"
     en_generic = r"(?:source-neutral|generic|general concept|general knowledge)"
     patterns = [
