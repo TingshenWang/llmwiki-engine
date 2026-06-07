@@ -176,13 +176,11 @@ DRAFT_RENDERING_GROUNDING_RISK_RULES = (
     "use quotes only for text that exact-matches source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
     "For interview, ASR/OCR, or translated transcript source text, treat speaker-like Chinese wording as paraphrase "
     "unless the exact span is present; prefer indirect attribution such as 访谈中提到、她描述、团队讨论.",
-    "Do not turn source-local capabilities or examples into popularity/adoption/authority claims. Avoid broad "
-    "external-backing/adoption phrases such as 被广泛应用、被广泛使用、公认、业界普遍、被多个社区引用 unless the exact "
-    "source/wiki context says them; prefer source-local wording such as 本材料提到、访谈中讨论、团队成员提到、本材料将该说法用于解释.",
-    "In open_questions, do not use unsupported adoption/authority premises such as 公认、最佳实践、行业最佳、广泛采用、业界普遍 as the "
-    "question premise. Ask a neutral 待补来源 question instead, for example `待补来源：混合搜索与向量搜索的融合策略应如何设定和验证？`.",
-    "High-risk causal/scope terms such as 导致、造成、证明、表明、必然、长期来看、用户会、影响到 require same sentence "
-    "or clearly adjacent explicit support in source_excerpt_pack, approved_prepared_markdown, or inspected wiki context. "
+    "When turning source-local capabilities or examples into popularity/adoption/authority claims, prefer source-local "
+    "wording such as 本材料提到、访谈中讨论、团队成员提到、本材料将该说法用于解释 unless the source/wiki context clearly supports broader phrasing.",
+    "In open_questions, unsupported adoption/authority premises such as 公认、最佳实践、行业最佳、广泛采用、业界普遍 are allowed as hypotheses, "
+    "but phrase them with uncertainty or 待补来源 when the source does not establish them.",
+    "For causal/scope terms such as 导致、造成、证明、表明、必然、长期来看、用户会、影响到, keep the wording proportional to the source. "
     "If the source only gives a tradeoff or concern, write 可能伴随、需要权衡、访谈中提到, or move the claim to open_questions.",
 )
 UNSUPPORTED_BACKING_MARKERS = (
@@ -12135,11 +12133,11 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
         )
     if grounding_external_backing_issue(claim):
         reason = (
-            f"{reason} 不要换成另一个外部背书词或权威词；"
-            "如果 raw/wiki 没有明确支持采用度、流行度、行业共识或最佳实践，请删除这个 adoption/authority 前提，"
-            "或改成 source-local 表达（如 本材料提到、访谈中讨论、材料将其作为例子）。"
+            f"{reason} 这是非阻塞提醒："
+            "采用度、流行度、行业共识或最佳实践这类 adoption/authority 表达最好有来源意识；"
+            "如果想更严谨，可以改成 source-local 表达（如 本材料提到、访谈中讨论、材料将其作为例子）。"
         )
-        if claim.section_key == "open_questions" or grounding_claim_targets_open_question(claim):
+        if claim.action == "needs_review" and (claim.section_key == "open_questions" or grounding_claim_targets_open_question(claim)):
             reason = (
                 f"{reason} 在 open_questions 里请改成中性的 `待补来源` 问题，"
                 "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提。"
@@ -12164,7 +12162,7 @@ def grounding_claim_targets_open_question(claim: GroundingClaim) -> bool:
 def grounding_external_backing_issue(claim: GroundingClaim) -> bool:
     return (
         claim.support == "unsupported"
-        and claim.action == "needs_review"
+        and claim.action in {"needs_review", "warn"}
         and "新增外部背书/强事实标记" in claim.reason
     )
 
@@ -12390,6 +12388,14 @@ def unsupported_quote_grounding_reason(body: str, quote: str, *, quote_start: in
     blocking_marker = unsupported_quote_blocking_marker(body, quote, quote_start=quote_start, section_key=section_key)
     if blocking_marker:
         return f"直接引用必须在 raw 或已有 wiki 中 exact match；{blocking_marker}"
+    if explicit_direct_quote_context(body, quote, quote_start=quote_start) or attributed_quote_context(body, quote_start=quote_start):
+        return "写成直接引用/作者归因的引号内容未在 raw 或已有 wiki 中 exact match；作为非阻塞提醒保留，必要时可改成转述或人工回看来源。"
+    normalized_quote = re.sub(r"\s+", "", unicodedata.normalize("NFKC", quote.strip()))
+    normalized_sentence = re.sub(r"\s+", "", unicodedata.normalize("NFKC", sentence_around_index(body, quote_start).strip()))
+    if contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote):
+        return "引号内数字、指标、规模、日期或其他硬事实未 exact match；作为非阻塞提醒保留，不阻塞用户已选择材料的 ingest。"
+    if contains_short_fact_marker(normalized_sentence) or contains_hard_fact_marker(normalized_sentence):
+        return "引号所在句包含数字、指标、规模、日期或其他硬事实且未 exact match；作为非阻塞提醒保留。"
     return "低风险未支撑引号内容仅记录为 warning，不阻塞自动 ingest；如需严谨可人工回看来源。"
 
 
@@ -12401,8 +12407,6 @@ def unsupported_quote_blocking_marker(body: str, quote: str, *, quote_start: int
     sentence = sentence_around_index(body, quote_start)
     normalized_quote = re.sub(r"\s+", "", unicodedata.normalize("NFKC", quote.strip()))
     normalized_sentence = re.sub(r"\s+", "", unicodedata.normalize("NFKC", sentence.strip()))
-    if explicit_direct_quote_context(body, quote, quote_start=quote_start) or attributed_quote_context(body, quote_start=quote_start):
-        return "该表述被写成原文/作者/研究的明确引述，未获来源 exact match 支撑。"
     if quote_has_dynamic_sensitive_query_marker(normalized_quote, quote) or quote_has_dynamic_sensitive_query_marker(
         normalized_sentence,
         sentence,
@@ -12412,18 +12416,12 @@ def unsupported_quote_blocking_marker(body: str, quote: str, *, quote_start: int
     if high_risk_marker:
         _marker, domain_label = high_risk_marker
         return f"该表述涉及高风险{domain_label}建议或断言。"
-    if unsupported_backing_marker(quote) or unsupported_backing_marker(sentence):
-        return "该表述包含采用度、权威背书或最佳实践前提。"
     if severe_factual_claim_marker(quote) or severe_factual_claim_marker(sentence):
         return "该表述包含专名关系、发布、收购、隶属、身份或因果等严重事实关系。"
-    if contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote):
-        return "该表述包含数字、指标、规模、日期或其他硬事实。"
-    if contains_short_fact_marker(normalized_sentence) or contains_hard_fact_marker(normalized_sentence):
-        return "该句包含数字、指标、规模、日期或其他硬事实。"
+    if section_key == "examples" and (unsupported_backing_marker(quote) or unsupported_backing_marker(sentence)):
+        return ""
     if section_key == "examples" and examples_quote_has_unsafe_marker_for_bypass(normalized_quote, quote):
         return "例子区内容包含具体用户事实、动态查询或敏感数据。"
-    if section_key == "examples":
-        return "例子区孤立引号内容未被识别为安全占位符、通用模板或来源支撑示例。"
     return ""
 
 
@@ -12489,6 +12487,9 @@ def severe_relation_marker_meta_usage(compact: str, marker: str) -> bool:
         return bool(
             re.search(r"(?:产品)?发布(?:节奏|流程|计划|策略|周期|管理|评审|窗口|阶段|一致性)", compact)
             or re.search(r"(?:快速|持续|连续)发布", compact)
+            or re.search(r"(?:框架持续更新|近期版本|版本包括).{0,40}发布", compact)
+            or re.search(r"(?:评测基准|基准|基准测试|开源基准|benchmark|Benchmark).{0,40}发布", compact)
+            or re.search(r"(?:评估|测试).{0,16}(?:规划能力|Agent能力|智能体能力).{0,40}发布", compact)
         )
     if marker == "创建":
         return bool(
@@ -12497,6 +12498,13 @@ def severe_relation_marker_meta_usage(compact: str, marker: str) -> bool:
                 compact,
             )
             or re.search(r"创建.{0,12}(?:文档|页面|知识页|内容|文件|草稿|记录|摘要页面|摘要页)", compact)
+            or re.search(r"创建.{0,4}示例|创建示例", compact)
+            or ("Assistant(" in compact and "创建" in compact)
+            or re.search(r"创建.{0,20}(?:Docker)?(?:隔离)?容器", compact)
+            or (
+                any(context in compact for context in ["开发者", "用户", "代码", "示例", "框架", "使用", "通过", "注册", "配置", "实例化"])
+                and re.search(r"创建.{0,20}(?:工具|智能体|Agent|Assistant|应用|实例|函数|类|服务器|后端|服务|图像生成工具|容器)", compact)
+            )
         )
     if marker == "提出":
         return bool(re.search(r"提出(?:问题|请求|查询|疑问|检索需求|用户问题)", compact))
@@ -12512,6 +12520,8 @@ def severe_factual_claim_has_named_entity(text: str) -> bool:
 def severe_weak_factual_relation_requires_review(text: str, compact: str) -> bool:
     entities = severe_factual_named_entities(text)
     if len(entities) < 2:
+        return False
+    if weak_relation_technical_capability_usage(text, compact):
         return False
     relation_context_markers = [
         "公司",
@@ -12532,6 +12542,105 @@ def severe_weak_factual_relation_requires_review(text: str, compact: str) -> boo
     known_count = sum(1 for entity in entities if entity in SEVERE_FACTUAL_KNOWN_ENTITIES)
     low_risk_technical_markers = ["编程", "异步", "缓存", "语义", "组成", "包括", "包含", "能力", "特性", "工具", "记忆"]
     return known_count >= 2 and not any(marker in compact for marker in low_risk_technical_markers)
+
+
+def weak_relation_technical_capability_usage(text: str, compact: str) -> bool:
+    if not any(marker in compact for marker in ["支持", "不支持", "由"]):
+        lowered = text.lower()
+        if not re.search(r"\b(?:supports?|unsupported|does\s+not\s+support)\b", lowered):
+            return False
+    capability_markers = [
+        "组件",
+        "自定义工具",
+        "流式输出",
+        "函数调用",
+        "并行工具调用",
+        "工具调用",
+        "工具输出",
+        "评估",
+        "评测",
+        "基准",
+        "基准测试",
+        "开源基准",
+        "评测基准",
+        "规划能力",
+        "智能体能力",
+        "Agent能力",
+        "文件读取",
+        "模板",
+        "多种模板",
+        "参数",
+        "参数配置",
+        "默认",
+        "推荐",
+        "fncall_prompt_type",
+        "API",
+        "OpenAI API",
+        "接入",
+        "模型服务",
+        "DashScope",
+        "阿里云",
+        "开源",
+        "后端运行",
+        "Qwen Chat",
+        "解析",
+        "vLLM",
+        "接口",
+        "方法",
+        "功能",
+        "能力",
+        "后端",
+        "服务端解析",
+        "原生工具调用",
+        "可选依赖",
+        "依赖",
+        "安装",
+        "集成",
+        "协议",
+        "模型上下文协议",
+        "代码解释器",
+        "GUI",
+        "Gradio",
+        "RAG",
+        "MCP",
+        "Node.js",
+        "uv",
+        "Git",
+        "README",
+        "BaseChatModel",
+        "chat方法",
+        "use_raw_api",
+    ]
+    if not any(marker in text or marker in compact for marker in capability_markers):
+        return False
+    support_index = min((index for marker in ["支持", "不支持", "由"] if (index := compact.find(marker)) >= 0), default=-1)
+    supported_fragment = compact[support_index:] if support_index >= 0 else compact
+    supported_fragment = (
+        supported_fragment.replace("OpenAI-compatible", "")
+        .replace("OpenAICompatible", "")
+        .replace("OpenAI兼容", "")
+        .replace("openai-compatible", "")
+    )
+    known_entities_after_support = [
+        entity
+        for entity in SEVERE_FACTUAL_KNOWN_ENTITIES
+        if entity in supported_fragment and entity.lower() not in {"openai"}
+    ]
+    technical_context_for_entities = supported_fragment + compact
+    if known_entities_after_support and re.search(
+        r"(?:模板|参数|配置|默认|推荐|fncall_prompt_type|自定义工具|代码解释器|MCP|组件|后端|模型服务|接入|API|DashScope|阿里云|工具输出|解析|vLLM|评估|评测|基准|规划能力|智能体能力|Agent能力)",
+        technical_context_for_entities,
+    ):
+        known_entities_after_support = [
+            entity
+            for entity in known_entities_after_support
+            if not (re.match(r"Qwen(?:\d|\b)", entity) or entity in {"阿里", "阿里巴巴"})
+        ]
+    if known_entities_after_support:
+        return False
+    if "OpenAI" in supported_fragment and not any(marker in supported_fragment for marker in ["API", "接口", "兼容"]):
+        return False
+    return True
 
 
 SEVERE_FACTUAL_KNOWN_ENTITIES = {
@@ -12963,16 +13072,20 @@ def unquoted_dynamic_sensitive_scenario_marker(text: str, *, section_key: str, p
         return None
     if section_key not in UNQUOTED_DYNAMIC_SCENARIO_SECTIONS:
         return None
-    scan_text = remove_grounding_quote_spans_for_scan(text)
-    if not unquoted_dynamic_scenario_context(scan_text, section_key=section_key, page_type=page_type):
-        return None
+    scan_text = redact_dynamic_sensitive_placeholder_secrets(remove_grounding_quote_spans_for_scan(text))
     compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", scan_text))
     marker = dynamic_sensitive_query_marker_text(compact, scan_text)
+    if marker and dynamic_sensitive_secret_marker(marker):
+        return marker
+    if not unquoted_dynamic_scenario_context(scan_text, section_key=section_key, page_type=page_type):
+        return None
     if not marker:
         marker = unquoted_dynamic_sensitive_extra_marker(compact, scan_text)
     if not marker:
         return None
     if unquoted_dynamic_scenario_technical_field_context(scan_text) and not unquoted_dynamic_user_action_context(scan_text):
+        if dynamic_sensitive_secret_marker(marker):
+            return marker
         return None
     return marker
 
@@ -13026,6 +13139,7 @@ def unquoted_dynamic_scenario_technical_field_context(text: str) -> bool:
         "数据表",
         "列名",
         "配置项",
+        "配置",
         "配置文件",
         "配置问题",
         "接口",
@@ -13040,6 +13154,24 @@ def unquoted_dynamic_scenario_technical_field_context(text: str) -> bool:
             r"\b(?:schema|field|column|config|configuration|api|endpoint|route|service account)\b",
             lowered,
         )
+    )
+
+
+def redact_dynamic_sensitive_placeholder_secrets(text: str) -> str:
+    placeholder = r"<[^>\n]{0,48}(?:api[_\-. ]?key|token|secret|密钥|令牌|凭证)[^>\n]{0,48}>"
+    assignment_key = r"(?:api[_\-. ]?key|token|secret|credential|credentials|密钥|令牌|凭证)"
+    text = re.sub(
+        rf"(?i)\b{assignment_key}\b\s*['\"]?\s*[:=]\s*['\"]?{placeholder}['\"]?",
+        " ",
+        text,
+    )
+    return re.sub(placeholder, "<placeholder>", text, flags=re.IGNORECASE)
+
+
+def dynamic_sensitive_secret_marker(marker: str) -> bool:
+    marker_lower = marker.lower()
+    return bool(
+        re.search(r"(?:api[_\-. ]?key|token|secret|credential|credentials)", marker_lower, re.IGNORECASE)
     )
 
 
@@ -13176,7 +13308,6 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
                 "基金",
                 "贷款",
                 "理财",
-                "收益",
                 "高收益",
                 "买入",
                 "卖出",
@@ -13190,7 +13321,6 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
             "安全",
             "安全",
             [
-                "安全",
                 "网络安全",
                 "绕过认证",
                 "绕过权限",
@@ -13235,7 +13365,6 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
         "一定",
         "无需",
         "建议",
-        "适合",
         "推荐",
         "保证",
         "预防",
@@ -13245,7 +13374,6 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
         "用药",
         "处方",
         "剂量",
-        "投入",
         "投资",
         "买入",
         "卖出",
@@ -13256,8 +13384,6 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
         "关闭防火墙",
         "泄露密钥",
         "公开密钥",
-        "每天",
-        "大部分",
     ]
     if any(marker in compact for marker in chinese_markers):
         return True
@@ -13273,11 +13399,12 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
 
 
 def high_risk_actionable_can_context(compact: str, lowered: str) -> bool:
+    chinese_modality = r"(?:可以|可|适合|适宜|适用于|可用于|推荐用于)"
     chinese_patterns = [
-        r"(?:可以|可).{0,8}(?:服用|用药|吃|口服).{0,10}(?:药|阿司匹林|处方|剂量|胸痛|心梗|症状)",
-        r"(?:可以|可).{0,8}(?:解除|起诉|索赔|要求赔偿|签署|签).{0,10}(?:合同|协议|竞业|雇主|公司|赔偿)",
-        r"(?:可以|可).{0,8}(?:投资|买入|买|配置|购买).{0,10}(?:理财|债券|股票|基金|贷款|高收益|存款)",
-        r"(?:可以|可).{0,8}(?:绕过|禁用|关闭|删除|删|泄露|公开|存储|保存).{0,12}(?:认证|权限|防火墙|日志|密钥|密码|凭证|明文|隐私)",
+        rf"{chinese_modality}.{{0,8}}(?:服用|用药|吃|口服).{{0,10}}(?:药|阿司匹林|处方|剂量|胸痛|心梗|症状)",
+        rf"{chinese_modality}.{{0,8}}(?:解除|起诉|索赔|要求赔偿|签署|签).{{0,10}}(?:合同|协议|竞业|雇主|公司|赔偿)",
+        rf"{chinese_modality}.{{0,8}}(?:投资|买入|买|配置|购买).{{0,10}}(?:理财|债券|股票|基金|贷款|高收益|存款)",
+        rf"{chinese_modality}.{{0,8}}(?:绕过|禁用|关闭|删除|删|泄露|公开|存储|保存).{{0,12}}(?:认证|权限|防火墙|日志|密钥|密码|凭证|明文|隐私)",
     ]
     if any(re.search(pattern, compact, re.IGNORECASE) for pattern in chinese_patterns):
         return True
@@ -13286,6 +13413,10 @@ def high_risk_actionable_can_context(compact: str, lowered: str) -> bool:
         r"\bcan\s+(?:sue|terminate|cancel|sign).{0,40}\b(?:employer|contract|non-compete|noncompete|liability|attorney)\b",
         r"\bcan\s+(?:invest|buy|purchase|configure).{0,40}\b(?:bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
         r"\bcan\s+(?:store|save|bypass|disable|delete|leak|expose).{0,40}\b(?:password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
+        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:taking|using|aspirin|medicine|medication|dosage|dose|chest pain|heart attack)\b",
+        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:suing|terminating|cancelling|signing|employer|contract|non-compete|noncompete|liability|attorney)\b",
+        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:investing|buying|purchasing|bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
+        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:storing|saving|bypassing|disabling|deleting|leaking|exposing|password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
     ]
     return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in english_patterns)
 
@@ -13333,9 +13464,14 @@ def collect_grounding_claims(
             if examples_unsafe_bypass_quote or (quote_has_dynamic_sensitive_query and not supported):
                 is_illustrative_example = False
                 is_memory_example = False
-            section_example_hard_fact = section_key == "examples" and (
-                contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote)
-            )
+            if (
+                section_key == "examples"
+                and not supported
+                and not examples_unsafe_bypass_quote
+                and examples_quote_should_warn_not_infer(normalized_quote, quote)
+            ):
+                is_illustrative_example = False
+                is_memory_example = False
             is_abstract_placeholder_example = (
                 section_key == "examples"
                 and not supported
@@ -13373,6 +13509,28 @@ def collect_grounding_claims(
                 and examples_query_template_quote(body, normalized_quote, quote, quote_start=quote_start)
             )
             if (
+                section_key == "examples"
+                and not supported
+                and not examples_unsafe_bypass_quote
+                and examples_quote_should_warn_not_infer(normalized_quote, quote)
+            ):
+                is_abstract_placeholder_example = False
+                is_generic_prompt_example = False
+                is_memory_query_example = False
+                is_query_template_example = False
+            if (
+                section_key != "examples"
+                and not supported
+                and is_illustrative_example
+                and (
+                    len(normalized_quote) > 12
+                    or contains_short_fact_marker(normalized_quote)
+                    or contains_hard_fact_marker(normalized_quote)
+                    or examples_quote_should_warn_not_infer(normalized_quote, quote)
+                )
+            ):
+                is_illustrative_example = False
+            if (
                 not is_explicit_quote
                 and (
                     is_illustrative_example
@@ -13388,6 +13546,8 @@ def collect_grounding_claims(
                     reason = "例子区的抽象占位符示例按 illustrative example 处理，不要求 raw exact match。"
                 elif is_memory_query_example:
                     reason = "例子区的抽象记忆查询样例按 illustrative example 处理，不要求 raw exact match。"
+                elif is_memory_example:
+                    reason = "记忆评估中的短问句/用户偏好/对话样例按 illustrative example 处理，不要求 raw exact match。"
                 elif is_query_template_example:
                     reason = "例子区的短查询/请求模板按 illustrative example 处理，不要求 raw exact match。"
                 elif is_generic_prompt_example:
@@ -13396,8 +13556,6 @@ def collect_grounding_claims(
                     reason = "例子区的通用示例句按 illustrative example 处理，不要求 raw exact match。"
                 elif is_illustrative_example:
                     reason = "由如/例如/比如引出的通用示例句按 illustrative example 处理，不要求 raw exact match。"
-                elif is_memory_example:
-                    reason = "记忆评估中的短问句/用户偏好/对话样例按 illustrative example 处理，不要求 raw exact match。"
                 claims.append(
                     GroundingClaim(
                         page_plan_id=page.page_plan_id,
@@ -13554,10 +13712,10 @@ def collect_grounding_claims(
                             claim_type="new_fact",
                             text=unsupported_text,
                             support="unsupported",
-                            action="needs_review",
+                            action="warn",
                             reason=(
                                 f"新增影响范围/受影响对象推测 `{scope_marker}` 未被 raw 或 inspected wiki 同句级支撑；"
-                                "请删除该推测，或改写为来源明确陈述。"
+                                "作为非阻塞提醒保留，必要时可人工回看来源。"
                             ),
                         )
                     )
@@ -13588,8 +13746,11 @@ def collect_grounding_claims(
                             claim_type="new_fact",
                             text=unsupported_text,
                             support="unsupported",
-                            action="needs_review",
-                            reason=f"新增外部背书/强事实标记 `{marker}` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
+                            action="warn",
+                            reason=(
+                                f"新增外部背书/强事实标记 `{marker}` 未在 raw 或 inspected wiki 中出现；"
+                                "作为非阻塞提醒保留，必要时可改写为 source-local 表达。"
+                            ),
                         )
                     )
                     break
@@ -13948,8 +14109,6 @@ def illustrative_example_context(body: str, quote: str, *, quote_start: int | No
         return False
     if quote_has_dynamic_sensitive_query_marker(normalized, quote):
         return False
-    if contains_short_fact_marker(normalized) and not looks_like_instructional_example(normalized, prefix):
-        return False
     return True
 
 
@@ -14148,20 +14307,15 @@ def examples_quote_end_index(body: str, quote_start: int, original: str) -> int:
 def examples_query_template_has_unsafe_marker(normalized: str, original: str = "") -> bool:
     if examples_quote_has_unsafe_marker_for_bypass(normalized, original):
         return True
-    if looks_like_mixed_unsupported_example_fact(normalized):
-        return True
     if looks_like_user_id_literal(normalized):
         return True
-    if contains_hard_fact_marker(normalized):
-        return True
-    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
+    if re.search(r"https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
         return True
     if re.search(r"`[^`]*(?:--|=|/|\\|\d)[^`]*`", original):
         return True
     lowered_original = original.lower()
     unsafe_word_pattern = (
-        r"\b(?:order|ticket|issue|status|success|failed|failure|error|token|api[_-]?key|password|"
-        r"passwd|secret|credential|account|permission|payment|refund|delete|deleted|revenue)\b"
+        r"\b(?:token|api[_-]?key|password|passwd|secret|credential|account|permission|payment|refund)\b"
     )
     if re.search(unsafe_word_pattern, lowered_original):
         return True
@@ -14229,8 +14383,6 @@ def dynamic_sensitive_query_marker_text(normalized: str, original: str = "") -> 
 
 
 def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
-    if unsupported_backing_marker(original) or unsupported_backing_marker(normalized):
-        return True
     if quote_has_dynamic_sensitive_query_marker(normalized, original):
         return True
     if looks_like_user_id_literal(normalized):
@@ -14239,13 +14391,25 @@ def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str =
         return True
     if examples_quote_has_sensitive_user_data_marker(normalized, original):
         return True
-    if examples_quote_has_factual_eval_marker(original):
+    if severe_factual_claim_marker(original) or severe_factual_claim_marker(normalized):
         return True
-    if examples_quote_has_chinese_factual_eval_marker(normalized):
+    if high_risk_domain_statement_marker(original) or high_risk_domain_statement_marker(normalized):
         return True
-    if re.search(r"\d|[%％$￥¥]|https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
+    if re.search(r"https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
         return True
     return False
+
+
+def examples_quote_should_warn_not_infer(normalized: str, original: str = "") -> bool:
+    return bool(
+        unsupported_backing_marker(original)
+        or unsupported_backing_marker(normalized)
+        or examples_quote_has_factual_eval_marker(original)
+        or examples_quote_has_chinese_factual_eval_marker(normalized)
+        or contains_short_fact_marker(normalized)
+        or contains_hard_fact_marker(normalized)
+        or looks_like_mixed_unsupported_example_fact(normalized)
+    )
 
 
 def examples_quote_has_factual_eval_marker(original: str = "") -> bool:

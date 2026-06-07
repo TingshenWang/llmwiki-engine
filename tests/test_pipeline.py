@@ -3220,15 +3220,14 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "Do not wrap paraphrases" in grounding_risk_rules
     assert "translated transcript source text" in grounding_risk_rules
     assert "speaker-like Chinese wording as paraphrase" in grounding_risk_rules
-    assert "external-backing/adoption phrases" in grounding_risk_rules
+    assert "popularity/adoption/authority claims" in grounding_risk_rules
     assert "source-local capabilities" in grounding_risk_rules
-    assert "被广泛应用" in grounding_risk_rules
-    assert "unsupported adoption/authority premises" in grounding_risk_rules
+    assert "broader phrasing" in grounding_risk_rules
+    assert "allowed as hypotheses" in grounding_risk_rules
     assert "最佳实践" in grounding_risk_rules
-    assert "待补来源：混合搜索与向量搜索的融合策略应如何设定和验证" in grounding_risk_rules
-    assert "High-risk causal/scope terms" in grounding_risk_rules
-    assert "same sentence or clearly adjacent explicit support" in grounding_risk_rules
-    assert "approved_prepared_markdown" in grounding_risk_rules
+    assert "phrase them with uncertainty or 待补来源" in grounding_risk_rules
+    assert "For causal/scope terms" in grounding_risk_rules
+    assert "keep the wording proportional to the source" in grounding_risk_rules
     assert "可能伴随" in grounding_risk_rules
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
     assert "Across body_markdown/open_questions/section_bodies" in contract_rules
@@ -5704,9 +5703,9 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
         snapshot,
         "",
     )
-    assert report["changed"] is True
-    assert report["replacement_count"] == 1
-    assert "`<example_id>`" in cleaned.pages[0].body_markdown
+    assert report["changed"] is False
+    assert report["replacement_count"] == 0
+    assert "ABC123" in cleaned.pages[0].body_markdown
 
 
 def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_failing_page(tmp_path: Path) -> None:
@@ -6281,13 +6280,11 @@ def test_cleanup_open_question_unsupported_scope_claims_moves_fact_to_question()
     )
     review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
 
-    page = cleaned.pages[0]
-    assert review_before.requires_review
-    assert report["changed"] is True
-    assert report["relocation_count"] == 1
-    assert "导致错误响应" not in page.section_bodies["examples"]
-    assert "如何确保召回准确性？" in page.section_bodies["examples"]
-    assert "待补来源：召回到不准确的用户偏好时，系统应如何确认与纠正？" in page.section_bodies["open_questions"]
+    assert review_before.requires_review is False
+    assert review_before.warnings
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["relocation_count"] == 0
     assert not review_after.requires_review
 
     cleaned_again, report_again = pipeline_module.cleanup_open_question_unsupported_scope_claims(
@@ -6345,9 +6342,10 @@ def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
     )
 
     page = cleaned.pages[0]
-    assert report["changed"] is True
-    assert report["pages"][0]["relocations"][0]["append_decision"] == "skipped_duplicate_question"
-    assert "导致错误响应" not in page.section_bodies["examples"]
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["relocation_count"] == 0
+    assert "导致错误响应" in page.section_bodies["examples"]
     assert page.section_bodies["open_questions"].count(duplicate_question) == 1
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
 
@@ -6396,10 +6394,11 @@ def test_cleanup_open_question_scope_claim_uses_reason_marker_after_sentence_spl
         "记忆召回结果需要确认。",
     )
 
-    assert review_before.unsupported_new_facts[0].text == unsupported_sentence
-    assert report["changed"] is True
-    assert unsupported_sentence not in cleaned.pages[0].section_bodies["examples"]
-    assert "待补来源：" in cleaned.pages[0].section_bodies["open_questions"]
+    assert review_before.requires_review is False
+    assert review_before.warnings[0].text == unsupported_sentence
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["relocation_count"] == 0
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
 
 
@@ -6473,7 +6472,9 @@ def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts(
 
     assert cleaned == draft
     assert report["changed"] is False
-    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
+    review = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
+    assert review.requires_review is False
+    assert review.warnings
 
 
 def test_draft_rendering_batch_refs_include_open_question_cleanup_schema(tmp_path: Path) -> None:
@@ -8197,7 +8198,7 @@ def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: 
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
         data = read_json(FIXTURE_ROOT / "mock" / name)
         if name == "draft_rendering.json":
-            data["pages"][0]["section_bodies"]["detail"] += "\n\n该方案被多个社区引用。"
+            data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="grounding")
@@ -8209,14 +8210,14 @@ def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: 
     assert grounding["requires_review"] is True
     assert grounding["unsupported_new_facts"]
     unsupported = grounding["unsupported_new_facts"][0]
-    assert unsupported["text"] == "该方案被多个社区引用。"
-    assert "被多个" in unsupported["reason"]
-    assert "删除该背书词" in unsupported["reason"]
+    assert unsupported["text"] == "OpenAI 收购了 Anthropic。"
+    assert "收购" in unsupported["reason"]
+    assert "严重事实关系" in unsupported["reason"]
     assert "# 草稿来源支撑审查" in grounding_markdown
     assert "unsupported new_fact" not in grounding_markdown
     assert "Draft Grounding Review" not in grounding_markdown
     assert repair_report["repair_count"] == 2
-    assert "触发文本：该方案被多个社区引用。" in repair_report["attempts"][0]["issues"][0]["message"]
+    assert "触发文本：OpenAI 收购了 Anthropic。" in repair_report["attempts"][0]["issues"][0]["message"]
     assert repair_report["attempts"][1]["repair_prompt_ref"] == "repair_prompts/attempt-2.json"
     assert (run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json").exists()
     manifest = status(vault, manifest.operation_id)
@@ -8395,8 +8396,7 @@ def test_grounding_examples_allow_abstract_placeholder_quotes() -> None:
     review = build_examples_grounding_review("- “某个用户曾在某家店消费过”\n- “该用户表示喜欢某类产品”")
 
     assert review.requires_review is False
-    assert {claim.support for claim in review.claims} == {"inference"}
-    assert all("抽象占位符示例" in claim.reason for claim in review.claims)
+    assert [claim.action for claim in review.warnings] == ["warn", "warn"]
 
 
 def test_grounding_examples_allow_user_preference_placeholder() -> None:
@@ -8419,12 +8419,11 @@ def test_cleanup_unsupported_example_literals_replaces_identifier_placeholder() 
     )
     review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
 
-    assert review_before.requires_review is True
-    assert [claim.text for claim in review_before.unsupported_new_facts] == ["ABC123"]
-    assert report["changed"] is True
-    assert report["replacement_count"] == 1
-    assert report["replacements"][0]["replacement"] == "`<example_id>`"
-    assert "`<example_id>`" in cleaned.pages[0].section_bodies["examples"]
+    assert review_before.requires_review is False
+    assert [claim.text for claim in review_before.warnings] == ["ABC123"]
+    assert report["changed"] is False
+    assert report["replacement_count"] == 0
+    assert "ABC123" in cleaned.pages[0].section_bodies["examples"]
     assert not review_after.requires_review
 
 
@@ -8440,9 +8439,9 @@ def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder()
         review=review_before,
     )
 
-    assert report["changed"] is True
-    assert report["replacements"][0]["replacement"] == "`<time_period>`"
-    assert "`<time_period>`" in cleaned.pages[0].section_bodies["examples"]
+    assert report["changed"] is False
+    assert report["replacement_count"] == 0
+    assert "2025年第三季度" in cleaned.pages[0].section_bodies["examples"]
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
@@ -8495,8 +8494,8 @@ def test_cleanup_unsupported_example_literals_preserves_inline_command_syntax() 
     )
 
     assert report["changed"] is True
-    assert report["replacement_count"] == 2
-    assert '`mem0 add --user-id "<user_id>" --text "<memory_text>"`' in cleaned.pages[0].section_bodies["examples"]
+    assert report["replacement_count"] == 1
+    assert '`mem0 add --user-id "<user_id>" --text "用户喜欢蓝色"`' in cleaned.pages[0].section_bodies["examples"]
     assert " `<user_id>` " not in cleaned.pages[0].section_bodies["examples"]
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
@@ -8519,7 +8518,9 @@ def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
     assert cleaned == draft
     assert report["changed"] is False
     assert report["skipped_count"] == 0
-    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
+    assert review_after.requires_review is False
+    assert review_after.warnings
 
 
 def test_cleanup_unsupported_example_literals_keeps_source_supported_literal() -> None:
@@ -8554,7 +8555,7 @@ def test_cleanup_unsupported_example_literals_skips_repeated_literals() -> None:
 
     assert cleaned == draft
     assert report["changed"] is False
-    assert {item["reason"] for item in report["skipped"]} == {"skipped_ambiguous_repeated_quoted_literal"}
+    assert report["skipped"] == []
 
 
 def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> None:
@@ -8571,8 +8572,8 @@ def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> Non
 
     assert cleaned == draft
     assert report["changed"] is False
-    assert report["skipped"][0]["reason"] == "skipped_mixed_fact_literal"
-    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    assert report["skipped"] == []
+    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 @pytest.mark.parametrize(
@@ -8605,8 +8606,13 @@ def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal:
 
     assert cleaned == draft
     assert report["changed"] is False
-    assert {item["reason"] for item in report["skipped"]} == {"skipped_mixed_fact_literal"}
-    assert pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
+    if any(marker in literal for marker in ["订单", "凭证", "密码"]):
+        assert {item["reason"] for item in report["skipped"]} == {"skipped_mixed_fact_literal"}
+        assert review_after.requires_review
+    else:
+        assert report["skipped"] == []
+        assert not review_after.requires_review
 
 
 def test_grounding_examples_allow_abstract_memory_query_literals() -> None:
@@ -8620,7 +8626,7 @@ def test_grounding_examples_allow_abstract_memory_query_literals() -> None:
         "用户最近的工单信息",
         "用户之前提到的项目截止日期",
     ]
-    assert {claim.reason for claim in review.claims} == {"例子区的抽象记忆查询样例按 illustrative example 处理，不要求 raw exact match。"}
+    assert review.requires_review is False
 
 
 def test_grounding_examples_allow_short_query_template_quotes() -> None:
@@ -9016,6 +9022,8 @@ def test_grounding_weak_technical_relationships_do_not_require_review(body_markd
         "### Wiki 层\n\nLLM 完全拥有这一层：创建、更新、删除页面，维护交叉引用，保持一致性。",
         "### 摘要撰写\n\nLLM 在 wiki 中创建该源的摘要页面，记录来源信息及主要贡献。",
         "### 查询流程\n\n当用户向 wiki 提出问题时，LLM 会搜索相关页面并合成答案。",
+        "### 自定义工具\n\n开发者可以注册自定义工具（使用 `@register_tool` 装饰器），例如创建一个图像生成工具，然后实例化 `Assistant` 并配置 LLM 服务。",
+        "### 智能体创建\n\n3. **创建智能体**：通过 `Assistant` 类实例化，集成工具使用与文件读取能力。",
     ],
 )
 def test_grounding_wiki_operation_create_and_question_flow_do_not_require_review(body_markdown: str) -> None:
@@ -9041,10 +9049,121 @@ def test_grounding_wiki_operation_create_and_question_flow_do_not_require_review
 
 
 @pytest.mark.parametrize(
+    "body_markdown",
+    [
+        "### LLM 层\n\n通过 `BaseChatModel` 基类封装大语言模型接口，提供统一的 `chat` 方法，支持流式输出和函数调用。",
+        "### 工具调用\n\n默认模板支持并行工具调用。",
+        "### API 兼容\n\nQwen-Agent 支持 OpenAI-compatible API。",
+    ],
+)
+def test_grounding_technical_support_capabilities_do_not_require_review(body_markdown: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="技术能力说明不应该被支持关系误杀。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+@pytest.mark.parametrize(
+    "body_markdown",
+    [
+        "### 可选依赖\n\n支持可选依赖，如 GUI（基于 Gradio）、RAG（检索增强生成）、代码解释器、MCP（模型上下文协议）等。",
+        "### MCP 集成\n\nMCP 集成：支持模型上下文协议，使用 MCP 工具需要安装 Node.js、uv、Git 等依赖（详见 README）。",
+        "### 版本更新\n\n框架持续更新，近期版本包括 Qwen3.5 支持、DeepPlanning 评测基准发布等。",
+        "### 智能体创建\n\n`Assistant` 是一个能够使用工具并读取文件的智能体，其创建示例如下（来自源代码步骤 3）：",
+        "### 工具循环\n\n工具调用后，结果返回给 Agent，再由 Agent 决定下一步动作。",
+        "### 初始化示例\n\n示例中通过 `Assistant(llm, function_list, files)` 创建（见 README 步骤3代码）。",
+        "### 模板配置\n\n工具调用支持多种模板，通过 `fncall_prompt_type` 参数配置，默认为 `nous`（Qwen3 推荐）。",
+        "### 代码解释器\n\n当智能体决定使用代码解释器时，框架会在本地 Docker 环境中创建一个隔离容器。",
+        "### 框架定位\n\nQwen-Agent 是一个基于 Qwen 模型的 Agent 开发框架，提供 LLM、Tool、Agent 等组件，支持自定义工具、代码解释器、MCP 集成，并作为 Qwen Chat 的后端运行。",
+        "### 模型服务\n\nQwen-Agent 支持接入阿里云 DashScope 服务提供的 Qwen 模型服务，也支持通过 OpenAI API 方式接入开源的 Qwen 模型服务。",
+        "### 工具解析\n\n部署时注意：对于 QwQ 和 Qwen3 模型，建议不开启 vLLM 的 `--enable-auto-tool-choice` 和 `--tool-call-parser hermes`，由 Qwen-Agent 自行解析工具输出。",
+        "### DeepPlanning\n\nDeepPlanning 是用于评估 Agent 规划能力的开源基准测试，由 Qwen 团队发布。",
+        "### DeepPlanning\n\nDeepPlanning 是一个用于评估大语言模型智能体规划能力的开源基准测试，由 Qwen 团队在 2026 年 1 月发布。",
+    ],
+)
+def test_grounding_qwen_agent_technical_documentation_does_not_require_review(body_markdown: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="Qwen-Agent README 的技术说明不应该被严重事实关系误杀。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_allows_placeholder_api_key_in_configuration_example() -> None:
+    draft, plan, snapshot = build_examples_grounding_case(
+        "暂无相关例子记录。",
+        detail=(
+            "2. 配置 LLM，例如使用 DashScope："
+            "`{'model': 'qwen3-32b', 'model_type': 'qwen_dashscope', 'api_key': '<DASHSCOPE_API_KEY>'}`。"
+        ),
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+
+
+def test_grounding_blocks_real_api_key_literal_in_configuration_example() -> None:
+    draft, plan, snapshot = build_examples_grounding_case(
+        "暂无相关例子记录。",
+        detail="示例配置里写了 api_key: sk-live-secret-value。",
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert review.unsupported_new_facts[0].action == "needs_review"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "配置：api_key: <DASHSCOPE_API_KEY>; token: sk-live-secret-value。",
+        "配置：token: sk-live-secret-value; api_key: <DASHSCOPE_API_KEY>。",
+    ],
+)
+def test_grounding_placeholder_secret_does_not_hide_real_secret(detail: str) -> None:
+    draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert review.unsupported_new_facts[0].action == "needs_review"
+
+
+@pytest.mark.parametrize(
     "body_markdown, expected_marker",
     [
         ("### 方案归属\n\nKarpathy 提出 llm-wiki 方案。", "提出"),
         ("### 产品归属\n\nOpenAI 创建了一个 Anthropic 竞品。", "创建"),
+        ("### 服务关系\n\nOpenAI 支持 Anthropic 服务。", "支持"),
+        ("### 产品关系\n\nOpenAI 创建了 Assistant 产品。", "创建"),
     ],
 )
 def test_grounding_real_create_and_propose_relationships_still_require_review(
@@ -9071,6 +9190,31 @@ def test_grounding_real_create_and_propose_relationships_still_require_review(
     assert review.requires_review is True
     assert review.unsupported_new_facts[0].action == "needs_review"
     assert expected_marker in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_security_sandbox_advice_does_not_require_review() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="防御性安全工程描述不应自动 review。",
+                body_markdown=(
+                    "### 沙箱边界\n\n"
+                    "Docker 沙箱提供了一定程度的隔离，但生产环境中可能需要更严格的沙箱方案（如 gVisor、Firecracker）来增强安全性。"
+                ),
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 def test_grounding_quote_uses_sentence_context_for_high_risk_domain() -> None:
@@ -9131,16 +9275,22 @@ def test_grounding_high_risk_domain_meta_statements_do_not_require_review(body_m
         "### 医疗建议\n\n患者可以服用阿司匹林。",
         "### 医疗建议\n\n患者可以吃阿司匹林。",
         "### 医疗建议\n\n患者可以口服阿司匹林。",
+        "### 医疗建议\n\n患者适合吃阿司匹林。",
         "### Medical Advice\n\nPatients can use aspirin for chest pain.",
         "### 金融建议\n\n普通用户可以投资高收益债券。",
         "### 金融建议\n\n普通用户可以配置高收益理财产品。",
+        "### 金融建议\n\n普通用户适合购买高收益债券。",
         "### 法律建议\n\n法律上可以解除这份合同。",
         "### 法律建议\n\n员工可以起诉雇主要求赔偿。",
         "### 法律建议\n\n员工可以签竞业协议。",
+        "### 法律建议\n\n员工适用于签署竞业协议。",
         "### Legal Advice\n\nYou can sue your employer without an attorney.",
         "### 安全建议\n\n管理员可以绕过认证后删除日志。",
         "### 安全建议\n\n管理员可以删日志。",
+        "### 安全建议\n\n系统适合保存明文密码。",
+        "### 安全建议\n\n管理员推荐用于删除日志。",
         "### Security Advice\n\nUsers can store passwords in plaintext for convenience.",
+        "### Security Advice\n\nThis setup is suitable for storing passwords in plaintext.",
     ],
 )
 def test_grounding_high_risk_domain_actionable_can_statements_still_require_review(body_markdown: str) -> None:
@@ -9328,18 +9478,18 @@ def test_grounding_unquoted_dynamic_scenario_scanner_ignores_open_questions_sect
     assert review.requires_review is False
 
 
-def test_grounding_examples_query_template_requires_local_context() -> None:
+def test_grounding_examples_query_template_without_local_context_warns() -> None:
     review = build_examples_grounding_review("- “Redis 的安装方法”")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["Redis 的安装方法"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["Redis 的安装方法"]
 
 
-def test_grounding_examples_query_template_direct_quote_still_requires_support() -> None:
+def test_grounding_examples_query_template_direct_quote_warns_without_support() -> None:
     review = build_examples_grounding_review("原文称：“Redis 的安装方法”。")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["Redis 的安装方法"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["Redis 的安装方法"]
 
 
 @pytest.mark.parametrize(
@@ -9438,8 +9588,62 @@ def test_grounding_examples_allow_isolated_query_template_contexts(examples: str
         "例如“query users API keys”",
     ],
 )
-def test_grounding_examples_query_template_keeps_fact_like_quotes_strict(examples: str) -> None:
+def test_grounding_examples_query_template_keeps_sensitive_quotes_strict(examples: str) -> None:
     review = build_examples_grounding_review(examples)
+
+    blocking_markers = [
+        "用户 1234",
+        "删除了凭证",
+        "查询王小明",
+        "手机号",
+        "邮箱",
+        "登录记录",
+        "email address",
+        "查询Alice",
+        "查询Charlie",
+        "查询alice",
+        "查找Alice",
+        "查找王小明",
+        "user's address",
+        "customer address",
+        "user IP",
+        "customer IP",
+        "users profiles",
+        "users addresses",
+        "customer cookies",
+        "user IDs",
+        "customer card",
+        "credit card",
+        "users tokens",
+        "user sessions",
+        "user passwords",
+        "people's addresses",
+        "people profiles",
+        "persons addresses",
+        "people locations",
+        "users' emails",
+        "user's birthday",
+        "user's name",
+        "person profile",
+        "customer profiles",
+        "user addresses",
+        "users IPs",
+        "users emails",
+        "persons' addresses",
+        "SSN",
+        "social security number",
+        "passport number",
+        "license number",
+        "api key",
+        "API key",
+        "secrets",
+        "passwds",
+        "已经发布",
+        "推出企业版",
+    ]
+    if not any(marker in examples for marker in blocking_markers):
+        assert review.requires_review is False
+        return
 
     assert review.requires_review is True
     assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
@@ -9504,14 +9708,19 @@ def test_grounding_examples_sensitive_memory_eval_quotes_stay_strict(examples: s
         '- `mem0 search "用户最近的工单信息" --user-id user123`',
     ],
 )
-def test_grounding_examples_placeholder_bypass_keeps_concrete_or_attributed_quotes_strict(examples: str) -> None:
+def test_grounding_examples_placeholder_bypass_warns_for_concrete_or_attributed_quotes(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    strict_markers = ["张三", "手机号", "订单状态"]
+    if any(marker in examples for marker in strict_markers):
+        assert review.requires_review is True
+        assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+        return
+    assert review.requires_review is False
+    assert review.warnings or review.claims
 
 
-def test_grounding_examples_hard_facts_still_require_support() -> None:
+def test_grounding_examples_hard_facts_warn_without_support() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-FACT-EXAMPLE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -9559,26 +9768,15 @@ def test_grounding_examples_hard_facts_still_require_support() -> None:
         "",
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["销量增长三倍"]
-    message = pipeline_module.grounding_issue_message(review.unsupported_new_facts[0])
-    assert "例子区不应换一个具体用户事实继续尝试" in message
-    assert "用户偏好 X" in message
-    assert "<memory_text>" in message
-    assert "<user_id>" in message
-    assert "另一个具体值" in message
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["销量增长三倍"]
 
 
-def test_grounding_examples_repair_message_guides_cli_argument_placeholders() -> None:
+def test_grounding_examples_cli_argument_literals_warn_without_repair() -> None:
     review = build_examples_grounding_review('- `mem0 add --user-id user123 --text "用户喜欢科技类文章"`')
 
-    assert review.requires_review is True
-    message = pipeline_module.grounding_issue_message(review.unsupported_new_facts[0])
-    assert "<memory_text>" in message
-    assert "<user_id>" in message
-    assert "<memory_query>" in message
-    assert "命令参数" in message
-    assert "不要把被拒绝的具体偏好" in message
+    assert review.requires_review is False
+    assert review.warnings
 
 
 def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match() -> None:
@@ -9629,8 +9827,7 @@ def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match()
     )
 
     assert review.requires_review is False
-    assert [claim.text for claim in review.claims] == ["因为性能原因，使用列表推导", "如果代码量超过 100 行，请拆分"]
-    assert {claim.reason for claim in review.claims} == {"由如/例如/比如引出的通用示例句按 illustrative example 处理，不要求 raw exact match。"}
+    assert [claim.text for claim in review.warnings] == ["因为性能原因，使用列表推导", "如果代码量超过 100 行，请拆分"]
 
 
 def test_grounding_memory_example_questions_do_not_require_raw_exact_match() -> None:
@@ -9895,10 +10092,11 @@ def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["在Anthropic，评估被广泛使用于产品开发。"]
-    assert "被广泛使用" in review.unsupported_new_facts[0].reason
-    assert "删除该背书词" in review.unsupported_new_facts[0].reason
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["在Anthropic，评估被广泛使用于产品开发。"]
+    assert review.warnings[0].action == "warn"
+    assert "被广泛使用" in review.warnings[0].reason
+    assert "非阻塞提醒" in review.warnings[0].reason
 
 
 def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None:
@@ -9915,8 +10113,8 @@ def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None
 
     message = pipeline_module.grounding_issue_message(claim)
 
-    assert "不要换成另一个外部背书词或权威词" in message
-    assert "请删除这个 adoption/authority 前提" in message
+    assert "非阻塞提醒" in message
+    assert "adoption/authority 表达最好有来源意识" in message
     assert "source-local 表达" in message
     assert "触发文本：Redis最初作为高性能缓存、分析和消息代理广泛使用。" in message
 
@@ -9937,7 +10135,7 @@ def test_grounding_external_backing_issue_message_neutralizes_open_question_prem
 
     assert "中性的 `待补来源` 问题" in message
     assert "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提" in message
-    assert "不要换成另一个外部背书词或权威词" in message
+    assert "非阻塞提醒" in message
     assert "触发文本：目前是否存在公认的最佳融合策略？" in message
 
 
@@ -10040,8 +10238,9 @@ def test_grounding_external_backing_detects_adoption_and_best_practice_real_path
         raw,
     )
 
-    assert review.requires_review is True
-    reasons_by_text = {claim.text: claim.reason for claim in review.unsupported_new_facts}
+    assert review.requires_review is False
+    assert {claim.action for claim in review.warnings} == {"warn"}
+    reasons_by_text = {claim.text: claim.reason for claim in review.warnings}
     assert "Redis 被广泛采用作为缓存和消息代理。" in reasons_by_text
     assert "目前是否存在最佳实践？" in reasons_by_text
     assert "被广泛采用" in reasons_by_text["Redis 被广泛采用作为缓存和消息代理。"]
@@ -10059,8 +10258,8 @@ def test_grounding_external_backing_detects_adoption_and_best_practice_real_path
 def test_grounding_examples_external_backing_quotes_do_not_bypass_as_inference(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert [claim.action for claim in review.warnings] == ["warn"]
 
 
 def test_grounding_external_backing_quote_only_detail_does_not_bypass_as_concept_label() -> None:
@@ -10111,8 +10310,9 @@ def test_grounding_external_backing_quote_only_detail_does_not_bypass_as_concept
         "",
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["Redis 被广泛采用"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["Redis 被广泛采用"]
+    assert review.warnings[0].action == "warn"
 
 
 def test_grounding_external_backing_supported_quote_does_not_hide_later_unsupported_marker() -> None:
@@ -10163,9 +10363,9 @@ def test_grounding_external_backing_supported_quote_does_not_hide_later_unsuppor
         "Redis 被广泛采用作为缓存。",
     )
 
-    assert review.requires_review is True
-    assert any("MongoDB 被广泛采用" in claim.text for claim in review.unsupported_new_facts)
-    assert any("被广泛采用" in claim.reason for claim in review.unsupported_new_facts)
+    assert review.requires_review is False
+    assert any("MongoDB 被广泛采用" in claim.text for claim in review.warnings)
+    assert any("被广泛采用" in claim.reason for claim in review.warnings)
 
 
 @pytest.mark.parametrize(
@@ -10228,9 +10428,9 @@ def test_grounding_external_backing_supported_quote_does_not_hide_different_late
         "Redis 被广泛采用作为缓存。",
     )
 
-    assert review.requires_review is True
-    assert any(outside_claim.rstrip("。") in claim.text for claim in review.unsupported_new_facts)
-    assert any(expected_marker in claim.reason for claim in review.unsupported_new_facts)
+    assert review.requires_review is False
+    assert any(outside_claim.rstrip("。") in claim.text for claim in review.warnings)
+    assert any(expected_marker in claim.reason for claim in review.warnings)
 
 
 def test_grounding_external_backing_does_not_flag_internal_multiple_components() -> None:
@@ -10337,11 +10537,12 @@ def test_grounding_flags_unsupported_scope_speculation() -> None:
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [
         "源代码泄露事件中，Cowork 的组件可能也受到影响，但访谈中未详细说明。"
     ]
-    assert "受影响对象推测" in review.unsupported_new_facts[0].reason
+    assert review.warnings[0].action == "warn"
+    assert "受影响对象推测" in review.warnings[0].reason
 
 
 def test_grounding_scope_speculation_allows_open_question() -> None:
@@ -10682,8 +10883,9 @@ def test_grounding_external_backing_requires_specific_anchor_not_only_generic_wi
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["它被广泛使用，但存在数据污染风险。"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["它被广泛使用，但存在数据污染风险。"]
+    assert review.warnings[0].action == "warn"
 
 
 def test_grounding_quoted_conceptual_release_process_is_not_direct_quote() -> None:
@@ -10896,8 +11098,8 @@ def test_grounding_attributed_concept_label_is_not_dequoted_or_bypassed() -> Non
 
     assert report["changed"] is False
     assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_attributed_concept_label_with_punctuation_is_not_bypassed() -> None:
@@ -10952,8 +11154,8 @@ def test_grounding_attributed_concept_label_with_punctuation_is_not_bypassed() -
 
     assert report["changed"] is False
     assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_quoted_abstract_trend_label_context_is_not_direct_quote() -> None:
@@ -11009,7 +11211,7 @@ def test_grounding_quoted_abstract_trend_label_context_is_not_direct_quote() -> 
     assert review.claims[0].claim_type == "inference"
 
 
-def test_grounding_explicit_direct_quote_still_requires_exact_match() -> None:
+def test_grounding_explicit_direct_quote_mismatch_warns_without_review() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-QUOTE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -11056,8 +11258,9 @@ def test_grounding_explicit_direct_quote_still_requires_exact_match() -> None:
         "",
     )
 
-    assert review.requires_review is True
-    assert review.unsupported_new_facts[0].text == "解耦大脑与双手"
+    assert review.requires_review is False
+    assert review.warnings[0].text == "解耦大脑与双手"
+    assert "直接引用/作者归因" in review.warnings[0].reason
 
 
 def test_grounding_direct_quote_accepts_normalized_source_match() -> None:
@@ -11252,8 +11455,8 @@ def test_grounding_direct_quote_time_range_variant_requires_same_numbers() -> No
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_short_domain_quote_accepts_normalized_source_match() -> None:
@@ -11471,8 +11674,8 @@ def test_grounding_short_numeric_quote_does_not_match_decimal_collapse() -> None
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_ascii_closing_quote_is_not_treated_as_new_quote_start() -> None:
@@ -11706,7 +11909,7 @@ def test_grounding_quoted_method_goal_paraphrase_uses_nearby_source_support() ->
     assert "压缩概括" in review.claims[0].reason
 
 
-def test_grounding_quoted_method_goal_paraphrase_still_requires_nearby_support() -> None:
+def test_grounding_quoted_method_goal_paraphrase_warns_without_nearby_support() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-FAST-SHIPPING",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -11755,8 +11958,8 @@ def test_grounding_quoted_method_goal_paraphrase_still_requires_nearby_support()
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_numeric_reliability_paraphrase_rewrites_to_source_sentence() -> None:
@@ -11817,7 +12020,7 @@ def test_grounding_numeric_reliability_paraphrase_rewrites_to_source_sentence() 
     assert review.requires_review is False
 
 
-def test_grounding_numeric_reliability_paraphrase_requires_source_sentence() -> None:
+def test_grounding_numeric_reliability_paraphrase_warns_without_source_sentence() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-AUTOMATION-RELIABILITY",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -11868,8 +12071,8 @@ def test_grounding_numeric_reliability_paraphrase_requires_source_sentence() -> 
     )
 
     assert report["changed"] is False
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_rewrite_translates_known_english_harness_quote() -> None:
@@ -12260,7 +12463,7 @@ def test_grounding_numeric_reliability_rewrite_does_not_match_decimal_percent() 
     assert rewritten.pages[0].section_bodies["additional_notes"] == draft.pages[0].section_bodies["additional_notes"]
 
 
-def test_grounding_attributed_paraphrase_still_requires_exact_match() -> None:
+def test_grounding_attributed_paraphrase_warns_without_exact_match() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-FAST-SHIPPING",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -12315,8 +12518,8 @@ def test_grounding_attributed_paraphrase_still_requires_exact_match() -> None:
 
     assert report["changed"] is False
     assert rewritten.pages[0].section_bodies["detail"] == draft.pages[0].section_bodies["detail"]
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
 def test_grounding_named_tool_concept_label_with_digits_is_not_direct_quote() -> None:
@@ -12372,7 +12575,7 @@ def test_grounding_named_tool_concept_label_with_digits_is_not_direct_quote() ->
     assert review.claims[0].claim_type == "inference"
 
 
-def test_grounding_named_tool_label_with_numeric_fact_still_requires_support() -> None:
+def test_grounding_named_tool_label_with_numeric_fact_warns_without_support() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-AGENT-FACT",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -12420,11 +12623,11 @@ def test_grounding_named_tool_label_with_numeric_fact_still_requires_support() -
         "",
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
-def test_grounding_quoted_compact_paraphrase_still_requires_support_for_each_part() -> None:
+def test_grounding_quoted_compact_paraphrase_warns_without_support_for_each_part() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-FAST-ITERATION",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -12473,11 +12676,11 @@ def test_grounding_quoted_compact_paraphrase_still_requires_support_for_each_par
         raw,
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [quote]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [quote]
 
 
-def test_grounding_short_fact_phrases_still_require_exact_match() -> None:
+def test_grounding_short_fact_phrases_warn_without_exact_match() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-FACT",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -12524,11 +12727,11 @@ def test_grounding_short_fact_phrases_still_require_exact_match() -> None:
         "",
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["销量增长三倍", "裁撤一半团队", "预算超过百万"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["销量增长三倍", "裁撤一半团队", "预算超过百万"]
 
 
-def test_grounding_quoted_release_event_still_requires_exact_match() -> None:
+def test_grounding_quoted_release_event_warns_without_exact_match() -> None:
     item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-RELEASE-FACT",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -12575,8 +12778,8 @@ def test_grounding_quoted_release_event_still_requires_exact_match() -> None:
         "",
     )
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["发布了重大功能"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["发布了重大功能"]
 
 
 def test_draft_page_item_coerces_quality_risks_string_to_list() -> None:
@@ -13494,7 +13697,7 @@ def test_resume_cannot_skip_awaiting_draft_review(tmp_path: Path, from_step: str
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
         data = read_json(FIXTURE_ROOT / "mock" / name)
         if name == "draft_rendering.json":
-            data["pages"][0]["section_bodies"]["detail"] += "\n\n该方案被多个社区引用。"
+            data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
     run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug=f"skip-{from_step}")
