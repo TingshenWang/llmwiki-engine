@@ -1613,8 +1613,10 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "sources" not in frontmatter
     assert "[[sources/" not in knowledge_text
     assert "## Sources" not in knowledge_text
-    assert "## 详情" in knowledge_text
-    assert "## 价值点" in knowledge_text
+    assert "## 核心内容" in knowledge_text
+    assert "\n## 详情\n" not in knowledge_text
+    assert "### 价值点" in knowledge_text
+    assert "\n## 价值点\n" not in knowledge_text
     source_text = (draft_root / "sources" / "Source_raw_project_note.md").read_text(encoding="utf-8")
     source_frontmatter = yaml.safe_load(source_text.split("---\n", 2)[1])
     assert source_frontmatter["raw_cleanup_pre_sha256"] == source_frontmatter["raw_cleanup_post_sha256"]
@@ -3212,7 +3214,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     grounding_risk_rules = " ".join(payload["contract"]["grounding_risk_rules"])
     assert "source_excerpt_pack" in contract_rules
     assert "satisfy update_preservation_pack in the first draft" in contract_rules
-    assert "matching section body" in contract_rules
+    assert "body_markdown or the matching legacy section body" in contract_rules
     assert "change_summary may summarize retention but does not satisfy the obligation" in contract_rules
     assert "Do not wrap paraphrases" in contract_rules
     assert "Do not wrap paraphrases" in grounding_risk_rules
@@ -3229,7 +3231,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "approved_prepared_markdown" in grounding_risk_rules
     assert "可能伴随" in grounding_risk_rules
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
-    assert "Across all section_bodies" in contract_rules
+    assert "Across body_markdown/open_questions/section_bodies" in contract_rules
     assert "张三" in contract_rules
     assert "user-123" in contract_rules
     assert "do not invent concrete user facts" in contract_rules
@@ -4274,22 +4276,117 @@ def test_draft_rendering_normalizes_model_section_keys(tmp_path: Path) -> None:
     assert set(first_page["section_bodies"]) == {
         "summary",
         "detail",
-        "value_points",
-        "additional_notes",
         "open_questions",
     }
     assert first_page["section_bodies"]["summary"] == "这是模型用英文 key 写出的摘要。"
+    assert first_page["body_markdown"] == first_page["section_bodies"]["detail"]
     assert "### Background" in first_page["section_bodies"]["detail"]
     assert "### Product Philosophy" in first_page["section_bodies"]["detail"]
-    assert first_page["section_bodies"]["value_points"] == "- PM 应该把建议写到价值点中。\n- 数组也要转成 Markdown 字符串。"
-    assert first_page["section_bodies"]["additional_notes"] == "这是模型明确放进自由发挥区的观察。"
+    assert "### 价值点" in first_page["section_bodies"]["detail"]
+    assert "- PM 应该把建议写到价值点中。" in first_page["section_bodies"]["detail"]
+    assert "### 补充观察" in first_page["section_bodies"]["detail"]
+    assert "这是模型明确放进自由发挥区的观察。" in first_page["section_bodies"]["detail"]
     assert first_page["source_coverage_notes"] == "严格按照源内容，无额外添加。"
 
     concept_text = (run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md").read_text(
         encoding="utf-8"
     )
-    assert "## 补充观察" in concept_text
+    assert "## 核心内容" in concept_text
+    assert "\n## 补充观察\n" not in concept_text
     assert "这是模型明确放进自由发挥区的观察。" in concept_text
+
+
+def test_validate_draft_rendering_accepts_freeform_body_markdown() -> None:
+    plan = qwen_related_block_plan()
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QWEN",
+                action="create",
+                canonical_target_path="entities/Entity_Qwen-Agent.md",
+                summary="Qwen-Agent 是 Agent 开发框架。",
+                body_markdown=(
+                    "### 能力边界\n\n"
+                    "Qwen-Agent 把工具调用、规划和记忆能力组织成可运行的 Agent 框架。"
+                    "这不是单纯罗列功能，而是强调开发者可以围绕具体任务把模型能力和外部工具组合起来。\n\n"
+                    "### 使用场景\n\n"
+                    "例如，团队可以用它搭建一个处理内部知识查询的助手，并用占位符描述用户输入。"
+                ),
+                open_questions="- 待补来源：不同工具组合方式的可靠性如何验证？",
+                change_summary="创建 Qwen-Agent 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+
+
+def test_finalize_draft_rendering_merges_body_markdown_with_legacy_core_sections() -> None:
+    plan = qwen_related_block_plan()
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Qwen-Agent.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QWEN",
+                action="create",
+                canonical_target_path="entities/Entity_Qwen-Agent.md",
+                summary="Qwen-Agent 是 Agent 开发框架。",
+                body_markdown="### 自定义核心\n\n模型自己写的核心判断。",
+                section_bodies={
+                    "examples": "这个旧槽里的例子也不能丢。",
+                    "value_points": "这个旧槽里的价值判断也不能丢。",
+                },
+                change_summary="创建 Qwen-Agent 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    finalized = pipeline_module.finalize_draft_rendering(draft, plan, snapshot)
+    body = finalized.pages[0].body_markdown
+
+    assert "### 自定义核心" in body
+    assert "这个旧槽里的例子也不能丢。" in body
+    assert "这个旧槽里的价值判断也不能丢。" in body
+
+
+def test_validate_draft_rendering_rejects_system_heading_inside_body_markdown() -> None:
+    plan = qwen_related_block_plan()
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QWEN",
+                action="create",
+                canonical_target_path="entities/Entity_Qwen-Agent.md",
+                summary="Qwen-Agent 是 Agent 开发框架。",
+                body_markdown=(
+                    "### 能力边界\n\n"
+                    "Qwen-Agent 支持工具使用、规划和记忆能力。\n\n"
+                    "## 相关页面\n\n"
+                    "- [[entities/Entity_Qwen-Agent|Qwen-Agent]]"
+                ),
+                change_summary="创建 Qwen-Agent 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+        pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+
+    assert exc_info.value.issues[0].issue_code == "forbidden_system_section_in_core"
 
 
 def test_blocked_apply_eligibility_stops_at_merge_plan_review(tmp_path: Path) -> None:
@@ -4452,12 +4549,12 @@ def test_update_preserves_and_reports_existing_summary_detail_and_index_title(tm
     assert sections["summary"]["removed"] == []
     assert any("知识编译工程骨架强调" in item for item in sections["summary"]["added"])
     assert any("与旧页架构视角相衔接" in item for item in sections["summary"]["added"])
-    assert "旧详情正文应该参与 update 审计。" in sections["detail"]["retained"]
-    assert sections["detail"]["preserved_old"] == []
-    assert sections["detail"]["needs_manual_resolution"] is False
-    assert sections["detail"]["removed"] == []
-    assert any("这个判断把 MVP 的重点" in item for item in sections["detail"]["added"])
-    assert any("与旧页架构视角相衔接" in item for item in sections["detail"]["added"])
+    assert "旧详情正文应该参与 update 审计。" in sections["core_content"]["retained"]
+    assert sections["core_content"]["preserved_old"] == []
+    assert sections["core_content"]["needs_manual_resolution"] is False
+    assert sections["core_content"]["removed"] == []
+    assert any("这个判断把 MVP 的重点" in item for item in sections["core_content"]["added"])
+    assert any("与旧页架构视角相衔接" in item for item in sections["core_content"]["added"])
     assert reinforcement_report["changed"] is True
     assert reinforcement_report["reinforced_section_count"] == 2
     assert repair_report["final_outcome"] == "success"
@@ -5276,7 +5373,7 @@ def test_validate_draft_rendering_rejects_related_block_inside_content() -> None
         pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
-    assert exc_info.value.issues[0].field_path == "pages.PP-QWEN.section_bodies.additional_notes"
+    assert exc_info.value.issues[0].field_path == "pages.PP-QWEN.body_markdown"
 
 
 def test_validate_draft_rendering_rejects_decorated_related_markdown_links_inside_content() -> None:
@@ -5550,7 +5647,7 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
     )
 
     assert extracted is not None
-    assert "ABC123" in extracted.pages[0].section_bodies["examples"]
+    assert "ABC123" in extracted.pages[0].body_markdown
     cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
         extracted,
         plan.model_copy(update={"items": [ok_item]}),
@@ -5559,7 +5656,7 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
     )
     assert report["changed"] is True
     assert report["replacement_count"] == 1
-    assert "`<example_id>`" in cleaned.pages[0].section_bodies["examples"]
+    assert "`<example_id>`" in cleaned.pages[0].body_markdown
 
 
 def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_failing_page(tmp_path: Path) -> None:
@@ -6501,7 +6598,8 @@ def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None
     assert pipeline_module.update_preservation_issues(reinforced, pack) == []
     page = reinforced.pages[0]
     assert "从旧页保留的架构视角看" in page.section_bodies["summary"]
-    assert "从旧页保留的架构视角看" in page.section_bodies["examples"]
+    assert "从旧页保留的架构视角看" in page.body_markdown
+    assert "从旧页保留的架构视角看" in page.section_bodies["detail"]
 
 
 def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_english_dump() -> None:
@@ -8580,6 +8678,107 @@ def test_grounding_detail_memory_examples_sensitive_dynamic_queries_do_not_bypas
     assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
 
 
+def test_grounding_body_markdown_sensitive_dynamic_query_requires_review() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="语义缓存需要区分稳定知识和动态查询。",
+                body_markdown="### 风险边界\n\n用户查询订单状态时，系统不能把这个动态场景当成可缓存知识。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+@pytest.mark.parametrize(
+    "body_markdown, expected_marker",
+    [
+        ("### 医疗建议\n\n患者每天服用阿司匹林可以预防心梗。", "阿司匹林"),
+        ("### 法律判断\n\n员工签署竞业协议后一定不能加入竞争公司。", "竞业"),
+        ("### 金融建议\n\n普通用户应该把大部分存款投入高收益债券。", "存款"),
+    ],
+)
+def test_grounding_body_markdown_high_risk_domain_advice_requires_review(
+    body_markdown: str,
+    expected_marker: str,
+) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="高风险建议需要来源支撑。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert review.unsupported_new_facts[0].action == "needs_review"
+    assert expected_marker in review.unsupported_new_facts[0].reason or expected_marker in review.unsupported_new_facts[0].text
+
+
+def test_grounding_body_markdown_high_risk_domain_advice_allows_source_supported_claim() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    sentence = "患者每天服用阿司匹林可以预防心梗。"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="高风险建议需要来源支撑。",
+                body_markdown=f"### 医疗建议\n\n{sentence}",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, sentence)
+
+    assert review.requires_review is False
+    assert review.claims[-1].support == "raw"
+    assert review.claims[-1].action == "kept"
+
+
+def test_grounding_open_questions_high_risk_domain_gap_is_not_blocked_as_fact() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="高风险建议需要来源支撑。",
+                body_markdown="### 边界\n\n这里不把高风险建议写成事实。",
+                open_questions="- 待补来源：患者每天服用阿司匹林是否可以预防心梗？",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+
+
 @pytest.mark.parametrize(
     "detail",
     [
@@ -9163,6 +9362,55 @@ def test_grounding_short_concept_phrases_do_not_require_raw_exact_match() -> Non
                     "detail": "还保留“会话作为持久上下文对象”这个标题式表达。",
                     "examples": "暂无相关例子记录。",
                 },
+                change_summary="创建 Scaling 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Scaling.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.claims] == ["宠物 vs 牛", "解耦大脑与双手", "会话作为持久上下文对象"]
+    assert {claim.claim_type for claim in review.claims} == {"inference"}
+
+
+def test_grounding_short_concept_phrases_in_body_markdown_do_not_require_raw_exact_match() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-SCALING",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Scaling.md",
+        display_title="Scaling Managed Agents",
+        page_type="concept",
+        new_understanding="Scaling 讨论管理型 Agent 的协作边界。",
+        section_plans={"summary": "摘要"},
+        reason="测试 grounding 短语。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-SCALING",
+                action="create",
+                canonical_target_path="concepts/Concept_Scaling.md",
+                summary="页面围绕“宠物 vs 牛”和“解耦大脑与双手”两个概念展开。",
+                body_markdown="### 概念框架\n\n还保留“会话作为持久上下文对象”这个标题式表达。",
                 change_summary="创建 Scaling 页面。",
                 source_coverage_notes="测试。",
             )

@@ -551,7 +551,10 @@ class DraftPageItem(StrictModel):
     action: Literal["create", "update"]
     canonical_target_path: str
     preimage_sha256: str | None = None
-    section_bodies: dict[str, str]
+    summary: str = ""
+    body_markdown: str = ""
+    open_questions: str = ""
+    section_bodies: dict[str, str] = Field(default_factory=dict)
     change_summary: str
     source_coverage_notes: str = ""
     quality_risks: list[str] = Field(default_factory=list)
@@ -567,6 +570,9 @@ class DraftPageItem(StrictModel):
             data["source_coverage_notes"] = _coerce_section_body_scalar(coverage_checks)
         if "quality_risks" in data:
             data["quality_risks"] = _coerce_string_list(data["quality_risks"])
+        for field_name in ["summary", "body_markdown", "open_questions"]:
+            if field_name in data:
+                data[field_name] = _coerce_section_body(data[field_name])
         section_bodies = data.get("section_bodies")
         if not isinstance(section_bodies, dict):
             return data
