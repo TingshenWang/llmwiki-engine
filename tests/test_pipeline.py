@@ -3216,7 +3216,11 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "translated transcript source text" in grounding_risk_rules
     assert "speaker-like Chinese wording as paraphrase" in grounding_risk_rules
     assert "external-backing/adoption phrases" in grounding_risk_rules
+    assert "source-local capabilities" in grounding_risk_rules
     assert "被广泛应用" in grounding_risk_rules
+    assert "unsupported adoption/authority premises" in grounding_risk_rules
+    assert "最佳实践" in grounding_risk_rules
+    assert "待补来源：混合搜索与向量搜索的融合策略应如何设定和验证" in grounding_risk_rules
     assert "High-risk causal/scope terms" in grounding_risk_rules
     assert "same sentence or clearly adjacent explicit support" in grounding_risk_rules
     assert "approved_prepared_markdown" in grounding_risk_rules
@@ -9008,6 +9012,317 @@ def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
     assert [claim.text for claim in review.unsupported_new_facts] == ["在Anthropic，评估被广泛使用于产品开发。"]
     assert "被广泛使用" in review.unsupported_new_facts[0].reason
     assert "删除该背书词" in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None:
+    claim = pipeline_module.GroundingClaim(
+        page_plan_id="PP-REDIS",
+        target_path="concepts/Concept_Redis.md",
+        section_key="detail",
+        claim_type="new_fact",
+        text="Redis最初作为高性能缓存、分析和消息代理广泛使用。",
+        support="unsupported",
+        action="needs_review",
+        reason="新增外部背书/强事实标记 `广泛使用` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
+    )
+
+    message = pipeline_module.grounding_issue_message(claim)
+
+    assert "不要换成另一个外部背书词或权威词" in message
+    assert "请删除这个 adoption/authority 前提" in message
+    assert "source-local 表达" in message
+    assert "触发文本：Redis最初作为高性能缓存、分析和消息代理广泛使用。" in message
+
+
+def test_grounding_external_backing_issue_message_neutralizes_open_question_premise() -> None:
+    claim = pipeline_module.GroundingClaim(
+        page_plan_id="PP-SEARCH",
+        target_path="open_questions/Open_Question_混合搜索策略.md",
+        section_key="open_questions",
+        claim_type="new_fact",
+        text="目前是否存在公认的最佳融合策略？",
+        support="unsupported",
+        action="needs_review",
+        reason="新增外部背书/强事实标记 `公认` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
+    )
+
+    message = pipeline_module.grounding_issue_message(claim)
+
+    assert "中性的 `待补来源` 问题" in message
+    assert "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提" in message
+    assert "不要换成另一个外部背书词或权威词" in message
+    assert "触发文本：目前是否存在公认的最佳融合策略？" in message
+
+
+def test_grounding_external_backing_detects_adoption_and_best_practice_real_path() -> None:
+    concept_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-REDIS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Redis.md",
+        display_title="Redis",
+        page_type="concept",
+        new_understanding="Redis 可以用作缓存。",
+        section_plans={"detail": "说明 Redis 能力。"},
+        reason="测试广泛采用 marker。",
+    )
+    question_item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-SEARCH",
+        source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
+        action="create",
+        canonical_target_path="open_questions/Open_Question_混合搜索策略.md",
+        display_title="混合搜索策略",
+        page_type="open_question",
+        new_understanding="混合搜索策略仍需确认。",
+        section_plans={"open_questions": "记录待补来源问题。"},
+        reason="测试最佳实践 marker。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-REDIS",
+                action="create",
+                canonical_target_path="concepts/Concept_Redis.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "Redis 被广泛采用作为缓存和消息代理。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            ),
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-SEARCH",
+                action="create",
+                canonical_target_path="open_questions/Open_Question_混合搜索策略.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "整理仍需确认的策略问题。",
+                    "open_questions": "- 目前是否存在最佳实践？",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            ),
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Redis.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            ),
+            pipeline_module.WikiContextEntry(
+                path="wiki/open_questions/Open_Question_混合搜索策略.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            ),
+        ],
+    )
+    raw = "Redis 可以作为缓存和消息代理使用。材料讨论了混合搜索与向量搜索的融合策略需要继续验证。"
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[concept_item, question_item]),
+        snapshot,
+        raw,
+    )
+
+    assert review.requires_review is True
+    reasons_by_text = {claim.text: claim.reason for claim in review.unsupported_new_facts}
+    assert "Redis 被广泛采用作为缓存和消息代理。" in reasons_by_text
+    assert "目前是否存在最佳实践？" in reasons_by_text
+    assert "被广泛采用" in reasons_by_text["Redis 被广泛采用作为缓存和消息代理。"]
+    assert "最佳实践" in reasons_by_text["目前是否存在最佳实践？"]
+
+
+@pytest.mark.parametrize(
+    "examples",
+    [
+        "例子写成“Redis 被广泛采用”。",
+        "类似“是否存在广泛采用的方案？”的问题",
+        "类似“是否存在公认方案？”的问题",
+    ],
+)
+def test_grounding_examples_external_backing_quotes_do_not_bypass_as_inference(examples: str) -> None:
+    review = build_examples_grounding_review(examples)
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+def test_grounding_external_backing_quote_only_detail_does_not_bypass_as_concept_label() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-REDIS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Redis.md",
+        display_title="Redis",
+        page_type="concept",
+        new_understanding="Redis 作为缓存能力被讨论。",
+        section_plans={"detail": "说明 Redis 能力。"},
+        reason="测试引号内外部背书 marker。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-REDIS",
+                action="create",
+                canonical_target_path="concepts/Concept_Redis.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "主题写成“Redis 被广泛采用”。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Redis.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "",
+    )
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["Redis 被广泛采用"]
+
+
+def test_grounding_external_backing_supported_quote_does_not_hide_later_unsupported_marker() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-REDIS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Redis.md",
+        display_title="Redis",
+        page_type="concept",
+        new_understanding="Redis 作为缓存能力被讨论。",
+        section_plans={"detail": "说明 Redis 能力。"},
+        reason="测试 supported quote 后的额外 marker。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-REDIS",
+                action="create",
+                canonical_target_path="concepts/Concept_Redis.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": "材料写到“Redis 被广泛采用作为缓存”，因此 MongoDB 被广泛采用。",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Redis.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "Redis 被广泛采用作为缓存。",
+    )
+
+    assert review.requires_review is True
+    assert any("MongoDB 被广泛采用" in claim.text for claim in review.unsupported_new_facts)
+    assert any("被广泛采用" in claim.reason for claim in review.unsupported_new_facts)
+
+
+@pytest.mark.parametrize(
+    ("outside_claim", "expected_marker"),
+    [
+        ("因此 MongoDB 广泛采用。", "广泛采用"),
+        ("因此 MongoDB 公认可靠。", "公认"),
+        ("这说明 Redis 是行业最佳。", "行业最佳"),
+        ("这说明 MongoDB 有最佳实践明确支持。", "最佳实践"),
+    ],
+)
+def test_grounding_external_backing_supported_quote_does_not_hide_different_later_marker(
+    outside_claim: str,
+    expected_marker: str,
+) -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-REDIS",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="create",
+        canonical_target_path="concepts/Concept_Redis.md",
+        display_title="Redis",
+        page_type="concept",
+        new_understanding="Redis 作为缓存能力被讨论。",
+        section_plans={"detail": "说明 Redis 能力。"},
+        reason="测试 supported quote 后的不同 marker。",
+    )
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-REDIS",
+                action="create",
+                canonical_target_path="concepts/Concept_Redis.md",
+                section_bodies={
+                    "summary": "摘要。",
+                    "detail": f"材料写到“Redis 被广泛采用作为缓存”，{outside_claim}",
+                    "examples": "暂无相关例子记录。",
+                },
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/concepts/Concept_Redis.md",
+                expected_state="missing",
+                preimage_sha256=None,
+                content="",
+            )
+        ],
+    )
+
+    review = pipeline_module.build_draft_grounding_review(
+        draft,
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+        "Redis 被广泛采用作为缓存。",
+    )
+
+    assert review.requires_review is True
+    assert any(outside_claim.rstrip("。") in claim.text for claim in review.unsupported_new_facts)
+    assert any(expected_marker in claim.reason for claim in review.unsupported_new_facts)
 
 
 def test_grounding_external_backing_does_not_flag_internal_multiple_components() -> None:

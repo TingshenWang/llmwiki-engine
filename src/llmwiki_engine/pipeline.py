@@ -176,9 +176,11 @@ DRAFT_RENDERING_GROUNDING_RISK_RULES = (
     "use quotes only for text that exact-matches source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
     "For interview, ASR/OCR, or translated transcript source text, treat speaker-like Chinese wording as paraphrase "
     "unless the exact span is present; prefer indirect attribution such as 访谈中提到、她描述、团队讨论.",
-    "Avoid broad external-backing/adoption phrases such as 被广泛应用、被广泛使用、公认、业界普遍、被多个社区引用 "
-    "unless the exact source/wiki context says them; prefer source-local wording such as 本材料提到、访谈中讨论、"
-    "团队成员提到、本材料将该说法用于解释.",
+    "Do not turn source-local capabilities or examples into popularity/adoption/authority claims. Avoid broad "
+    "external-backing/adoption phrases such as 被广泛应用、被广泛使用、公认、业界普遍、被多个社区引用 unless the exact "
+    "source/wiki context says them; prefer source-local wording such as 本材料提到、访谈中讨论、团队成员提到、本材料将该说法用于解释.",
+    "In open_questions, do not use unsupported adoption/authority premises such as 公认、最佳实践、行业最佳、广泛采用、业界普遍 as the "
+    "question premise. Ask a neutral 待补来源 question instead, for example `待补来源：混合搜索与向量搜索的融合策略应如何设定和验证？`.",
     "High-risk causal/scope terms such as 导致、造成、证明、表明、必然、长期来看、用户会、影响到 require same sentence "
     "or clearly adjacent explicit support in source_excerpt_pack, approved_prepared_markdown, or inspected wiki context. "
     "If the source only gives a tradeoff or concern, write 可能伴随、需要权衡、访谈中提到, or move the claim to open_questions.",
@@ -186,11 +188,15 @@ DRAFT_RENDERING_GROUNDING_RISK_RULES = (
 UNSUPPORTED_BACKING_MARKERS = (
     "被广泛应用",
     "被广泛使用",
+    "被广泛采用",
     "广泛应用",
     "广泛使用",
+    "广泛采用",
     "被多个",
     "被广泛",
     "公认",
+    "最佳实践",
+    "行业最佳",
     "业界普遍",
     "多个社区",
 )
@@ -11657,6 +11663,17 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
             "如果是 CLI/API/code 示例，命令参数要么照抄来源 literal，要么改成 `<memory_text>`、`<user_id>`、`<memory_query>` 这类占位符；"
             "不要把被拒绝的具体偏好、用户 ID、查询或命令参数换成另一个具体值。"
         )
+    if grounding_external_backing_issue(claim):
+        reason = (
+            f"{reason} 不要换成另一个外部背书词或权威词；"
+            "如果 raw/wiki 没有明确支持采用度、流行度、行业共识或最佳实践，请删除这个 adoption/authority 前提，"
+            "或改成 source-local 表达（如 本材料提到、访谈中讨论、材料将其作为例子）。"
+        )
+        if claim.section_key == "open_questions" or grounding_claim_targets_open_question(claim):
+            reason = (
+                f"{reason} 在 open_questions 里请改成中性的 `待补来源` 问题，"
+                "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提。"
+            )
     if grounding_claim_targets_open_question(claim) and claim.section_key != "open_questions":
         reason = (
             f"{reason} 这是 open_questions 页面；无来源支撑的场景、后果或影响推测不要留在 detail/examples 当事实；"
@@ -11674,7 +11691,21 @@ def grounding_claim_targets_open_question(claim: GroundingClaim) -> bool:
     return target_path.startswith("open_questions/")
 
 
+def grounding_external_backing_issue(claim: GroundingClaim) -> bool:
+    return (
+        claim.support == "unsupported"
+        and claim.action == "needs_review"
+        and "新增外部背书/强事实标记" in claim.reason
+    )
+
+
 def unsupported_backing_marker(text: str) -> str | None:
+    markers = unsupported_backing_markers(text)
+    return markers[0] if markers else None
+
+
+def unsupported_backing_markers(text: str) -> list[str]:
+    markers: list[str] = []
     for marker in UNSUPPORTED_BACKING_MARKERS:
         if marker == "被多个" and not re.search(
             r"被多个(?:社区|团队|公司|机构|组织|项目|产品|用户|客户|开发者|研究|论文|媒体|开源项目).{0,12}(?:引用|采用|使用|验证|复现|报道|认可|采纳)",
@@ -11682,8 +11713,8 @@ def unsupported_backing_marker(text: str) -> str | None:
         ):
             continue
         if marker in text:
-            return marker
-    return None
+            markers.append(marker)
+    return markers
 
 
 def external_backing_supported_by_context(
@@ -12238,6 +12269,7 @@ def collect_grounding_claims(
             raw_supported = quote_supported_by_text(quote, approved_raw_text)
             existing_supported = quote_supported_by_text(quote, existing_entry.content)
             supported = raw_supported or existing_supported
+            quote_has_external_backing_marker = unsupported_backing_marker(quote) is not None
             examples_unsafe_bypass_quote = (
                 section_key == "examples"
                 and not supported
@@ -12246,7 +12278,12 @@ def collect_grounding_claims(
             is_concept_label_quote = (
                 looks_like_concept_phrase(quote)
                 or looks_like_abstract_trend_label(re.sub(r"\s+", "", quote.strip()))
-            ) and not supported and not strict_direct_quote_context(body, quote_start=quote_start) and not attributed_quote_context(body, quote_start=quote_start)
+            ) and (
+                not supported
+                and not quote_has_external_backing_marker
+                and not strict_direct_quote_context(body, quote_start=quote_start)
+                and not attributed_quote_context(body, quote_start=quote_start)
+            )
             if section_key == "examples" and is_concept_label_quote and (
                 examples_quote_has_concrete_marker(normalized_quote, quote) or examples_unsafe_bypass_quote
             ):
@@ -12395,37 +12432,38 @@ def collect_grounding_claims(
                             ),
                         )
                     )
-            marker = unsupported_backing_marker(text)
-            if not marker:
-                continue
-            if unsupported_backing_marker_inside_supported_quote(
-                text,
-                marker,
-                approved_raw_text,
-                existing_entry.content,
-            ):
-                continue
-            unsupported_text = sentence_with_marker(text, marker)
-            backing_context_text = text if len(text) <= 600 else unsupported_text
-            supported, _support_source = external_backing_supported_by_context(
-                backing_context_text,
-                marker,
-                approved_raw_text,
-                existing_entry.content,
-            )
-            if not supported:
-                claims.append(
-                    GroundingClaim(
-                        page_plan_id=page.page_plan_id,
-                        target_path=item.canonical_target_path,
-                        section_key=section_key,
-                        claim_type="new_fact",
-                        text=unsupported_text,
-                        support="unsupported",
-                        action="needs_review",
-                        reason=f"新增外部背书/强事实标记 `{marker}` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
-                    )
+            for marker in unsupported_backing_markers(text):
+                if unsupported_backing_marker_only_inside_quote(text, marker):
+                    continue
+                if unsupported_backing_marker_only_inside_supported_quote(
+                    text,
+                    marker,
+                    approved_raw_text,
+                    existing_entry.content,
+                ):
+                    continue
+                unsupported_text = sentence_with_marker(text, marker)
+                backing_context_text = text if len(text) <= 600 else unsupported_text
+                supported, _support_source = external_backing_supported_by_context(
+                    backing_context_text,
+                    marker,
+                    approved_raw_text,
+                    existing_entry.content,
                 )
+                if not supported:
+                    claims.append(
+                        GroundingClaim(
+                            page_plan_id=page.page_plan_id,
+                            target_path=item.canonical_target_path,
+                            section_key=section_key,
+                            claim_type="new_fact",
+                            text=unsupported_text,
+                            support="unsupported",
+                            action="needs_review",
+                            reason=f"新增外部背书/强事实标记 `{marker}` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
+                        )
+                    )
+                    break
     if item.action == "update" and existing_entry.content:
         claims.append(
             GroundingClaim(
@@ -12439,18 +12477,30 @@ def collect_grounding_claims(
                 )
 
 
-def unsupported_backing_marker_inside_supported_quote(
+def unsupported_backing_marker_only_inside_quote(text: str, marker: str) -> bool:
+    marker_count = text.count(marker)
+    if marker_count <= 0:
+        return False
+    quoted_count = sum(quote.count(marker) for quote, _quote_start in iter_grounding_quote_spans(text))
+    return quoted_count == marker_count
+
+
+def unsupported_backing_marker_only_inside_supported_quote(
     text: str,
     marker: str,
     approved_raw_text: str,
     existing_wiki_text: str,
 ) -> bool:
+    marker_count = text.count(marker)
+    if marker_count <= 0:
+        return False
+    supported_count = 0
     for quote, _quote_start in iter_grounding_quote_spans(text):
         if marker not in quote:
             continue
         if quote_supported_by_text(quote, approved_raw_text) or quote_supported_by_text(quote, existing_wiki_text):
-            return True
-    return False
+            supported_count += quote.count(marker)
+    return supported_count == marker_count
 
 
 def quote_supported_by_text(quote: str, text: str) -> bool:
@@ -12993,6 +13043,8 @@ def examples_query_template_has_unsafe_marker(normalized: str, original: str = "
 
 
 def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str = "") -> bool:
+    if unsupported_backing_marker(original) or unsupported_backing_marker(normalized):
+        return True
     if looks_like_user_id_literal(normalized):
         return True
     if examples_quote_has_personal_name_reference(normalized, original):
