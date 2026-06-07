@@ -659,13 +659,14 @@ class GroundingClaim(StrictModel):
     claim_type: Literal["new_fact", "retained_fact", "inference", "needs_source"]
     text: str
     support: Literal["raw", "wiki_context", "existing_wiki", "inference", "unsupported"] = "unsupported"
-    action: Literal["kept", "moved_to_open_questions", "removed", "needs_review"] = "kept"
+    action: Literal["kept", "moved_to_open_questions", "removed", "warn", "needs_review"] = "kept"
     reason: str = ""
 
 
 class DraftGroundingReview(StrictModel):
     schema_version: Literal["draft_grounding_review.v1"] = "draft_grounding_review.v1"
     unsupported_new_facts: list[GroundingClaim] = Field(default_factory=list)
+    warnings: list[GroundingClaim] = Field(default_factory=list)
     claims: list[GroundingClaim] = Field(default_factory=list)
     requires_review: bool = False
 

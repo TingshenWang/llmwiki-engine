@@ -575,6 +575,14 @@ def _print_manifest_table(vault: Path, manifest: OperationManifest) -> None:
         console.print(f"[red]latest error:[/] {latest_error}")
     _print_metrics_summary(vault, manifest)
     _print_artifact_hints(vault, manifest)
+    grounding_summary = _draft_grounding_summary(vault, manifest.operation_id)
+    if grounding_summary.get("exists") and (grounding_summary.get("blocking_count") or grounding_summary.get("warning_count")):
+        console.print(
+            "[yellow]grounding review:[/] "
+            f"blocking={grounding_summary.get('blocking_count', 0)}; "
+            f"非阻塞提醒={grounding_summary.get('warning_count', 0)}; "
+            f"see `{grounding_summary.get('path', '')}`"
+        )
     console.print(f"next: {_next_action(manifest)}")
 
 
@@ -616,6 +624,7 @@ def _operation_inspect_payload(vault: Path, manifest: OperationManifest) -> dict
     ]
     applied_log = RunStore(vault).applied_log
     current_receipt_exists = _current_operation_receipt_exists(vault, manifest.operation_id)
+    grounding_summary = _draft_grounding_summary(vault, manifest.operation_id)
     return {
         "vault": vault.as_posix(),
         "operation_id": manifest.operation_id,
@@ -627,9 +636,27 @@ def _operation_inspect_payload(vault: Path, manifest: OperationManifest) -> dict
         "raw_bindings": [raw.model_dump(mode="json") for raw in manifest.raw_bindings],
         "metrics": metrics,
         "artifact_hints": _run_next_artifact_hints(vault, manifest.operation_id),
+        "grounding_review": grounding_summary,
         "applied_receipt_log": applied_log.as_posix(),
         "current_operation_receipt_exists": current_receipt_exists,
         "next_action": _next_action(manifest),
+    }
+
+
+def _draft_grounding_summary(vault: Path, operation_id: str) -> dict[str, object]:
+    path = RunStore(vault).run_dir(operation_id) / "draft_rendering" / "draft_grounding_review.json"
+    if not path.exists():
+        return {"path": path.as_posix(), "exists": False, "blocking_count": 0, "warning_count": 0}
+    try:
+        data = read_json(path)
+    except Exception as exc:
+        return {"path": path.as_posix(), "exists": True, "error": str(exc), "blocking_count": 0, "warning_count": 0}
+    return {
+        "path": path.as_posix(),
+        "exists": True,
+        "blocking_count": len(data.get("unsupported_new_facts", []) or []),
+        "warning_count": len(data.get("warnings", []) or []),
+        "requires_review": bool(data.get("requires_review", False)),
     }
 
 
@@ -647,6 +674,11 @@ def _print_inspect_report(payload: dict[str, object]) -> None:
     table.add_row("status", str(payload["operation_status"]))
     table.add_row("run_mode", str(payload["run_mode"]))
     table.add_row("awaiting_review_step", str(payload.get("awaiting_review_step") or ""))
+    grounding_review = payload.get("grounding_review")
+    if isinstance(grounding_review, dict) and grounding_review.get("exists"):
+        table.add_row("grounding_blocking_count", str(grounding_review.get("blocking_count", 0)))
+        table.add_row("grounding_warning_count", str(grounding_review.get("warning_count", 0)))
+        table.add_row("grounding_review", f"`{grounding_review.get('path', '')}`")
     metrics = payload.get("metrics")
     if isinstance(metrics, dict):
         for key in [

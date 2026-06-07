@@ -94,6 +94,30 @@ def test_status_verify_exit_codes(tmp_path: Path) -> None:
     assert inspect_table.exit_code == 0
     assert "Ingest inspect" in inspect_table.output
     assert "artifact_hints" in inspect_table.output
+    grounding_path = RunStore(vault).run_dir(manifest.operation_id) / "draft_rendering" / "draft_grounding_review.json"
+    grounding = read_json(grounding_path)
+    warning_claim = {
+        "page_plan_id": "PP-WARN",
+        "target_path": "concepts/Concept_Warn.md",
+        "section_key": "detail",
+        "claim_type": "new_fact",
+        "text": "好的产品判断往往来自长期实践中形成的经验直觉",
+        "support": "unsupported",
+        "action": "warn",
+        "reason": "低风险未支撑引号内容仅记录为 warning，不阻塞自动 ingest；如需严谨可人工回看来源。",
+    }
+    grounding["warnings"] = [warning_claim]
+    grounding["claims"] = [*grounding.get("claims", []), warning_claim]
+    write_json(grounding_path, grounding)
+    warning_status = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])
+    assert warning_status.exit_code == 0
+    assert "grounding review" in warning_status.output
+    assert "blocking=0" in warning_status.output
+    assert "非阻塞提醒=1" in warning_status.output
+    warning_inspect = runner.invoke(app, ["ingest", "inspect", str(vault), manifest.operation_id, "--json"])
+    assert warning_inspect.exit_code == 0
+    warning_payload = json.loads(warning_inspect.output)
+    assert warning_payload["grounding_review"]["warning_count"] == 1
     digest = RunStore(vault).run_dir(manifest.operation_id) / "source_digest" / "source_digest.json"
     digest.write_text(digest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     drift = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--verify"])

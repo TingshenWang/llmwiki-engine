@@ -8779,6 +8779,299 @@ def test_grounding_open_questions_high_risk_domain_gap_is_not_blocked_as_fact() 
     assert review.requires_review is False
 
 
+def test_grounding_low_risk_open_question_quote_warns_without_review() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="PM 角色演变仍待讨论。",
+                body_markdown="### 背景\n\n这里把问题保留为待研究方向。",
+                open_questions="- 待补来源：“AGI后PM是否必要？”",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["AGI后PM是否必要？"]
+    assert review.warnings[0].action == "warn"
+
+
+def test_grounding_low_risk_body_quote_warns_without_review() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="产品直觉需要长期训练。",
+                body_markdown="### 表达方式\n\n这里把“好的产品判断往往来自长期实践中形成的经验直觉”当作一个低风险表述来记录。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["好的产品判断往往来自长期实践中形成的经验直觉"]
+
+
+@pytest.mark.parametrize(
+    "body_markdown, expected",
+    [
+        ("### 公司关系\n\n“OpenAI 收购了 Anthropic”是一个需要来源支撑的公司关系。", "OpenAI 收购了 Anthropic"),
+        ("### 身份关系\n\n“Sam Altman 担任 Anthropic CEO”是一个需要来源支撑的身份关系。", "Sam Altman 担任 Anthropic CEO"),
+        ("### 产品关系\n\n“Claude 由 Google 发布”是一个需要来源支撑的产品关系。", "Claude 由 Google 发布"),
+    ],
+)
+def test_grounding_severe_factual_relationship_quote_requires_review(body_markdown: str, expected: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="严重事实关系需要来源支撑。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [expected]
+
+
+@pytest.mark.parametrize(
+    "body_markdown, expected",
+    [
+        ("### 公司关系\n\nOpenAI 收购了 Anthropic。", "OpenAI 收购了 Anthropic。"),
+        ("### 身份关系\n\nSam Altman 担任 Anthropic CEO。", "Sam Altman 担任 Anthropic CEO。"),
+        ("### 产品关系\n\nClaude 由 Google 发布。", "Claude 由 Google 发布。"),
+    ],
+)
+def test_grounding_severe_factual_relationship_unquoted_requires_review(body_markdown: str, expected: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="严重事实关系需要来源支撑。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [expected]
+
+
+def test_grounding_severe_factual_relationship_quote_is_not_duplicated_by_unquoted_scan() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="严重事实关系需要来源支撑。",
+                body_markdown="### 公司关系\n\n“OpenAI 收购了 Anthropic”是一个需要来源支撑的公司关系。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic"]
+
+
+def test_grounding_severe_factual_relationship_unquoted_allows_source_supported_claim() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    sentence = "OpenAI 收购了 Anthropic。"
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="严重事实关系如果来自来源则保留。",
+                body_markdown=f"### 公司关系\n\n{sentence}",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, sentence)
+
+    assert review.requires_review is False
+    assert [claim.action for claim in review.claims if claim.text == sentence] == ["kept"]
+
+
+@pytest.mark.parametrize(
+    "body_markdown",
+    [
+        "### 技术解释\n\nAI Agent 由模型、工具和记忆组成。",
+        "### 技术解释\n\nPython 支持异步编程。",
+        "### 技术解释\n\nRedis 支持语义缓存。",
+    ],
+)
+def test_grounding_weak_technical_relationships_do_not_require_review(body_markdown: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="普通技术解释不应该被严重事实关系误杀。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+def test_grounding_quote_uses_sentence_context_for_high_risk_domain() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="高风险建议需要来源支撑。",
+                body_markdown="### 医疗建议\n\n医疗上通常推荐“方案A”。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["医疗上通常推荐“方案A”。"]
+
+
+@pytest.mark.parametrize(
+    "body_markdown",
+    [
+        "### 安全协作\n\nAI 安全团队可以把评估结果作为产品发布节奏的参考。",
+        "### 金融产品表达\n\n金融产品可以用更清晰的解释降低用户理解成本。",
+        "### 法务协作\n\n法务团队可以提前参与合同评审流程。",
+    ],
+)
+def test_grounding_high_risk_domain_meta_statements_do_not_require_review(body_markdown: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="普通领域元叙述不应该被高风险建议误杀。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+
+
+@pytest.mark.parametrize(
+    "body_markdown",
+    [
+        "### 医疗建议\n\n患者可以服用阿司匹林。",
+        "### 医疗建议\n\n患者可以吃阿司匹林。",
+        "### 医疗建议\n\n患者可以口服阿司匹林。",
+        "### Medical Advice\n\nPatients can use aspirin for chest pain.",
+        "### 金融建议\n\n普通用户可以投资高收益债券。",
+        "### 金融建议\n\n普通用户可以配置高收益理财产品。",
+        "### 法律建议\n\n法律上可以解除这份合同。",
+        "### 法律建议\n\n员工可以起诉雇主要求赔偿。",
+        "### 法律建议\n\n员工可以签竞业协议。",
+        "### Legal Advice\n\nYou can sue your employer without an attorney.",
+        "### 安全建议\n\n管理员可以绕过认证后删除日志。",
+        "### 安全建议\n\n管理员可以删日志。",
+        "### Security Advice\n\nUsers can store passwords in plaintext for convenience.",
+    ],
+)
+def test_grounding_high_risk_domain_actionable_can_statements_still_require_review(body_markdown: str) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="可执行高风险建议需要来源支撑。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+
+    assert review.requires_review is True
+    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+
+
+def test_render_draft_grounding_review_shows_warning_section() -> None:
+    claim = pipeline_module.GroundingClaim(
+        page_plan_id="PP-WARN",
+        target_path="concepts/Concept_Warn.md",
+        section_key="detail",
+        claim_type="new_fact",
+        text="好的产品判断往往来自长期实践中形成的经验直觉",
+        support="unsupported",
+        action="warn",
+        reason="低风险未支撑引号内容仅记录为 warning，不阻塞自动 ingest；如需严谨可人工回看来源。",
+    )
+    review = pipeline_module.DraftGroundingReview(warnings=[claim], claims=[claim], requires_review=False)
+
+    markdown = pipeline_module.render_draft_grounding_review(review)
+
+    assert "- 结果：通过，有非阻塞提醒" in markdown
+    assert "- 非阻塞提醒数量：1" in markdown
+    assert "## 非阻塞提醒" in markdown
+    assert "好的产品判断往往来自长期实践中形成的经验直觉" in markdown
+
+
 @pytest.mark.parametrize(
     "detail",
     [

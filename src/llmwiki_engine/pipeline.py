@@ -12348,6 +12348,204 @@ def grounding_text_supported_by_context(text: str, approved_raw_text: str, exist
     return quote_supported_by_text(text, approved_raw_text) or quote_supported_by_text(text, existing_wiki_text)
 
 
+def unsupported_quote_grounding_action(body: str, quote: str, *, quote_start: int, section_key: str) -> Literal["warn", "needs_review"]:
+    return "warn" if low_risk_unsupported_quote_warning(body, quote, quote_start=quote_start, section_key=section_key) else "needs_review"
+
+
+def unsupported_quote_grounding_reason(body: str, quote: str, *, quote_start: int, section_key: str) -> str:
+    blocking_marker = unsupported_quote_blocking_marker(body, quote, quote_start=quote_start, section_key=section_key)
+    if blocking_marker:
+        return f"直接引用必须在 raw 或已有 wiki 中 exact match；{blocking_marker}"
+    return "低风险未支撑引号内容仅记录为 warning，不阻塞自动 ingest；如需严谨可人工回看来源。"
+
+
+def low_risk_unsupported_quote_warning(body: str, quote: str, *, quote_start: int, section_key: str) -> bool:
+    return unsupported_quote_blocking_marker(body, quote, quote_start=quote_start, section_key=section_key) == ""
+
+
+def unsupported_quote_blocking_marker(body: str, quote: str, *, quote_start: int, section_key: str) -> str:
+    sentence = sentence_around_index(body, quote_start)
+    normalized_quote = re.sub(r"\s+", "", unicodedata.normalize("NFKC", quote.strip()))
+    normalized_sentence = re.sub(r"\s+", "", unicodedata.normalize("NFKC", sentence.strip()))
+    if explicit_direct_quote_context(body, quote, quote_start=quote_start) or attributed_quote_context(body, quote_start=quote_start):
+        return "该表述被写成原文/作者/研究的明确引述，未获来源 exact match 支撑。"
+    if quote_has_dynamic_sensitive_query_marker(normalized_quote, quote) or quote_has_dynamic_sensitive_query_marker(
+        normalized_sentence,
+        sentence,
+    ):
+        return "该表述涉及账户、密码、支付、订单、登录、凭证或隐私等动态/敏感用户场景。"
+    high_risk_marker = high_risk_domain_statement_marker(sentence) or high_risk_domain_statement_marker(quote)
+    if high_risk_marker:
+        _marker, domain_label = high_risk_marker
+        return f"该表述涉及高风险{domain_label}建议或断言。"
+    if unsupported_backing_marker(quote) or unsupported_backing_marker(sentence):
+        return "该表述包含采用度、权威背书或最佳实践前提。"
+    if severe_factual_claim_marker(quote) or severe_factual_claim_marker(sentence):
+        return "该表述包含专名关系、发布、收购、隶属、身份或因果等严重事实关系。"
+    if contains_short_fact_marker(normalized_quote) or contains_hard_fact_marker(normalized_quote):
+        return "该表述包含数字、指标、规模、日期或其他硬事实。"
+    if contains_short_fact_marker(normalized_sentence) or contains_hard_fact_marker(normalized_sentence):
+        return "该句包含数字、指标、规模、日期或其他硬事实。"
+    if section_key == "examples" and examples_quote_has_unsafe_marker_for_bypass(normalized_quote, quote):
+        return "例子区内容包含具体用户事实、动态查询或敏感数据。"
+    if section_key == "examples":
+        return "例子区孤立引号内容未被识别为安全占位符、通用模板或来源支撑示例。"
+    return ""
+
+
+def sentence_around_index(text: str, index: int) -> str:
+    if index < 0:
+        return ""
+    start = 0
+    end = len(text)
+    for pos in range(index - 1, -1, -1):
+        if text[pos] in "\n。！？!?；;":
+            start = pos + 1
+            break
+    for pos in range(index, len(text)):
+        if text[pos] in "\n。！？!?；;":
+            end = pos + 1
+            break
+    return text[start:end].strip(" -*\t")
+
+
+def severe_factual_claim_marker(text: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", text)
+    compact = re.sub(r"\s+", "", normalized)
+    lowered = normalized.lower()
+    strong_relation_markers = [
+        "收购",
+        "发布",
+        "推出",
+        "创立",
+        "创建",
+        "隶属",
+        "属于",
+        "担任",
+        "任职",
+        "宣布",
+        "提出",
+    ]
+    strong_marker = next(
+        (marker for marker in strong_relation_markers if marker in compact and not severe_relation_marker_meta_usage(compact, marker)),
+        "",
+    )
+    if strong_marker and severe_factual_claim_has_named_entity(normalized):
+        return strong_marker
+    english_strong_pattern = (
+        r"\b(?:acquired|acquires|acquire|released|releases|launched|launches|founded|created|"
+        r"announced|owned\s+by|developed\s+by|built\s+by|proposed\s+by|ceo|cto|founder)\b"
+    )
+    match = re.search(english_strong_pattern, lowered, re.IGNORECASE)
+    if match and severe_factual_claim_has_named_entity(normalized):
+        return match.group(0)
+    weak_relation_markers = ["证明", "导致", "造成", "取代", "替代", "支持", "不支持", "由"]
+    weak_marker = next((marker for marker in weak_relation_markers if marker in compact), "")
+    if weak_marker and severe_weak_factual_relation_requires_review(normalized, compact):
+        return weak_marker
+    english_weak_pattern = r"\b(?:proves?|causes?|caused|replaces?|replaced|supports?|unsupported|does\s+not\s+support)\b"
+    weak_match = re.search(english_weak_pattern, lowered, re.IGNORECASE)
+    if weak_match and severe_weak_factual_relation_requires_review(normalized, compact):
+        return weak_match.group(0)
+    return None
+
+
+def severe_relation_marker_meta_usage(compact: str, marker: str) -> bool:
+    if marker == "发布":
+        return bool(
+            re.search(r"(?:产品)?发布(?:节奏|流程|计划|策略|周期|管理|评审|窗口|阶段|一致性)", compact)
+            or re.search(r"(?:快速|持续|连续)发布", compact)
+        )
+    if marker == "创建":
+        return bool(re.search(r"创建(?:文档|页面|知识页|内容|文件|草稿|记录)", compact))
+    if marker in {"推出", "宣布"}:
+        return bool(re.search(rf"{marker}(?:计划|策略|流程|节奏|安排)", compact))
+    return False
+
+
+def severe_factual_claim_has_named_entity(text: str) -> bool:
+    return bool(severe_factual_named_entities(text))
+
+
+def severe_weak_factual_relation_requires_review(text: str, compact: str) -> bool:
+    entities = severe_factual_named_entities(text)
+    if len(entities) < 2:
+        return False
+    relation_context_markers = [
+        "公司",
+        "团队",
+        "产品",
+        "模型",
+        "系统",
+        "CEO",
+        "CTO",
+        "创始人",
+        "发布方",
+        "开发方",
+        "母公司",
+        "子公司",
+    ]
+    if any(marker in compact for marker in relation_context_markers):
+        return True
+    known_count = sum(1 for entity in entities if entity in SEVERE_FACTUAL_KNOWN_ENTITIES)
+    low_risk_technical_markers = ["编程", "异步", "缓存", "语义", "组成", "包括", "包含", "能力", "特性", "工具", "记忆"]
+    return known_count >= 2 and not any(marker in compact for marker in low_risk_technical_markers)
+
+
+SEVERE_FACTUAL_KNOWN_ENTITIES = {
+    "OpenAI",
+    "Anthropic",
+    "Claude",
+    "Google",
+    "Microsoft",
+    "Meta",
+    "Karpathy",
+    "Andrej",
+    "DeepMind",
+    "Redis",
+    "Qwen",
+    "阿里",
+    "阿里巴巴",
+    "腾讯",
+    "字节",
+    "百度",
+    "华为",
+}
+
+
+def severe_factual_named_entities(text: str) -> list[str]:
+    known_entities = [
+        "OpenAI",
+        "Anthropic",
+        "Claude",
+        "Google",
+        "Microsoft",
+        "Meta",
+        "Karpathy",
+        "Andrej",
+        "DeepMind",
+        "Redis",
+        "Qwen",
+        "阿里",
+        "阿里巴巴",
+        "腾讯",
+        "字节",
+        "百度",
+        "华为",
+        "Claude",
+        "OpenAI",
+        "Anthropic",
+        "Google",
+    ]
+    entities: list[str] = [entity for entity in known_entities if entity in text]
+    entities.extend(re.findall(r"\b[A-Z][A-Za-z0-9.+_-]{2,}(?:\s+[A-Z][A-Za-z0-9.+_-]{2,})?\b", text))
+    chinese_known_entities = [entity for entity in SEVERE_FACTUAL_KNOWN_ENTITIES if re.search(r"[\u4e00-\u9fff]", entity)]
+    for entity in re.findall(r"[\u4e00-\u9fff]{2,}(?:公司|团队|模型|系统|产品|CEO|CTO|创始人)", text):
+        if any(known_entity in entity for known_entity in chinese_known_entities):
+            entities.append(entity)
+    return _dedupe_strings(entities)
+
+
 def rewrite_grounding_sensitive_paraphrases(
     artifact: DraftRenderingArtifact,
     approved_raw_text: str,
@@ -12880,6 +13078,8 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
             "医疗",
             "医疗",
             [
+                "医疗",
+                "医学",
                 "患者",
                 "病人",
                 "服用",
@@ -12903,6 +13103,8 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
             "法律",
             "法律",
             [
+                "法律",
+                "法务",
                 "竞业",
                 "竞业协议",
                 "合同",
@@ -12923,6 +13125,8 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
             "金融",
             "金融",
             [
+                "金融",
+                "财务",
                 "投资",
                 "存款",
                 "债券",
@@ -12944,6 +13148,8 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
             "安全",
             "安全",
             [
+                "安全",
+                "网络安全",
                 "绕过认证",
                 "绕过权限",
                 "禁用安全",
@@ -12952,9 +13158,15 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
                 "泄露密钥",
                 "公开密钥",
                 "删除日志",
+                "删日志",
+                "密码",
+                "凭证",
+                "明文",
+                "隐私",
             ],
             [
-                r"\b(?:bypass authentication|bypass auth|disable security|turn off firewall|disable firewall|leak api key|expose secret|delete logs)\b",
+                r"\b(?:bypass authentication|bypass auth|disable security|turn off firewall|disable firewall|"
+                r"leak api key|expose secret|delete logs|password|passwords|credential|credentials|plaintext|privacy)\b",
             ],
         ),
     ]
@@ -12970,10 +13182,11 @@ def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
 
 
 def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> bool:
+    if high_risk_actionable_can_context(compact, lowered):
+        return True
     chinese_markers = [
         "应该",
         "应当",
-        "可以",
         "不能",
         "不得",
         "必须",
@@ -12985,11 +13198,22 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
         "保证",
         "预防",
         "治疗",
+        "诊断",
+        "服用",
+        "用药",
+        "处方",
+        "剂量",
         "投入",
+        "投资",
         "买入",
         "卖出",
         "签署",
         "加入",
+        "绕过",
+        "禁用",
+        "关闭防火墙",
+        "泄露密钥",
+        "公开密钥",
         "每天",
         "大部分",
     ]
@@ -12997,12 +13221,31 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
         return True
     return bool(
         re.search(
-            r"\b(?:should|must|can|cannot|can't|do not|don't|never|always|recommend|recommended|"
-            r"guarantees?|prevents?|treats?|take|invest|buy|sell|sign|join|disable|bypass)\b",
+            r"\b(?:should|must|cannot|can't|do not|don't|never|always|recommend|recommended|"
+            r"guarantees?|prevents?|diagnos(?:e|es|ed|ing)|treats?|prescrib(?:e|es|ed|ing)|"
+            r"dosage|dose|medication|take|invest|buy|sell|sign|join|disable|bypass|leak|expose)\b",
             lowered,
             re.IGNORECASE,
         )
     )
+
+
+def high_risk_actionable_can_context(compact: str, lowered: str) -> bool:
+    chinese_patterns = [
+        r"(?:可以|可).{0,8}(?:服用|用药|吃|口服).{0,10}(?:药|阿司匹林|处方|剂量|胸痛|心梗|症状)",
+        r"(?:可以|可).{0,8}(?:解除|起诉|索赔|要求赔偿|签署|签).{0,10}(?:合同|协议|竞业|雇主|公司|赔偿)",
+        r"(?:可以|可).{0,8}(?:投资|买入|买|配置|购买).{0,10}(?:理财|债券|股票|基金|贷款|高收益|存款)",
+        r"(?:可以|可).{0,8}(?:绕过|禁用|关闭|删除|删|泄露|公开|存储|保存).{0,12}(?:认证|权限|防火墙|日志|密钥|密码|凭证|明文|隐私)",
+    ]
+    if any(re.search(pattern, compact, re.IGNORECASE) for pattern in chinese_patterns):
+        return True
+    english_patterns = [
+        r"\bcan\s+(?:take|use|prescribe).{0,40}\b(?:aspirin|medicine|medication|dosage|dose|chest pain|heart attack)\b",
+        r"\bcan\s+(?:sue|terminate|cancel|sign).{0,40}\b(?:employer|contract|non-compete|noncompete|liability|attorney)\b",
+        r"\bcan\s+(?:invest|buy|purchase|configure).{0,40}\b(?:bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
+        r"\bcan\s+(?:store|save|bypass|disable|delete|leak|expose).{0,40}\b(?:password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
+    ]
+    return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in english_patterns)
 
 
 def collect_grounding_claims(
@@ -13036,6 +13279,8 @@ def collect_grounding_claims(
                 not supported
                 and not quote_has_external_backing_marker
                 and not quote_has_dynamic_sensitive_query
+                and not severe_factual_claim_marker(quote)
+                and not severe_factual_claim_marker(sentence_around_index(body, quote_start))
                 and not strict_direct_quote_context(body, quote_start=quote_start)
                 and not attributed_quote_context(body, quote_start=quote_start)
             )
@@ -13151,15 +13396,21 @@ def collect_grounding_claims(
                     claim_type="new_fact",
                     text=quote,
                     support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
-                    action="kept" if supported else "needs_review",
+                    action=(
+                        "kept"
+                        if supported
+                        else unsupported_quote_grounding_action(body, quote, quote_start=quote_start, section_key=section_key)
+                    ),
                     reason=(
                         "直接引用已在 raw 或已有 wiki 中规范化 exact match。"
                         if supported
-                        else "直接引用必须在 raw 或已有 wiki 中 exact match。"
+                        else unsupported_quote_grounding_reason(body, quote, quote_start=quote_start, section_key=section_key)
                     ),
                 )
             )
         for line in body.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
             text = line.strip(" -*")
             if not text or len(text) < 8:
                 continue
@@ -13194,6 +13445,8 @@ def collect_grounding_claims(
                 )
             scope_marker = None if section_key == "open_questions" else unsupported_scope_speculation_marker(text)
             high_risk_marker = None if section_key == "open_questions" else high_risk_domain_statement_marker(text)
+            unquoted_scan_text = remove_grounding_quote_spans_for_scan(text)
+            severe_marker = None if section_key == "open_questions" else severe_factual_claim_marker(unquoted_scan_text)
             if high_risk_marker:
                 marker, domain_label = high_risk_marker
                 unsupported_text = sentence_with_marker(text, marker)
@@ -13215,6 +13468,30 @@ def collect_grounding_claims(
                             else (
                                 f"高风险{domain_label}领域断言 `{marker}` 缺少 raw 或 inspected wiki 同句级支撑；"
                                 "法律、医疗、金融、安全、账户/密码/支付/隐私相关建议必须删除、改成待补来源问题，或提供明确来源支撑。"
+                            )
+                        ),
+                    )
+                )
+            if severe_marker:
+                unsupported_text = sentence_with_marker(text, severe_marker)
+                raw_supported = quote_supported_by_text(unsupported_text, approved_raw_text)
+                existing_supported = quote_supported_by_text(unsupported_text, existing_entry.content)
+                supported = raw_supported or existing_supported
+                claims.append(
+                    GroundingClaim(
+                        page_plan_id=page.page_plan_id,
+                        target_path=item.canonical_target_path,
+                        section_key=section_key,
+                        claim_type="new_fact",
+                        text=unsupported_text,
+                        support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
+                        action="kept" if supported else "needs_review",
+                        reason=(
+                            "严重事实关系已在 raw 或已有 wiki 中规范化 exact match。"
+                            if supported
+                            else (
+                                f"新增严重事实关系 `{severe_marker}` 缺少 raw 或 inspected wiki 同句级支撑；"
+                                "专名关系、发布、收购、隶属或身份关系需要来源支撑。"
                             )
                         ),
                     )
@@ -14952,8 +15229,14 @@ def draft_grounding_review_from_claims(claims: list[GroundingClaim]) -> DraftGro
         for claim in claims
         if claim.claim_type == "new_fact" and claim.support == "unsupported" and claim.action == "needs_review"
     ]
+    warnings = [
+        claim
+        for claim in claims
+        if claim.claim_type == "new_fact" and claim.support == "unsupported" and claim.action == "warn"
+    ]
     return DraftGroundingReview(
         unsupported_new_facts=unsupported_new_facts,
+        warnings=warnings,
         claims=claims,
         requires_review=bool(unsupported_new_facts),
     )
@@ -15701,7 +15984,12 @@ def render_related_merge_report(report: RelatedMergeReport) -> str:
 
 
 def render_draft_grounding_review(review: DraftGroundingReview) -> str:
-    summary = "需要人工确认" if review.requires_review else "通过"
+    if review.requires_review:
+        summary = "需要人工确认"
+    elif review.warnings:
+        summary = "通过，有非阻塞提醒"
+    else:
+        summary = "通过"
     rows = [
         [
             claim.page_plan_id,
@@ -15725,15 +16013,30 @@ def render_draft_grounding_review(review: DraftGroundingReview) -> str:
         ]
         for claim in review.unsupported_new_facts
     ]
+    warning_rows = [
+        [
+            claim.page_plan_id,
+            f"`{claim.target_path}`",
+            claim.section_key,
+            claim.reason,
+            claim.text[:240],
+        ]
+        for claim in review.warnings
+    ]
     sections = [
         "# 草稿来源支撑审查",
         "",
         f"- 结果：{summary}",
         f"- 未支撑新增事实数量：{len(review.unsupported_new_facts)}",
+        f"- 非阻塞提醒数量：{len(review.warnings)}",
         "",
         "## 需要确认的新事实",
         "",
         format_markdown_table(["页面计划", "目标", "段落", "原因", "文本"], unsupported_rows) if unsupported_rows else "暂无。",
+        "",
+        "## 非阻塞提醒",
+        "",
+        format_markdown_table(["页面计划", "目标", "段落", "原因", "文本"], warning_rows) if warning_rows else "暂无。",
         "",
         "## 全部分类",
         "",
