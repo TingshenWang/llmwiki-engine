@@ -388,7 +388,10 @@ def execute_ingest(
             write_manifest(store.manifest_path(operation_id), manifest)
             _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
             return manifest
-    ensure_pipeline_completed(manifest)
+    incomplete = [step for step in manifest.steps if not step_satisfied(step.status)]
+    if incomplete:
+        details = ", ".join(f"{step.name}={step.status.value}" for step in incomplete)
+        raise _errors.PipelineError(f"Operation is not draft-ready; incomplete step(s): {details}")
     manifest.status = OperationStatus.drafted
     write_manifest(store.manifest_path(operation_id), manifest)
     _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
@@ -403,13 +406,6 @@ def validate_resume_start(manifest: OperationManifest, start_step: str) -> None:
                 f"Cannot resume from {start_step}: upstream step {step.name} is {step.status.value}; "
                 f"resume from {step.name} or earlier."
             )
-
-
-def ensure_pipeline_completed(manifest: OperationManifest) -> None:
-    incomplete = [step for step in manifest.steps if not step_satisfied(step.status)]
-    if incomplete:
-        details = ", ".join(f"{step.name}={step.status.value}" for step in incomplete)
-        raise _errors.PipelineError(f"Operation is not draft-ready; incomplete step(s): {details}")
 
 
 def model_steps_for_raw_prepare_policy(
@@ -953,7 +949,12 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
         retrieval_config=retrieval_config,
         force_exact_backend=force_exact_backend,
     )
-    ensure_snapshot_within_limit(snapshot, ctx.manifest.vault_config_snapshot.max_context_chars)
+    snapshot_content_chars = sum(len(entry.content) for entry in snapshot.entries)
+    max_context_chars = ctx.manifest.vault_config_snapshot.max_context_chars
+    if snapshot_content_chars > max_context_chars:
+        raise _errors.PipelineError(
+            f"wiki_context_snapshot exceeds max_context_chars ({snapshot_content_chars} > {max_context_chars}); retry with a smaller vault or higher limit."
+        )
     contexts_path = step_root / "candidate_contexts.json"
     write_json(contexts_path, snapshot.candidate_contexts)
     contexts_md = step_root / "candidate_contexts.md"
@@ -3614,12 +3615,6 @@ def build_wiki_context_snapshot(
         candidate_contexts=candidate_contexts,
         entries=entries,
     )
-
-
-def ensure_snapshot_within_limit(snapshot: WikiContextSnapshot, max_context_chars: int) -> None:
-    total = sum(len(entry.content) for entry in snapshot.entries)
-    if total > max_context_chars:
-        raise _errors.PipelineError(f"wiki_context_snapshot exceeds max_context_chars ({total} > {max_context_chars}); retry with a smaller vault or higher limit.")
 
 
 def resolve_model_related_pages(
