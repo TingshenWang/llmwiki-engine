@@ -30,7 +30,6 @@ from .pipeline import (
     resume_ingest,
     revise_review,
     run_simplified_ingest,
-    scan_raw_ingest_candidates,
     status as ingest_status,
 )
 from .provider_checks import check_providers
@@ -38,6 +37,7 @@ from .provider_config import ProviderConfigError
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
 from .raw_import import RawUrlImportError, RawUrlImportResult, import_raw_url
+from .source_records import scan_raw_ingest_candidates
 from .steps import STEP_NAMES
 from .verify import VerifyError, verify_run
 from .workspace import RunStore, WorkspaceError

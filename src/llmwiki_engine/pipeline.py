@@ -7,16 +7,15 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import unified_diff
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, TypeVar
 
-import yaml
 from rich.console import Console
 from pydantic import BaseModel
 
 from . import __version__
+from . import apply_guards as _apply_guards
 from . import draft_validation as _draft_validation
 from . import errors as _errors
 from . import markdown_utils as _markdown_utils
@@ -24,6 +23,7 @@ from . import open_questions as _open_questions
 from . import page_sections as _page_sections
 from . import section_merge as _section_merge
 from . import source_excerpt as _source_excerpt
+from . import source_records as _source_records
 from . import update_preservation as _update_preservation
 from . import wiki_markup as _wiki_markup
 from .events import EventLogger, format_duration
@@ -63,8 +63,6 @@ from .models import (
     OperationStatus,
     ProviderResult,
     RawBinding,
-    RawIngestCandidate,
-    RawIngestCandidateReport,
     RawLinkCleanupArtifact,
     RawPreparePolicy,
     RawPreparationArtifact,
@@ -73,7 +71,6 @@ from .models import (
     RelatedMergeReport,
     RelatedCandidateReport,
     SourceBasis,
-    SourceDuplicateGuardArtifact,
     SourceDigestArtifact,
     SourceDigestCandidate,
     StepStatus,
@@ -144,17 +141,6 @@ from .verify import require_verified
 from .vault_config import read_vault_config, write_default_vault_config
 from .wiki_context import wiki_context_drift_messages
 from .workspace import RunStore, apply_lock, ensure_workspace_layout, relative_to_vault, resolve_raw_path, run_lock
-
-
-RAW_INGEST_TEXT_SUFFIXES = {".md", ".markdown", ".mdown", ".txt"}
-
-
-@dataclass(frozen=True)
-class _SourceRawCoverageRecord:
-    source_page: str
-    raw_paths: tuple[str, ...]
-    raw_hashes: tuple[str, ...]
-    operation_ids: tuple[str, ...]
 
 
 RAW_PREPARE_CONTRACT = {
@@ -1388,7 +1374,7 @@ def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
     prepared = require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md"
-    artifact = build_source_duplicate_guard_artifact(
+    artifact = _apply_guards.build_source_duplicate_guard_artifact(
         ctx.vault,
         source_raw_path=digest.source_raw_path,
         source_raw_hash=sha256_file(ctx.vault / digest.source_raw_path),
@@ -1398,7 +1384,7 @@ def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
     out = step_root / "source_duplicate_guard.json"
     write_json(out, artifact)
     md = step_root / "source_duplicate_guard.md"
-    md.write_text(render_source_duplicate_guard_markdown(artifact), encoding="utf-8")
+    md.write_text(_apply_guards.render_source_duplicate_guard_markdown(artifact), encoding="utf-8")
     if artifact.status == "source_duplicate":
         raise _errors.PipelineError(f"source_duplicate: {artifact.reason}")
     if artifact.status == "source_revision_detected":
@@ -4370,7 +4356,7 @@ def source_anchor_signal(text: str, anchor: str) -> dict[str, Any]:
             "source_locator": "",
             "reason": "absent",
         }
-    frontmatter = parse_frontmatter(text) or {}
+    frontmatter = _source_records.parse_frontmatter(text) or {}
     metadata_text = "\n".join(
         str(frontmatter.get(key) or "")
         for key in ["title", "description", "source", "author"]
@@ -5466,16 +5452,6 @@ def first_source_basis_candidate(
     return None
 
 
-def parse_frontmatter(text: str) -> dict[str, Any] | None:
-    if not text.startswith("---\n"):
-        return None
-    parts = text.split("---\n", 2)
-    if len(parts) < 3:
-        return None
-    data = yaml.safe_load(parts[1]) or {}
-    return data if isinstance(data, dict) else None
-
-
 def resolve_related_pages(
     item: CandidateResolutionItem,
     candidate: SourceDigestCandidate,
@@ -5990,30 +5966,6 @@ def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactR
     return _ref(run_dir, path, step_name, artifact_kind_for_path(path), schemas.get(path.name))
 
 
-M42_REQUIRED_DRAFT_SIDECARS = (
-    "draft_rendering/draft_rendering.json",
-    "draft_rendering/draft_write_manifest.json",
-    "draft_rendering/provider_result.json",
-    "draft_rendering/update_merge_report.json",
-    "draft_rendering/update_merge_report.md",
-    "draft_rendering/related_merge_report.json",
-    "draft_rendering/related_merge_report.md",
-    "draft_rendering/draft_grounding_review.json",
-    "draft_rendering/draft_grounding_review.md",
-)
-
-
-def require_m42_draft_sidecars(run_dir: Path) -> None:
-    missing = [rel_path for rel_path in M42_REQUIRED_DRAFT_SIDECARS if not (run_dir / rel_path).is_file()]
-    if missing:
-        preview = ", ".join(f"`{path}`" for path in missing[:6])
-        suffix = "" if len(missing) <= 6 else f", ... and {len(missing) - 6} more"
-        raise _errors.PipelineError(
-            "M4.2 draft sidecar artifacts are missing; resume from draft_rendering or earlier before approve/apply: "
-            f"{preview}{suffix}"
-        )
-
-
 def complete_review_step(
     manifest: OperationManifest,
     name: str,
@@ -6040,306 +5992,6 @@ def render_candidate_table(candidates: list[SourceDigestCandidate] | list[WeakOr
         ["ID", "类型", "名称", "摘要", "重复风险"],
         [[f"`{item.candidate_id}`", item.type, item.name, item.one_sentence_summary, item.duplicate_risk] for item in candidates],
     )
-
-
-def build_source_duplicate_guard_artifact(
-    vault: Path,
-    *,
-    source_raw_path: str,
-    source_raw_hash: str,
-    source_prepared_hash: str,
-    operation_id: str,
-) -> SourceDuplicateGuardArtifact:
-    normalized_raw_path = normalize_vault_path(source_raw_path)
-    source_title = source_title_for_raw(normalized_raw_path)
-    source_target_path = f"sources/{safe_filename(source_title)}.md"
-    for source_page, frontmatter in scan_source_pages(vault):
-        operation_ids = _frontmatter_list(frontmatter, "source_operation_ids")
-        if operation_id in operation_ids:
-            continue
-        raw_paths = [normalize_vault_path(value) for value in _frontmatter_list(frontmatter, "source_raw_paths")]
-        raw_hashes = _frontmatter_list(frontmatter, "source_raw_hashes")
-        prepared_hashes = _frontmatter_list(frontmatter, "source_prepared_hashes")
-        if normalized_raw_path in raw_paths and source_raw_hash in raw_hashes:
-            return SourceDuplicateGuardArtifact(
-                source_raw_path=normalized_raw_path,
-                source_raw_hash=source_raw_hash,
-                source_prepared_hash=source_prepared_hash,
-                source_target_path=source_target_path,
-                status="source_duplicate",
-                matched_source_page=source_page,
-                matched_raw_path=normalized_raw_path,
-                matched_raw_hash=source_raw_hash,
-                matched_prepared_hash=source_prepared_hash if source_prepared_hash in prepared_hashes else None,
-                reason="same raw path and raw hash already recorded in source page frontmatter",
-            )
-        if source_raw_hash in raw_hashes:
-            return SourceDuplicateGuardArtifact(
-                source_raw_path=normalized_raw_path,
-                source_raw_hash=source_raw_hash,
-                source_prepared_hash=source_prepared_hash,
-                source_target_path=source_target_path,
-                status="source_duplicate",
-                matched_source_page=source_page,
-                matched_raw_hash=source_raw_hash,
-                matched_prepared_hash=source_prepared_hash if source_prepared_hash in prepared_hashes else None,
-                reason="same raw hash already recorded in source page frontmatter",
-            )
-        if normalized_raw_path in raw_paths and source_raw_hash not in raw_hashes:
-            return SourceDuplicateGuardArtifact(
-                source_raw_path=normalized_raw_path,
-                source_raw_hash=source_raw_hash,
-                source_prepared_hash=source_prepared_hash,
-                source_target_path=source_target_path,
-                status="source_revision_detected",
-                matched_source_page=source_page,
-                matched_raw_path=normalized_raw_path,
-                reason="same raw path exists with a different content hash",
-            )
-    target = vault / "wiki" / source_target_path
-    if target.exists():
-        return SourceDuplicateGuardArtifact(
-            source_raw_path=normalized_raw_path,
-            source_raw_hash=source_raw_hash,
-            source_prepared_hash=source_prepared_hash,
-            source_target_path=source_target_path,
-            status="source_duplicate",
-            matched_source_page=f"wiki/{source_target_path}",
-            reason="source target page already exists",
-        )
-    return SourceDuplicateGuardArtifact(
-        source_raw_path=normalized_raw_path,
-        source_raw_hash=source_raw_hash,
-        source_prepared_hash=source_prepared_hash,
-        source_target_path=source_target_path,
-        status="clear",
-        reason="no matching source path, hash, or source target page found",
-    )
-
-
-def render_source_duplicate_guard_markdown(artifact: SourceDuplicateGuardArtifact) -> str:
-    return "\n".join(
-        [
-            "# 来源重复检查",
-            "",
-            format_markdown_table(
-                ["字段", "值"],
-                [
-                    ["status", artifact.status],
-                    ["source_raw_path", f"`{artifact.source_raw_path}`"],
-                    ["source_raw_hash", f"`{artifact.source_raw_hash}`"],
-                    ["source_prepared_hash", f"`{artifact.source_prepared_hash}`"],
-                    ["source_target_path", f"`{artifact.source_target_path}`"],
-                    ["matched_source_page", f"`{artifact.matched_source_page}`" if artifact.matched_source_page else ""],
-                    ["reason", artifact.reason],
-                ],
-            ),
-        ]
-    ).rstrip() + "\n"
-
-
-def scan_source_pages(vault: Path) -> list[tuple[str, dict[str, Any]]]:
-    source_root = vault / "wiki" / "sources"
-    if not source_root.exists():
-        return []
-    found: list[tuple[str, dict[str, Any]]] = []
-    for path in sorted(source_root.rglob("*.md")):
-        frontmatter = parse_frontmatter(path.read_text(encoding="utf-8"))
-        if frontmatter is not None:
-            found.append((path.relative_to(vault).as_posix(), frontmatter))
-    return found
-
-
-def scan_raw_ingest_candidates(
-    vault: Path,
-    *,
-    include_processed: bool = False,
-    limit: int | None = None,
-) -> RawIngestCandidateReport:
-    if limit is not None and limit < 0:
-        raise ValueError("limit must be >= 0")
-    vault = vault.expanduser().resolve()
-    raw_root = vault / "raw"
-    if not raw_root.exists():
-        raise ValueError(f"Raw directory not found: {raw_root}")
-    records_by_path, records_by_hash = _source_raw_coverage_index(vault)
-    raw_files = _iter_raw_ingest_files(raw_root)
-    duplicate_url_first_paths = _duplicate_raw_url_first_paths(raw_files)
-    items: list[RawIngestCandidate] = []
-    for raw_path in raw_files:
-        rel_path = normalize_vault_path(raw_path.relative_to(vault).as_posix())
-        raw_hash = sha256_file(raw_path)
-        path_records = records_by_path.get(rel_path, [])
-        hash_records = records_by_hash.get(raw_hash, [])
-        duplicate_url_first_path = duplicate_url_first_paths.get(raw_path)
-        matched_records: list[_SourceRawCoverageRecord] = []
-        if any(raw_hash in record.raw_hashes for record in path_records):
-            status = "processed"
-            matched_by = "path_and_hash"
-            matched_records = [record for record in path_records if raw_hash in record.raw_hashes]
-            reason = "same raw path and content hash are already recorded in source frontmatter"
-        elif path_records and not any(record.raw_hashes for record in path_records):
-            status = "processed"
-            matched_by = "path"
-            matched_records = path_records
-            reason = "same raw path is recorded in source frontmatter; content hash is unavailable"
-        elif path_records:
-            status = "changed"
-            matched_by = "path"
-            matched_records = path_records
-            reason = "same raw path is recorded, but the current content hash is different"
-        elif hash_records:
-            status = "duplicate_hash"
-            matched_by = "hash"
-            matched_records = hash_records
-            reason = "same content hash is already recorded under another raw path"
-        elif duplicate_url_first_path is not None:
-            status = "duplicate_url"
-            matched_by = "url"
-            reason = (
-                "same imported URL is already present under another raw path: "
-                f"{normalize_vault_path(duplicate_url_first_path.relative_to(vault).as_posix())}"
-            )
-        else:
-            status = "unprocessed"
-            matched_by = "none"
-            reason = "no matching source raw path or content hash found"
-        stat = raw_path.stat()
-        items.append(
-            RawIngestCandidate(
-                raw_path=rel_path,
-                status=status,
-                raw_sha256=raw_hash,
-                size_bytes=stat.st_size,
-                mtime=datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-                matched_by=matched_by,
-                source_pages=sorted({record.source_page for record in matched_records}),
-                operation_ids=sorted(
-                    {operation_id for record in matched_records for operation_id in record.operation_ids}
-                ),
-                reason=reason,
-            )
-        )
-    status_rank = {"unprocessed": 0, "changed": 1, "duplicate_hash": 2, "duplicate_url": 3, "processed": 4}
-    items.sort(key=lambda item: (status_rank[item.status], item.raw_path))
-    visible_items = items if include_processed else [item for item in items if item.status != "processed"]
-    if limit is not None:
-        visible_items = visible_items[:limit]
-    return RawIngestCandidateReport(
-        vault=vault.as_posix(),
-        raw_root=raw_root.as_posix(),
-        include_processed=include_processed,
-        limit=limit,
-        total_raw_files=len(items),
-        candidate_count=len(visible_items),
-        processed_count=sum(1 for item in items if item.status == "processed"),
-        changed_count=sum(1 for item in items if item.status == "changed"),
-        duplicate_hash_count=sum(1 for item in items if item.status == "duplicate_hash"),
-        duplicate_url_count=sum(1 for item in items if item.status == "duplicate_url"),
-        unprocessed_count=sum(1 for item in items if item.status == "unprocessed"),
-        items=visible_items,
-    )
-
-
-def _duplicate_raw_url_first_paths(raw_files: list[Path]) -> dict[Path, Path]:
-    first_by_url: dict[str, Path] = {}
-    duplicates: dict[Path, Path] = {}
-    for raw_path in raw_files:
-        matched_first: Path | None = None
-        for url in _raw_import_urls(raw_path):
-            first = first_by_url.get(url)
-            if first is not None and first != raw_path:
-                matched_first = first
-                break
-        if matched_first is not None:
-            duplicates[raw_path] = matched_first
-            continue
-        for url in _raw_import_urls(raw_path):
-            first_by_url.setdefault(url, raw_path)
-    return duplicates
-
-
-def _raw_import_urls(raw_path: Path) -> list[str]:
-    urls: list[str] = []
-    try:
-        with raw_path.open("r", encoding="utf-8", errors="ignore") as handle:
-            prefix = handle.read(8192)
-    except OSError:
-        return urls
-    for line in prefix.splitlines()[:24]:
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        if key.strip().lower() not in {"imported from", "fetched url", "final url"}:
-            continue
-        url = value.strip()
-        if url and url not in urls:
-            urls.append(url)
-    return urls
-
-
-def _iter_raw_ingest_files(raw_root: Path) -> list[Path]:
-    paths: list[Path] = []
-    for path in raw_root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative_parts = path.relative_to(raw_root).parts
-        if any(part.startswith(".") for part in relative_parts):
-            continue
-        if relative_parts and relative_parts[0] == "log":
-            continue
-        if path.suffix.lower() not in RAW_INGEST_TEXT_SUFFIXES:
-            continue
-        paths.append(path)
-    return sorted(paths)
-
-
-def _source_raw_coverage_index(
-    vault: Path,
-) -> tuple[dict[str, list[_SourceRawCoverageRecord]], dict[str, list[_SourceRawCoverageRecord]]]:
-    records_by_path: dict[str, list[_SourceRawCoverageRecord]] = {}
-    records_by_hash: dict[str, list[_SourceRawCoverageRecord]] = {}
-    for source_page, frontmatter in scan_source_pages(vault):
-        raw_paths = tuple(_frontmatter_raw_paths(frontmatter))
-        raw_hashes = tuple(value.strip() for value in _frontmatter_list(frontmatter, "source_raw_hashes") if value.strip())
-        operation_ids = tuple(
-            value.strip() for value in _frontmatter_list(frontmatter, "source_operation_ids") if value.strip()
-        )
-        if not raw_paths and not raw_hashes:
-            continue
-        record = _SourceRawCoverageRecord(
-            source_page=source_page,
-            raw_paths=raw_paths,
-            raw_hashes=raw_hashes,
-            operation_ids=operation_ids,
-        )
-        for raw_path in raw_paths:
-            records_by_path.setdefault(raw_path, []).append(record)
-        for raw_hash in raw_hashes:
-            records_by_hash.setdefault(raw_hash, []).append(record)
-    return records_by_path, records_by_hash
-
-
-def _frontmatter_raw_paths(frontmatter: dict[str, Any]) -> list[str]:
-    raw_paths: list[str] = []
-    for value in _frontmatter_list(frontmatter, "source_raw_paths"):
-        normalized = normalize_vault_path(value)
-        if normalized:
-            raw_paths.append(normalized)
-    return raw_paths
-
-
-def _frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:
-    value = frontmatter.get(key, [])
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [item for item in value if isinstance(item, str)]
-    return []
-
-
-def normalize_vault_path(path: str) -> str:
-    return unicodedata.normalize("NFC", path.strip()).replace("\\", "/")
 
 
 def backfill_missing_candidate_resolution_items(
@@ -11673,14 +11325,14 @@ def build_draft_approval(
     auto_approved: bool,
     notes: str,
 ) -> DraftApproval:
-    require_m42_draft_sidecars(run_dir)
+    _apply_guards.require_draft_rendering_sidecars(run_dir)
     approved_manifest = read_model(approved_manifest_path, DraftWriteManifest)
     markdown_hashes: dict[str, str] = {}
     for target in approved_manifest.targets:
         draft = run_dir / target.draft_path
         if draft.suffix == ".md" and draft.exists():
             markdown_hashes[target.draft_path] = sha256_file(draft)
-    for rel_path in M42_REQUIRED_DRAFT_SIDECARS:
+    for rel_path in _apply_guards.REQUIRED_DRAFT_RENDERING_SIDECARS:
         path = run_dir / rel_path
         markdown_hashes[rel_path] = sha256_file(path)
     return DraftApproval(

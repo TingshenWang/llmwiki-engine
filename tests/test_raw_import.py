@@ -5,8 +5,9 @@ import httpx
 import pytest
 
 from llmwiki_engine.hash_utils import sha256_file
-from llmwiki_engine.pipeline import init_vault, scan_raw_ingest_candidates
+from llmwiki_engine.pipeline import init_vault
 from llmwiki_engine.raw_import import RawUrlImportError, import_raw_url, normalize_arxiv_html_url
+from llmwiki_engine.source_records import scan_raw_ingest_candidates
 
 
 def test_normalize_arxiv_html_url_prefers_html_for_abs_and_pdf_urls() -> None:

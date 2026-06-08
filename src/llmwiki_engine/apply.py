@@ -25,7 +25,7 @@ from .models import (
 from .steps import require_step_output_dir
 from .verify import require_verified
 from . import run_metrics as _run_metrics
-from .pipeline import build_source_duplicate_guard_artifact, require_m42_draft_sidecars
+from . import apply_guards as _apply_guards
 from .wiki_context import wiki_context_drift_messages
 from .workspace import RunStore, apply_lock, run_lock
 
@@ -210,7 +210,7 @@ def _verify_wiki_context(vault: Path, run_dir: Path) -> None:
 
 def _verify_draft_approval(run_dir: Path, preview: ApplyPreview) -> None:
     try:
-        require_m42_draft_sidecars(run_dir)
+        _apply_guards.require_draft_rendering_sidecars(run_dir)
     except Exception as exc:
         raise ApplyError(str(exc)) from exc
     approval_path = require_step_output_dir(run_dir, "draft_review") / "draft_approval.json"
@@ -274,7 +274,7 @@ def _verify_write_set(run_dir: Path, preview: ApplyPreview) -> None:
 def _verify_source_duplicate(vault: Path, run_dir: Path, operation_id: str) -> None:
     digest = read_model(require_step_output_dir(run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
     prepared = require_step_output_dir(run_dir, "prepared_raw_review") / "approved_prepared.md"
-    artifact = build_source_duplicate_guard_artifact(
+    artifact = _apply_guards.build_source_duplicate_guard_artifact(
         vault,
         source_raw_path=digest.source_raw_path,
         source_raw_hash=sha256_file(vault / digest.source_raw_path),

@@ -14838,7 +14838,7 @@ def test_apply_rejects_draft_missing_grounding_sidecar(tmp_path: Path) -> None:
             ]
     write_json(manifest_path, manifest_data)
 
-    with pytest.raises(ApplyError, match="M4.2 draft sidecar artifacts are missing"):
+    with pytest.raises(ApplyError, match="Draft rendering sidecar artifacts are missing"):
         apply_operation(vault, manifest.operation_id)
 
 
