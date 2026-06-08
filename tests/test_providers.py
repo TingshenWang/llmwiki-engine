@@ -34,6 +34,29 @@ def test_raw_prepare_fixture_contract() -> None:
     assert model.risk_level == "low"
 
 
+def test_mock_provider_numbered_json_takes_precedence_over_plain_fixture(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "mock"
+    fixture_dir.mkdir()
+    (fixture_dir / "source_digest.json").write_text('{"summary": "plain"}', encoding="utf-8")
+    (fixture_dir / "source_digest.1.json").write_text('{"summary": "first"}', encoding="utf-8")
+    provider = ProviderRegistry().create("mock:fixture", fixture_dir=fixture_dir)
+
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"summary": "first"}'
+    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"summary": "plain"}'
+
+
+def test_mock_provider_repair_payload_uses_normal_call_count_contract(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "mock"
+    fixture_dir.mkdir()
+    (fixture_dir / "draft_rendering.json").write_text('{"status": "plain"}', encoding="utf-8")
+    (fixture_dir / "draft_rendering.1.json").write_text('{"status": "first"}', encoding="utf-8")
+    (fixture_dir / "draft_rendering.repair.json").write_text('{"status": "stale-repair"}', encoding="utf-8")
+    provider = ProviderRegistry().create("mock:fixture", fixture_dir=fixture_dir)
+
+    assert provider.generate_raw("draft_rendering", {"repair_contract": {"mode": "page_scoped_repair"}}, JsonLikeArtifact) == '{"status": "first"}'
+    assert provider.generate_raw("draft_rendering", {"repair_contract": {"mode": "page_scoped_repair"}}, JsonLikeArtifact) == '{"status": "plain"}'
+
+
 def test_source_digest_bad_format_is_blocked(tmp_path: Path) -> None:
     fixture_dir = tmp_path / "mock"
     fixture_dir.mkdir()

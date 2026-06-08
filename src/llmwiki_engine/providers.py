@@ -44,27 +44,9 @@ class MockProvider:
 
     def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
         self.call_counts[task] = self.call_counts.get(task, 0) + 1
-        sequence_path = self.fixture_dir / f"{task}.sequence.jsonl"
-        if sequence_path.exists():
-            rows = [line for line in sequence_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-            index = min(self.call_counts[task], len(rows)) - 1
-            item = json.loads(rows[index])
-            if isinstance(item, dict):
-                if "raw" in item:
-                    return str(item["raw"])
-                if "file" in item:
-                    return (self.fixture_dir / str(item["file"])).read_text(encoding="utf-8")
-            return json.dumps(item, ensure_ascii=False)
         numbered_path = self.fixture_dir / f"{task}.{self.call_counts[task]}.json"
         if numbered_path.exists():
             return numbered_path.read_text(encoding="utf-8")
-        numbered_raw_path = self.fixture_dir / f"{task}.{self.call_counts[task]}.raw"
-        if numbered_raw_path.exists():
-            return numbered_raw_path.read_text(encoding="utf-8")
-        if isinstance(payload, dict) and payload.get("repair_contract"):
-            repair_path = self.fixture_dir / f"{task}.repair.json"
-            if repair_path.exists():
-                return repair_path.read_text(encoding="utf-8")
         path = self.fixture_dir / f"{task}.json"
         if not path.exists():
             raise ProviderError(f"Mock fixture missing: {path}")
