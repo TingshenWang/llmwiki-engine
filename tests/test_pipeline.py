@@ -17,6 +17,7 @@ import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.run_metrics as run_metrics_module
 import llmwiki_engine.source_digest_budget as source_digest_budget
+import llmwiki_engine.source_digest_payload as source_digest_payload_module
 import llmwiki_engine.steps as steps_module
 from llmwiki_engine import open_questions as open_questions_module
 from llmwiki_engine import page_sections as page_sections_module
@@ -629,6 +630,15 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "augment_source_digest_anchor_entities")
     assert not hasattr(pipeline_module, "cap_source_digest_candidates")
     assert not hasattr(pipeline_module, "render_source_digest_budget_report")
+    assert not hasattr(pipeline_module, "build_source_digest_source_map")
+    assert not hasattr(pipeline_module, "project_source_digest_source_map_for_payload")
+    assert not hasattr(pipeline_module, "build_source_kind_hints")
+    assert not hasattr(pipeline_module, "source_digest_language_contract")
+    assert not hasattr(pipeline_module, "render_source_digest_source_map_markdown")
+    assert not hasattr(pipeline_module, "render_source_kind_hints_markdown")
+    assert not hasattr(pipeline_module, "build_source_digest_payload")
+    assert not hasattr(pipeline_module, "SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT")
+    assert not hasattr(pipeline_module, "PAPER_CAPTION_RE")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -2271,7 +2281,7 @@ def test_source_kind_hints_do_not_mark_article_with_single_github_link_as_readme
         "固定路径适合确定性高的任务，Agent 适合开放任务。\n"
     )
 
-    hints = pipeline_module.build_source_kind_hints(text, "raw/building-effective-agents.md")
+    hints = source_digest_payload_module.build_source_kind_hints(text, "raw/building-effective-agents.md")
 
     assert hints["github_url_present"] is True
     assert hints["repository_readme"] is False
@@ -2288,7 +2298,7 @@ def test_source_kind_hints_do_not_mark_article_quickstart_heading_as_tutorial_in
         "完整代码见 [repo](https://github.com/example/agent-note)。\n"
     )
 
-    hints = pipeline_module.build_source_kind_hints(text, "raw/agent-design-note.md")
+    hints = source_digest_payload_module.build_source_kind_hints(text, "raw/agent-design-note.md")
 
     assert hints["github_url_present"] is True
     assert hints["tutorial_index"] is False
@@ -2304,7 +2314,7 @@ def test_source_kind_hints_do_not_mark_reference_heavy_article_as_navigation_ind
         f"{links}\n"
     )
 
-    hints = pipeline_module.build_source_kind_hints(text, "raw/agent-evaluation-review.md")
+    hints = source_digest_payload_module.build_source_kind_hints(text, "raw/agent-evaluation-review.md")
 
     assert hints["counts"]["markdown_link_count"] >= 24
     assert hints["tutorial_index"] is False
@@ -2321,7 +2331,7 @@ def test_source_kind_hints_do_not_mark_deep_dive_related_docs_as_tutorial_index(
         f"{links}\n"
     )
 
-    hints = pipeline_module.build_source_kind_hints(text, "raw/context-engineering-deep-dive.md")
+    hints = source_digest_payload_module.build_source_kind_hints(text, "raw/context-engineering-deep-dive.md")
 
     assert hints["counts"]["toc_link_count"] >= 6
     assert hints["tutorial_index"] is False
@@ -2338,15 +2348,15 @@ def test_source_digest_source_map_triggers_for_long_structured_interview() -> No
         )
     text = "---\ntitle: Long Interview\n---\n\n## 访谈全文\n\n" + "\n\n".join(sections)
 
-    source_map = pipeline_module.build_source_digest_source_map(
+    source_map = source_digest_payload_module.build_source_digest_source_map(
         text,
         approved_prepared_ref="prepared_raw_review/approved_prepared.md",
     )
 
-    assert len(text) > pipeline_module.SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT
+    assert len(text) > source_digest_payload_module.SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT
     assert source_map["full_source_in_payload"] is False
     assert source_map["included_char_count"] < source_map["original_char_count"]
-    assert source_map["section_excerpt_limit"] >= pipeline_module.SOURCE_DIGEST_SOURCE_MAP_MIN_SECTION_EXCERPT_LIMIT
+    assert source_map["section_excerpt_limit"] >= source_digest_payload_module.SOURCE_DIGEST_SOURCE_MAP_MIN_SECTION_EXCERPT_LIMIT
     assert any(section["heading"] == "访谈主题 20" for section in source_map["sections"])
 
 
@@ -2404,7 +2414,7 @@ def test_source_digest_payload_uses_source_map_for_long_prepared_source(
     assert source_map["schema_version"] == "source_digest_source_map_payload.v1"
     assert source_map["full_source_map_ref"] == "source_digest/source_digest_source_map.json"
     assert source_map["full_source_in_payload"] is False
-    assert source_map["original_char_count"] > pipeline_module.SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT
+    assert source_map["original_char_count"] > source_digest_payload_module.SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT
     assert source_map["included_char_count"] < source_map["original_char_count"]
     assert any(section["heading"] == "2 Method" for section in source_map["sections"])
     assert source_map["captions"]
