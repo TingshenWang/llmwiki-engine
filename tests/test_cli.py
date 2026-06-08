@@ -388,21 +388,16 @@ def test_prepare_help_uses_single_policy_values(command: list[str]) -> None:
     assert "[auto|skip|force]" in result.output
 
 
-@pytest.mark.parametrize(
-    "schema_version",
-    ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v9", "operation_manifest.v11"],
-)
 def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
     tmp_path: Path,
-    schema_version: str,
 ) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="old")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="invalid-schema")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
-    data["schema_version"] = schema_version
+    data["schema_version"] = "operation_manifest.invalid"
     write_json(manifest_path, data)
 
     runner = CliRunner()

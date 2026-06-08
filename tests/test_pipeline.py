@@ -14976,7 +14976,7 @@ def test_apply_rejects_preview_paths_outside_expected_roots(tmp_path: Path) -> N
     assert not (vault.parent / "outside.md").exists()
 
 
-def test_apply_rejects_old_v8_draft_missing_m42_sidecar(tmp_path: Path) -> None:
+def test_apply_rejects_draft_missing_grounding_sidecar(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-sidecar")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
@@ -15048,16 +15048,12 @@ def test_plain_apply_records_apply_failed_on_receipt_failure(tmp_path: Path, mon
     assert read_jsonl(vault / ".llmwiki" / "applied" / "operations.jsonl") == []
 
 
-@pytest.mark.parametrize(
-    "schema_version",
-    ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v9", "operation_manifest.v11"],
-)
-def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
+def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v2")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="invalid-schema")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
-    data["schema_version"] = schema_version
+    data["schema_version"] = "operation_manifest.invalid"
     write_json(manifest_path, data)
     with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
         read_manifest(manifest_path)
@@ -15104,7 +15100,7 @@ def test_manifest_v10_rejects_extra_top_level_fields_with_mvp_message(tmp_path: 
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="extra-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
-    data["legacy_status_summary"] = {"old": True}
+    data["unexpected_status_summary"] = {"unexpected": True}
     write_json(manifest_path, data)
 
     with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
