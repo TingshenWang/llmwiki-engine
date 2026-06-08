@@ -57,15 +57,6 @@ console = Console()
 VALID_RESUME_STEPS_HELP = ", ".join(STEP_NAMES)
 
 
-def _raw_prepare_command_suffix(
-    *,
-    prepare: RawPreparePolicy | None = None,
-) -> str:
-    if prepare is not None:
-        return f" --prepare {prepare.value}"
-    return ""
-
-
 @app.command()
 def init(vault: Path, profile: str = "project_basic") -> None:
     """Initialize a vault with profile directories and config."""
@@ -204,9 +195,7 @@ def ingest_run_next(
 ) -> None:
     """Run ingest for the next safe raw candidate."""
     try:
-        prepare_cli_suffix = _raw_prepare_command_suffix(
-            prepare=prepare,
-        )
+        prepare_cli_suffix = f" --prepare {prepare.value}" if prepare is not None else ""
         report = scan_raw_ingest_candidates(vault)
         candidate = _select_next_raw_candidate(report, include_changed=include_changed)
         if candidate is None:
