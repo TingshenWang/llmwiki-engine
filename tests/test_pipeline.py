@@ -5050,7 +5050,7 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
     assert extracted is None
 
 
-def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> None:
+def test_partial_draft_extraction_preserves_example_literals_without_cleanup_report() -> None:
     ok_item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-OK",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
@@ -5080,7 +5080,7 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
                 action="create",
                 canonical_target_path="concepts/Concept_OK.md",
                 summary="通过页摘要。",
-                body_markdown=draft_body(detail="这个页面用于说明 deterministic cleanup 的使用场景和边界：只处理 examples 里的示例参数，不把结果事实当占位符。", examples="- 示例构建编号是 “ABC123”。"),
+                body_markdown=draft_body(detail="这个页面用于说明示例值的使用场景和边界：examples 里的示例参数不应被改写成观察到的事实。", examples="- 示例构建编号是 “ABC123”。"),
                 change_summary="创建通过页。",
                 source_coverage_notes="测试。",
             )
@@ -5107,15 +5107,6 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
 
     assert extracted is not None
     assert "ABC123" in extracted.pages[0].body_markdown
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        extracted,
-        plan.model_copy(update={"items": [ok_item]}),
-        snapshot,
-        "",
-    )
-    assert report["changed"] is False
-    assert report["replacement_count"] == 0
-    assert "ABC123" in cleaned.pages[0].body_markdown
 
 
 def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_failing_page(tmp_path: Path) -> None:
@@ -5892,51 +5883,6 @@ def test_draft_rendering_batch_refs_include_open_question_cleanup_schema(tmp_pat
     cleanup_ref = next(ref for ref in refs if ref.relative_path.endswith("open_question_grounding_cleanup_report.json"))
 
     assert cleanup_ref.schema_version == "open_question_grounding_cleanup_report.v1"
-
-
-def test_draft_rendering_refs_include_example_cleanup_schema(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    step_root = run_dir / "draft_rendering"
-    report_path = step_root / "example_concrete_cleanup_report.json"
-    report_path.parent.mkdir(parents=True)
-    write_json(
-        report_path,
-        {
-            "schema_version": "example_concrete_cleanup_report.v1",
-            "changed": False,
-            "replacement_count": 0,
-            "skipped_count": 0,
-            "replacements": [],
-            "skipped": [],
-        },
-    )
-
-    ref = pipeline_module._draft_rendering_ref(run_dir, report_path, "draft_rendering")
-
-    assert ref.schema_version == "example_concrete_cleanup_report.v1"
-
-
-def test_draft_rendering_batch_refs_include_example_cleanup_schema(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    step_root = run_dir / "draft_rendering"
-    report_path = step_root / "model_batches" / "batch-001" / "example_concrete_cleanup_report.json"
-    report_path.parent.mkdir(parents=True)
-    write_json(
-        report_path,
-        {
-            "schema_version": "example_concrete_cleanup_report.v1",
-            "changed": False,
-            "replacement_count": 0,
-            "skipped_count": 0,
-            "replacements": [],
-            "skipped": [],
-        },
-    )
-
-    refs = pipeline_module.draft_rendering_model_batch_refs(run_dir, step_root, "draft_rendering")
-    cleanup_ref = next(ref for ref in refs if ref.relative_path.endswith("example_concrete_cleanup_report.json"))
-
-    assert cleanup_ref.schema_version == "example_concrete_cleanup_report.v1"
 
 
 def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> None:
@@ -7838,210 +7784,6 @@ def test_grounding_examples_allow_user_preference_placeholder() -> None:
 
     assert review.requires_review is False
     assert [claim.text for claim in review.claims] == ["用户偏好 X", "<example_id>", "<time_period>"]
-
-
-def test_cleanup_unsupported_example_literals_replaces_identifier_placeholder() -> None:
-    draft, plan, snapshot = build_examples_grounding_case("- 例如可以用 “ABC123” 表示一个构建编号。")
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "")
-
-    assert review_before.requires_review is False
-    assert [claim.text for claim in review_before.warnings] == ["ABC123"]
-    assert report["changed"] is False
-    assert report["replacement_count"] == 0
-    assert "ABC123" in cleaned.pages[0].body_markdown
-    assert not review_after.requires_review
-
-
-def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder() -> None:
-    draft, plan, snapshot = build_examples_grounding_case("- 例子里的时间可以写成 “2025年第三季度”。")
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert report["changed"] is False
-    assert report["replacement_count"] == 0
-    assert "2025年第三季度" in cleaned.pages[0].body_markdown
-    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
-
-
-def test_cleanup_unsupported_example_literals_replaces_user_id_leaf_placeholder() -> None:
-    draft, plan, snapshot = build_examples_grounding_case('- 示例用户参数可以写成 “user123”。')
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    assert report["replacement_count"] == 0
-    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
-
-
-def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() -> None:
-    draft, plan, snapshot = build_examples_grounding_case('- `recall("张三的工单 1234")`')
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    assert report["replacement_count"] == 0
-    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
-
-
-def test_cleanup_unsupported_example_literals_preserves_inline_command_syntax() -> None:
-    draft, plan, snapshot = build_examples_grounding_case('- `mem0 add --user-id "user123" --text "用户喜欢蓝色"`')
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    assert report["replacement_count"] == 0
-    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
-
-
-def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
-    draft, plan, snapshot = build_examples_grounding_case(
-        "- 例子区没有具体值。",
-        detail="详情里出现 “ABC123” 时仍应交给 grounding review。",
-    )
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    assert report["skipped_count"] == 0
-    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "")
-    assert review_after.requires_review is False
-    assert review_after.warnings
-
-
-def test_cleanup_unsupported_example_literals_keeps_source_supported_literal() -> None:
-    draft, plan, snapshot = build_examples_grounding_case("- 来源里的构建编号是 “ABC123”。")
-    approved_raw = "本段来源明确提到构建编号 ABC123。"
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        approved_raw,
-        review=review_before,
-    )
-
-    assert review_before.requires_review is False
-    assert cleaned == draft
-    assert report["changed"] is False
-
-
-def test_cleanup_unsupported_example_literals_skips_repeated_literals() -> None:
-    draft, plan, snapshot = build_examples_grounding_case("- “ABC123” 和 “ABC123” 都是具体构建编号。")
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    assert report["skipped"] == []
-
-
-def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> None:
-    draft, plan, snapshot = build_examples_grounding_case("- “销量增长三倍” 不是安全的示例占位符。")
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    assert report["skipped"] == []
-    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
-
-
-@pytest.mark.parametrize(
-    "literal",
-    [
-        "2025年第三季度收入增长三倍",
-        "ABC123 导致错误响应",
-        "订单 ABC123 失败导致退款",
-        "Build number 1234 completed with status success",
-        "Alice 在 2026 年买了 MacBook。",
-        "user-123 purchased MacBook in 2025",
-        "用户 1234 删除了凭证",
-        "客户 user123 喜欢蓝色并删除了密码",
-        "Alice uses MacBook in 2026",
-        "Alice visited Beijing in 2025",
-        "张三在2025年使用MacBook",
-    ],
-)
-def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal: str) -> None:
-    draft, plan, snapshot = build_examples_grounding_case(f"- “{literal}” 不应被整体替成占位符。")
-    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
-
-    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
-        draft,
-        plan,
-        snapshot,
-        "",
-        review=review_before,
-    )
-
-    assert cleaned == draft
-    assert report["changed"] is False
-    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "")
-    assert report["skipped"] == []
-    assert not review_after.requires_review
 
 
 def test_grounding_examples_allow_abstract_memory_query_literals() -> None:

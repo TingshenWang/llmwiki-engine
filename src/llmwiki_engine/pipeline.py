@@ -1401,8 +1401,6 @@ def run_draft_rendering_model(
         reinforcement_report = read_json(reinforcement_path) if reinforcement_path.exists() else {}
         grounding_rewrite_path = job["batch_dir"] / "grounding_paraphrase_rewrite_report.json"
         grounding_rewrite_report = read_json(grounding_rewrite_path) if grounding_rewrite_path.exists() else {}
-        example_cleanup_path = job["batch_dir"] / "example_concrete_cleanup_report.json"
-        example_cleanup_report = read_json(example_cleanup_path) if example_cleanup_path.exists() else {}
         batch_payload_char_count = _run_metrics.provider_results_payload_char_count(
             [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
         )
@@ -1439,12 +1437,6 @@ def run_draft_rendering_model(
                     else ""
                 ),
                 "grounding_rewrite_count": int(grounding_rewrite_report.get("rewrite_count", 0)),
-                "example_concrete_cleanup_report_ref": (
-                    f"model_batches/{batch_id}/example_concrete_cleanup_report.json"
-                    if example_cleanup_path.exists()
-                    else ""
-                ),
-                "example_concrete_replacement_count": int(example_cleanup_report.get("replacement_count", 0)),
                 "schema_valid": result.schema_valid,
             },
         }
@@ -1830,17 +1822,7 @@ def extract_valid_partial_draft_rendering(
     if _update_preservation.update_preservation_issues(candidate, update_preservation_pack):
         return None
     candidate, _grounding_rewrite_report = _draft_grounding.rewrite_grounding_sensitive_paraphrases(candidate, approved_prepared_text)
-    grounding_candidate = candidate
-    grounding_review = _draft_grounding.build_draft_grounding_review(grounding_candidate, partial_plan, snapshot, approved_prepared_text)
-    grounding_candidate, example_cleanup_report = _draft_grounding.cleanup_unsupported_example_literals(
-        grounding_candidate,
-        partial_plan,
-        snapshot,
-        approved_prepared_text,
-        review=grounding_review,
-    )
-    if example_cleanup_report.get("changed"):
-        grounding_review = _draft_grounding.build_draft_grounding_review(grounding_candidate, partial_plan, snapshot, approved_prepared_text)
+    grounding_review = _draft_grounding.build_draft_grounding_review(candidate, partial_plan, snapshot, approved_prepared_text)
     if grounding_review.requires_review:
         return None
     return candidate
@@ -1926,15 +1908,6 @@ def run_single_draft_rendering_model_call(
             approved_prepared_text,
         )
         grounding_review = _draft_grounding.build_draft_grounding_review(cleaned_candidate, merge_plan, snapshot, approved_prepared_text)
-        cleaned_candidate, _example_cleanup_report = _draft_grounding.cleanup_unsupported_example_literals(
-            cleaned_candidate,
-            merge_plan,
-            snapshot,
-            approved_prepared_text,
-            review=grounding_review,
-        )
-        if _example_cleanup_report.get("changed"):
-            grounding_review = _draft_grounding.build_draft_grounding_review(cleaned_candidate, merge_plan, snapshot, approved_prepared_text)
         if grounding_review.requires_review:
             repair_issues.extend(
                 [
@@ -2054,22 +2027,6 @@ def run_single_draft_rendering_model_call(
         renderer=_draft_grounding.render_open_question_grounding_cleanup_report,
         count_keys=["relocation_count", "skipped_count"],
     )
-    grounding_review = _draft_grounding.build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
-    draft_artifact, example_cleanup_report = _draft_grounding.cleanup_unsupported_example_literals(
-        draft_artifact,
-        merge_plan,
-        snapshot,
-        approved_prepared_text,
-        review=grounding_review,
-    )
-    redacted_example_cleanup_report = ctx.execution_context.redactor.redact(example_cleanup_report)
-    write_draft_aux_report_if_active(
-        output_dir=output_dir,
-        stem="example_concrete_cleanup_report",
-        report=redacted_example_cleanup_report,
-        renderer=_draft_grounding.render_example_concrete_cleanup_report,
-        count_keys=["replacement_count", "skipped_count"],
-    )
     return draft_artifact
 
 
@@ -2172,7 +2129,6 @@ def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
             f"{int(batch.get('payload_char_count', 0)):,}",
             str(batch.get("reinforced_section_count", 0)),
             str(batch.get("grounding_rewrite_count", 0)),
-            str(batch.get("example_concrete_replacement_count", 0)),
         ]
         for batch in report["batches"]
     ]
@@ -2197,7 +2153,6 @@ def render_draft_rendering_batch_report(report: dict[str, Any]) -> str:
                 "Payload Chars",
                 "Reinforced Sections",
                 "Grounding Rewrites",
-                "Example Replacements",
             ],
             rows,
         )
@@ -2283,8 +2238,6 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         step_root / "grounding_paraphrase_rewrite_report.md",
         step_root / "open_question_grounding_cleanup_report.json",
         step_root / "open_question_grounding_cleanup_report.md",
-        step_root / "example_concrete_cleanup_report.json",
-        step_root / "example_concrete_cleanup_report.md",
     ]:
         if optional_sidecar.exists():
             outputs.append(optional_sidecar)
@@ -3165,8 +3118,6 @@ def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: 
             schema = "grounding_paraphrase_rewrite_report.v1"
         elif path.name == "open_question_grounding_cleanup_report.json":
             schema = "open_question_grounding_cleanup_report.v1"
-        elif path.name == "example_concrete_cleanup_report.json":
-            schema = "example_concrete_cleanup_report.v1"
         refs.append(_ref(run_dir, path, step_name, artifact_kind_for_path(path), schema, required_for_resume=required))
     return refs
 
@@ -3188,7 +3139,6 @@ def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactR
         "update_preservation_reinforcement_report.json": "update_preservation_reinforcement_report.v1",
         "grounding_paraphrase_rewrite_report.json": "grounding_paraphrase_rewrite_report.v1",
         "open_question_grounding_cleanup_report.json": "open_question_grounding_cleanup_report.v1",
-        "example_concrete_cleanup_report.json": "example_concrete_cleanup_report.v1",
         "draft_write_manifest.json": "draft_write_manifest.v1",
         "update_merge_report.json": "update_merge_report.v1",
         "related_merge_report.json": "related_merge_report.v1",
