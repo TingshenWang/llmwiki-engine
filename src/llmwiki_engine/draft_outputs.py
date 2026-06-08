@@ -70,7 +70,14 @@ def assemble_knowledge_page(
             summary,
             absorption_context=update_absorption_context,
         )
-        old_core = _page_sections.existing_core_content_from_sections(existing_sections)
+        old_core = existing_sections.get("core_content", "").strip()
+        if not old_core:
+            old_core_blocks: list[str] = []
+            for key, title in [("detail", ""), ("examples", "例子"), ("value_points", "价值点"), ("additional_notes", "补充观察")]:
+                body = existing_sections.get(key, "").strip()
+                if body:
+                    old_core_blocks.append(f"### {title}\n\n{body}" if title else body)
+            old_core = "\n\n".join(old_core_blocks).strip()
         core, core_change = _section_merge.merge_update_section(
             "core_content",
             old_core,

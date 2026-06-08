@@ -45,15 +45,3 @@ def parse_existing_sections(markdown: str) -> dict[str, str]:
         if current_key is not None:
             sections[current_key].append(line)
     return {key: "\n".join(value).strip() for key, value in sections.items()}
-
-
-def existing_core_content_from_sections(sections: dict[str, str]) -> str:
-    if sections.get("core_content", "").strip():
-        return sections["core_content"].strip()
-    blocks: list[str] = []
-    for key, title in [("detail", ""), ("examples", "例子"), ("value_points", "价值点"), ("additional_notes", "补充观察")]:
-        body = sections.get(key, "").strip()
-        if not body:
-            continue
-        blocks.append(f"### {title}\n\n{body}" if title else body)
-    return "\n\n".join(blocks).strip()
