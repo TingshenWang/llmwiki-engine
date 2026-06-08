@@ -24,28 +24,119 @@ DEFERRED_AGGREGATION_GROUP_LABELS = {
     "open_questions": "延后未决问题",
     "entities": "延后实体",
 }
-SOURCE_DIGEST_ANCHOR_ENTITIES: dict[str, dict[str, str]] = {
-    "Managed Agents": {
-        "summary": "Managed Agents 是源材料显式讨论的托管智能体系统，用于将大脑、会话和双手解耦，并容纳未来不同 harness、sandbox 或其他组件。",
-        "why_matters": "它是本材料的中心系统名称，后续材料很可能继续补充其产品、架构和使用边界。",
-        "wiki_value": "作为稳定实体锚点，可承接后续关于 Claude Code、harness、sandbox、session 与托管代理能力的更新。",
-        "resolution_hint": "deterministic_source_anchor_entity: source title/body repeatedly names Managed Agents; keep as a central reusable entity anchor before page budget.",
-    },
-    "Claude Code": {
-        "summary": "Claude Code 是源材料显式提到的 Anthropic 编程 harness/产品，在本材料中作为 Managed Agents 可适配并广泛使用的 harness 示例出现。",
-        "why_matters": "它是后续访谈、产品方法和托管智能体材料之间最容易复用的产品实体锚点。",
-        "wiki_value": "让后续 Claude Code 访谈可以 update 既有页面，而不是把架构材料中的 harness 视角遗失到孤立相关页里。",
-        "resolution_hint": "deterministic_source_anchor_entity: source body explicitly names Claude Code as an excellent harness; keep as a reusable update target when the model omits it.",
-    },
-    "Cowork": {
-        "summary": "Cowork 是源材料显式提到的 Anthropic 知识工作协作者产品，可作为 Claude Code 之外的产品实体锚点。",
-        "why_matters": "它经常与 Claude Code 同源出现，适合承接后续关于非编程知识工作场景的更新。",
-        "wiki_value": "提供稳定产品实体页，便于后续比较、团队组织和使用场景材料进行 update 或互链。",
-        "resolution_hint": "deterministic_source_anchor_entity: source explicitly names Cowork as a durable product/entity anchor.",
-    },
-}
-
+SOURCE_ANCHOR_AUTO_ENTITY_LIMIT = 2
 SOURCE_ANCHOR_RELATED_LIMIT = 3
+SOURCE_ANCHOR_NOISE_TITLES = {
+    "api",
+    "appendix",
+    "author",
+    "benchmark",
+    "conclusion",
+    "contributors",
+    "documentation",
+    "document",
+    "doc",
+    "docs",
+    "download",
+    "downloads",
+    "examples",
+    "faq",
+    "getting started",
+    "github",
+    "installation",
+    "index",
+    "introduction",
+    "license",
+    "long",
+    "note",
+    "overview",
+    "paper",
+    "pdf",
+    "project",
+    "quick start",
+    "readme",
+    "references",
+    "research",
+    "start",
+    "table",
+}
+SOURCE_ANCHOR_LEADING_NOISE_WORDS = {
+    "about",
+    "building",
+    "decoupling",
+    "getting",
+    "how",
+    "introduction",
+    "overview",
+    "quick",
+    "scaling",
+    "the",
+    "using",
+    "why",
+}
+SOURCE_ANCHOR_NEGATIVE_CONTEXT_MARKERS = (
+    "只是随口提",
+    "随口提",
+    "没有说明",
+    "未说明",
+    "未详细说明",
+    "no context",
+    "not explain",
+    "only mentions",
+    "just mentions",
+)
+SOURCE_ANCHOR_POSITIVE_CONTEXT_MARKERS = (
+    " is ",
+    " are ",
+    " can ",
+    " provides ",
+    " supports ",
+    " hosts ",
+    " enables ",
+    " powered by ",
+    " built on ",
+    " integrates ",
+    "是一个",
+    "是一种",
+    "是一款",
+    "作为",
+    "用于",
+    "发布",
+    "推出",
+    "创建",
+)
+SOURCE_ANCHOR_DOCUMENT_SUFFIX_TOKENS = {
+    "chapter",
+    "doc",
+    "docs",
+    "documentation",
+    "download",
+    "downloads",
+    "guide",
+    "index",
+    "note",
+    "paper",
+    "pdf",
+    "project",
+}
+SOURCE_ANCHOR_ENTITY_DESCRIPTOR_TERMS = (
+    " agent",
+    " api",
+    " app",
+    " company",
+    " framework",
+    " harness",
+    " library",
+    " model",
+    " organization",
+    " platform",
+    " product",
+    " runtime",
+    " sdk",
+    " service",
+    " system",
+    " tool",
+)
 
 
 def augment_source_digest_anchor_entities(
@@ -58,7 +149,7 @@ def augment_source_digest_anchor_entities(
         for candidate in digest.ingest_candidates()
         if source_digest_candidate_title_key(candidate)
     }
-    for anchor, metadata in SOURCE_DIGEST_ANCHOR_ENTITIES.items():
+    for anchor in source_anchor_entity_candidates(approved_prepared_text):
         anchor_key = _source_excerpt.normalized_source_match_text(anchor)
         if not anchor_key or anchor_key in existing_keys:
             continue
@@ -69,23 +160,62 @@ def augment_source_digest_anchor_entities(
             candidate_id=f"auto-ent-{anchor_key}",
             name=anchor,
             type="entity",
-            one_sentence_summary=metadata["summary"],
-            why_matters=metadata["why_matters"],
-            wiki_value=metadata["wiki_value"],
+            one_sentence_summary=f"{anchor} 是源材料中高信号出现的实体，系统在页面预算前自动保留为实体候选。",
+            why_matters=f"{anchor} 出现在标题、元数据或明确实体语境中，可能是后续材料复用的稳定知识锚点。",
+            wiki_value=f"作为来源内实体锚点，可承接后续关于 {anchor} 的更新、互链和合并判断。",
             source_locator=signal["source_locator"],
             suggested_page_title=anchor,
             related_candidates=source_anchor_related_candidates(anchor, digest),
             resolution_hint=(
-                f"{metadata['resolution_hint']} occurrence_count={signal['occurrence_count']}; "
+                f"generic_source_anchor_entity: high-confidence source anchor kept before page budget; "
+                f"occurrence_count={signal['occurrence_count']}; "
                 f"signal_reason={signal['reason']}"
             ),
             duplicate_risk="medium",
         )
         additions.append(candidate)
         existing_keys.add(anchor_key)
+        if len(additions) >= SOURCE_ANCHOR_AUTO_ENTITY_LIMIT:
+            break
     if not additions:
         return digest
     return digest.model_copy(update={"entities": [*additions, *digest.entities]})
+
+
+def source_anchor_entity_candidates(text: str) -> list[str]:
+    frontmatter = _frontmatter.parse_frontmatter(text) or {}
+    metadata_text = "\n".join(str(frontmatter.get(key) or "") for key in ["title", "description", "source", "author"])
+    heading_text = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
+    candidates: dict[str, dict[str, Any]] = {}
+    for source_text, source_rank in [
+        (metadata_text, 0),
+        (heading_text, 1),
+        ("\n".join(source_anchor_positive_context_sentences(text)), 2),
+    ]:
+        for candidate in source_anchor_candidate_phrases(source_text):
+            signal = source_anchor_signal(text, candidate)
+            if not signal["should_add"]:
+                continue
+            key = source_digest_title_key(candidate)
+            current = candidates.get(key)
+            rank = source_anchor_signal_rank(signal["reason"], source_rank)
+            if current is None or rank < current["rank"]:
+                candidates[key] = {"anchor": candidate, "rank": rank, "occurrence_count": signal["occurrence_count"]}
+    ordered = sorted(candidates.values(), key=lambda item: (item["rank"], -int(item["occurrence_count"]), item["anchor"].lower()))
+    return [str(item["anchor"]) for item in ordered[:SOURCE_ANCHOR_AUTO_ENTITY_LIMIT]]
+
+
+def source_anchor_signal_rank(reason: str, source_rank: int) -> tuple[int, int]:
+    reason_parts = set(reason.split("+"))
+    if {"metadata_or_heading", "explicit_context"} <= reason_parts:
+        return (0, source_rank)
+    if "metadata_or_heading" in reason_parts:
+        return (1, source_rank)
+    if {"repeated", "explicit_context"} <= reason_parts:
+        return (2, source_rank)
+    if "explicit_context" in reason_parts:
+        return (3, source_rank)
+    return (4, source_rank)
 
 
 def source_anchor_signal(text: str, anchor: str) -> dict[str, Any]:
@@ -105,8 +235,8 @@ def source_anchor_signal(text: str, anchor: str) -> dict[str, Any]:
     heading_text = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
     high_signal_text = "\n".join([metadata_text, heading_text])
     high_signal = source_anchor_occurrence_count(high_signal_text, anchor) > 0
-    explicit_context = source_anchor_has_explicit_context(text, anchor)
-    should_add = high_signal or occurrence_count >= 3 or explicit_context
+    explicit_context = source_anchor_has_positive_context(text, anchor)
+    should_add = explicit_context or (high_signal and occurrence_count >= 3)
     reason_parts: list[str] = []
     if high_signal:
         reason_parts.append("metadata_or_heading")
@@ -126,40 +256,133 @@ def source_anchor_occurrence_count(text: str, anchor: str) -> int:
     if not text or not anchor:
         return 0
     pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])", re.IGNORECASE)
-    return len(pattern.findall(unicodedata.normalize("NFKC", text)))
+    return len(pattern.findall(source_anchor_readable_text(text)))
 
 
-def source_anchor_has_explicit_context(text: str, anchor: str) -> bool:
-    lower = unicodedata.normalize("NFKC", text).lower()
+def source_anchor_readable_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = re.sub(r"!\[[^\]]*]\([^)]+\)", " ", normalized)
+    normalized = re.sub(r"\[([^\]]+)]\([^)]+\)", r"\1", normalized)
+    normalized = re.sub(r"https?://\S+", " ", normalized)
+    return normalized
+
+
+def source_anchor_has_positive_context(text: str, anchor: str) -> bool:
+    lower = source_anchor_readable_text(text).lower()
     anchor_lower = anchor.lower()
-    context_terms = {
-        "managed agents": [
-            "meta-harness",
-            "托管智能体",
-            "managed agents is",
-            "managed agents can",
-            "managed agents,",
-        ],
-        "claude code": [
-            "excellent harness",
-            "广泛使用",
-            "head of product",
-            "创建了claude code",
-            "claude code团队",
-            "claude code和cowork",
-        ],
-        "cowork": [
-            "claude code和cowork",
-            "head of product",
-            "知识工作",
-            "not code",
-            "非代码",
-        ],
-    }.get(anchor_lower, [])
     for match in re.finditer(rf"(?<![a-z0-9]){re.escape(anchor_lower)}(?![a-z0-9])", lower):
         window = lower[max(0, match.start() - 120) : min(len(lower), match.end() + 120)]
-        if any(term in window for term in context_terms):
+        if any(marker in window for marker in SOURCE_ANCHOR_NEGATIVE_CONTEXT_MARKERS):
+            continue
+        relation_tail = lower[match.end() : min(len(lower), match.end() + 80)]
+        if source_anchor_relation_tail_has_positive_context(anchor, relation_tail):
             return True
+    return False
+
+
+def source_anchor_relation_tail_has_positive_context(anchor: str, text: str) -> bool:
+    tail = text.lstrip(" \t\r\n:：,，-–—()（）[]【】")
+    if re.match(r"^(?:is|are)\b", tail):
+        return source_anchor_tail_has_entity_descriptor(tail)
+    if re.match(r"^as\s+(?:an?\s+|the\s+)?", tail):
+        return source_anchor_tail_has_entity_descriptor(tail)
+    if re.match(r"^(?:can|provides|supports|hosts|enables|integrates)\b", tail):
+        return source_anchor_name_has_distinctive_token(anchor)
+    if tail.startswith(("powered by", "built on")):
+        return source_anchor_name_has_distinctive_token(anchor) or source_anchor_tail_has_entity_descriptor(tail)
+    return tail.startswith(("是一个", "是一种", "是一款", "作为", "用于", "发布", "推出", "创建"))
+
+
+def source_anchor_tail_has_entity_descriptor(text: str) -> bool:
+    padded = f" {text.lower()} "
+    return any(term in padded for term in SOURCE_ANCHOR_ENTITY_DESCRIPTOR_TERMS)
+
+
+def source_anchor_name_has_distinctive_token(anchor: str) -> bool:
+    return any(source_anchor_single_token_is_distinctive(token.strip(".-")) for token in anchor.split())
+
+
+def source_anchor_has_document_suffix(candidate: str) -> bool:
+    tokens = [token.lower().strip(".-") for token in candidate.split()]
+    if not tokens:
+        return False
+    if tokens[-1] in SOURCE_ANCHOR_DOCUMENT_SUFFIX_TOKENS:
+        return True
+    if len(tokens) >= 2 and " ".join(tokens[-2:]) in SOURCE_ANCHOR_DOCUMENT_SUFFIX_TOKENS:
+        return True
+    return False
+
+
+def source_anchor_positive_context_sentences(text: str) -> list[str]:
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[。！？!?\.])\s+|\n+", text) if sentence.strip()]
+    return [
+        sentence
+        for sentence in sentences
+        if not any(marker in sentence.lower() for marker in SOURCE_ANCHOR_NEGATIVE_CONTEXT_MARKERS)
+        and any(marker in sentence.lower() for marker in SOURCE_ANCHOR_POSITIVE_CONTEXT_MARKERS)
+    ]
+
+
+def source_anchor_candidate_phrases(text: str) -> list[str]:
+    normalized = source_anchor_readable_text(text)
+    normalized = re.sub(r"[`*_#>\\[\\]\"“”]", " ", normalized)
+    phrases: list[str] = []
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"(?:[A-Z][A-Za-z0-9+.-]{2,}|[A-Z]{2,})"
+        r"(?:[ -]+(?:[A-Z][A-Za-z0-9+.-]{1,}|[A-Z]{2,})){0,3}"
+        r"(?![A-Za-z0-9])"
+    )
+    for match in pattern.finditer(normalized):
+        for phrase in source_anchor_phrase_variants(match.group(0)):
+            if phrase not in phrases:
+                phrases.append(phrase)
+    return phrases
+
+
+def source_anchor_phrase_variants(phrase: str) -> list[str]:
+    cleaned = re.sub(r"[^A-Za-z0-9+.-]+", " ", phrase).strip()
+    if not cleaned:
+        return []
+    tokens = cleaned.split()
+    while tokens and tokens[0].lower().strip(".-") in SOURCE_ANCHOR_LEADING_NOISE_WORDS:
+        tokens = tokens[1:]
+    if not tokens:
+        return []
+    candidate = " ".join(tokens).strip()
+    if not source_anchor_candidate_is_useful(candidate):
+        return []
+    return [candidate]
+
+
+def source_anchor_candidate_is_useful(candidate: str) -> bool:
+    normalized = re.sub(r"\s+", " ", candidate.strip())
+    if not normalized or len(normalized) > 64:
+        return False
+    lowered = normalized.lower()
+    if lowered in SOURCE_ANCHOR_NOISE_TITLES:
+        return False
+    tokens = [token.lower().strip(".-") for token in normalized.split()]
+    if source_anchor_has_document_suffix(normalized):
+        return False
+    if all(token in SOURCE_ANCHOR_NOISE_TITLES or token in SOURCE_ANCHOR_LEADING_NOISE_WORDS for token in tokens):
+        return False
+    if len(tokens) == 1 and (
+        len(tokens[0]) < 4
+        or tokens[0] in SOURCE_ANCHOR_NOISE_TITLES
+        or not source_anchor_single_token_is_distinctive(normalized)
+    ):
+        return False
+    return True
+
+
+def source_anchor_single_token_is_distinctive(token: str) -> bool:
+    if token.isupper() and 2 <= len(token) <= 12:
+        return True
+    if re.search(r"[A-Z].*[A-Z]", token):
+        return True
+    if re.search(r"\d|[+.-]", token):
+        return True
     return False
 
 
@@ -172,14 +395,16 @@ def source_anchor_first_locator(text: str, anchor: str) -> str:
 
 
 def source_anchor_related_candidates(anchor: str, digest: SourceDigestArtifact) -> list[str]:
-    existing_titles = [candidate.suggested_page_title or candidate.name for candidate in digest.ingest_candidates()]
-    desired = {
-        "Managed Agents": ["Claude Code", "Harness（适配框架）", "Session（会话）", "大脑与双手解耦"],
-        "Claude Code": ["Managed Agents", "Harness（适配框架）", "Cowork"],
-        "Cowork": ["Claude Code"],
-    }.get(anchor, [])
-    available = [title for title in desired if title in existing_titles or title in SOURCE_DIGEST_ANCHOR_ENTITIES]
-    return available[:SOURCE_ANCHOR_RELATED_LIMIT]
+    related: list[tuple[float, str]] = []
+    for candidate in digest.ingest_candidates():
+        title = candidate.suggested_page_title or candidate.name
+        if source_digest_title_key(title) == source_digest_title_key(anchor):
+            continue
+        score = source_digest_text_similarity(anchor, source_digest_candidate_intent_text(candidate))
+        if score >= 0.12:
+            related.append((score, title))
+    related.sort(key=lambda item: (-item[0], item[1]))
+    return _markdown_utils.dedupe_strings([title for _score, title in related])[:SOURCE_ANCHOR_RELATED_LIMIT]
 
 
 def cap_source_digest_candidates(digest: SourceDigestArtifact, max_candidates: int) -> tuple[SourceDigestArtifact, dict[str, Any]]:

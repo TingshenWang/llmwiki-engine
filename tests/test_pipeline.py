@@ -811,7 +811,8 @@ def test_source_digest_anchor_entities_are_added_before_page_budget() -> None:
     assert [item.suggested_page_title for item in augmented.entities[:2]] == ["Managed Agents", "Claude Code"]
     assert augmented.entities[0].candidate_id == "auto-ent-managedagents"
     assert augmented.entities[1].source_locator.startswith("L")
-    assert "deterministic_source_anchor_entity" in augmented.entities[1].resolution_hint
+    assert "generic_source_anchor_entity" in augmented.entities[1].resolution_hint
+    assert not hasattr(source_digest_budget, "SOURCE_DIGEST_ANCHOR_ENTITIES")
 
     capped, report = source_digest_budget.cap_source_digest_candidates(augmented, 12)
 
@@ -866,6 +867,65 @@ def test_source_digest_anchor_entities_ignore_weak_single_mentions() -> None:
     augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
 
     assert augmented.entities == []
+
+
+def test_source_digest_anchor_entities_ignore_readme_section_noise() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/readme.md", summary="README 摘要。")
+    text = (
+        "# Quick Start\n\n"
+        "Quick Start is easy.\n\n"
+        "## Installation\n\n"
+        "Installation provides setup commands.\n\n"
+        "## Examples\n\n"
+        "Examples show common usage.\n\n"
+        "## Documentation\n\n"
+        "Documentation links to API references.\n"
+    )
+
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
+
+    assert augmented.entities == []
+
+
+def test_source_digest_anchor_entities_ignore_contextless_document_titles() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/readme.md", summary="README 摘要。")
+    text = (
+        "# Hello-Agents\n\n"
+        "![GitHub stars](https://img.shields.io/github/stars/datawhalechina/Hello-Agents)\n"
+        "[GitHub Project](https://github.com/datawhalechina/Hello-Agents)\n\n"
+        "# Long Research Note\n\n"
+        "This note studies agent memory evaluation and durable wiki candidates.\n"
+    )
+
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
+
+    assert augmented.entities == []
+
+
+def test_source_digest_anchor_entities_ignore_positive_marker_noise() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/noise.md", summary="噪声摘要。")
+    for text in [
+        "# How AI Agents Can Automate Workflows\n\n"
+        "The article discusses workflow automation patterns.",
+        "# Hello-Agents\n\n"
+        "[GitHub Project](https://github.com/datawhalechina/Hello-Agents) provides examples and docs.",
+        "# FooBar\n\n"
+        "[FooBar Project](https://example.test/foo) provides examples and docs.",
+        "# FooBar\n\n"
+        "[FooBar Docs](https://example.test/foo/docs) provides documentation.",
+        "# Paper Index\n\n"
+        "[PDF Download](https://example.test/paper.pdf) provides the full paper.",
+        "# Long Research Note\n\n"
+        "Long Research Note is a collection of reading notes, not a product or organization.",
+        "# Product Development\n\n"
+        "Product Development is hard.",
+        "# Creating Documents\n\n"
+        "Creating Documents is a workflow.",
+        "# Release Planning\n\n"
+        "Release Planning supports teams.",
+    ]:
+        augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
+        assert augmented.entities == []
 
 
 def test_source_digest_candidate_budget_promotes_multiple_topic_aggregations_without_cross_cluster() -> None:
