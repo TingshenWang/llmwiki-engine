@@ -309,10 +309,6 @@ def _receipt_exists(path: Path, operation_id: str) -> bool:
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        if read_json_line(line).get("operation_id") == operation_id:
+        if json.loads(line).get("operation_id") == operation_id:
             return True
     return False
-
-
-def read_json_line(line: str) -> dict:
-    return json.loads(line)
