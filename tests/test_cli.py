@@ -67,7 +67,12 @@ def test_status_verify_exit_codes(tmp_path: Path) -> None:
     assert "global applied receipt log path" in ok.output
     assert "current operation receipt: `not found yet`" in ok.output
     assert ".llmwiki/applied/operations.jsonl" in _compact_output(ok.output)
-    assert ok.output.count("auto_stub/approved (auto-approved)") >= 2
+    compact_status = _compact_output(ok.output)
+    assert "prepared_raw_review=approved (auto-approved)" in compact_status
+    assert "source_digest_review=approved (auto-approved)" in compact_status
+    assert "merge_plan_review=approved (auto-approved)" in compact_status
+    assert "draft_review=approved (auto-approved)" in compact_status
+    assert "auto_stub" not in ok.output
     batch_report = RunStore(vault).run_dir(manifest.operation_id) / "draft_rendering" / "draft_rendering_batch_report.md"
     batch_report.write_text("# Draft Rendering Batches\n", encoding="utf-8")
     batch_hint = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])

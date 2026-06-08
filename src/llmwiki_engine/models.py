@@ -220,10 +220,9 @@ class RawLinkCleanupArtifact(StrictModel):
 
 
 class ReviewDecision(StrictModel):
-    schema_version: Literal["review_decision.v1"] = "review_decision.v1"
+    schema_version: Literal["review_decision.v2"] = "review_decision.v2"
     review_step: str
     decision: Literal["approved", "revised", "pending", "rejected"] = "approved"
-    review_mode: Literal["auto_stub", "manual"] = "manual"
     auto_approved: bool = False
     revision: int = 1
     feedback_count: int = 0
@@ -671,10 +670,9 @@ class DraftWriteManifest(StrictModel):
 
 
 class DraftApproval(StrictModel):
-    schema_version: Literal["draft_review.v1"] = "draft_review.v1"
+    schema_version: Literal["draft_review.v2"] = "draft_review.v2"
     review_step: str = "draft_review"
     decision: Literal["approved", "pending", "rejected"] = "approved"
-    review_mode: Literal["auto_stub", "manual", "not_required"] = "manual"
     auto_approved: bool = False
     approved_draft_json_sha256: str | None = None
     approved_markdown_sha256: dict[str, str] = Field(default_factory=dict)

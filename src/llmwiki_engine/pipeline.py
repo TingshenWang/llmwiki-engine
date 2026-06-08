@@ -1133,11 +1133,11 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
             "\n## Raw Prepare 风险提示\n\n"
             f"- risk_level: `{preparation.risk_level}`\n"
             f"- requires_human_review: `{str(preparation.requires_human_review).lower()}`\n"
-            "- 说明：当前 MVP 仍自动批准 prepared raw；下游步骤会继续基于 Approved Raw 校验。\n"
+            "- 说明：当前运行会自动批准 prepared raw；下游步骤会继续基于 Approved Raw 校验。\n"
         )
     prompt.write_text(
         "# Prepared Raw 审核\n\n"
-        "当前 MVP 自动批准 prepared raw；后续会加入交互式人工审核。\n"
+        "当前运行自动批准 prepared raw；后续可在这里接入交互式审核。\n"
         f"{risk_section}",
         encoding="utf-8",
     )
@@ -1146,9 +1146,8 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
     decision = ReviewDecision(
         review_step=step_name,
         decision="approved",
-        review_mode="auto_stub",
         auto_approved=True,
-        notes="当前 MVP 自动批准；交互式审核是后续工作。",
+        notes="当前运行自动批准；交互式审核尚未接入。",
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
@@ -1158,7 +1157,7 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
         outputs=[
             _ref(ctx.run_dir, prompt, step_name, "markdown"),
             _ref(ctx.run_dir, feedback, step_name, "jsonl"),
-            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v1"),
+            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
             _ref(ctx.run_dir, approved, step_name, "markdown"),
         ],
         review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
@@ -1606,7 +1605,7 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
     feedback = step_root / "review_feedback.jsonl"
     prompt.write_text(
         "# Source Digest 审核\n\n"
-        "当前 MVP 自动批准 source digest；这一步检查单篇材料提取是否完整、是否中文、是否把弱相关内容放进噪声区。\n\n"
+        "当前运行自动批准 source digest；这一步检查单篇材料提取是否完整、是否中文、是否把弱相关内容放进噪声区。\n\n"
         "## 核心判断\n\n"
         "- 是否漏掉了值得入库的实体、概念、设计、对比或未决问题？\n"
         "- 是否把只是口播过渡、广告、寒暄或弱相关提及错误变成页面候选？\n"
@@ -1615,16 +1614,15 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
         f"- 待审摘要：`{digest_md.relative_to(ctx.run_dir).as_posix()}`\n"
         f"- 可编辑批准文件：`{approved_json.relative_to(ctx.run_dir).as_posix()}`\n"
         f"- 反馈记录：`{feedback.relative_to(ctx.run_dir).as_posix()}`\n\n"
-        "后续会加入真正的 list/filter/show/diff/revise/approve；本轮仍为 auto-stub。\n",
+        "后续可在这里接入 list/filter/show/diff/revise/approve 审核操作。\n",
         encoding="utf-8",
     )
     feedback.write_text("", encoding="utf-8")
     decision = ReviewDecision(
         review_step=step_name,
         decision="approved",
-        review_mode="auto_stub",
         auto_approved=True,
-        notes="当前 MVP 自动批准 source digest；交互式 digest 审核是后续工作。",
+        notes="当前运行自动批准 source digest；交互式 digest 审核尚未接入。",
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
@@ -1634,7 +1632,7 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
         outputs=[
             _ref(ctx.run_dir, prompt, step_name, "markdown"),
             _ref(ctx.run_dir, feedback, step_name, "jsonl"),
-            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v1"),
+            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
             _ref(ctx.run_dir, approved_json, step_name, "json", "source_digest.v2"),
             _ref(ctx.run_dir, approved_md, step_name, "markdown"),
         ],
@@ -2530,7 +2528,6 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
         decision = ReviewDecision(
             review_step=step_name,
             decision="pending",
-            review_mode="manual",
             auto_approved=False,
             notes=all_create_risk or "合并计划包含 needs_human_decision；继续前需要先 revise 为 create/update/noop。",
         )
@@ -2543,7 +2540,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
                 _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
                 _ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
                 _ref(ctx.run_dir, pending_path, step_name, "json", "wiki_merge_plan.v5"),
-                _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v1"),
+                _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
             ],
             reason=all_create_risk or "merge plan requires human decision; run merge-level revise.",
             review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
@@ -2553,9 +2550,8 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     decision = ReviewDecision(
         review_step=step_name,
         decision="approved",
-        review_mode="auto_stub",
         auto_approved=True,
-        notes="合并计划不含 needs_human_decision，本轮按 auto-stub 自动批准。",
+        notes="合并计划不含 needs_human_decision，当前运行自动批准。",
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
@@ -2565,7 +2561,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
         outputs=[
             _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
             _ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
-            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v1"),
+            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
             _ref(ctx.run_dir, approved_path, step_name, "json", "wiki_merge_plan.v5"),
         ],
         review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
@@ -5648,7 +5644,6 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             ctx.run_dir,
             approved_manifest_path,
             decision="approved",
-            review_mode="not_required",
             auto_approved=True,
             notes="全 noop operation：来源会被记录，但没有知识页变化。",
         )
@@ -5659,7 +5654,7 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             outputs=[
                 _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
                 _ref(ctx.run_dir, approved_manifest_path, step_name, "json", "draft_write_manifest.v1"),
-                _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v1"),
+                _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
             ],
             review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
         )
@@ -5667,15 +5662,14 @@ def _run_draft_review(ctx: StepRunContext) -> None:
     if not draft_review_requires_manual(ctx.run_dir, draft_manifest):
         write_json(approved_manifest_path, draft_manifest)
         notes = (
-            "纯 create operation，本轮按 auto-stub 自动批准。"
+            "纯 create operation，当前运行自动批准。"
             if not draft_manifest.has_updates
-            else "update operation 未发现 grounding 或旧页保留观察风险；本地旧知识补强已写入审计报告，本轮按 auto-stub 自动批准。"
+            else "update operation 未发现 grounding 或旧页保留观察风险；本地旧知识补强已写入审计报告，当前运行自动批准。"
         )
         approval = build_draft_approval(
             ctx.run_dir,
             approved_manifest_path,
             decision="approved",
-            review_mode="auto_stub",
             auto_approved=True,
             notes=notes,
         )
@@ -5686,7 +5680,7 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             outputs=[
                 _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
                 _ref(ctx.run_dir, approved_manifest_path, step_name, "json", "draft_write_manifest.v1"),
-                _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v1"),
+                _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
             ],
             review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
         )
@@ -5696,7 +5690,6 @@ def _run_draft_review(ctx: StepRunContext) -> None:
     review_reason = draft_review_reason(ctx.run_dir, draft_manifest)
     approval = DraftApproval(
         decision="pending",
-        review_mode="manual",
         auto_approved=False,
         notes=review_reason,
     )
@@ -5707,7 +5700,7 @@ def _run_draft_review(ctx: StepRunContext) -> None:
         outputs=[
             _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
             _ref(ctx.run_dir, pending_manifest, step_name, "json", "draft_write_manifest.v1"),
-            _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v1"),
+            _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
         ],
         reason=review_reason,
         review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
@@ -7599,7 +7592,6 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                 run_dir,
                 approved,
                 decision="approved",
-                review_mode="manual",
                 auto_approved=False,
                 notes="人工批准草稿；pending_write_manifest.json 已由 approved_write_manifest.json 取代，pending artifact 保留作审计。",
             )
@@ -7612,7 +7604,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                     _ref(run_dir, step_root / "review_prompt.md", review_step, "markdown"),
                     _ref(run_dir, step_root / "pending_write_manifest.json", review_step, "json", "draft_write_manifest.v1"),
                     _ref(run_dir, approved, review_step, "json", "draft_write_manifest.v1"),
-                    _ref(run_dir, approval_path, review_step, "json", "draft_review.v1"),
+                    _ref(run_dir, approval_path, review_step, "json", "draft_review.v2"),
                 ],
             )
             delete_downstream_step_dirs(vault, operation_id, "validation")
@@ -7642,7 +7634,6 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             decision = ReviewDecision(
                 review_step=review_step,
                 decision="approved",
-                review_mode="manual",
                 auto_approved=False,
                 notes="人工批准合并计划；pending_merge_plan.json 已由 approved_merge_plan.json 取代，pending artifact 保留作审计。",
             )
@@ -7655,7 +7646,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                     _ref(run_dir, step_root / "review_prompt.md", review_step, "markdown"),
                     _ref(run_dir, pending, review_step, "json", "wiki_merge_plan.v5"),
                     _ref(run_dir, approved, review_step, "json", "wiki_merge_plan.v5"),
-                    _ref(run_dir, decision_path, review_step, "json", "review_decision.v1"),
+                    _ref(run_dir, decision_path, review_step, "json", "review_decision.v2"),
                 ],
             )
             delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
@@ -14798,7 +14789,6 @@ def build_draft_approval(
     approved_manifest_path: Path,
     *,
     decision: Literal["approved", "pending", "rejected"],
-    review_mode: Literal["auto_stub", "manual", "not_required"],
     auto_approved: bool,
     notes: str,
 ) -> DraftApproval:
@@ -14814,7 +14804,6 @@ def build_draft_approval(
         markdown_hashes[rel_path] = sha256_file(path)
     return DraftApproval(
         decision=decision,
-        review_mode=review_mode,
         auto_approved=auto_approved,
         approved_draft_json_sha256=sha256_file(approved_manifest_path),
         approved_markdown_sha256=markdown_hashes,

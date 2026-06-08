@@ -14,6 +14,7 @@ from .eval import load_eval_report, run_eval
 from .events import format_duration
 from .io import read_json, read_jsonl, read_model
 from .models import (
+    DraftApproval,
     OperationManifest,
     RawIngestCandidate,
     RawIngestCandidateReport,
@@ -666,14 +667,17 @@ def _format_bytes(size: int) -> str:
 def _review_label(vault: Path, manifest: OperationManifest, step_name: str) -> str:
     if not step_name.endswith("_review"):
         return ""
-    path = RunStore(vault).run_dir(manifest.operation_id) / step_name / "review_decision.json"
+    step = next((step for step in manifest.steps if step.name == step_name), None)
+    if step is None or not step.review_decision_ref:
+        return ""
+    path = RunStore(vault).run_dir(manifest.operation_id) / step.review_decision_ref
     if not path.exists():
         return ""
     try:
-        decision = read_model(path, ReviewDecision)
+        decision = read_model(path, DraftApproval if step_name == "draft_review" else ReviewDecision)
     except Exception:
         return "decision unreadable"
-    label = f"{decision.review_mode}/{decision.decision}"
+    label = decision.decision
     if decision.auto_approved:
         label += " (auto-approved)"
     return label

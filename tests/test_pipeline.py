@@ -1662,21 +1662,28 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert (run_dir / "raw_prepare" / "preparation_review.md").exists()
     assert (run_dir / "prepared_raw_review" / "approved_prepared.md").exists()
     prepared_decision = read_json(run_dir / "prepared_raw_review" / "review_decision.json")
+    assert prepared_decision["schema_version"] == "review_decision.v2"
     assert prepared_decision["decision"] == "approved"
-    assert prepared_decision["review_mode"] == "auto_stub"
+    assert "review_mode" not in prepared_decision
     assert prepared_decision["auto_approved"] is True
     assert (run_dir / "source_digest" / "source_digest.json").exists()
     assert (run_dir / "source_digest" / "source_digest_budget_report.json").exists()
     assert (run_dir / "source_digest" / "source_digest_budget_report.md").exists()
     assert (run_dir / "source_digest_review" / "approved_digest.json").exists()
     digest_decision = read_json(run_dir / "source_digest_review" / "review_decision.json")
+    assert digest_decision["schema_version"] == "review_decision.v2"
     assert digest_decision["decision"] == "approved"
-    assert digest_decision["review_mode"] == "auto_stub"
+    assert "review_mode" not in digest_decision
     assert digest_decision["auto_approved"] is True
     assert (run_dir / "candidate_resolution" / "candidate_resolution.json").exists()
     assert (run_dir / "source_duplicate_guard" / "source_duplicate_guard.json").exists()
     assert (run_dir / "wiki_context_snapshot" / "wiki_context_snapshot.json").exists()
     assert (run_dir / "merge_plan_review" / "approved_merge_plan.json").exists()
+    merge_decision = read_json(run_dir / "merge_plan_review" / "review_decision.json")
+    assert merge_decision["schema_version"] == "review_decision.v2"
+    assert merge_decision["decision"] == "approved"
+    assert "review_mode" not in merge_decision
+    assert merge_decision["auto_approved"] is True
     assert (run_dir / "draft_review" / "approved_write_manifest.json").exists()
     assert (run_dir / "apply_preview" / "apply_preview.json").exists()
     assert (run_dir / "draft_rendering" / "draft_pages" / "sources" / "Source_raw_project_note.md").exists()
@@ -2247,7 +2254,7 @@ def test_prepared_raw_review_for_skip_policy_is_plain_auto_approval(tmp_path: Pa
 
     assert "Skip Prepare 风险提示" not in prompt
     assert "policy_suppressed" not in prompt
-    assert decision["notes"] == "当前 MVP 自动批准；交互式审核是后续工作。"
+    assert decision["notes"] == "当前运行自动批准；交互式审核尚未接入。"
 
 
 def test_source_digest_provider_payload_omits_formal_candidate_suggested_action(
@@ -3885,7 +3892,9 @@ def test_m3_update_target_auto_approves_when_no_review_risks(tmp_path: Path) -> 
     assert (run_dir / "draft_rendering" / "draft_write_manifest.json").exists()
     assert (run_dir / "draft_review" / "approved_write_manifest.json").exists()
     approval = read_json(run_dir / "draft_review" / "draft_approval.json")
+    assert approval["schema_version"] == "draft_review.v2"
     assert approval["decision"] == "approved"
+    assert "review_mode" not in approval
     assert approval["auto_approved"] is True
     assert "update operation 未发现" in approval["notes"]
     assert (run_dir / "apply_preview").exists()
