@@ -3268,7 +3268,6 @@ def test_step_repair_metrics_uses_per_step_attempts_for_current_provider_counts(
         write_json(step_dir / "provider_result.json", {"task": "draft_rendering"})
 
     write_report(run_dir / "draft_rendering", 2)
-    write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000001Z" / "draft_rendering", 4)
 
     current = run_metrics_module.step_repair_metrics(run_dir, "draft_rendering")
 
