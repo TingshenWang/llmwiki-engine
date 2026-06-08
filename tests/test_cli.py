@@ -285,25 +285,6 @@ def test_run_rejects_fixture_dir_and_mock_fixture_dir_together(tmp_path: Path) -
     assert "Use either --fixture-dir or --mock-fixture-dir" in result.output
 
 
-def test_run_passes_skip_prepare_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    raw = tmp_path / "raw.md"
-    raw.write_text("# Raw\n", encoding="utf-8")
-    seen: dict[str, object] = {}
-
-    def fake_run_simplified_ingest(**kwargs):
-        seen.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(cli_module, "run_simplified_ingest", fake_run_simplified_ingest)
-    monkeypatch.setattr(cli_module, "_print_operation_outcome", lambda manifest: None)
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), "--skip-prepare"])
-
-    assert result.exit_code == 0
-    assert seen["raw_prepare_policy"] == RawPreparePolicy.skip_model
-
-
 @pytest.mark.parametrize(
     ("prepare", "expected"),
     [
@@ -336,6 +317,19 @@ def test_run_passes_prepare_policy(
     assert seen["raw_prepare_policy"] == expected
 
 
+@pytest.mark.parametrize("flag", ["--skip-prepare", "--force-prepare"])
+def test_run_rejects_removed_legacy_prepare_flags(tmp_path: Path, flag: str) -> None:
+    vault = tmp_path / "vault"
+    raw = tmp_path / "raw.md"
+    raw.write_text("# Raw\n", encoding="utf-8")
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), flag])
+
+    assert result.exit_code != 0
+    assert f"No such option: {flag}" in result.output
+
+
 def test_status_labels_skip_prepare_as_local_provider(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -354,37 +348,6 @@ def test_status_labels_skip_prepare_as_local_provider(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "local:skip_prepare" in result.output
     assert "openai_compatible" not in next(line for line in result.output.splitlines() if "raw_prepare" in line)
-
-
-def test_run_rejects_skip_prepare_and_force_prepare_together(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    raw = tmp_path / "raw.md"
-    raw.write_text("# Raw\n", encoding="utf-8")
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), "--skip-prepare", "--force-prepare"])
-
-    assert result.exit_code != 0
-    assert "Use either --skip-prepare or --force-prepare" in result.output
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["--prepare", "auto", "--skip-prepare"],
-        ["--prepare", "skip", "--skip-prepare"],
-        ["--prepare", "force", "--force-prepare"],
-        ["--prepare", "skip", "--force-prepare"],
-    ],
-)
-def test_run_rejects_prepare_mixed_with_legacy_flags(tmp_path: Path, args: list[str]) -> None:
-    vault = tmp_path / "vault"
-    raw = tmp_path / "raw.md"
-    raw.write_text("# Raw\n", encoding="utf-8")
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), *args])
-
-    assert result.exit_code != 0
-    assert "Use either --prepare or --skip-prepare/--force-prepare" in result.output
 
 
 def test_resume_passes_prepare_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -670,204 +633,6 @@ def test_cli_reference_raw_import_overview_matches_current_flags() -> None:
         assert "--max-results" not in arxiv_line
 
 
-def test_raw_prepare_check_reports_clean_markdown_fast_path(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    configure_openai_provider(vault)
-    raw = vault / "raw" / "clean.md"
-    raw.write_text("# Clean\n\n这是一篇结构清楚、无需模型清洗的 Markdown。\n", encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
-    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["schema_version"] == "raw_prepare_diagnostic.v1"
-    assert payload["provider"]["fast_path_allowed"] is True
-    assert payload["auto_report"]["eligible"] is True
-    assert payload["recommendation"]["decision"] == "auto_deterministic_fast_path"
-    assert payload["recommendation"]["estimated_model_prepare"] is False
-    assert table_result.exit_code == 0
-    assert "auto_deterministic_fast_path" in table_result.output
-    assert "estimated_model_prepare" in table_result.output
-
-
-def test_raw_prepare_check_does_not_initialize_uninitialized_vault(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    raw = vault / "raw" / "clean.md"
-    raw.parent.mkdir(parents=True)
-    raw.write_text("# Clean\n\n未初始化 vault 中的 raw。\n", encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
-
-    assert result.exit_code != 0
-    assert not (vault / ".llmwiki").exists()
-    assert not (vault / ".gitignore").exists()
-
-
-def test_raw_prepare_check_does_not_create_run_or_rewrite_gitignore(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    configure_openai_provider(vault)
-    raw = vault / "raw" / "clean.md"
-    raw.write_text("# Clean\n\n结构清楚的 Markdown。\n", encoding="utf-8")
-    gitignore = vault / ".gitignore"
-    before_gitignore = gitignore.read_text(encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
-
-    assert result.exit_code == 0
-    assert gitignore.read_text(encoding="utf-8") == before_gitignore
-    assert list((vault / ".llmwiki" / "runs" / "ingest").iterdir()) == []
-    assert (vault / ".llmwiki" / "applied" / "operations.jsonl").read_text(encoding="utf-8") == ""
-
-
-def test_raw_prepare_check_respects_provider_fast_path_gate(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    config = read_yaml(vault / ".llmwiki" / "config.yaml")
-    config["providers"] = {"default": "mock:fixture"}
-    write_yaml(vault / ".llmwiki" / "config.yaml", config)
-    raw = vault / "raw" / "clean.md"
-    raw.write_text("# Clean\n\n这是一篇结构清楚的 Markdown，但默认 mock provider 不能走 auto fast-path。\n", encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
-    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["provider"]["raw_prepare_spec"] == "mock:fixture"
-    assert payload["provider"]["fast_path_allowed"] is False
-    assert payload["provider"]["diagnostic_requires_fixture"] is True
-    assert payload["auto_report"]["eligible"] is False
-    assert payload["auto_report"]["reasons"] == ["configured provider is not eligible for deterministic fast-path"]
-    assert payload["recommendation"]["decision"] == "auto_provider_prepare_required"
-    assert payload["recommendation"]["estimated_model_prepare"] is True
-    assert table_result.exit_code == 0
-    assert "provider_fast_path" in table_result.output
-    assert "provider note: mock raw_prepare will require" in table_result.output
-
-
-def test_raw_prepare_check_provider_gate_still_surfaces_raw_hard_blockers(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    config = read_yaml(vault / ".llmwiki" / "config.yaml")
-    config["providers"] = {"default": "mock:fixture"}
-    write_yaml(vault / ".llmwiki" / "config.yaml", config)
-    raw = vault / "raw" / "empty.md"
-    raw.write_text("", encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
-    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["auto_report"]["reasons"] == ["configured provider is not eligible for deterministic fast-path"]
-    assert payload["auto_report"]["raw_hard_blockers"] == ["raw text is empty"]
-    assert payload["auto_report"]["raw_fast_path_report"]["reasons"] == ["raw text is empty"]
-    assert payload["recommendation"]["raw_hard_blockers"] == ["raw text is empty"]
-    assert table_result.exit_code == 0
-    assert "auto blockers: configured provider is not eligible for deterministic fast-path" in table_result.output
-    assert "raw hard blockers: raw text is empty" in table_result.output
-
-
-def test_raw_prepare_check_recommends_model_for_translated_podcast_markdown(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    configure_openai_provider(vault)
-    raw = vault / "raw" / "podcast.md"
-    raw.write_text(
-        "# Cat Wu 访谈（中文翻译）\n\n"
-        "source https://www.youtube.com/watch?v=demo\n\n"
-        "![cover](cover.png)\n\n"
-        "## 访谈全文\n\n"
-        "这是一份 podcast 视频转写再翻译的文本。\n\n"
-        "### 产品速度\n\n"
-        "主持人和嘉宾讨论 AI 产品团队如何快速发布。\n\n"
-        "### Eval\n\n"
-        "他们讨论评估如何帮助产品经理判断质量。\n",
-        encoding="utf-8",
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--json"])
-    skip_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare", "--json"])
-    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw)])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["auto_report"]["eligible"] is False
-    assert payload["auto_report"]["noise_profile"]["transcript_provenance_risk"] is True
-    assert payload["recommendation"]["decision"] == "auto_model_prepare_recommended"
-    assert payload["recommendation"]["skip_prepare_available"] is True
-    assert "structured markdown looks like noisy ASR or translated transcript" in payload["auto_report"]["reasons"]
-    assert skip_result.exit_code == 0
-    skip_payload = json.loads(skip_result.output)
-    assert skip_payload["selected_policy"] == RawPreparePolicy.skip_model.value
-    assert skip_payload["selected_report"]["eligible"] is True
-    assert skip_payload["recommendation"]["auto_estimated_model_prepare"] is True
-    assert skip_payload["recommendation"]["selected_estimated_model_prepare"] is False
-    assert skip_payload["recommendation"]["estimated_model_prepare"] is False
-    assert set(skip_payload["selected_report"]["policy_suppressed_reasons"]) == {
-        "structured markdown looks like noisy ASR or translated transcript",
-        "raw contains markdown media embeds",
-        "raw contains interview/transcript section markers",
-    }
-    assert table_result.exit_code == 0
-    assert "--skip-prepare would suppress" in table_result.output
-    assert "markdown_media_embeds" in table_result.output
-    skip_table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare"])
-    assert skip_table_result.exit_code == 0
-    assert "--skip-prepare`" in skip_table_result.output
-
-
-def test_raw_prepare_check_skip_unavailable_omits_skip_next_command(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    configure_openai_provider(vault)
-    raw = vault / "raw" / "empty.md"
-    raw.write_text("", encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare", "--json"])
-    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--skip-prepare"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["selected_policy"] == RawPreparePolicy.skip_model.value
-    assert payload["selected_report"]["eligible"] is False
-    assert payload["selected_report"]["reasons"] == ["raw text is empty"]
-    assert payload["recommendation"]["selected_estimated_model_prepare"] is True
-    assert table_result.exit_code == 0
-    assert "selected blockers: raw text is empty" in table_result.output
-    assert "--skip-prepare`" not in table_result.output
-
-
-def test_raw_prepare_check_preserves_prepare_choice_in_next_command(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    configure_openai_provider(vault)
-    raw = vault / "raw" / "clean.md"
-    raw.write_text("# Clean\n\n这是一份已经整理好的 Markdown。\n", encoding="utf-8")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--prepare", "skip", "--json"])
-    table_result = runner.invoke(app, ["ingest", "raw-prepare-check", str(vault), str(raw), "--prepare", "skip"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["selected_policy"] == RawPreparePolicy.skip_model.value
-    assert payload["prepare_cli_suffix"] == " --prepare skip"
-    assert table_result.exit_code == 0
-    assert "llmwiki ingest run" in table_result.output
-    assert "--prepare skip" in table_result.output
-
-
 def test_raw_candidates_all_includes_processed_and_table_gives_next_command(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -971,15 +736,12 @@ def test_run_next_dry_run_preserves_prepare_choice_in_next_command(tmp_path: Pat
     runner = CliRunner()
     result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--prepare", "skip"])
     json_result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--prepare", "auto", "--json"])
-    legacy_result = runner.invoke(app, ["ingest", "run-next", str(vault), "--dry-run", "--skip-prepare"])
 
     assert result.exit_code == 0
     assert "llmwiki ingest run" in result.output
     assert "--prepare skip" in result.output
     assert json_result.exit_code == 0
     assert json.loads(json_result.output)["next_command"].endswith("--prepare auto")
-    assert legacy_result.exit_code == 0
-    assert "--skip-prepare" in legacy_result.output
 
 
 def test_run_next_dry_run_outputs_json(tmp_path: Path) -> None:

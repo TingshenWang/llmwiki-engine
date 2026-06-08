@@ -18,8 +18,7 @@ digest 做候选页面规划、冻结带本地 embedding 召回证据的 wiki co
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
-llmwiki ingest raw-prepare-check /path/to/vault raw/project_note.md
-llmwiki ingest run /path/to/vault raw/project_note.md --fixture-dir tests/fixtures/simple_project/mock
+llmwiki ingest run /path/to/vault raw/project_note.md --prepare auto --fixture-dir tests/fixtures/simple_project/mock
 llmwiki providers check /path/to/vault
 llmwiki ingest status /path/to/vault <operation_id>
 llmwiki ingest apply /path/to/vault <operation_id>
@@ -35,9 +34,8 @@ llmwiki ingest apply /path/to/vault <operation_id>
 - `raw/` 是规范化材料层。MVP 只展开 `[[Page]]`、`[[Page|Alias]]` 这类
   Obsidian 文本 wikilink；网页链接、Markdown 链接、媒体 embed 和代码块保持不变。
 - `raw_prepare` 将规范化后的 raw 转换为下游知识编译使用的 canonical prepared raw。
-  运行前可用 `llmwiki ingest raw-prepare-check` 按当前 provider 预览 auto/selected policy
-  是否会调用模型清洗；对已经人工校对的 Markdown 可在 run/resume 时使用 `--skip-prepare`，
-  对低质量 ASR/翻译稿可使用 `--force-prepare`。
+  常规情况用 `--prepare auto` 开启模型清洗；用户明确想跳过清洗时用
+  `--prepare skip` 做 Markdown 透传；用户明确想强制清洗时用 `--prepare force`。
 - `source_digest` 是单篇 raw 的完整消化文件，用于人工审核候选知识。
 - `candidate_resolution` 基于 approved prepared 全文和 digest 规划 wiki 选题；
   `wiki_context_snapshot` 会为每个计划页召回最相关的已有 wiki 页面；

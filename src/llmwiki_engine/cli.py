@@ -14,11 +14,18 @@ from .apply import ApplyError, apply_operation
 from .eval import load_eval_report, run_eval
 from .events import format_duration
 from .io import read_json, read_jsonl, read_model
-from .models import OperationManifest, RawIngestCandidateReport, RawPreparePolicy, ReviewDecision, RunMode, VerificationStatus
+from .models import (
+    OperationManifest,
+    RawIngestCandidate,
+    RawIngestCandidateReport,
+    RawPreparePolicy,
+    ReviewDecision,
+    RunMode,
+    VerificationStatus,
+)
 from .pipeline import (
     PipelineError,
     approve_review,
-    build_raw_prepare_diagnostic,
     init_vault,
     latest_operation,
     resume_ingest,
@@ -60,39 +67,23 @@ class PrepareChoice(str, Enum):
 def _raw_prepare_policy_from_flags(
     *,
     prepare: PrepareChoice | None = None,
-    skip_prepare: bool,
-    force_prepare: bool,
 ) -> RawPreparePolicy | None:
     if prepare is not None:
-        if skip_prepare or force_prepare:
-            raise typer.BadParameter("Use either --prepare or --skip-prepare/--force-prepare, not both.")
         if prepare == PrepareChoice.auto:
             return RawPreparePolicy.auto
         if prepare == PrepareChoice.skip:
             return RawPreparePolicy.skip_model
         if prepare == PrepareChoice.force:
             return RawPreparePolicy.force_model
-    if skip_prepare and force_prepare:
-        raise typer.BadParameter("Use either --skip-prepare or --force-prepare, not both.")
-    if skip_prepare:
-        return RawPreparePolicy.skip_model
-    if force_prepare:
-        return RawPreparePolicy.force_model
     return None
 
 
 def _raw_prepare_command_suffix(
     *,
     prepare: PrepareChoice | None = None,
-    skip_prepare: bool,
-    force_prepare: bool,
 ) -> str:
     if prepare is not None:
         return f" --prepare {prepare.value}"
-    if skip_prepare:
-        return " --skip-prepare"
-    if force_prepare:
-        return " --force-prepare"
     return ""
 
 
@@ -125,16 +116,6 @@ def ingest_run(
         "--prepare",
         help="Raw prepare policy: auto, skip, or force.",
     ),
-    skip_prepare: bool = typer.Option(
-        False,
-        "--skip-prepare",
-        help="Use local passthrough for eligible Markdown raw; hard blockers still fall back to the configured raw_prepare provider.",
-    ),
-    force_prepare: bool = typer.Option(
-        False,
-        "--force-prepare",
-        help="Force model raw_prepare cleanup and disable deterministic prepare fast-path.",
-    ),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
 ) -> None:
     """Run simplified Ingest through draft generation."""
@@ -143,8 +124,6 @@ def ingest_run(
             raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
         raw_prepare_policy = _raw_prepare_policy_from_flags(
             prepare=prepare,
-            skip_prepare=skip_prepare,
-            force_prepare=force_prepare,
         )
         run_console = Console(file=io.StringIO()) if json_output else console
         manifest = run_simplified_ingest(
@@ -238,53 +217,6 @@ def ingest_raw_candidates(
     _print_raw_candidates_report(report)
 
 
-@ingest_app.command("raw-prepare-check")
-def ingest_raw_prepare_check(
-    vault: Path,
-    raw: Path,
-    prepare: Optional[PrepareChoice] = typer.Option(
-        None,
-        "--prepare",
-        help="Preview raw prepare policy: auto, skip, or force.",
-    ),
-    skip_prepare: bool = typer.Option(
-        False,
-        "--skip-prepare",
-        help="Preview the user-selected skip prepare policy.",
-    ),
-    force_prepare: bool = typer.Option(
-        False,
-        "--force-prepare",
-        help="Preview the user-selected force prepare policy.",
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
-) -> None:
-    """Preview whether raw_prepare will use deterministic passthrough or model cleanup."""
-    try:
-        raw_prepare_policy = _raw_prepare_policy_from_flags(
-            prepare=prepare,
-            skip_prepare=skip_prepare,
-            force_prepare=force_prepare,
-        ) or RawPreparePolicy.auto
-        prepare_cli_suffix = _raw_prepare_command_suffix(
-            prepare=prepare,
-            skip_prepare=skip_prepare,
-            force_prepare=force_prepare,
-        )
-        payload = build_raw_prepare_diagnostic(
-            vault=vault,
-            raw_file=raw,
-            raw_prepare_policy=raw_prepare_policy,
-        )
-        payload["prepare_cli_suffix"] = prepare_cli_suffix
-    except (PipelineError, ProviderConfigError, WorkspaceError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if json_output:
-        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
-        return
-    _print_raw_prepare_diagnostic(payload)
-
-
 @ingest_app.command("run-next")
 def ingest_run_next(
     vault: Path,
@@ -308,16 +240,6 @@ def ingest_run_next(
         "--prepare",
         help="Raw prepare policy: auto, skip, or force.",
     ),
-    skip_prepare: bool = typer.Option(
-        False,
-        "--skip-prepare",
-        help="Use local passthrough for eligible Markdown raw; hard blockers still fall back to the configured raw_prepare provider.",
-    ),
-    force_prepare: bool = typer.Option(
-        False,
-        "--force-prepare",
-        help="Force model raw_prepare cleanup and disable deterministic prepare fast-path.",
-    ),
     json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
 ) -> None:
     """Run ingest for the next safe raw candidate."""
@@ -326,13 +248,9 @@ def ingest_run_next(
             raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
         raw_prepare_policy = _raw_prepare_policy_from_flags(
             prepare=prepare,
-            skip_prepare=skip_prepare,
-            force_prepare=force_prepare,
         )
         prepare_cli_suffix = _raw_prepare_command_suffix(
             prepare=prepare,
-            skip_prepare=skip_prepare,
-            force_prepare=force_prepare,
         )
         report = scan_raw_ingest_candidates(vault)
         candidate = _select_next_raw_candidate(report, include_changed=include_changed)
@@ -492,24 +410,12 @@ def ingest_resume(
         "--prepare",
         help="Raw prepare policy when resuming from raw_prepare or earlier: auto, skip, or force.",
     ),
-    skip_prepare: bool = typer.Option(
-        False,
-        "--skip-prepare",
-        help="Use local passthrough for eligible Markdown raw when resuming from raw_prepare or earlier; hard blockers still call the provider.",
-    ),
-    force_prepare: bool = typer.Option(
-        False,
-        "--force-prepare",
-        help="Force model raw_prepare cleanup when resuming from raw_prepare or earlier.",
-    ),
     mode: Optional[RunMode] = None,
 ) -> None:
     """Resume using the current provider config for steps that will execute."""
     try:
         raw_prepare_policy = _raw_prepare_policy_from_flags(
             prepare=prepare,
-            skip_prepare=skip_prepare,
-            force_prepare=force_prepare,
         )
         manifest = resume_ingest(
             vault=vault,
@@ -740,74 +646,11 @@ def _print_raw_candidates_report(report: RawIngestCandidateReport) -> None:
         console.print("[green]No raw ingest candidates found.[/]")
 
 
-def _print_raw_prepare_diagnostic(payload: dict[str, object]) -> None:
-    selected_report = payload.get("selected_report") if isinstance(payload.get("selected_report"), dict) else {}
-    auto_report = payload.get("auto_report") if isinstance(payload.get("auto_report"), dict) else {}
-    skip_report = payload.get("skip_prepare_report") if isinstance(payload.get("skip_prepare_report"), dict) else {}
-    recommendation = payload.get("recommendation") if isinstance(payload.get("recommendation"), dict) else {}
-    cleanup = payload.get("raw_link_cleanup") if isinstance(payload.get("raw_link_cleanup"), dict) else {}
-    provider = payload.get("provider") if isinstance(payload.get("provider"), dict) else {}
-    noise = auto_report.get("noise_profile", {}) if isinstance(auto_report.get("noise_profile"), dict) else {}
-    selected_policy = payload.get("selected_policy")
-    table = Table(title="Raw prepare check")
-    table.add_column("Field", no_wrap=True)
-    table.add_column("Value", overflow="fold")
-    table.add_row("raw", f"`{payload.get('raw_path')}`")
-    table.add_row("selected_policy", f"`{payload.get('selected_policy')}`")
-    table.add_row("provider", f"`{provider.get('raw_prepare_spec', '') or 'unknown'}`")
-    table.add_row("provider_fast_path", str(provider.get("fast_path_allowed", False)).lower())
-    table.add_row("auto_decision", str(recommendation.get("decision", "")))
-    table.add_row("recommendation", str(recommendation.get("summary", "")))
-    table.add_row("selected_fast_path", str(selected_report.get("eligible", False)).lower())
-    table.add_row("auto_fast_path", str(auto_report.get("eligible", False)).lower())
-    table.add_row("skip_prepare_available", str(recommendation.get("skip_prepare_available", False)).lower())
-    table.add_row("selected_estimated_model_prepare", str(recommendation.get("selected_estimated_model_prepare", False)).lower())
-    table.add_row("auto_estimated_model_prepare", str(recommendation.get("auto_estimated_model_prepare", False)).lower())
-    table.add_row("raw_cleanup_changed", str(cleanup.get("changed", False)).lower())
-    table.add_row("cleaned_links", str(cleanup.get("cleaned_link_count", 0)))
-    table.add_row("obsidian_media_embeds", str(cleanup.get("preserved_media_embed_count", 0)))
-    table.add_row("markdown_media_embeds", str(noise.get("markdown_media_embed_count", 0)))
-    table.add_row("transcript_risk", str(noise.get("transcript_provenance_risk", False)).lower())
-    table.add_row("structured_quality_risk", str(noise.get("structured_markdown_quality_risk", False)).lower())
-    console.print(table)
-    auto_reasons = [str(reason) for reason in auto_report.get("reasons", [])]
-    selected_reasons = [str(reason) for reason in selected_report.get("reasons", [])]
-    suppressed_reasons = [str(reason) for reason in skip_report.get("policy_suppressed_reasons", [])]
-    raw_hard_blockers = [str(reason) for reason in recommendation.get("raw_hard_blockers", [])]
-    if auto_reasons:
-        console.print("auto blockers: " + "; ".join(auto_reasons))
-    else:
-        console.print("auto blockers: none")
-    if raw_hard_blockers:
-        console.print("raw hard blockers: " + "; ".join(raw_hard_blockers))
-    if selected_policy != RawPreparePolicy.auto.value and selected_reasons:
-        console.print("selected blockers: " + "; ".join(selected_reasons))
-    if suppressed_reasons:
-        console.print("--skip-prepare would suppress: " + "; ".join(suppressed_reasons))
-    elif recommendation.get("skip_prepare_available"):
-        console.print("--skip-prepare would pass through without suppressing auto blockers.")
-    if provider.get("diagnostic_requires_fixture"):
-        console.print("provider note: mock raw_prepare will require `--fixture-dir` or configured fixture_dir during run.")
-    if selected_policy == RawPreparePolicy.skip_model.value and bool(selected_report.get("eligible")):
-        flag = "--skip-prepare"
-    elif selected_policy == RawPreparePolicy.force_model.value:
-        flag = "--force-prepare"
-    else:
-        flag = recommendation.get("recommended_flag")
-    raw_abs = payload.get("raw_absolute_path") or payload.get("raw_path")
-    prepare_cli_suffix = str(payload.get("prepare_cli_suffix") or "")
-    if (
-        prepare_cli_suffix
-        and selected_policy == RawPreparePolicy.skip_model.value
-        and not bool(selected_report.get("eligible"))
-    ):
-        command_flag = ""
-    else:
-        command_flag = prepare_cli_suffix or (f" {flag}" if flag else "")
-    console.print(f"next: `llmwiki ingest run {payload.get('vault')} {raw_abs}{command_flag}`")
-
-
-def _select_next_raw_candidate(report: RawIngestCandidateReport, *, include_changed: bool = False):
+def _select_next_raw_candidate(
+    report: RawIngestCandidateReport,
+    *,
+    include_changed: bool,
+) -> RawIngestCandidate | None:
     for item in report.items:
         if item.status == "unprocessed":
             return item
@@ -861,7 +704,6 @@ def _run_next_artifact_hints(vault: Path, operation_id: str) -> list[dict[str, o
         ("manifest", store.manifest_path(operation_id)),
         ("run_metrics", run_dir / "run_metrics.json"),
         ("run_metrics_markdown", run_dir / "run_metrics.md"),
-        ("raw_prepare_fast_path", run_dir / "raw_prepare" / "raw_prepare_fast_path.md"),
         ("prepared_markdown", run_dir / "raw_prepare" / "prepared.md"),
         ("source_digest", run_dir / "source_digest" / "source_digest.json"),
         ("candidate_budget", run_dir / "source_digest" / "source_digest_budget_report.md"),
@@ -1125,17 +967,8 @@ def _metrics_bottleneck_summary(metrics: dict[str, object], *, limit: int = 3) -
 
 
 def _provider_label(vault: Path, manifest: OperationManifest, step_name: str, provider_spec: str | None) -> str:
-    if step_name == "raw_prepare":
-        fast_path_report = RunStore(vault).run_dir(manifest.operation_id) / "raw_prepare" / "raw_prepare_fast_path.json"
-        if fast_path_report.exists():
-            try:
-                report = read_json(fast_path_report)
-                if report.get("eligible"):
-                    if report.get("raw_prepare_policy") == RawPreparePolicy.skip_model.value:
-                        return "local:skip_prepare"
-                    return "local:raw_prepare_fast_path"
-            except Exception:
-                pass
+    if step_name == "raw_prepare" and provider_spec is None and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip_model:
+        return "local:skip_prepare"
     if provider_spec:
         return provider_spec
     if step_name.endswith("_review"):

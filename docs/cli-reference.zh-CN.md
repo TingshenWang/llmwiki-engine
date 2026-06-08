@@ -167,15 +167,14 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 llmwiki init <vault> [--profile project_basic]
 llmwiki providers list
 llmwiki providers check <vault> [--live]
-llmwiki ingest raw-prepare-check <vault> <raw> [--skip-prepare|--force-prepare] [--json]
-llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
-llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
+llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--prepare auto|skip|force] [--json]
+llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--prepare auto|skip|force] [--json]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest inspect <vault> [operation_id] [--json]
 llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
 llmwiki ingest raw-import-url <vault> <url> [--title TEXT] [--output PATH] [--overwrite] [--dedupe-url|--no-dedupe-url] [--arxiv-html|--no-arxiv-html] [--timeout SECONDS] [--max-bytes BYTES] [--json]
 llmwiki ingest raw-import-arxiv <vault> <query> [--limit N] [--dry-run] [--overwrite] [--dedupe-url|--no-dedupe-url] [--sort-by VALUE] [--sort-order VALUE] [--min-relevance-score N] [--timeout SECONDS] [--max-bytes BYTES] [--json]
-llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--skip-prepare|--force-prepare] [--mode dev|standard]
+llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--prepare auto|skip|force] [--mode dev|standard]
 llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
 llmwiki profile validate <path_or_name>
@@ -273,30 +272,6 @@ human 不发请求。真实 provider 会收到一次小型 Chat Completions 探�
 通过后仍会给 warning。live probe 本身不使用 transient retry，所以 provider 检查仍然保持轻量。
 `temperature=0` 也不承诺所有 thinking 模型都完全确定性。
 
-## `llmwiki ingest raw-prepare-check`
-
-在正式 ingest 前，预览 `raw_prepare` 会走 deterministic passthrough 还是模型清洗。
-这个命令只读，不创建 operation，也不会修改 raw。
-
-```bash
-uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW"
-uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW" --json
-```
-
-它会模拟 `raw_link_cleanup` 后的文本，读取当前 raw_prepare provider，并复用真实
-`raw_prepare` fast-path 规则输出：
-
-- 当前 provider 是否允许 deterministic fast-path；
-- auto 是否会启用 fast-path；
-- 如果 auto 会走模型，原因是什么；
-- `--skip-prepare` 是否可用，以及会覆盖哪些自动拦截原因；
-- selected policy 与 auto policy 各自是否预计会调用 raw_prepare provider；
-- 是否检测到播客/视频转写、翻译稿、timestamp/speaker-turn、media embed 等风险。
-
-如果 raw 已经人工校对、结构清晰，可以在 `ingest run` 或从 `raw_prepare` 之前 resume 时加
-`--skip-prepare` 节省模型时间。如果材料明显是低质量 ASR/翻译稿，可保留 auto 或加
-`--force-prepare` 明确要求模型清洗。
-
 ## `llmwiki ingest run`
 
 启动一次 ingest operation。
@@ -314,8 +289,7 @@ uv run llmwiki ingest run "$VAULT" "$RAW" --fixture-dir "$FIXTURE" --slug manual
 - `--profile NAME`：临时覆盖 vault config 里的 profile。
 - `--slug TEXT`：operation ID 的可读后缀，方便手动测试辨认。
 - `--mode dev|standard`：运行模式，默认 `dev`。
-- `--skip-prepare`：对符合条件的 Markdown raw 使用 deterministic passthrough；空 raw、非 Markdown 等 hard blocker 仍会回落到配置的 `raw_prepare` provider。
-- `--force-prepare`：强制模型 raw_prepare 清洗，禁用 deterministic fast-path。
+- `--prepare auto|skip|force`：选择 raw_prepare 策略。`auto` 使用模型清洗，`skip` 明确对非空 Markdown 做本地透传，`force` 明确要求模型清洗。
 
 `--slug manual` 只影响 operation ID，例如：
 
@@ -380,8 +354,8 @@ uv run llmwiki ingest resume "$VAULT" "$OP" --from source_digest
 resume 也可以覆盖本次会重跑步骤的 provider 或 raw_prepare 策略：
 
 ```bash
-uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --skip-prepare
-uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --force-prepare
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --prepare skip
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --prepare force
 uv run llmwiki ingest resume "$VAULT" "$OP" --mock-fixture-dir "$FIXTURE"
 ```
 

@@ -20,8 +20,7 @@ drafts, and produces an apply preview:
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
-llmwiki ingest raw-prepare-check /path/to/vault raw/project_note.md
-llmwiki ingest run /path/to/vault raw/project_note.md --fixture-dir tests/fixtures/simple_project/mock
+llmwiki ingest run /path/to/vault raw/project_note.md --prepare auto --fixture-dir tests/fixtures/simple_project/mock
 llmwiki providers check /path/to/vault
 llmwiki ingest status /path/to/vault <operation_id>
 llmwiki ingest apply /path/to/vault <operation_id>
@@ -38,11 +37,9 @@ and drafts can be tested before real models are introduced.
   wikilinks such as `[[Page]]` and `[[Page|Alias]]`; web links, Markdown links,
   media embeds, and code blocks are preserved.
 - `raw_prepare` turns original raw material into the canonical prepared raw used
-  by downstream knowledge compilation. Before a run, use
-  `llmwiki ingest raw-prepare-check` to preview whether auto and the selected
-  policy will call model cleanup under the current provider; use
-  `--skip-prepare` for human-audited Markdown and `--force-prepare` for
-  low-quality ASR/translated transcripts.
+  by downstream knowledge compilation. Use `--prepare auto` for normal model
+  cleanup, `--prepare skip` when the user explicitly wants Markdown passthrough,
+  and `--prepare force` when the user wants to force model cleanup.
 - `source_digest` is the complete single-source digestion artifact used for
   human review of candidate knowledge.
 - `candidate_resolution` plans wiki topics from the approved prepared text and

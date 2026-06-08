@@ -168,15 +168,14 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 llmwiki init <vault> [--profile project_basic]
 llmwiki providers list
 llmwiki providers check <vault> [--live]
-llmwiki ingest raw-prepare-check <vault> <raw> [--skip-prepare|--force-prepare] [--json]
-llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
-llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--skip-prepare|--force-prepare] [--json]
+llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--prepare auto|skip|force] [--json]
+llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--mode dev|standard] [--prepare auto|skip|force] [--json]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest inspect <vault> [operation_id] [--json]
 llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
 llmwiki ingest raw-import-url <vault> <url> [--title TEXT] [--output PATH] [--overwrite] [--dedupe-url|--no-dedupe-url] [--arxiv-html|--no-arxiv-html] [--timeout SECONDS] [--max-bytes BYTES] [--json]
 llmwiki ingest raw-import-arxiv <vault> <query> [--limit N] [--dry-run] [--overwrite] [--dedupe-url|--no-dedupe-url] [--sort-by VALUE] [--sort-order VALUE] [--min-relevance-score N] [--timeout SECONDS] [--max-bytes BYTES] [--json]
-llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--skip-prepare|--force-prepare] [--mode dev|standard]
+llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--prepare auto|skip|force] [--mode dev|standard]
 llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
 llmwiki profile validate <path_or_name>
@@ -270,26 +269,6 @@ uv run llmwiki providers check "$VAULT" --live
 
 `max_tokens=512` is a completion cap, not a fixed cost. Thinking models usually stop earlier, but may consume up to that limit. If JSON mode is unsupported, the check falls back once with a prompt-only JSON probe and reports a warning if that succeeds. The live probe itself does not use transient retry, so provider checks stay quick. `temperature=0` does not promise deterministic behavior for every thinking model.
 
-## `llmwiki ingest raw-prepare-check`
-
-Preview whether `raw_prepare` will use deterministic passthrough or model cleanup before starting a real ingest. This command is read-only: it does not create an operation and does not modify the raw file.
-
-```bash
-uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW"
-uv run llmwiki ingest raw-prepare-check "$VAULT" "$RAW" --json
-```
-
-It simulates the text after `raw_link_cleanup`, reads the current raw_prepare provider, then reuses the real `raw_prepare` fast-path rules to report:
-
-- whether the current provider allows the deterministic fast path;
-- whether auto mode will use the fast path;
-- why auto mode would call the model;
-- whether `--skip-prepare` is available, and which auto blockers it would suppress;
-- whether the selected policy and auto policy are expected to call the raw_prepare provider;
-- whether podcast/video transcript, translated transcript, timestamp/speaker-turn, or media embed risk was detected.
-
-If the raw file has already been human-audited and is structurally clean, pass `--skip-prepare` to `ingest run` or to `resume` before `raw_prepare` to save model time. If the material is likely low-quality ASR or translated transcript text, keep auto mode or pass `--force-prepare` to explicitly request model cleanup.
-
 ## `llmwiki ingest run`
 
 Start an ingest operation.
@@ -307,8 +286,7 @@ Arguments and options:
 - `--profile NAME`: temporarily override the vault config profile.
 - `--slug TEXT`: readable suffix for the operation ID.
 - `--mode dev|standard`: run mode. Default: `dev`.
-- `--skip-prepare`: use deterministic passthrough for eligible Markdown raw; hard blockers such as empty or non-Markdown raw still fall back to the configured `raw_prepare` provider.
-- `--force-prepare`: force model `raw_prepare` cleanup and disable the deterministic fast path.
+- `--prepare auto|skip|force`: choose raw preparation policy. `auto` uses model cleanup, `skip` explicitly passes non-empty Markdown through locally, and `force` explicitly requests model cleanup.
 
 `--slug manual` only affects the operation ID, for example:
 
@@ -374,8 +352,8 @@ uv run llmwiki ingest resume "$VAULT" "$OP" --from source_digest
 Resume can also override providers or raw preparation policy for steps that will rerun:
 
 ```bash
-uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --skip-prepare
-uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --force-prepare
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --prepare skip
+uv run llmwiki ingest resume "$VAULT" "$OP" --from raw_prepare --prepare force
 uv run llmwiki ingest resume "$VAULT" "$OP" --mock-fixture-dir "$FIXTURE"
 ```
 

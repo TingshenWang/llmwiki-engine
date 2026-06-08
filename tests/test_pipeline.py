@@ -1881,9 +1881,19 @@ def test_model_artifacts_are_redacted(tmp_path: Path, monkeypatch: pytest.Monkey
             assert secret not in path.read_text(encoding="utf-8")
 
 
-def test_raw_prepare_fast_path_skips_live_provider_for_clean_markdown(
+
+@pytest.mark.parametrize(
+    ("raw_prepare_policy", "expected_policy_value"),
+    [
+        (RawPreparePolicy.auto, "auto"),
+        (RawPreparePolicy.force_model, "force-model"),
+    ],
+)
+def test_raw_prepare_auto_and_force_use_model_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    raw_prepare_policy: RawPreparePolicy,
+    expected_policy_value: str,
 ) -> None:
     vault, raw = make_vault(tmp_path)
     config_path = vault / ".llmwiki" / "config.yaml"
@@ -1896,583 +1906,34 @@ def test_raw_prepare_fast_path_skips_live_provider_for_clean_markdown(
         }
     }
     write_yaml(config_path, config)
-    called_tasks: list[str] = []
+    captured_payloads: dict[str, dict] = {}
 
     def fake_generate_raw(self, task, payload, output_model):
-        called_tasks.append(task)
+        captured_payloads[task] = payload
         data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
         return json.dumps(data, ensure_ascii=False)
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
-
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="raw-fast-path")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-
-    assert "raw_prepare" not in called_tasks
-    assert {"source_digest", "candidate_resolution", "draft_rendering"} <= set(called_tasks)
-    assert "wiki_merge_planning" not in called_tasks
-    preparation = read_json(run_dir / "raw_prepare" / "raw_preparation.json")
-    assert preparation["operations_applied"] == ["deterministic_markdown_passthrough"]
-    assert preparation["prepared_markdown"].strip() == raw.read_text(encoding="utf-8").strip()
-    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
-    assert fast_path["eligible"] is True
-    assert fast_path["reasons"] == []
-    assert not (run_dir / "raw_prepare" / "structured_repair_report.json").exists()
-    metrics = read_json(run_dir / "run_metrics.json")
-    raw_prepare_step = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
-    assert raw_prepare_step["local_fast_path"] is True
-    assert raw_prepare_step["provider"] == "local:raw_prepare_fast_path"
-    assert "internal_model_call_count" not in raw_prepare_step
-    assert metrics["internal_model_call_count"] == 3
-
-
-def test_raw_prepare_fast_path_truncates_long_reference_section(tmp_path: Path) -> None:
-    raw = tmp_path / "paper.md"
-    body = "# Paper\n\n" + "\n\n".join(
-        f"Main argument paragraph {index}. " + ("agent evaluation evidence " * 8) for index in range(90)
-    )
-    references = "## References\n\n" + "\n".join(
-        f"[{index}] Reference title {index}. Conference proceedings and arXiv metadata."
-        for index in range(90)
-    )
-    raw.write_text(body + "\n\n" + references + "\n", encoding="utf-8")
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/paper.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/paper.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert preparation.operations_applied == [
-        "deterministic_markdown_passthrough",
-        "deterministic_reference_section_truncation",
-    ]
-    assert preparation.omission_policy == "reference_section_omitted_from_prepared_markdown_raw_retained"
-    assert "Main argument paragraph 89" in preparation.prepared_markdown
-    assert "## References" in preparation.prepared_markdown
-    assert "Reference section omitted from prepared markdown" in preparation.prepared_markdown
-    assert "Reference title 89" not in preparation.prepared_markdown
-    assert "original raw retains the full reference list" in preparation.review_notes
-    assert report["reference_truncation"]["truncated"] is True
-    assert report["reference_truncation"]["omitted_char_count"] > 1_500
-
-
-def test_raw_prepare_fast_path_omits_references_before_appendix(tmp_path: Path) -> None:
-    raw = tmp_path / "paper-with-appendix.md"
-    body = "# Paper\n\n" + "\n\n".join(
-        f"Main body paragraph {index}. " + ("memory benchmark method " * 8) for index in range(75)
-    )
-    references = "## References\n\n" + "\n".join(
-        f"[{index}] Reference title {index}. Conference proceedings and arXiv metadata."
-        for index in range(120)
-    )
-    appendix = "## Appendix A Case Studies\n\n" + "\n\n".join(
-        f"Appendix example {index}. User relation graph evidence." for index in range(30)
-    )
-    raw.write_text(body + "\n\n" + references + "\n\n" + appendix + "\n", encoding="utf-8")
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/paper-with-appendix.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/paper-with-appendix.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert "Main body paragraph 74" in preparation.prepared_markdown
-    assert "Reference section omitted from prepared markdown" in preparation.prepared_markdown
-    assert "Reference title 119" not in preparation.prepared_markdown
-    assert "## Appendix A Case Studies" in preparation.prepared_markdown
-    assert "Appendix example 29" in preparation.prepared_markdown
-    assert report["reference_truncation"]["truncated"] is True
-    assert report["reference_truncation"]["preserved_following_appendix"] is True
-    assert report["reference_truncation"]["omitted_char_count"] > 1_500
-
-
-def test_raw_prepare_fast_path_compacts_paper_appendix_sections(tmp_path: Path) -> None:
-    raw = tmp_path / "arxiv-paper-with-appendix.md"
-    body = (
-        "# Long Paper\n\n"
-        "Imported from: http://arxiv.org/abs/2500.00000v1\n\n"
-        "###### Abstract\n\n"
-        + ("This paper studies agent memory benchmarks and evaluation. " * 120)
-        + "\n\n## 1 Introduction\n\n"
-        + ("The introduction explains the durable contribution and method. " * 220)
-        + "\n\n## 2 Method\n\n"
-        + ("The method section defines the evaluation setting and metrics. " * 220)
-        + "\n\n## 3 Experiments\n\n"
-        + ("Experiments compare memory mechanisms across scenarios. " * 220)
-        + "\n\n## 4 Conclusion\n\n"
-        + ("Conclusion summarizes the main contribution. " * 120)
-    )
-    references = "## References\n\n" + "\n".join(
-        f"[{index}] Reference title {index}. Conference proceedings and arXiv metadata."
-        for index in range(120)
-    )
-    appendix_sections = []
-    for index in range(1, 8):
-        appendix_sections.append(
-            f"### A.{index} Long Appendix Section\n\n"
-            + (f"Appendix section {index} contains generated examples, prompts, tables, and long case data. " * 90)
-        )
-    appendix = "## Appendix A Case Studies\n\n" + "\n\n".join(appendix_sections)
-    raw.write_text(body + "\n\n" + references + "\n\n" + appendix + "\n", encoding="utf-8")
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/arxiv-paper-with-appendix.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/arxiv-paper-with-appendix.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert preparation.document_kind == "article"
-    assert preparation.operations_applied == [
-        "deterministic_markdown_passthrough",
-        "deterministic_reference_section_truncation",
-        "deterministic_appendix_section_compaction",
-    ]
-    assert preparation.omission_policy == "reference_section_omitted_and_appendix_compacted_from_prepared_markdown_raw_retained"
-    assert "Reference title 119" not in preparation.prepared_markdown
-    assert "## Appendix A Case Studies" in preparation.prepared_markdown
-    assert "### A.1 Long Appendix Section" in preparation.prepared_markdown
-    assert "Appendix section compacted in prepared markdown" in preparation.prepared_markdown
-    assert "Appendix section 7 contains generated examples" in preparation.prepared_markdown
-    assert len(preparation.prepared_markdown) < len(raw.read_text(encoding="utf-8")) - 8_000
-    assert report["appendix_compaction"]["compacted"] is True
-    assert report["appendix_compaction"]["omitted_char_count"] > 4_000
-    _, report_md = pipeline_module.write_raw_prepare_fast_path_report(tmp_path, report)
-    report_text = report_md.read_text(encoding="utf-8")
-    assert "## Appendix 压缩" in report_text
-    assert "compacted_section_count" in report_text
-
-
-def test_raw_prepare_fast_path_allows_arxiv_paper_with_dialogue_examples(tmp_path: Path) -> None:
-    raw = tmp_path / "membench.md"
-    sections = []
-    for heading in [
-        "Abstract",
-        "Introduction",
-        "Related Work",
-        "Method",
-        "Experiments",
-        "Evaluation",
-        "Results",
-        "Discussion",
-        "Conclusion",
-    ]:
-        sections.append(
-            f"## {heading}\n\n"
-            + "\n".join(
-                f"{heading} paragraph {index} explains LLM agent memory evaluation and benchmark design."
-                for index in range(1, 25)
-            )
-        )
-    dialogue_examples = "\n".join(
-        f"User: synthetic memory example {index}\nAssistant: synthetic assistant response {index}\n"
-        f"Question: benchmark question {index}\nAnswer: benchmark answer {index}"
-        for index in range(1, 9)
-    )
-    raw.write_text(
-        "# MemBench Paper\n\n"
-        "Imported from: https://arxiv.org/abs/2506.21605v1\n"
-        "Fetched URL: https://arxiv.org/html/2506.21605v1\n\n"
-        + "\n\n".join(sections)
-        + "\n\nTable 1: Dataset comparison.\nFigure 1: Dialogue generation example.\nTable 2: Memory results.\n\n"
-        + dialogue_examples
-        + "\n\n## References\n\n[1] Memory benchmark paper.\n",
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/membench.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/membench.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert report["eligible"] is True
-    assert report["noise_profile"]["speaker_turn_count"] >= 20
-    assert report["noise_profile"]["paper_like_marker"] is True
-    assert pipeline_module.raw_prepare_speaker_turn_transcript_noise(report["noise_profile"]) is False
-    assert preparation.document_kind == "article"
-    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
-
-
-def test_raw_prepare_fast_path_skips_live_provider_for_structured_interview_markdown(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    vault, raw = make_vault(tmp_path)
-    sections = []
-    for index in range(1, 8):
-        sections.append(
-            f"### 小节 {index}\n\n"
-            + "\n".join(f"这是结构化访谈正文第 {index}-{line} 段，没有时间戳或说话人标签。" for line in range(1, 7))
-        )
-    raw.write_text(
-        "---\ntitle: Structured Interview\n---\n\n"
-        "## 访谈全文\n\n"
-        + "\n\n".join(sections),
-        encoding="utf-8",
-    )
-    config_path = vault / ".llmwiki" / "config.yaml"
-    config = read_yaml(config_path)
-    config["providers"] = {
-        "default": {
-            "spec": "openai_compatible:test-model",
-            "endpoint": "https://example.test/v1/chat/completions",
-            "api_key": "sk-test",
-        }
-    }
-    write_yaml(config_path, config)
-    called_tasks: list[str] = []
-
-    def fake_generate_raw(self, task, payload, output_model):
-        called_tasks.append(task)
-        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
-        return json.dumps(data, ensure_ascii=False)
-
-    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
-
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="structured-raw-fast-path")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-
-    assert "raw_prepare" not in called_tasks
-    assert {"source_digest", "candidate_resolution", "draft_rendering"} <= set(called_tasks)
-    assert "wiki_merge_planning" not in called_tasks
-    preparation = read_json(run_dir / "raw_prepare" / "raw_preparation.json")
-    assert preparation["document_kind"] == "transcript"
-    assert preparation["operations_applied"] == ["deterministic_structured_markdown_passthrough"]
-    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
-    assert fast_path["eligible"] is True
-    assert fast_path["fast_path_mode"] == "structured_markdown_passthrough"
-    assert set(fast_path["allowed_soft_markers"]) == {"interview_transcript_marker"}
-    raw_prepare_step = [step for step in read_json(run_dir / "run_metrics.json")["steps"] if step["name"] == "raw_prepare"][0]
-    assert raw_prepare_step["local_fast_path"] is True
-    assert "internal_model_call_count" not in raw_prepare_step
-
-
-def test_raw_prepare_fast_path_keeps_translated_podcast_markdown_on_model_path(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    vault, raw = make_vault(tmp_path)
-    sections = []
-    for index in range(1, 8):
-        sections.append(
-            f"### 访谈主题 {index}\n\n"
-            + "\n".join(f"这是播客翻译稿第 {index}-{line} 段，有完整句读但仍需要清洗。" for line in range(1, 7))
-        )
-    raw.write_text(
-        "---\n"
-        "title: Translated Podcast\n"
-        "source: https://www.youtube.com/watch?v=test\n"
-        "author:\n"
-        "  - \"Lenny's Podcast\"\n"
-        "tags:\n"
-        "  - 翻译\n"
-        "---\n\n"
-        "![](https://www.youtube.com/watch?v=test)\n\n"
-        "## 访谈全文\n\n"
-        + "\n\n".join(sections),
-        encoding="utf-8",
-    )
-    config_path = vault / ".llmwiki" / "config.yaml"
-    config = read_yaml(config_path)
-    config["providers"] = {
-        "default": {
-            "spec": "openai_compatible:test-model",
-            "endpoint": "https://example.test/v1/chat/completions",
-            "api_key": "sk-test",
-        }
-    }
-    write_yaml(config_path, config)
-    called_tasks: list[str] = []
-
-    def fake_generate_raw(self, task, payload, output_model):
-        called_tasks.append(task)
-        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
-        return json.dumps(data, ensure_ascii=False)
-
-    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
-
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="translated-podcast")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-
-    assert "raw_prepare" in called_tasks
-    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
-    assert fast_path["eligible"] is False
-    assert "structured markdown looks like noisy ASR or translated transcript" in fast_path["reasons"]
-    assert fast_path["noise_profile"]["transcript_provenance_risk"] is True
-    assert fast_path["noise_profile"]["structured_markdown_quality_risk"] is True
-
-
-def test_raw_prepare_skip_prepare_overrides_translated_podcast_guard(tmp_path: Path) -> None:
-    raw = tmp_path / "translated-podcast.md"
-    raw.write_text(
-        "---\n"
-        "title: Translated Podcast\n"
-        "source: https://www.youtube.com/watch?v=test\n"
-        "tags:\n"
-        "  - 翻译\n"
-        "---\n\n"
-        "![](https://www.youtube.com/watch?v=test)\n\n"
-        "## 访谈全文\n\n"
-        + "\n\n".join(
-            f"### 访谈主题 {index}\n\n"
-            + "\n".join(f"这是播客翻译稿第 {index}-{line} 段，有完整句读但用户确认无需模型清洗。" for line in range(1, 7))
-            for index in range(1, 8)
-        ),
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/translated-podcast.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/translated-podcast.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
-    )
-
-    assert preparation is not None
-    assert report["raw_prepare_policy"] == "skip-model"
-    assert report["eligible"] is True
-    assert report["fast_path_mode"] == "user_skip_model_passthrough"
-    assert "user_skip_prepare" in report["allowed_soft_markers"]
-    assert "structured markdown looks like noisy ASR or translated transcript" in report["policy_suppressed_reasons"]
-    assert preparation.operations_applied == ["user_skip_model_markdown_passthrough"]
-    assert preparation.risk_level == "medium"
-    assert preparation.requires_human_review is True
-
-
-def test_raw_prepare_noise_profile_does_not_count_url_scheme_as_speaker_turn() -> None:
-    noise = pipeline_module.raw_prepare_noise_profile(
-        "Imported source https://www.youtube.com/watch?v=test\n"
-        "Speaker: this is a real transcript turn.\n"
-    )
-
-    assert noise["speaker_turn_count"] == 1
-
-
-def test_raw_prepare_noise_profile_does_not_count_explanatory_colon_labels_as_speaker_turn() -> None:
-    noise = pipeline_module.raw_prepare_noise_profile(
-        "When to use this workflow: choose it when the path is predictable.\n"
-        "Examples where routing helps: customer service and model selection.\n"
-        "Sectioning: break a task into independent subtasks.\n"
-        "Voting: run the same task multiple times.\n"
-        "Table 1: accuracy and cost comparison.\n"
-        "## Product Strategy: release approach.\n"
-        "- Key Idea: keep routing explicit.\n"
-        "- Agent Design: document tool contracts.\n"
-        "- Speaker: bullet role labels still count.\n"
-        "- Speaker 1: numbered bullet speaker labels still count.\n"
-        "- Interviewer A: lettered bullet role labels still count.\n"
-        "User: this is a real transcript turn.\n"
-        "Cat Wu: this is also a real speaker turn.\n"
-        "主持人：这是中文主持人发言。\n"
-    )
-
-    assert noise["speaker_turn_count"] == 6
-
-
-def test_raw_prepare_fast_path_allows_structured_web_article_with_colon_labels(tmp_path: Path) -> None:
-    raw = tmp_path / "anthropic-agent-patterns.md"
-    sections = []
-    for heading in [
-        "What are agents?",
-        "When and how to use frameworks",
-        "Building block: The augmented LLM",
-        "Workflow: Prompt chaining",
-        "Workflow: Routing",
-        "Workflow: Parallelization",
-        "Workflow: Orchestrator-workers",
-        "Workflow: Evaluator-optimizer",
-    ]:
-        sections.append(
-            f"## {heading}\n\n"
-            f"When to use this workflow: choose it when {heading.lower()} fits the task boundary.\n"
-            f"Examples where this helps: customer support, coding tasks, and evaluation loops.\n"
-            f"Sectioning: split the problem when independent work can run in parallel.\n"
-            f"Voting: repeat the same judgment when confidence matters.\n"
-            + "\n".join(
-                f"This paragraph {index} explains a practical agentic system pattern with clear punctuation."
-                for index in range(1, 5)
-            )
-        )
-    raw.write_text(
-        "# Building Effective AI Agents\n\n"
-        "Imported from: https://www.anthropic.com/research/building-effective-agents\n"
-        "Fetched URL: https://www.anthropic.com/engineering/building-effective-agents\n\n"
-        "Q: Should teams always build agents?\n"
-        "A: No, teams should start with the simplest useful system.\n\n"
-        + "\n\n".join(sections),
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/anthropic-agent-patterns.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/anthropic-agent-patterns.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert report["eligible"] is True
-    assert report["noise_profile"]["speaker_turn_count"] == 2
-    assert "raw looks like a speaker-turn transcript" not in report["reasons"]
-    assert preparation.document_kind == "article"
-    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
-
-
-def test_raw_prepare_fast_path_allows_code_heavy_official_docs_chrome(tmp_path: Path) -> None:
-    raw = tmp_path / "cloudflare-agent-memory.md"
-    tab_links = "\n".join(
-        [
-            "[  JavaScript ](#tab-panel-4670)",
-            "[  TypeScript ](#tab-panel-4671)",
-            "[  wrangler.jsonc ](#tab-panel-4662)",
-            "[  wrangler.toml ](#tab-panel-4663)",
-            "[  JavaScript ](#tab-panel-4666)",
-            "[  TypeScript ](#tab-panel-4667)",
-            "[  JavaScript ](#tab-panel-4664)",
-            "[  TypeScript ](#tab-panel-4665)",
-            "[  JavaScript ](#tab-panel-4672)",
-            "[  TypeScript ](#tab-panel-4673)",
-        ]
-    )
-    sections = []
-    for heading in [
-        "How agent memory works",
-        "Create a project",
-        "Create a namespace",
-        "Configure bindings",
-        "Add memory tools",
-        "Run locally",
-    ]:
-        sections.append(
-            f"## {heading}\n\n"
-            + "\n".join(
-                f"This official docs paragraph {index} explains durable memory setup, recall, ingest, and agent integration."
-                for index in range(1, 6)
-            )
-        )
-    raw.write_text(
-        "# Cloudflare Agent Memory: Get started\n\n"
-        "Source URL: https://developers.cloudflare.com/agent-memory/get-started/\n"
-        "Language: English\n"
-        "Category: web tutorial / docs\n\n"
-        "---\n"
-        "---\n"
-        "title: Get started\n"
-        "description: Add durable memory recall and ingestion to an agent.\n"
-        "image: https://developers.cloudflare.com/dev-products-preview.png\n"
-        "---\n\n"
-        "> Documentation Index\n"
-        "> Fetch the complete documentation index at: https://developers.cloudflare.com/agent-memory/llms.txt\n\n"
-        "[Skip to content](#%5Ftop)\n\n"
-        "npm  yarn  pnpm\n\n"
-        "Terminal window\n\n"
-        f"{tab_links}\n\n"
-        + "\n\n".join(sections)
-        + "\n\n```jsonc\n"
-        "{\n"
-        '  "name": "memory-agent",\n'
-        '  "agent_memory": [{"binding": "MEMORY", "namespace": "my-agent"}]\n'
-        "}\n"
-        "```\n",
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/cloudflare-agent-memory.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/cloudflare-agent-memory.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert report["eligible"] is True
-    assert report["noise_profile"]["long_unpunctuated_body_line_count"] >= 8
-    assert report["noise_profile"]["structured_markdown_quality_risk"] is False
-    assert preparation.document_kind == "article"
-    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
-
-
-def test_raw_prepare_skip_prepare_records_local_provider(tmp_path: Path) -> None:
-    vault, raw = make_vault(tmp_path)
 
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
-        slug="skip-prepare-provider",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        slug=f"raw-prepare-{expected_policy_value.replace('-', '-')}",
+        raw_prepare_policy=raw_prepare_policy,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    loaded = status(vault, manifest.operation_id)
-    raw_prepare_step = [step for step in loaded.steps if step.name == "raw_prepare"][0]
-    metrics = read_json(run_dir / "run_metrics.json")
-    raw_prepare_metrics = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
 
-    assert raw_prepare_step.attempts[-1].provider_spec is None
-    assert raw_prepare_metrics["provider"] == "local:skip_prepare"
-    assert "raw_prepare" not in manifest.provider_contexts[0].providers
+    assert "raw_prepare" in captured_payloads
+    assert captured_payloads["raw_prepare"]["raw_prepare_policy"] == expected_policy_value
+    assert captured_payloads["raw_prepare"]["raw_markdown"].strip() == raw.read_text(encoding="utf-8").strip()
+    assert captured_payloads["raw_prepare"]["contract"]
+    preparation = read_json(run_dir / "raw_prepare" / "raw_preparation.json")
+    assert preparation["operations_applied"] == ["kept_clean_markdown"]
+    assert (run_dir / "raw_prepare" / "prepared.md").exists()
+    assert (run_dir / "raw_prepare" / "provider_result.json").exists()
 
 
-def test_raw_prepare_skip_prepare_does_not_require_raw_prepare_fixture(tmp_path: Path) -> None:
+def test_raw_prepare_skip_prepare_writes_local_passthrough_without_model_fixture(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "mock-without-raw-prepare"
     fixture_dir.mkdir()
@@ -2483,27 +1944,7 @@ def test_raw_prepare_skip_prepare_does_not_require_raw_prepare_fixture(tmp_path:
         vault=vault,
         raw_file=raw,
         fixture_dir=fixture_dir,
-        slug="skip-prepare-no-raw-fixture",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
-    )
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    metrics = read_json(run_dir / "run_metrics.json")
-    raw_prepare_metrics = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
-
-    assert "raw_prepare" not in manifest.provider_contexts[0].providers
-    assert raw_prepare_metrics["provider"] == "local:skip_prepare"
-    assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
-
-
-def test_raw_prepare_skip_prepare_hard_blocker_keeps_model_provider_label(tmp_path: Path) -> None:
-    vault, raw = make_vault(tmp_path)
-    raw.write_text("", encoding="utf-8")
-
-    manifest = run_simplified_ingest(
-        vault=vault,
-        raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
-        slug="skip-prepare-empty",
+        slug="skip-prepare-local-passthrough",
         raw_prepare_policy=RawPreparePolicy.skip_model,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
@@ -2511,290 +1952,64 @@ def test_raw_prepare_skip_prepare_hard_blocker_keeps_model_provider_label(tmp_pa
     raw_prepare_step = [step for step in loaded.steps if step.name == "raw_prepare"][0]
     metrics = read_json(run_dir / "run_metrics.json")
     raw_prepare_metrics = [step for step in metrics["steps"] if step["name"] == "raw_prepare"][0]
-    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
+    preparation = read_json(run_dir / "raw_prepare" / "raw_preparation.json")
 
-    assert fast_path["eligible"] is False
-    assert fast_path["reasons"] == ["raw text is empty"]
-    assert raw_prepare_step.attempts[-1].provider_spec == "mock:fixture"
-    assert raw_prepare_metrics["provider"] == "mock:fixture"
+    assert raw_prepare_step.attempts[-1].provider_spec is None
+    assert raw_prepare_metrics["provider"] == "local"
+    assert "raw_prepare" not in manifest.provider_contexts[0].providers
+    assert preparation["operations_applied"] == ["user_skip_model_markdown_passthrough"]
+    assert preparation["requires_human_review"] is False
+    assert (run_dir / "raw_prepare" / "prepared.md").read_text(encoding="utf-8") == raw.read_text(encoding="utf-8").rstrip() + "\n"
+    assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
+    assert not (run_dir / "raw_prepare" / "structured_repair_report.json").exists()
 
 
-def test_prepared_raw_review_surfaces_skip_prepare_risk(tmp_path: Path) -> None:
+def test_raw_prepare_skip_prepare_rejects_empty_markdown_without_provider_fallback(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    raw.write_text(
-        "# Cat Wu 访谈（中文翻译）\n\n"
-        "source https://www.youtube.com/watch?v=demo\n\n"
-        "![cover](cover.png)\n\n"
-        "## 访谈全文\n\n"
-        + "\n\n".join(
-            f"### 访谈主题 {index}\n\n"
-            + "\n".join(f"这是播客翻译稿第 {index}-{line} 段，有完整句读但用户确认无需模型清洗。" for line in range(1, 7))
-            for index in range(1, 8)
-        ),
-        encoding="utf-8",
-    )
+    raw.write_text("", encoding="utf-8")
+
+    with pytest.raises(PipelineError, match="--prepare skip requires non-empty raw Markdown"):
+        run_simplified_ingest(
+            vault=vault,
+            raw_file=raw,
+            fixture_dir=FIXTURE_ROOT / "mock",
+            slug="skip-prepare-empty",
+            raw_prepare_policy=RawPreparePolicy.skip_model,
+        )
+
+
+def test_raw_prepare_skip_prepare_rejects_non_markdown_without_provider_fallback(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    raw = vault / "raw" / "note.txt"
+    raw.write_text("Plain text raw should use model prepare, not skip passthrough.\n", encoding="utf-8")
+
+    with pytest.raises(PipelineError, match="--prepare skip requires Markdown raw"):
+        run_simplified_ingest(
+            vault=vault,
+            raw_file=raw,
+            fixture_dir=FIXTURE_ROOT / "mock",
+            slug="skip-prepare-non-markdown",
+            raw_prepare_policy=RawPreparePolicy.skip_model,
+        )
+
+
+def test_prepared_raw_review_for_skip_prepare_is_plain_auto_approval(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
 
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
         fixture_dir=FIXTURE_ROOT / "mock",
-        slug="skip-prepare-risk-review",
+        slug="skip-prepare-review",
         raw_prepare_policy=RawPreparePolicy.skip_model,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     prompt = (run_dir / "prepared_raw_review" / "review_prompt.md").read_text(encoding="utf-8")
     decision = read_json(run_dir / "prepared_raw_review" / "review_decision.json")
 
-    assert "Skip Prepare 风险提示" in prompt
+    assert "Skip Prepare 风险提示" not in prompt
     assert "policy_suppressed" not in prompt
-    assert "structured markdown looks like noisy ASR or translated transcript" in prompt
-    assert "--skip-prepare 覆盖" in decision["notes"]
-
-
-def test_raw_prepare_force_prepare_disables_clean_markdown_fast_path(tmp_path: Path) -> None:
-    raw = tmp_path / "clean.md"
-    raw.write_text("# Clean\n\n这是一篇人工整理过的短文。\n", encoding="utf-8")
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/clean.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/clean.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-        raw_prepare_policy=RawPreparePolicy.force_model,
-    )
-
-    assert preparation is None
-    assert report["raw_prepare_policy"] == "force-model"
-    assert report["eligible"] is False
-    assert report["reasons"] == ["raw_prepare policy forces model cleaning"]
-
-
-def test_raw_prepare_fast_path_allows_audited_text_wikilink_cleanup(tmp_path: Path) -> None:
-    raw = tmp_path / "structured-interview-cleaned.md"
-    raw.write_text(
-        "---\n"
-        "title: Structured Interview\n"
-        "author:\n"
-        "  - \"Lenny's Podcast\"\n"
-        "---\n\n"
-        "## 产品访谈整理\n\n"
-        + "\n\n".join(
-            f"### 小节 {index}\n\n"
-            + "\n".join(f"这是结构化访谈正文第 {index}-{line} 段，没有时间戳或说话人标签。" for line in range(1, 7))
-            for index in range(1, 8)
-        ),
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/structured-interview-cleaned.md",
-        changed=True,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-        cleaned_link_count=1,
-        preserved_media_embed_count=0,
-        links=[
-            pipeline_module.RawLinkCleanupLink(
-                link_id="L001",
-                link_kind="wikilink",
-                label="Lenny's Podcast",
-                target="Lenny's Podcast",
-                cleanup_action="unwrap_text",
-                cleanup_context="frontmatter",
-                line_number=4,
-                original_line_hash="hash",
-                line_excerpt="- \"[[Lenny's Podcast]]\"",
-            )
-        ],
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/structured-interview-cleaned.md",
-        input_raw_sha256="post",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is not None
-    assert report["eligible"] is True
-    assert report["raw_link_cleanup_fast_path_compatible"] is True
-    assert "raw_link_cleanup_text_unwrap" in report["allowed_soft_markers"]
-    assert "Raw link cleanup only unwrapped Obsidian text wikilinks" in preparation.review_notes
-    assert preparation.operations_applied == ["deterministic_markdown_passthrough"]
-
-
-def test_raw_prepare_fast_path_keeps_timestamped_transcript_on_model_path(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    vault, raw = make_vault(tmp_path)
-    raw.write_text(
-        "\n".join(f"[00:{index:02d}] Speaker: transcript line {index}" for index in range(12)),
-        encoding="utf-8",
-    )
-    config_path = vault / ".llmwiki" / "config.yaml"
-    config = read_yaml(config_path)
-    config["providers"] = {
-        "default": {
-            "spec": "openai_compatible:test-model",
-            "endpoint": "https://example.test/v1/chat/completions",
-            "api_key": "sk-test",
-        }
-    }
-    write_yaml(config_path, config)
-    called_tasks: list[str] = []
-
-    def fake_generate_raw(self, task, payload, output_model):
-        called_tasks.append(task)
-        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
-        return json.dumps(data, ensure_ascii=False)
-
-    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
-
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="raw-transcript")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-
-    assert "raw_prepare" in called_tasks
-    fast_path = read_json(run_dir / "raw_prepare" / "raw_prepare_fast_path.json")
-    assert fast_path["eligible"] is False
-    assert "raw looks like a timestamped transcript" in fast_path["reasons"]
-    raw_prepare_step = [step for step in read_json(run_dir / "run_metrics.json")["steps"] if step["name"] == "raw_prepare"][0]
-    assert raw_prepare_step["local_fast_path"] is False
-    assert raw_prepare_step["internal_model_call_count"] == 1
-
-
-def test_raw_prepare_fast_path_rejects_structured_markdown_with_asr_chunking(tmp_path: Path) -> None:
-    raw = tmp_path / "chunked-asr.md"
-    sections = []
-    for index in range(1, 8):
-        sections.append(
-            f"### 小节 {index}\n\n"
-            + "\n".join(f"这个地方 可能 是 识别 错误 {index} {line}" for line in range(1, 7))
-        )
-    raw.write_text("---\ntitle: Chunked ASR\n---\n\n" + "\n\n".join(sections), encoding="utf-8")
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/chunked-asr.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/chunked-asr.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is None
-    assert report["eligible"] is False
-    assert "structured markdown looks like noisy ASR or translated transcript" in report["reasons"]
-    assert report["noise_profile"]["low_punctuation_body_line_ratio"] >= 0.40
-    assert report["noise_profile"]["structured_markdown_quality_risk"] is True
-
-
-def test_raw_prepare_fast_path_rejects_sparse_speaker_turn_transcript(tmp_path: Path) -> None:
-    raw = tmp_path / "speaker-turn.md"
-    sections = []
-    for index in range(1, 7):
-        sections.append(
-            f"### Section {index}\n\n"
-            f"Speaker: transcript turn {index}\n\n"
-            + "\n\n".join(f"Regular paragraph {index}-{line}." for line in range(1, 7))
-        )
-    raw.write_text("\n\n".join(sections), encoding="utf-8")
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/speaker-turn.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/speaker-turn.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is None
-    assert report["eligible"] is False
-    assert "raw looks like a speaker-turn transcript" in report["reasons"]
-
-
-def test_raw_prepare_fast_path_rejects_interview_markdown_media(tmp_path: Path) -> None:
-    raw = tmp_path / "interview.md"
-    raw.write_text(
-        "---\ntitle: Interview\n---\n\n![](https://www.youtube.com/watch?v=test)\n\n## 访谈全文\n\n这里是访谈正文。",
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/interview.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/interview.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is None
-    assert report["eligible"] is False
-    assert "raw contains markdown media embeds" in report["reasons"]
-    assert "raw contains interview/transcript section markers" in report["reasons"]
-
-
-def test_raw_prepare_fast_path_rejects_structured_markdown_interview_with_media(tmp_path: Path) -> None:
-    raw = tmp_path / "structured-interview.md"
-    sections = []
-    for index in range(1, 8):
-        sections.append(
-            f"### 小节 {index}\n\n"
-            + "\n".join(f"这是结构化访谈正文第 {index}-{line} 段，没有时间戳或说话人标签。" for line in range(1, 7))
-        )
-    raw.write_text(
-        "---\ntitle: Structured Interview\n---\n\n"
-        "![](https://www.youtube.com/watch?v=test)\n\n"
-        "## 访谈全文\n\n"
-        + "\n\n".join(sections),
-        encoding="utf-8",
-    )
-    cleanup = pipeline_module.RawLinkCleanupArtifact(
-        raw_path="raw/structured-interview.md",
-        changed=False,
-        pre_cleanup_sha256="pre",
-        post_cleanup_sha256="post",
-    )
-
-    preparation, report = pipeline_module.build_raw_prepare_fast_path(
-        raw_path=raw,
-        raw_rel="raw/structured-interview.md",
-        input_raw_sha256="hash",
-        cleanup=cleanup,
-        cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-    )
-
-    assert preparation is None
-    assert report["eligible"] is False
-    assert "structured markdown looks like noisy ASR or translated transcript" in report["reasons"]
-    assert "raw contains markdown media embeds" in report["reasons"]
-    assert "raw contains interview/transcript section markers" in report["reasons"]
-    assert report["noise_profile"]["transcript_provenance_risk"] is True
-    assert report["noise_profile"]["heading_count"] >= 8
+    assert decision["notes"] == "当前 MVP 自动批准；交互式审核是后续工作。"
 
 
 def test_source_digest_provider_payload_omits_formal_candidate_suggested_action(
@@ -3029,7 +2244,12 @@ def test_source_digest_payload_uses_source_map_for_long_prepared_source(
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="source-digest-map")
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        slug="source-digest-map",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
     payload = captured_payloads["source_digest"]
@@ -3090,7 +2310,12 @@ def test_candidate_resolution_payload_uses_excerpt_pack_for_long_prepared_source
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="candidate-resolution-pack")
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        slug="candidate-resolution-pack",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
     payload = captured_payloads["candidate_resolution"]
@@ -3145,7 +2370,12 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="long-draft-payload")
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        slug="long-draft-payload",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
     payload = captured_payloads["draft_rendering"]
@@ -3174,8 +2404,8 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "change_summary may summarize retention but does not satisfy the obligation" in contract_rules
     assert "Do not wrap paraphrases" in contract_rules
     assert "Do not wrap paraphrases" in grounding_risk_rules
-    assert "translated transcript source text" in grounding_risk_rules
-    assert "speaker-like Chinese wording as paraphrase" in grounding_risk_rules
+    assert "conversational source text" in grounding_risk_rules
+    assert "speaker-like wording as paraphrase" in grounding_risk_rules
     assert "popularity/adoption/authority claims" in grounding_risk_rules
     assert "source-local capabilities" in grounding_risk_rules
     assert "broader phrasing" in grounding_risk_rules
@@ -3479,7 +2709,12 @@ def test_wiki_merge_planning_payload_uses_compact_context_projection(
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="planning-projection")
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        slug="planning-projection",
+        raw_prepare_policy=RawPreparePolicy.skip_model,
+    )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
     payload = captured_payloads["wiki_merge_planning"]

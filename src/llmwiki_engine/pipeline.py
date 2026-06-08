@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import shutil
 import re
-import tempfile
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import unified_diff
@@ -158,8 +157,8 @@ RAW_PREPARE_CONTRACT = {
     "goal": "Create a higher-quality canonical prepared raw for downstream knowledge compilation.",
     "rules": [
         "Do not add facts that are not supported by the original raw.",
-        "Remove or relocate non-content noise such as media timestamps, self-promotion, and obvious formatting artifacts.",
-        "Correct obvious ASR/OCR/formatting errors only when the context makes the correction clear.",
+        "Remove or relocate non-content noise such as navigation fragments, boilerplate, self-promotion, and obvious formatting artifacts.",
+        "Correct obvious wording or formatting errors only when the surrounding context makes the correction clear.",
         "Record uncertainty instead of guessing.",
         "Return prepared_markdown as clean Markdown suitable for source_digest and downstream knowledge digestion.",
     ],
@@ -174,8 +173,8 @@ LOCAL_MEDIUM_CREATE_REASON_MARKER = "本地补充结构化 create/update 对比�
 DRAFT_RENDERING_GROUNDING_RISK_RULES = (
     "Do not wrap paraphrases, inferred concept labels, or rewritten source ideas in Chinese/English quotation marks; "
     "use quotes only for text that exact-matches source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
-    "For interview, ASR/OCR, or translated transcript source text, treat speaker-like Chinese wording as paraphrase "
-    "unless the exact span is present; prefer indirect attribution such as 访谈中提到、她描述、团队讨论.",
+    "For conversational source text, treat speaker-like wording as paraphrase unless the exact span is present; "
+    "prefer indirect attribution such as 访谈中提到、她描述、团队讨论.",
     "The user has already approved this source for ingest. Do not reject or avoid a domain just because it is medical, legal, financial, security, account, password, payment, or privacy related.",
     "The only hard grounding boundary is contradiction with the approved source: absence of support is a warning, not a blocker.",
     "When turning source-local capabilities or examples into popularity/adoption/authority claims, prefer source-local "
@@ -329,23 +328,6 @@ SOURCE_DIGEST_ANCHOR_ENTITIES: dict[str, dict[str, str]] = {
         "resolution_hint": "deterministic_source_anchor_entity: source explicitly names Cowork as a durable product/entity anchor.",
     },
 }
-RAW_PREPARE_FAST_PATH_RULE_VERSION = "markdown_passthrough.v1"
-REFERENCE_SECTION_HEADING_RE = re.compile(
-    r"^\s{0,3}#{1,6}\s+(?:references|bibliography|works cited|参考文献|参考资料)\s*:?\s*$",
-    re.IGNORECASE,
-)
-APPENDIX_SECTION_HEADING_RE = re.compile(
-    r"^\s{0,3}#{1,6}\s+(?:appendix|appendices|supplementary|附录)\b",
-    re.IGNORECASE,
-)
-REFERENCE_TRUNCATION_MIN_DOCUMENT_CHARS = 8_000
-REFERENCE_TRUNCATION_MIN_OMITTED_CHARS = 1_500
-REFERENCE_TRUNCATION_MIN_START_RATIO = 0.45
-APPENDIX_COMPACTION_MIN_DOCUMENT_CHARS = 24_000
-APPENDIX_COMPACTION_MIN_OMITTED_CHARS = 4_000
-APPENDIX_COMPACTION_MIN_START_RATIO = 0.45
-APPENDIX_COMPACTION_SECTION_EXCERPT_LIMIT = 700
-APPENDIX_COMPACTION_MAX_SECTIONS = 12
 UPDATE_PRESERVATION_SECTION_KEYS = ("summary", "detail", "value_points")
 UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION = 8
 UPDATE_PRESERVATION_CONCEPT_GROUPS = (
@@ -448,43 +430,7 @@ MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT = 120
 MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK = 2
 MERGE_PLANNING_CONTEXT_QUERY_LIMIT = 420
 MERGE_PLANNING_ENTRY_EXCERPT_LIMIT = 900
-TRANSCRIPT_TIMESTAMP_RE = re.compile(r"^\s*(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\d{1,2}:\d{2}(?::\d{2})?\s*[-–—])")
-SPEAKER_TURN_RE = re.compile(r"^\s*(?P<label>[^:：\n]{1,48})\s*[:：](?!//)\s*(?P<body>.*)$")
-SPEAKER_ROLE_LABEL_RE = re.compile(
-    r"(?i)^(?:"
-    r"(?:q|a|qa|question|answer|user|assistant|human|system|speaker|host|guest|moderator|"
-    r"interviewer|interviewee|participant|audience)(?:\s*(?:#?\d+|[A-Z]))?"
-    r"|(?:问|答|主持人|嘉宾|采访者|受访者|提问|回答)(?:[A-Za-z0-9一二三四五六七八九十]+)?"
-    r")$"
-)
-SPEAKER_EXPLANATORY_LABEL_RE = re.compile(
-    r"(?i)\b(?:"
-    r"when|where|why|how|what|example|examples|sectioning|voting|workflow|workflows|pattern|"
-    r"steps?|input|output|use|best for|limitations?|notes?|summary|goal|tables?|figures?|appendix|"
-    r"imported from|"
-    r"fetched url|final url|content type|source|title|author|tags"
-    r")\b"
-    r"|何时|哪里|为什么|如何|什么|示例|例子|分片|投票|工作流|模式|步骤|输入|输出|用法|"
-    r"适用|限制|注意|摘要|目标|表格|图表|附录|来源|标题|作者|标签"
-)
-MARKDOWN_MEDIA_EMBED_RE = re.compile(r"!\[[^\]\n]*\]\([^)]+\)")
-INTERVIEW_TRANSCRIPT_MARKER_RE = re.compile(r"(?im)^\s*#{1,3}\s*(?:访谈全文|采访全文|完整访谈|Transcript|Full Transcript)\s*$")
-PAPER_SECTION_HEADING_RE = re.compile(
-    r"(?im)^\s{0,3}#{1,6}\s+"
-    r"(?:abstract|introduction|related work|methodology|method|experiments?|evaluation|results?|discussion|conclusion|references)\b"
-)
 PAPER_CAPTION_RE = re.compile(r"(?im)^\s*(?:table|figure)\s+\d+\s*:")
-ARXIV_IMPORT_MARKER_RE = re.compile(r"(?im)^\s*(?:imported from|fetched url|final url):\s+https?://(?:www\.)?arxiv\.org/")
-YOUTUBE_URL_RE = re.compile(r"(?i)https?://(?:www\.)?(?:youtube\.com|youtu\.be)/")
-PODCAST_MARKER_RE = re.compile(r"(?i)\bpodcast\b|播客")
-AUDIO_VIDEO_SOURCE_MARKER_RE = re.compile(r"(?i)\b(?:youtube|video|audio|episode)\b|视频|音频|节目")
-TRANSLATION_MARKER_RE = re.compile(r"(?i)\b(?:translated|translation)\b|翻译|译文")
-ASR_SOURCE_MARKER_RE = re.compile(
-    r"(?i)\b(?:asr|auto[- ]?generated|automatic captions?|machine transcript|transcribed by)\b"
-    r"|自动(?:转录|生成|字幕)|语音识别|机翻字幕|字幕稿|转写|转录"
-)
-SENTENCE_TERMINAL_PUNCTUATION = "。！？；：.!?;:"
-INLINE_PUNCTUATION = SENTENCE_TERMINAL_PUNCTUATION + "，,、"
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
     profile = load_profile(profile_name)
@@ -536,8 +482,6 @@ def run_simplified_ingest(
         vault_config.raw_prepare_policy = raw_prepare_policy
     model_steps = model_steps_for_raw_prepare_policy(
         list(MODEL_BACKED_STEPS),
-        raw_path=raw_path,
-        raw_rel=raw_rel,
         raw_prepare_policy=vault_config.raw_prepare_policy,
     )
     provider_execution_context = build_provider_execution_context(
@@ -608,13 +552,8 @@ def resume_ingest(
         ensure_wiki_context_current_before_resume(vault, store.run_dir(operation_id), start)
         model_steps = model_steps_from(start)
         if "raw_prepare" in model_steps:
-            raw_binding = manifest.raw_bindings[0] if manifest.raw_bindings else None
-            raw_rel = raw_binding.relative_path if raw_binding is not None else ""
-            raw_path = vault / raw_rel if raw_rel else vault
             model_steps = model_steps_for_raw_prepare_policy(
                 model_steps,
-                raw_path=raw_path,
-                raw_rel=raw_rel,
                 raw_prepare_policy=manifest.vault_config_snapshot.raw_prepare_policy,
             )
         provider_execution_context = build_provider_execution_context(
@@ -758,91 +697,24 @@ def ensure_pipeline_completed(manifest: OperationManifest) -> None:
 def model_steps_for_raw_prepare_policy(
     model_steps: list[str],
     *,
-    raw_path: Path,
-    raw_rel: str,
     raw_prepare_policy: RawPreparePolicy,
 ) -> list[str]:
-    if "raw_prepare" not in model_steps:
-        return model_steps
-    if raw_prepare_policy != RawPreparePolicy.skip_model:
-        return model_steps
-    if not raw_prepare_skip_model_passthrough_expected(raw_path=raw_path, raw_rel=raw_rel):
-        return model_steps
-    return [step for step in model_steps if step != "raw_prepare"]
-
-
-def raw_prepare_skip_model_passthrough_expected(*, raw_path: Path, raw_rel: str) -> bool:
-    if not raw_path.is_file():
-        return False
-    try:
-        original_text = raw_path.read_text(encoding="utf-8")
-        cleaned_text, links, warnings, preserved_media_count = cleanup_raw_wikilinks(original_text)
-        pre_hash = sha256_file(raw_path)
-        post_hash = sha256_bytes(cleaned_text.encode("utf-8"))
-        cleanup = RawLinkCleanupArtifact(
-            raw_path=raw_rel,
-            changed=cleaned_text != original_text,
-            pre_cleanup_sha256=pre_hash,
-            post_cleanup_sha256=post_hash,
-            cleaned_link_count=len(links),
-            preserved_media_embed_count=preserved_media_count,
-            links=links,
-            warnings=warnings,
-        )
-        if cleanup.changed:
-            with tempfile.TemporaryDirectory(prefix="llmwiki-raw-prepare-skip-check-") as tmp_dir:
-                candidate_path = Path(tmp_dir) / raw_path.name
-                candidate_path.write_text(cleaned_text, encoding="utf-8")
-                preparation, _report = build_raw_prepare_fast_path(
-                    raw_path=candidate_path,
-                    raw_rel=raw_rel,
-                    input_raw_sha256=post_hash,
-                    cleanup=cleanup,
-                    cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-                    raw_prepare_policy=RawPreparePolicy.skip_model,
-                )
-        else:
-            preparation, _report = build_raw_prepare_fast_path(
-                raw_path=raw_path,
-                raw_rel=raw_rel,
-                input_raw_sha256=post_hash,
-                cleanup=cleanup,
-                cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-                raw_prepare_policy=RawPreparePolicy.skip_model,
-            )
-    except Exception:
-        return False
-    return preparation is not None
+    if raw_prepare_policy == RawPreparePolicy.skip_model:
+        return [step for step in model_steps if step != "raw_prepare"]
+    return model_steps
 
 
 def model_backed_step_can_run_locally(
     *,
     step_name: str,
-    vault: Path,
-    run_dir: Path,
-    raw_path: Path,
     manifest: OperationManifest,
     provider_runtime_present: bool,
 ) -> bool:
-    if provider_runtime_present or step_name != "raw_prepare":
-        return False
-    if manifest.vault_config_snapshot.raw_prepare_policy != RawPreparePolicy.skip_model:
-        return False
-    try:
-        cleanup_path = require_step_output_dir(run_dir, "raw_link_cleanup") / "raw_link_cleanup.json"
-        cleanup = read_model(cleanup_path, RawLinkCleanupArtifact)
-        raw_rel = relative_to_vault(vault, raw_path)
-        preparation, _report = build_raw_prepare_fast_path(
-            raw_path=raw_path,
-            raw_rel=raw_rel,
-            input_raw_sha256=sha256_file(raw_path),
-            cleanup=cleanup,
-            cleanup_ref=cleanup_path.relative_to(run_dir).as_posix(),
-            raw_prepare_policy=RawPreparePolicy.skip_model,
-        )
-    except Exception:
-        return False
-    return preparation is not None
+    return (
+        not provider_runtime_present
+        and step_name == "raw_prepare"
+        and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip_model
+    )
 
 
 def _run_step(
@@ -864,9 +736,6 @@ def _run_step(
     provider_spec_for_attempt = provider_runtime.spec if provider_runtime else None
     local_model_backed_step = runner.spec.model_backed and model_backed_step_can_run_locally(
         step_name=step_name,
-        vault=vault,
-        run_dir=run_dir,
-        raw_path=raw_path,
         manifest=manifest,
         provider_runtime_present=provider_runtime is not None,
     )
@@ -1133,943 +1002,76 @@ def render_raw_link_cleanup_markdown(artifact: RawLinkCleanupArtifact) -> str:
     )
 
 
-def raw_prepare_fast_path_provider_allowed(ctx: StepRunContext, step_name: str) -> bool:
-    if ctx.execution_context.record is None:
-        return False
-    runtime = ctx.execution_context.record.providers.get(step_name)
-    if runtime is None:
-        return False
-    return raw_prepare_fast_path_provider_spec_allowed(runtime.spec)
-
-
-def raw_prepare_fast_path_provider_spec_allowed(provider_spec: str | None) -> bool:
-    return bool(provider_spec and provider_spec.startswith("openai_compatible:"))
-
-
-def build_raw_prepare_fast_path(
+def build_raw_prepare_skip_passthrough(
     *,
     raw_path: Path,
     raw_rel: str,
     input_raw_sha256: str,
-    cleanup: RawLinkCleanupArtifact,
     cleanup_ref: str,
-    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto,
-) -> tuple[RawPreparationArtifact | None, dict[str, Any]]:
-    raw_text = raw_path.read_text(encoding="utf-8")
-    policy = RawPreparePolicy(raw_prepare_policy)
-    hard_reasons: list[str] = []
-    auto_reasons: list[str] = []
+) -> RawPreparationArtifact:
     if raw_path.suffix.lower() not in {".md", ".markdown", ".mdown"}:
-        hard_reasons.append("raw file extension is not markdown")
-    cleanup_fast_path_compatible = raw_link_cleanup_fast_path_compatible(cleanup)
-    if cleanup.changed and not cleanup_fast_path_compatible:
-        auto_reasons.append("raw_link_cleanup changed the raw text")
-    if cleanup.preserved_media_embed_count:
-        auto_reasons.append("raw contains preserved media embeds")
+        raise PipelineError("--prepare skip requires Markdown raw; use --prepare auto or --prepare force for non-Markdown raw.")
+    raw_text = raw_path.read_text(encoding="utf-8")
     if not raw_text.strip():
-        hard_reasons.append("raw text is empty")
-    noise = raw_prepare_noise_profile(raw_text)
-    structured_markdown_passthrough = raw_prepare_structured_markdown_fast_path_allowed(noise)
-    structured_quality_risk = raw_prepare_structured_markdown_quality_risk(noise)
-    allowed_soft_markers: list[str] = []
-    if policy == RawPreparePolicy.skip_model:
-        allowed_soft_markers.append("user_skip_prepare")
-    if cleanup_fast_path_compatible:
-        allowed_soft_markers.append("raw_link_cleanup_text_unwrap")
-    if structured_quality_risk:
-        auto_reasons.append("structured markdown looks like noisy ASR or translated transcript")
-    if noise["markdown_media_embed_count"]:
-        if policy == RawPreparePolicy.skip_model:
-            auto_reasons.append("raw contains markdown media embeds")
-            allowed_soft_markers.append("markdown_media_embed")
-        elif structured_markdown_passthrough:
-            allowed_soft_markers.append("markdown_media_embed")
-        else:
-            auto_reasons.append("raw contains markdown media embeds")
-    if raw_prepare_timestamp_transcript_noise(noise):
-        auto_reasons.append("raw looks like a timestamped transcript")
-        if policy == RawPreparePolicy.skip_model:
-            allowed_soft_markers.append("timestamp_transcript_marker")
-    if raw_prepare_speaker_turn_transcript_noise(noise):
-        auto_reasons.append("raw looks like a speaker-turn transcript")
-        if policy == RawPreparePolicy.skip_model:
-            allowed_soft_markers.append("speaker_turn_transcript_marker")
-    if noise["interview_transcript_marker"]:
-        if policy == RawPreparePolicy.skip_model:
-            auto_reasons.append("raw contains interview/transcript section markers")
-            allowed_soft_markers.append("interview_transcript_marker")
-        elif structured_markdown_passthrough:
-            allowed_soft_markers.append("interview_transcript_marker")
-        else:
-            auto_reasons.append("raw contains interview/transcript section markers")
-    if noise["webvtt_marker"]:
-        auto_reasons.append("raw contains WebVTT transcript markers")
-        if policy == RawPreparePolicy.skip_model:
-            allowed_soft_markers.append("webvtt_marker")
-    if policy == RawPreparePolicy.force_model:
-        reasons = ["raw_prepare policy forces model cleaning"]
-        policy_suppressed_reasons: list[str] = []
-    elif policy == RawPreparePolicy.skip_model:
-        reasons = hard_reasons
-        policy_suppressed_reasons = auto_reasons
-    else:
-        reasons = hard_reasons + auto_reasons
-        policy_suppressed_reasons = []
-    structured_soft_marker_passthrough = structured_markdown_passthrough and any(
-        marker in {"markdown_media_embed", "interview_transcript_marker"} for marker in allowed_soft_markers
-    )
-    if policy == RawPreparePolicy.skip_model:
-        fast_path_mode = "user_skip_model_passthrough"
-    elif structured_soft_marker_passthrough:
-        fast_path_mode = "structured_markdown_passthrough"
-    else:
-        fast_path_mode = "clean_markdown_passthrough"
-    report = {
-        "schema_version": "raw_prepare_fast_path.v1",
-        "rule_version": RAW_PREPARE_FAST_PATH_RULE_VERSION,
-        "raw_prepare_policy": policy.value,
-        "eligible": not reasons,
-        "source_raw_path": raw_rel,
-        "input_raw_sha256": input_raw_sha256,
-        "raw_link_cleanup_ref": cleanup_ref,
-        "reasons": reasons,
-        "policy_suppressed_reasons": policy_suppressed_reasons,
-        "noise_profile": noise,
-        "fast_path_mode": fast_path_mode,
-        "allowed_soft_markers": allowed_soft_markers,
-        "raw_link_cleanup_fast_path_compatible": cleanup_fast_path_compatible,
-    }
-    if reasons:
-        return None, report
-    document_kind = infer_passthrough_document_kind(raw_text, noise)
-    prepared_markdown, reference_truncation = truncate_reference_section_for_prepared_markdown(raw_text)
-    prepared_markdown, appendix_compaction = compact_appendix_sections_for_prepared_markdown(
-        prepared_markdown,
-        enabled=bool(noise.get("paper_like_marker")),
-    )
-    if policy == RawPreparePolicy.skip_model:
-        operations_applied = ["user_skip_model_markdown_passthrough"]
-    else:
-        operations_applied = [
-            "deterministic_structured_markdown_passthrough"
-            if structured_soft_marker_passthrough
-            else "deterministic_markdown_passthrough"
-        ]
-    if reference_truncation.get("truncated"):
-        operations_applied.append("deterministic_reference_section_truncation")
-    if appendix_compaction.get("compacted"):
-        operations_applied.append("deterministic_appendix_section_compaction")
-    if policy == RawPreparePolicy.skip_model:
-        review_notes = (
-            "User selected --skip-prepare; raw markdown was passed through without model cleanup. "
-            "Auto quality blockers were recorded as policy_suppressed_reasons for audit."
-        )
-    elif structured_soft_marker_passthrough:
-        review_notes = (
-            "Structured markdown used deterministic fast-path: media/interview markers were present, "
-            "but heading density was high and timestamp/speaker-turn transcript noise did not trigger."
-        )
-    elif cleanup_fast_path_compatible:
-        review_notes = (
-            "Raw markdown used deterministic fast-path after audited raw_link_cleanup text wikilink unwrap; "
-            "transcript/media-noise heuristics did not trigger."
-        )
-    else:
-        review_notes = (
-            "Raw markdown used deterministic fast-path: raw_link_cleanup made no content changes "
-            "and transcript/media-noise heuristics did not trigger."
-        )
-    preparation = RawPreparationArtifact(
+        raise PipelineError("--prepare skip requires non-empty raw Markdown.")
+    return RawPreparationArtifact(
         source_raw_path=raw_rel,
         input_raw_sha256=input_raw_sha256,
         raw_link_cleanup_ref=cleanup_ref,
-        document_kind=document_kind,
-        prepared_markdown=prepared_markdown,
-        operations_applied=operations_applied,
-        omission_policy=(
-            deterministic_omission_policy(
-                reference_truncated=bool(reference_truncation.get("truncated")),
-                appendix_compacted=bool(appendix_compaction.get("compacted")),
-            )
-        ),
+        document_kind="unknown",
+        prepared_markdown=raw_text.rstrip() + "\n",
+        operations_applied=["user_skip_model_markdown_passthrough"],
+        omission_policy="none",
         uncertain_items=[],
-        risk_level="medium" if policy == RawPreparePolicy.skip_model and policy_suppressed_reasons else "low",
-        requires_human_review=policy == RawPreparePolicy.skip_model and bool(policy_suppressed_reasons),
-        review_notes=review_notes,
+        risk_level="low",
+        requires_human_review=False,
+        review_notes="User selected --prepare skip; raw Markdown was passed through without model cleanup.",
     )
-    if cleanup_fast_path_compatible:
-        preparation.review_notes += (
-            " Raw link cleanup only unwrapped Obsidian text wikilinks and is recorded in raw_link_cleanup artifacts."
-        )
-    if reference_truncation.get("truncated"):
-        preparation.review_notes += (
-            " Reference section was omitted from prepared markdown to reduce digest noise; "
-            "the original raw retains the full reference list."
-        )
-    if appendix_compaction.get("compacted"):
-        preparation.review_notes += (
-            " Appendix sections were compacted to headings and short excerpts in prepared markdown; "
-            "the original raw retains the full appendix."
-        )
-    report["document_kind"] = document_kind
-    report["reference_truncation"] = reference_truncation
-    report["appendix_compaction"] = appendix_compaction
-    return preparation, report
 
 
-def raw_link_cleanup_fast_path_compatible(cleanup: RawLinkCleanupArtifact) -> bool:
-    if not cleanup.changed:
-        return False
-    if cleanup.warnings or cleanup.preserved_media_embed_count:
-        return False
-    if cleanup.cleaned_link_count <= 0 or cleanup.cleaned_link_count != len(cleanup.links):
-        return False
-    return all(link.cleanup_action == "unwrap_text" for link in cleanup.links)
-
-
-def build_raw_prepare_diagnostic(
-    *,
-    vault: Path,
-    raw_file: Path,
-    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto,
-) -> dict[str, Any]:
-    """Preview raw_prepare fast-path/model decision without mutating raw or creating a run."""
-    raw_path, raw_rel = resolve_raw_path(vault, raw_file)
-    original_text = raw_path.read_text(encoding="utf-8")
-    cleaned_text, links, warnings, preserved_media_count = cleanup_raw_wikilinks(original_text)
-    pre_hash = sha256_file(raw_path)
-    post_hash = sha256_bytes(cleaned_text.encode("utf-8"))
-    cleanup = RawLinkCleanupArtifact(
-        raw_path=raw_rel,
-        changed=cleaned_text != original_text,
-        pre_cleanup_sha256=pre_hash,
-        post_cleanup_sha256=post_hash,
-        cleaned_link_count=len(links),
-        preserved_media_embed_count=preserved_media_count,
-        links=links,
-        warnings=warnings,
-    )
-    provider_context = build_provider_execution_context(
-        vault=vault,
-        manifest_contexts=[],
-        fixture_dir=None,
-        mock_fixture_dir=None,
-        source="initial_run",
-        from_step=None,
-        tasks=["raw_prepare"],
-        require_mock_fixture=False,
-    )
-    provider_runtime = provider_context.record.providers.get("raw_prepare") if provider_context.record else None
-    provider_spec = provider_runtime.spec if provider_runtime is not None else None
-    provider_fast_path_allowed = raw_prepare_fast_path_provider_spec_allowed(provider_spec)
-
-    def build_for(policy: RawPreparePolicy, candidate_path: Path) -> dict[str, Any]:
-        _preparation, report = build_raw_prepare_fast_path(
-            raw_path=candidate_path,
-            raw_rel=raw_rel,
-            input_raw_sha256=post_hash,
-            cleanup=cleanup,
-            cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-            raw_prepare_policy=policy,
-        )
-        if policy == RawPreparePolicy.auto and not provider_fast_path_allowed:
-            provider_report = build_raw_prepare_provider_ineligible_report(
-                raw_path=candidate_path,
-                raw_rel=raw_rel,
-                input_raw_sha256=post_hash,
-                cleanup_ref="raw_link_cleanup/raw_link_cleanup.json",
-                raw_prepare_policy=policy,
-                provider_spec=provider_spec,
-            )
-            provider_report["raw_fast_path_report"] = report
-            provider_report["raw_hard_blockers"] = raw_prepare_hard_blockers(report)
-            return provider_report
-        return report
-
-    policies = [RawPreparePolicy.auto, RawPreparePolicy.skip_model, RawPreparePolicy.force_model]
-    if cleanup.changed:
-        with tempfile.TemporaryDirectory(prefix="llmwiki-raw-prepare-check-") as tmp_dir:
-            candidate_path = Path(tmp_dir) / raw_path.name
-            candidate_path.write_text(cleaned_text, encoding="utf-8")
-            reports = {policy.value: build_for(policy, candidate_path) for policy in policies}
-    else:
-        reports = {policy.value: build_for(policy, raw_path) for policy in policies}
-
-    selected_policy = RawPreparePolicy(raw_prepare_policy)
-    auto_report = reports[RawPreparePolicy.auto.value]
-    skip_report = reports[RawPreparePolicy.skip_model.value]
-    return {
-        "schema_version": "raw_prepare_diagnostic.v1",
-        "vault": vault.resolve().as_posix(),
-        "raw_path": raw_rel,
-        "raw_absolute_path": raw_path.as_posix(),
-        "selected_policy": selected_policy.value,
-        "selected_report": reports[selected_policy.value],
-        "auto_report": auto_report,
-        "skip_prepare_report": skip_report,
-        "force_prepare_report": reports[RawPreparePolicy.force_model.value],
-        "provider": {
-            "raw_prepare_spec": provider_spec or "",
-            "fast_path_allowed": provider_fast_path_allowed,
-            "diagnostic_requires_fixture": bool(provider_spec == "mock:fixture" and not (provider_runtime and provider_runtime.fixture_dir)),
-        },
-        "recommendation": raw_prepare_diagnostic_recommendation(
-            auto_report=auto_report,
-            skip_report=skip_report,
-            selected_report=reports[selected_policy.value],
-        ),
-        "raw_link_cleanup": cleanup.model_dump(mode="json"),
-    }
-
-
-def build_raw_prepare_provider_ineligible_report(
-    *,
-    raw_path: Path,
-    raw_rel: str,
-    input_raw_sha256: str,
-    cleanup_ref: str,
-    raw_prepare_policy: RawPreparePolicy,
-    provider_spec: str | None,
-) -> dict[str, Any]:
-    return {
-        "schema_version": "raw_prepare_fast_path.v1",
-        "rule_version": RAW_PREPARE_FAST_PATH_RULE_VERSION,
-        "raw_prepare_policy": raw_prepare_policy.value,
-        "eligible": False,
-        "source_raw_path": raw_rel,
-        "input_raw_sha256": input_raw_sha256,
-        "raw_link_cleanup_ref": cleanup_ref,
-        "reasons": ["configured provider is not eligible for deterministic fast-path"],
-        "policy_suppressed_reasons": [],
-        "noise_profile": raw_prepare_noise_profile(raw_path.read_text(encoding="utf-8")),
-        "provider_spec": provider_spec or "",
-        "provider_fast_path_allowed": False,
-    }
-
-
-def raw_prepare_diagnostic_recommendation(
-    *,
-    auto_report: dict[str, Any],
-    skip_report: dict[str, Any],
-    selected_report: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    auto_reasons = [str(reason) for reason in auto_report.get("reasons", [])]
-    skip_reasons = [str(reason) for reason in skip_report.get("reasons", [])]
-    noise = auto_report.get("noise_profile", {})
-    raw_fast_path_report = auto_report.get("raw_fast_path_report") if isinstance(auto_report.get("raw_fast_path_report"), dict) else auto_report
-    hard_blockers = raw_prepare_hard_blockers(raw_fast_path_report)
-    skip_available = not skip_reasons
-    selected_estimated_model_prepare = not bool((selected_report or auto_report).get("eligible"))
-    if bool(auto_report.get("eligible")):
-        return {
-            "decision": "auto_deterministic_fast_path",
-            "recommended_flag": "",
-            "summary": "auto 会使用 deterministic raw_prepare fast-path，不调用模型清洗。",
-            "skip_prepare_available": skip_available,
-            "force_prepare_available": True,
-            "auto_estimated_model_prepare": False,
-            "selected_estimated_model_prepare": selected_estimated_model_prepare,
-            "estimated_model_prepare": selected_estimated_model_prepare,
-            "raw_hard_blockers": hard_blockers,
-        }
-    if hard_blockers:
-        return {
-            "decision": "model_prepare_required",
-            "recommended_flag": "",
-            "summary": "auto 会走模型 raw_prepare；当前 raw 不是可安全 passthrough 的 Markdown，--skip-prepare 也不能覆盖硬性原因。",
-            "skip_prepare_available": skip_available,
-            "force_prepare_available": True,
-            "auto_estimated_model_prepare": True,
-            "selected_estimated_model_prepare": selected_estimated_model_prepare,
-            "estimated_model_prepare": selected_estimated_model_prepare,
-            "raw_hard_blockers": hard_blockers,
-        }
-    if "configured provider is not eligible for deterministic fast-path" in auto_reasons:
-        return {
-            "decision": "auto_provider_prepare_required",
-            "recommended_flag": "",
-            "summary": "auto 会调用 raw_prepare provider；当前 provider 不支持 deterministic fast-path。",
-            "skip_prepare_available": skip_available,
-            "force_prepare_available": True,
-            "auto_estimated_model_prepare": True,
-            "selected_estimated_model_prepare": selected_estimated_model_prepare,
-            "estimated_model_prepare": selected_estimated_model_prepare,
-            "raw_hard_blockers": hard_blockers,
-        }
-    noisy_transcript = bool(
-        noise.get("transcript_provenance_risk")
-        or noise.get("structured_markdown_quality_risk")
-        or noise.get("webvtt_marker")
-        or raw_prepare_timestamp_transcript_noise(noise)
-        or raw_prepare_speaker_turn_transcript_noise(noise)
-    )
-    if noisy_transcript:
-        return {
-            "decision": "auto_model_prepare_recommended",
-            "recommended_flag": "",
-            "summary": "auto 会走模型 raw_prepare；材料像播客/视频转写或翻译稿，建议保留清洗。若你确认 raw 已人工校对，可用 --skip-prepare 节省模型时间。",
-            "skip_prepare_available": skip_available,
-            "force_prepare_available": True,
-            "auto_estimated_model_prepare": True,
-            "selected_estimated_model_prepare": selected_estimated_model_prepare,
-            "estimated_model_prepare": selected_estimated_model_prepare,
-            "raw_hard_blockers": hard_blockers,
-        }
-    return {
-        "decision": "auto_model_prepare_user_choice",
-        "recommended_flag": "--skip-prepare" if skip_available else "",
-        "summary": "auto 会走模型 raw_prepare，但阻断原因不像强 ASR/翻译风险；若你确认 raw 质量足够，可以用 --skip-prepare。",
-        "skip_prepare_available": skip_available,
-        "force_prepare_available": True,
-        "auto_estimated_model_prepare": True,
-        "selected_estimated_model_prepare": selected_estimated_model_prepare,
-        "estimated_model_prepare": selected_estimated_model_prepare,
-        "raw_hard_blockers": hard_blockers,
-    }
-
-
-def raw_prepare_hard_blockers(report: dict[str, Any]) -> list[str]:
-    return [
-        str(reason)
-        for reason in report.get("reasons", [])
-        if str(reason) in {"raw file extension is not markdown", "raw text is empty"}
+def _write_raw_prepare_outputs(ctx: StepRunContext, preparation: RawPreparationArtifact, *, include_model_outputs: bool) -> None:
+    step_name = "raw_prepare"
+    step_root = require_step_output_dir(ctx.run_dir, step_name)
+    validate_raw_preparation(preparation)
+    out = step_root / "raw_preparation.json"
+    write_json(out, preparation)
+    prepared = step_root / "prepared.md"
+    prepared.parent.mkdir(parents=True, exist_ok=True)
+    prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
+    review = step_root / "preparation_review.md"
+    review.write_text(render_preparation_review(preparation), encoding="utf-8")
+    outputs = [
+        _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
+        _ref(ctx.run_dir, prepared, step_name, "markdown"),
+        _ref(ctx.run_dir, review, step_name, "markdown"),
     ]
-
-
-def deterministic_omission_policy(*, reference_truncated: bool, appendix_compacted: bool) -> str:
-    if reference_truncated and appendix_compacted:
-        return "reference_section_omitted_and_appendix_compacted_from_prepared_markdown_raw_retained"
-    if reference_truncated:
-        return "reference_section_omitted_from_prepared_markdown_raw_retained"
-    if appendix_compacted:
-        return "appendix_compacted_from_prepared_markdown_raw_retained"
-    return "none"
-
-
-def raw_prepare_noise_profile(text: str) -> dict[str, Any]:
-    lines = [line for line in text.splitlines() if line.strip()]
-    line_count = len(lines)
-    body_lines = raw_prepare_body_lines_for_noise(text)
-    body_line_count = len(body_lines)
-    timestamp_line_count = sum(1 for line in lines if TRANSCRIPT_TIMESTAMP_RE.search(line))
-    speaker_turn_count = sum(1 for line in lines if looks_like_speaker_turn_line(line))
-    heading_count = sum(1 for line in lines if re.match(r"^\s{0,3}#{1,6}\s+\S", line))
-    short_body_line_count = sum(1 for line in body_lines if len(line) <= 32)
-    missing_sentence_terminal_count = sum(
-        1 for line in body_lines if line and line[-1] not in SENTENCE_TERMINAL_PUNCTUATION
-    )
-    low_punctuation_body_line_count = sum(
-        1 for line in body_lines if len(line) >= 16 and not any(mark in line for mark in INLINE_PUNCTUATION)
-    )
-    long_unpunctuated_body_line_count = sum(
-        1 for line in body_lines if len(line) >= 24 and not any(mark in line for mark in INLINE_PUNCTUATION)
-    )
-    paper_section_marker_count = len(PAPER_SECTION_HEADING_RE.findall(text))
-    paper_caption_count = len(PAPER_CAPTION_RE.findall(text))
-    arxiv_import_marker = bool(ARXIV_IMPORT_MARKER_RE.search(text))
-    paper_like_marker = raw_prepare_paper_like_markdown(
-        line_count=line_count,
-        heading_count=heading_count,
-        arxiv_import_marker=arxiv_import_marker,
-        paper_section_marker_count=paper_section_marker_count,
-        paper_caption_count=paper_caption_count,
-        text=text,
-    )
-    noise = {
-        "line_count": line_count,
-        "body_line_count": body_line_count,
-        "heading_count": heading_count,
-        "heading_ratio": heading_count / line_count if line_count else 0.0,
-        "short_body_line_count": short_body_line_count,
-        "short_body_line_ratio": short_body_line_count / body_line_count if body_line_count else 0.0,
-        "missing_sentence_terminal_count": missing_sentence_terminal_count,
-        "missing_sentence_terminal_ratio": (
-            missing_sentence_terminal_count / body_line_count if body_line_count else 0.0
-        ),
-        "low_punctuation_body_line_count": low_punctuation_body_line_count,
-        "low_punctuation_body_line_ratio": (
-            low_punctuation_body_line_count / body_line_count if body_line_count else 0.0
-        ),
-        "long_unpunctuated_body_line_count": long_unpunctuated_body_line_count,
-        "timestamp_line_count": timestamp_line_count,
-        "timestamp_line_ratio": timestamp_line_count / line_count if line_count else 0.0,
-        "speaker_turn_count": speaker_turn_count,
-        "speaker_turn_ratio": speaker_turn_count / line_count if line_count else 0.0,
-        "markdown_media_embed_count": len(MARKDOWN_MEDIA_EMBED_RE.findall(text)),
-        "interview_transcript_marker": bool(INTERVIEW_TRANSCRIPT_MARKER_RE.search(text)),
-        "webvtt_marker": bool(re.search(r"(?im)^\s*WEBVTT\s*$", text)),
-        "youtube_url_count": len(YOUTUBE_URL_RE.findall(text)),
-        "podcast_marker_count": len(PODCAST_MARKER_RE.findall(text)),
-        "audio_video_marker_count": len(AUDIO_VIDEO_SOURCE_MARKER_RE.findall(text)),
-        "translation_marker_count": len(TRANSLATION_MARKER_RE.findall(text)),
-        "asr_source_marker_count": len(ASR_SOURCE_MARKER_RE.findall(text)),
-        "arxiv_import_marker": arxiv_import_marker,
-        "paper_section_marker_count": paper_section_marker_count,
-        "paper_caption_count": paper_caption_count,
-        "paper_like_marker": paper_like_marker,
-    }
-    noise["transcript_provenance_risk"] = raw_prepare_transcript_provenance_risk(noise)
-    noise["structured_markdown_quality_risk"] = raw_prepare_structured_markdown_quality_risk(noise)
-    return noise
-
-
-def looks_like_speaker_turn_line(line: str) -> bool:
-    stripped = line.strip()
-    if re.match(r"#{1,6}\s+\S", stripped):
-        return False
-    list_prefix_match = re.match(r"(?:[-*+]|\d+[.)])\s+", stripped)
-    in_list_item = list_prefix_match is not None
-    if list_prefix_match is not None:
-        stripped = stripped[list_prefix_match.end() :]
-    match = SPEAKER_TURN_RE.match(stripped)
-    if match is None:
-        return False
-    label = match.group("label").strip().strip("*_`[]()")
-    body = match.group("body").strip()
-    if not label or not raw_prepare_speaker_turn_body_has_content(body):
-        return False
-    if SPEAKER_EXPLANATORY_LABEL_RE.search(label):
-        return False
-    if SPEAKER_ROLE_LABEL_RE.fullmatch(label):
-        return True
-    if raw_prepare_short_cjk_speaker_label(label):
-        return True
-    return (not in_list_item) and raw_prepare_title_case_speaker_label(label)
-
-
-def raw_prepare_speaker_turn_body_has_content(body: str) -> bool:
-    if not body:
-        return False
-    if re.fullmatch(r"https?://\S+", body, flags=re.IGNORECASE):
-        return False
-    return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", body))
-
-
-def raw_prepare_short_cjk_speaker_label(label: str) -> bool:
-    compact = re.sub(r"\s+", "", label)
-    if not re.search(r"[\u4e00-\u9fff]", compact):
-        return False
-    return bool(re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9·・]{2,8}", compact))
-
-
-def raw_prepare_title_case_speaker_label(label: str) -> bool:
-    if len(label) > 40:
-        return False
-    words = re.findall(r"[A-Za-z][A-Za-z.'_-]*", label)
-    if not 1 <= len(words) <= 4:
-        return False
-    return all(word[0].isupper() or word.isupper() for word in words)
-
-
-def raw_prepare_body_lines_for_noise(text: str) -> list[str]:
-    body_lines: list[str] = []
-    in_frontmatter = False
-    in_fenced_code = False
-    for index, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
-        if index == 1 and stripped == "---":
-            in_frontmatter = True
-            continue
-        if in_frontmatter:
-            if stripped == "---":
-                in_frontmatter = False
-            continue
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fenced_code = not in_fenced_code
-            continue
-        if in_fenced_code or not stripped:
-            continue
-        if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
-            continue
-        if MARKDOWN_MEDIA_EMBED_RE.search(stripped):
-            continue
-        if re.match(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", stripped):
-            continue
-        stripped = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", stripped)
-        if stripped:
-            body_lines.append(stripped)
-    return body_lines
-
-
-def raw_prepare_paper_like_markdown(
-    *,
-    line_count: int,
-    heading_count: int,
-    arxiv_import_marker: bool,
-    paper_section_marker_count: int,
-    paper_caption_count: int,
-    text: str,
-) -> bool:
-    if line_count < 80 or heading_count < 6:
-        return False
-    if not arxiv_import_marker and "doi" not in text[:5000].lower():
-        return False
-    return paper_section_marker_count >= 2 or paper_caption_count >= 3 or bool(REFERENCE_SECTION_HEADING_RE.search(text))
-
-
-def raw_prepare_structured_markdown_fast_path_allowed(noise: dict[str, Any]) -> bool:
-    if noise.get("webvtt_marker"):
-        return False
-    if raw_prepare_timestamp_transcript_noise(noise):
-        return False
-    if raw_prepare_speaker_turn_transcript_noise(noise):
-        return False
-    if raw_prepare_structured_markdown_quality_risk(noise):
-        return False
-    return noise.get("line_count", 0) >= 40 and noise.get("heading_count", 0) >= 6
-
-
-def raw_prepare_timestamp_transcript_noise(noise: dict[str, Any]) -> bool:
-    return noise.get("timestamp_line_count", 0) >= 8 or noise.get("timestamp_line_ratio", 0.0) >= 0.05
-
-
-def raw_prepare_speaker_turn_transcript_noise(noise: dict[str, Any]) -> bool:
-    if noise.get("paper_like_marker") and noise.get("speaker_turn_ratio", 0.0) < 0.15:
-        return False
-    return noise.get("speaker_turn_count", 0) >= 20 or noise.get("speaker_turn_ratio", 0.0) >= 0.10
-
-
-def raw_prepare_transcript_provenance_risk(noise: dict[str, Any]) -> bool:
-    if noise.get("paper_like_marker"):
-        return False
-    if noise.get("asr_source_marker_count", 0) > 0:
-        return True
-    has_external_media = noise.get("youtube_url_count", 0) > 0 or noise.get("markdown_media_embed_count", 0) > 0
-    transcriptish = bool(noise.get("interview_transcript_marker")) or noise.get("podcast_marker_count", 0) > 0
-    translated = noise.get("translation_marker_count", 0) > 0
-    if has_external_media and (transcriptish or translated):
-        return True
-    if noise.get("podcast_marker_count", 0) > 0 and (bool(noise.get("interview_transcript_marker")) or translated):
-        return True
-    if translated and bool(noise.get("interview_transcript_marker")) and noise.get("heading_count", 0) >= 4:
-        return True
-    return False
-
-
-def raw_prepare_structured_markdown_quality_risk(noise: dict[str, Any]) -> bool:
-    if noise.get("paper_like_marker"):
-        return False
-    if raw_prepare_transcript_provenance_risk(noise):
-        return True
-    body_line_count = noise.get("body_line_count", 0)
-    if body_line_count >= 30 and noise.get("low_punctuation_body_line_ratio", 0.0) >= 0.40:
-        return True
-    if (
-        body_line_count >= 40
-        and noise.get("short_body_line_ratio", 0.0) >= 0.55
-        and noise.get("missing_sentence_terminal_ratio", 0.0) >= 0.35
-    ):
-        return True
-    if noise.get("long_unpunctuated_body_line_count", 0) >= 8:
-        return (
-            noise.get("low_punctuation_body_line_ratio", 0.0) >= 0.25
-            or noise.get("missing_sentence_terminal_ratio", 0.0) >= 0.65
-        )
-    return False
-
-
-def infer_passthrough_document_kind(text: str, noise: dict[str, Any]) -> Literal["transcript", "article", "notes", "mixed", "unknown"]:
-    if noise.get("paper_like_marker"):
-        return "article"
-    if raw_prepare_timestamp_transcript_noise(noise) or raw_prepare_speaker_turn_transcript_noise(noise):
-        return "transcript"
-    if noise.get("interview_transcript_marker"):
-        return "transcript"
-    non_empty = [line for line in text.splitlines() if line.strip()]
-    if not non_empty:
-        return "unknown"
-    heading_count = sum(1 for line in non_empty if line.lstrip().startswith("#"))
-    bullet_count = sum(1 for line in non_empty if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line))
-    bullet_ratio = bullet_count / len(non_empty)
-    if bullet_ratio >= 0.35:
-        return "notes"
-    if heading_count and len(non_empty) >= 6:
-        return "article"
-    if bullet_count:
-        return "notes"
-    return "mixed"
-
-
-def truncate_reference_section_for_prepared_markdown(text: str) -> tuple[str, dict[str, Any]]:
-    report: dict[str, Any] = {
-        "truncated": False,
-        "reason": "no eligible reference section found",
-        "omitted_char_count": 0,
-    }
-    if len(text) < REFERENCE_TRUNCATION_MIN_DOCUMENT_CHARS:
-        report["reason"] = "document is below reference truncation size threshold"
-        return text.rstrip() + "\n", report
-    lines = text.splitlines(keepends=True)
-    offsets: list[int] = []
-    offset = 0
-    for line in lines:
-        offsets.append(offset)
-        offset += len(line)
-    for index in range(len(lines) - 1, -1, -1):
-        line = lines[index]
-        if not REFERENCE_SECTION_HEADING_RE.match(line.strip()):
-            continue
-        start = offsets[index]
-        next_appendix_index = next(
-            (
-                following_index
-                for following_index in range(index + 1, len(lines))
-                if APPENDIX_SECTION_HEADING_RE.match(lines[following_index].strip())
-            ),
-            None,
-        )
-        end = offsets[next_appendix_index] if next_appendix_index is not None else len(text)
-        omitted_char_count = end - start
-        if start / len(text) < REFERENCE_TRUNCATION_MIN_START_RATIO:
-            report["reason"] = "reference section starts too early"
-            continue
-        if omitted_char_count < REFERENCE_TRUNCATION_MIN_OMITTED_CHARS:
-            report["reason"] = "reference section is below truncation size threshold"
-            continue
-        heading = line.strip()
-        marker = (
-            f"{heading}\n\n"
-            "[Reference section omitted from prepared markdown; original raw retains the full reference list.]\n"
-        )
-        suffix = text[end:].lstrip("\n")
-        prepared = text[:start].rstrip() + "\n\n" + marker
-        if suffix:
-            prepared = prepared.rstrip() + "\n\n" + suffix
-        return prepared.rstrip() + "\n", {
-            "truncated": True,
-            "reference_heading": heading,
-            "start_line": index + 1,
-            "start_char": start,
-            "end_line": next_appendix_index + 1 if next_appendix_index is not None else len(lines),
-            "end_char": end,
-            "preserved_following_appendix": next_appendix_index is not None,
-            "omitted_char_count": omitted_char_count,
-            "reason": "reference section omitted from prepared markdown while raw retains full text",
-        }
-    return text.rstrip() + "\n", report
-
-
-def compact_appendix_sections_for_prepared_markdown(
-    text: str,
-    *,
-    enabled: bool,
-    min_document_chars: int = APPENDIX_COMPACTION_MIN_DOCUMENT_CHARS,
-    min_omitted_chars: int = APPENDIX_COMPACTION_MIN_OMITTED_CHARS,
-    min_start_ratio: float = APPENDIX_COMPACTION_MIN_START_RATIO,
-    section_excerpt_limit: int = APPENDIX_COMPACTION_SECTION_EXCERPT_LIMIT,
-    max_sections: int = APPENDIX_COMPACTION_MAX_SECTIONS,
-) -> tuple[str, dict[str, Any]]:
-    report: dict[str, Any] = {
-        "compacted": False,
-        "reason": "appendix compaction disabled",
-        "omitted_char_count": 0,
-    }
-    if not enabled:
-        return text.rstrip() + "\n", report
-    if len(text) < min_document_chars:
-        report["reason"] = "document is below appendix compaction size threshold"
-        return text.rstrip() + "\n", report
-    lines = text.splitlines(keepends=True)
-    offsets: list[int] = []
-    offset = 0
-    for line in lines:
-        offsets.append(offset)
-        offset += len(line)
-    appendix_index = next(
-        (index for index, line in enumerate(lines) if APPENDIX_SECTION_HEADING_RE.match(line.strip())),
-        None,
-    )
-    if appendix_index is None:
-        report["reason"] = "no appendix-like heading found"
-        return text.rstrip() + "\n", report
-    appendix_start = offsets[appendix_index]
-    if appendix_start / len(text) < min_start_ratio:
-        report["reason"] = "appendix starts too early"
-        return text.rstrip() + "\n", report
-    appendix_text = text[appendix_start:]
-    compacted_appendix, appendix_report = compact_appendix_text(
-        appendix_text,
-        section_excerpt_limit=section_excerpt_limit,
-        max_sections=max_sections,
-    )
-    omitted_char_count = len(appendix_text.rstrip()) - len(compacted_appendix.rstrip())
-    if omitted_char_count < min_omitted_chars:
-        report["reason"] = "appendix omitted chars below compaction threshold"
-        report["omitted_char_count"] = max(0, omitted_char_count)
-        return text.rstrip() + "\n", report
-    prepared = text[:appendix_start].rstrip() + "\n\n" + compacted_appendix.rstrip() + "\n"
-    return prepared, {
-        "compacted": True,
-        "appendix_start_line": appendix_index + 1,
-        "appendix_start_char": appendix_start,
-        "original_appendix_char_count": len(appendix_text.rstrip()),
-        "compacted_appendix_char_count": len(compacted_appendix.rstrip()),
-        "omitted_char_count": omitted_char_count,
-        "section_excerpt_limit": section_excerpt_limit,
-        "max_sections": max_sections,
-        **appendix_report,
-        "reason": "appendix sections compacted while raw retains full appendix",
-    }
-
-
-def compact_appendix_text(
-    appendix_text: str,
-    *,
-    section_excerpt_limit: int,
-    max_sections: int,
-) -> tuple[str, dict[str, Any]]:
-    lines = appendix_text.splitlines(keepends=True)
-    heading_indices = [
-        index
-        for index, line in enumerate(lines)
-        if re.match(r"^\s{0,3}#{2,6}\s+\S", line) or (index == 0 and APPENDIX_SECTION_HEADING_RE.match(line.strip()))
-    ]
-    if not heading_indices or heading_indices[0] != 0:
-        heading_indices.insert(0, 0)
-    heading_indices = sorted(set(heading_indices))
-    sections: list[tuple[int, int]] = []
-    for position, start_index in enumerate(heading_indices):
-        end_index = heading_indices[position + 1] if position + 1 < len(heading_indices) else len(lines)
-        sections.append((start_index, end_index))
-    output: list[str] = []
-    compacted_sections = 0
-    omitted_sections = 0
-    for section_number, (start_index, end_index) in enumerate(sections, start=1):
-        section_text = "".join(lines[start_index:end_index]).strip()
-        if not section_text:
-            continue
-        heading = lines[start_index].strip() if start_index < len(lines) else f"Appendix section {section_number}"
-        if section_number > max_sections:
-            omitted_sections += 1
-            continue
-        excerpt = compact_payload_text(section_text, section_excerpt_limit)
-        if len(section_text) > len(excerpt):
-            compacted_sections += 1
-            output.append(
-                f"{excerpt}\n\n"
-                "[Appendix section compacted in prepared markdown; original raw retains the full appendix section.]"
-            )
-        else:
-            output.append(section_text)
-        if section_number == max_sections and len(sections) > max_sections:
-            omitted_sections += len(sections) - max_sections
-            output.append(
-                "## Additional Appendix Sections Omitted\n\n"
-                f"[{len(sections) - max_sections} additional appendix section(s) omitted from prepared markdown; original raw retains them.]"
-            )
-            break
-    return "\n\n".join(output).rstrip() + "\n", {
-        "original_section_count": len(sections),
-        "included_section_count": min(len(sections), max_sections),
-        "compacted_section_count": compacted_sections,
-        "omitted_section_count": omitted_sections,
-    }
-
-
-def write_raw_prepare_fast_path_report(step_root: Path, report: dict[str, Any]) -> tuple[Path, Path]:
-    json_path = step_root / "raw_prepare_fast_path.json"
-    md_path = step_root / "raw_prepare_fast_path.md"
-    write_json(json_path, report)
-    reason_rows = [[reason] for reason in report.get("reasons", [])]
-    suppressed_reason_rows = [[reason] for reason in report.get("policy_suppressed_reasons", [])]
-    noise = report.get("noise_profile", {})
-    noise_rows = [
-        [key, f"{value:.3f}" if isinstance(value, float) else str(value)]
-        for key, value in noise.items()
-    ]
-    reference_truncation = report.get("reference_truncation", {})
-    reference_rows = [[key, str(value)] for key, value in reference_truncation.items()]
-    appendix_compaction = report.get("appendix_compaction", {})
-    appendix_rows = [[key, str(value)] for key, value in appendix_compaction.items()]
-    success_note = (
-        "_无，已使用 --skip-prepare passthrough。_"
-        if report.get("raw_prepare_policy") == RawPreparePolicy.skip_model.value
-        else "_无，已使用 deterministic markdown passthrough。_"
-    )
-    md_path.write_text(
-        "# Raw Prepare Fast Path\n\n"
-        f"- 规则版本: `{report.get('rule_version', RAW_PREPARE_FAST_PATH_RULE_VERSION)}`\n"
-        f"- 清洗策略: `{report.get('raw_prepare_policy', RawPreparePolicy.auto.value)}`\n"
-        f"- 是否启用: `{str(report.get('eligible', False)).lower()}`\n"
-        f"- 原始材料: `{report.get('source_raw_path', '')}`\n"
-        f"- Raw Wikilink 规范化: `{report.get('raw_link_cleanup_ref', '')}`\n\n"
-        "## 未启用原因\n\n"
-        f"{format_markdown_table(['原因'], reason_rows) if reason_rows else success_note}\n\n"
-        "## Policy 覆盖的自动拦截原因\n\n"
-        f"{format_markdown_table(['原因'], suppressed_reason_rows) if suppressed_reason_rows else '_无。_'}\n\n"
-        "## 噪声画像\n\n"
-        f"{format_markdown_table(['字段', '值'], noise_rows) if noise_rows else '_暂无。_'}\n\n"
-        "## 参考文献截断\n\n"
-        f"{format_markdown_table(['字段', '值'], reference_rows) if reference_rows else '_未评估。_'}\n\n"
-        "## Appendix 压缩\n\n"
-        f"{format_markdown_table(['字段', '值'], appendix_rows) if appendix_rows else '_未评估。_'}\n",
-        encoding="utf-8",
-    )
-    return json_path, md_path
+    if include_model_outputs:
+        outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    complete_step(ctx.manifest, step_name, outputs=outputs)
 
 
 def _run_raw_prepare(ctx: StepRunContext) -> None:
     step_name = "raw_prepare"
-    step_root = require_step_output_dir(ctx.run_dir, step_name)
     raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
     cleanup_path = require_step_output_dir(ctx.run_dir, "raw_link_cleanup") / "raw_link_cleanup.json"
     cleanup = read_model(cleanup_path, RawLinkCleanupArtifact)
     input_raw_sha256 = sha256_file(ctx.raw_path)
     cleanup_ref = cleanup_path.relative_to(ctx.run_dir).as_posix()
-    fast_path_report_refs: list[ArtifactRef] = []
     raw_prepare_policy = ctx.manifest.vault_config_snapshot.raw_prepare_policy
-    if raw_prepare_policy != RawPreparePolicy.auto or raw_prepare_fast_path_provider_allowed(ctx, step_name):
-        preparation, fast_path_report = build_raw_prepare_fast_path(
-            raw_path=ctx.raw_path,
-            raw_rel=raw_rel,
-            input_raw_sha256=input_raw_sha256,
-            cleanup=cleanup,
-            cleanup_ref=cleanup_ref,
-            raw_prepare_policy=raw_prepare_policy,
-        )
-        fast_json, fast_md = write_raw_prepare_fast_path_report(step_root, fast_path_report)
-        fast_path_report_refs = [
-            _ref(ctx.run_dir, fast_json, step_name, "json", "raw_prepare_fast_path.v1"),
-            _ref(ctx.run_dir, fast_md, step_name, "markdown"),
-        ]
-        if preparation is not None:
-            validate_raw_preparation(preparation)
-            out = step_root / "raw_preparation.json"
-            write_json(out, preparation)
-            prepared = step_root / "prepared.md"
-            prepared.parent.mkdir(parents=True, exist_ok=True)
-            prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
-            review = step_root / "preparation_review.md"
-            review.write_text(render_preparation_review(preparation), encoding="utf-8")
-            complete_step(
-                ctx.manifest,
-                step_name,
-                outputs=[
-                    _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
-                    _ref(ctx.run_dir, prepared, step_name, "markdown"),
-                    _ref(ctx.run_dir, review, step_name, "markdown"),
-                    *fast_path_report_refs,
-                ],
-            )
-            return
-    elif ctx.raw_path.suffix.lower() in {".md", ".markdown", ".mdown"}:
-        runtime = ctx.execution_context.record.providers.get(step_name) if ctx.execution_context.record else None
-        skipped_report = build_raw_prepare_provider_ineligible_report(
+    if raw_prepare_policy == RawPreparePolicy.skip_model:
+        preparation = build_raw_prepare_skip_passthrough(
             raw_path=ctx.raw_path,
             raw_rel=raw_rel,
             input_raw_sha256=input_raw_sha256,
             cleanup_ref=cleanup_ref,
-            raw_prepare_policy=raw_prepare_policy,
-            provider_spec=runtime.spec if runtime is not None else None,
         )
-        fast_json, fast_md = write_raw_prepare_fast_path_report(step_root, skipped_report)
-        fast_path_report_refs = [
-            _ref(ctx.run_dir, fast_json, step_name, "json", "raw_prepare_fast_path.v1"),
-            _ref(ctx.run_dir, fast_md, step_name, "markdown"),
-        ]
+        _write_raw_prepare_outputs(ctx, preparation, include_model_outputs=False)
+        return
+
     payload = {
         "source_raw_path": raw_rel,
         "source_raw_sha256": input_raw_sha256,
+        "raw_prepare_policy": raw_prepare_policy.value,
         "raw_markdown": ctx.raw_path.read_text(encoding="utf-8"),
         "raw_link_cleanup_ref": cleanup_ref,
         "raw_link_cleanup": {
@@ -2080,6 +1082,7 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
         },
         "contract": RAW_PREPARE_CONTRACT,
     }
+
     def validate_raw_prepare_model(model: RawPreparationArtifact) -> None:
         candidate = model.model_copy(
             update={
@@ -2115,24 +1118,9 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
             "raw_link_cleanup_ref": cleanup_ref,
         }
     )
-    validate_raw_preparation(preparation)
     if preparation.source_raw_path != raw_rel:
         raise PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
-    out = step_root / "raw_preparation.json"
-    write_json(out, preparation)
-    prepared = step_root / "prepared.md"
-    prepared.parent.mkdir(parents=True, exist_ok=True)
-    prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
-    review = step_root / "preparation_review.md"
-    review.write_text(render_preparation_review(preparation), encoding="utf-8")
-    outputs = [
-        _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
-        _ref(ctx.run_dir, prepared, step_name, "markdown"),
-        _ref(ctx.run_dir, review, step_name, "markdown"),
-    ]
-    outputs.extend(fast_path_report_refs)
-    outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
-    complete_step(ctx.manifest, step_name, outputs=outputs)
+    _write_raw_prepare_outputs(ctx, preparation, include_model_outputs=True)
 
 
 def _run_prepared_raw_review(ctx: StepRunContext) -> None:
@@ -2140,31 +1128,16 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     prepared = require_step_output_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
     preparation = read_model(require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
-    fast_path_report_path = require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_prepare_fast_path.json"
-    suppressed_reasons: list[str] = []
-    if fast_path_report_path.exists():
-        try:
-            fast_path_report = json.loads(fast_path_report_path.read_text(encoding="utf-8"))
-            suppressed_reasons = [str(reason) for reason in fast_path_report.get("policy_suppressed_reasons", [])]
-        except Exception:
-            suppressed_reasons = []
     approved = step_root / "approved_prepared.md"
     approved.write_text(prepared.read_text(encoding="utf-8"), encoding="utf-8")
     prompt = step_root / "review_prompt.md"
     risk_section = ""
-    if preparation.requires_human_review or suppressed_reasons:
-        risk_rows = [[reason] for reason in suppressed_reasons]
+    if preparation.requires_human_review:
         risk_section = (
-            "\n## Skip Prepare 风险提示\n\n"
+            "\n## Raw Prepare 风险提示\n\n"
             f"- risk_level: `{preparation.risk_level}`\n"
             f"- requires_human_review: `{str(preparation.requires_human_review).lower()}`\n"
-            "- 说明：用户显式选择了 passthrough；本步骤仍自动批准，但下游审核应知道 raw_prepare 覆盖了自动质量拦截。\n\n"
-            + (
-                format_markdown_table(["被覆盖的自动拦截原因"], risk_rows)
-                if risk_rows
-                else "_无明确 policy_suppressed_reasons。_"
-            )
-            + "\n"
+            "- 说明：当前 MVP 仍自动批准 prepared raw；下游步骤会继续基于 Approved Raw 校验。\n"
         )
     prompt.write_text(
         "# Prepared Raw 审核\n\n"
@@ -2179,11 +1152,7 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
         decision="approved",
         review_mode="auto_stub",
         auto_approved=True,
-        notes=(
-            "当前 MVP 自动批准；交互式审核是后续工作。"
-            if not suppressed_reasons
-            else f"当前 MVP 自动批准；--skip-prepare 覆盖 {len(suppressed_reasons)} 个自动质量拦截。"
-        ),
+        notes="当前 MVP 自动批准；交互式审核是后续工作。",
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
@@ -8184,20 +7153,8 @@ def last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> int
 
 def step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
     if step_name == "raw_prepare":
-        path = require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_prepare_fast_path.json"
-        if not path.exists():
-            return None
-        try:
-            report = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if report.get("eligible") is True:
-            if report.get("raw_prepare_policy") == RawPreparePolicy.skip_model.value:
-                suppressed = report.get("policy_suppressed_reasons", [])
-                if isinstance(suppressed, list) and suppressed:
-                    return f"raw_prepare 使用 --skip-prepare passthrough，覆盖 {len(suppressed)} 个自动质量拦截；详见 raw_prepare_fast_path.md"
-                return "raw_prepare 使用 --skip-prepare passthrough，跳过模型清洗"
-            return "raw_prepare 使用 deterministic markdown passthrough，跳过模型清洗"
+        if ctx.manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip_model:
+            return "raw_prepare 使用 --prepare skip passthrough，跳过模型清洗"
         return None
     if step_name == "wiki_merge_planning":
         path = require_step_output_dir(ctx.run_dir, "wiki_merge_planning") / "merge_planning_shortcut_report.json"
@@ -8302,16 +7259,6 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
             row["total_provider_result_count"] = total_repair_metrics["provider_result_count"]
             row["total_http_attempt_count"] = total_repair_metrics["http_attempt_count"]
             row["total_payload_char_count"] = total_repair_metrics["payload_char_count"]
-        fast_path_report = run_dir / step.name / "raw_prepare_fast_path.json"
-        if fast_path_report.exists():
-            try:
-                fast_path_data = json.loads(fast_path_report.read_text(encoding="utf-8"))
-                row["local_fast_path"] = bool(fast_path_data.get("eligible"))
-                row["local_fast_path_rule"] = fast_path_data.get("rule_version", "")
-                if row["local_fast_path"]:
-                    row["provider"] = raw_prepare_fast_path_provider_label(fast_path_data)
-            except Exception:
-                row["local_fast_path"] = False
         shortcut_report = run_dir / step.name / "merge_planning_shortcut_report.json"
         if shortcut_report.exists():
             try:
@@ -8607,13 +7554,6 @@ def step_provider_label(step_name: str, provider_spec: str | None) -> str:
     if step_name.endswith("_review"):
         return "local:auto_review"
     return "local"
-
-
-def raw_prepare_fast_path_provider_label(report: dict[str, Any]) -> str:
-    policy = report.get("raw_prepare_policy")
-    if policy == RawPreparePolicy.skip_model.value:
-        return "local:skip_prepare"
-    return "local:raw_prepare_fast_path"
 
 
 def awaiting_review_duration_ms(step: Any) -> int | None:
