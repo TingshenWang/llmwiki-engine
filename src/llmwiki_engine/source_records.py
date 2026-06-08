@@ -6,8 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from . import frontmatter as _frontmatter
 from .hash_utils import sha256_file
 from .models import RawIngestCandidate, RawIngestCandidateReport
 
@@ -23,25 +22,15 @@ class _SourceRawCoverageRecord:
     operation_ids: tuple[str, ...]
 
 
-def parse_frontmatter(text: str) -> dict[str, Any] | None:
-    if not text.startswith("---\n"):
-        return None
-    parts = text.split("---\n", 2)
-    if len(parts) < 3:
-        return None
-    data = yaml.safe_load(parts[1]) or {}
-    return data if isinstance(data, dict) else None
-
-
 def scan_source_pages(vault: Path) -> list[tuple[str, dict[str, Any]]]:
     source_root = vault / "wiki" / "sources"
     if not source_root.exists():
         return []
     found: list[tuple[str, dict[str, Any]]] = []
     for path in sorted(source_root.rglob("*.md")):
-        frontmatter = parse_frontmatter(path.read_text(encoding="utf-8"))
-        if frontmatter is not None:
-            found.append((path.relative_to(vault).as_posix(), frontmatter))
+        data = _frontmatter.parse_frontmatter(path.read_text(encoding="utf-8"))
+        if data is not None:
+            found.append((path.relative_to(vault).as_posix(), data))
     return found
 
 
@@ -135,15 +124,6 @@ def scan_raw_ingest_candidates(
     )
 
 
-def frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:
-    value = frontmatter.get(key, [])
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [item for item in value if isinstance(item, str)]
-    return []
-
-
 def normalize_vault_path(path: str) -> str:
     return unicodedata.normalize("NFC", path.strip()).replace("\\", "/")
 
@@ -206,8 +186,8 @@ def _source_raw_coverage_index(vault: Path) -> tuple[dict[str, list[_SourceRawCo
     records_by_hash: dict[str, list[_SourceRawCoverageRecord]] = {}
     for source_page, frontmatter in scan_source_pages(vault):
         raw_paths = tuple(_frontmatter_raw_paths(frontmatter))
-        raw_hashes = tuple(value.strip() for value in frontmatter_list(frontmatter, "source_raw_hashes") if value.strip())
-        operation_ids = tuple(value.strip() for value in frontmatter_list(frontmatter, "source_operation_ids") if value.strip())
+        raw_hashes = tuple(value.strip() for value in _frontmatter.frontmatter_list(frontmatter, "source_raw_hashes") if value.strip())
+        operation_ids = tuple(value.strip() for value in _frontmatter.frontmatter_list(frontmatter, "source_operation_ids") if value.strip())
         if not raw_paths and not raw_hashes:
             continue
         record = _SourceRawCoverageRecord(
@@ -225,7 +205,7 @@ def _source_raw_coverage_index(vault: Path) -> tuple[dict[str, list[_SourceRawCo
 
 def _frontmatter_raw_paths(frontmatter: dict[str, Any]) -> list[str]:
     raw_paths: list[str] = []
-    for value in frontmatter_list(frontmatter, "source_raw_paths"):
+    for value in _frontmatter.frontmatter_list(frontmatter, "source_raw_paths"):
         normalized = normalize_vault_path(value)
         if normalized:
             raw_paths.append(normalized)

@@ -12,8 +12,6 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import yaml
-
 from .hash_utils import sha256_file
 from .models import (
     CandidateContextHit,
@@ -25,6 +23,7 @@ from .models import (
     WikiKnowledgePoolEntry,
     WikiPageMetadata,
 )
+from . import frontmatter as _frontmatter
 
 
 WIKI_EXCLUDED_ROOTS = {"sources", "logs"}
@@ -606,13 +605,8 @@ def normalize_path(value: str) -> str:
 
 
 def metadata_from_text(text: str, rel_path: str) -> WikiPageMetadata | None:
-    if not text.startswith("---\n"):
-        return None
-    parts = text.split("---\n", 2)
-    if len(parts) < 3:
-        return None
-    data = yaml.safe_load(parts[1]) or {}
-    if not isinstance(data, dict):
+    data = _frontmatter.parse_frontmatter(text)
+    if data is None:
         return None
     llmwiki_type = data.get("llmwiki_type")
     title = data.get("title")
@@ -634,16 +628,11 @@ def metadata_from_text(text: str, rel_path: str) -> WikiPageMetadata | None:
         created=created if isinstance(created, str) else "",
         updated=updated,
         aliases=aliases,
-        source_raw_paths=frontmatter_list(data, "source_raw_paths"),
-        source_raw_hashes=frontmatter_list(data, "source_raw_hashes"),
-        source_prepared_hashes=frontmatter_list(data, "source_prepared_hashes"),
-        source_operation_ids=frontmatter_list(data, "source_operation_ids"),
+        source_raw_paths=_frontmatter.frontmatter_list(data, "source_raw_paths"),
+        source_raw_hashes=_frontmatter.frontmatter_list(data, "source_raw_hashes"),
+        source_prepared_hashes=_frontmatter.frontmatter_list(data, "source_prepared_hashes"),
+        source_operation_ids=_frontmatter.frontmatter_list(data, "source_operation_ids"),
     )
-
-
-def frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:
-    value = frontmatter.get(key, [])
-    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
 def clean_title(value: str) -> str:

@@ -20,6 +20,7 @@ from llmwiki_engine import open_questions as open_questions_module
 from llmwiki_engine import page_sections as page_sections_module
 from llmwiki_engine import retrieval as retrieval_module
 from llmwiki_engine import section_merge as section_merge_module
+from llmwiki_engine import source_records as source_records_module
 from llmwiki_engine import update_preservation as update_preservation_module
 from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.hash_utils import sha256_file
@@ -593,6 +594,30 @@ def test_candidate_context_score_bucket_uses_persisted_rounded_score(tmp_path: P
     assert hits[0].score == 0.58
     assert hits[0].score_bucket == retrieval_module.retrieval_score_bucket(hits[0].score)
     assert f"bucket={hits[0].score_bucket}" in hits[0].sort_explanation
+
+
+def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
+    metadata = retrieval_module.metadata_from_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Scalar Source\n"
+        "summary: Scalar source summary.\n"
+        "updated: 2026-06-09\n"
+        "source_raw_paths: raw/scalar.md\n"
+        "source_operation_ids: OP-SCALAR\n"
+        "---\n\n"
+        "# Scalar Source\n",
+        "wiki/concepts/Concept_Scalar_Source.md",
+    )
+
+    assert metadata is not None
+    assert metadata.source_raw_paths == ["raw/scalar.md"]
+    assert metadata.source_operation_ids == ["OP-SCALAR"]
+    assert not hasattr(retrieval_module, "frontmatter_list")
+    assert not hasattr(retrieval_module, "parse_frontmatter")
+    assert not hasattr(source_records_module, "frontmatter_list")
+    assert not hasattr(source_records_module, "parse_frontmatter")
+    assert not hasattr(pipeline_module, "parse_frontmatter")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:

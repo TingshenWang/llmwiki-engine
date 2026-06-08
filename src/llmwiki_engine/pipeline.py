@@ -18,12 +18,12 @@ from . import __version__
 from . import apply_guards as _apply_guards
 from . import draft_validation as _draft_validation
 from . import errors as _errors
+from . import frontmatter as _frontmatter
 from . import markdown_utils as _markdown_utils
 from . import open_questions as _open_questions
 from . import page_sections as _page_sections
 from . import section_merge as _section_merge
 from . import source_excerpt as _source_excerpt
-from . import source_records as _source_records
 from . import update_preservation as _update_preservation
 from . import wiki_markup as _wiki_markup
 from .events import EventLogger, format_duration
@@ -4356,7 +4356,7 @@ def source_anchor_signal(text: str, anchor: str) -> dict[str, Any]:
             "source_locator": "",
             "reason": "absent",
         }
-    frontmatter = _source_records.parse_frontmatter(text) or {}
+    frontmatter = _frontmatter.parse_frontmatter(text) or {}
     metadata_text = "\n".join(
         str(frontmatter.get(key) or "")
         for key in ["title", "description", "source", "author"]

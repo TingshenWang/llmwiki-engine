@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import errors as _errors
+from . import frontmatter as _frontmatter
 from .models import SourceDuplicateGuardArtifact
 from .profiles import safe_filename
 from .rendering import source_title_for_raw
-from .source_records import frontmatter_list, normalize_vault_path, scan_source_pages
+from .source_records import normalize_vault_path, scan_source_pages
 from .system_pages import format_markdown_table
 
 
@@ -46,12 +47,12 @@ def build_source_duplicate_guard_artifact(
         "source_prepared_hash": source_prepared_hash, "source_target_path": source_target_path,
     }
     for source_page, frontmatter in scan_source_pages(vault):
-        operation_ids = frontmatter_list(frontmatter, "source_operation_ids")
+        operation_ids = _frontmatter.frontmatter_list(frontmatter, "source_operation_ids")
         if operation_id in operation_ids:
             continue
-        raw_paths = [normalize_vault_path(value) for value in frontmatter_list(frontmatter, "source_raw_paths")]
-        raw_hashes = frontmatter_list(frontmatter, "source_raw_hashes")
-        prepared_hashes = frontmatter_list(frontmatter, "source_prepared_hashes")
+        raw_paths = [normalize_vault_path(value) for value in _frontmatter.frontmatter_list(frontmatter, "source_raw_paths")]
+        raw_hashes = _frontmatter.frontmatter_list(frontmatter, "source_raw_hashes")
+        prepared_hashes = _frontmatter.frontmatter_list(frontmatter, "source_prepared_hashes")
         if normalized_raw_path in raw_paths and source_raw_hash in raw_hashes:
             return SourceDuplicateGuardArtifact(
                 **base,
