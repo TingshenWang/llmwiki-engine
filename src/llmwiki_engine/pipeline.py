@@ -194,7 +194,13 @@ def run_simplified_ingest(
     raw_hash, raw_size = raw_ref(raw_path)
     operation_id = f"ING-{safe_timestamp()}-{slug or raw_path.stem}"
     store = RunStore(vault)
-    resolved_profile_name = resolve_vault_profile_name(vault, profile_name)
+    if profile_name:
+        resolved_profile_name = profile_name
+    else:
+        config = read_yaml(vault / ".llmwiki" / "config.yaml")
+        resolved_profile_name = config.get("profile")
+        if not isinstance(resolved_profile_name, str) or not resolved_profile_name:
+            raise _errors.PipelineError(".llmwiki/config.yaml profile must be a non-empty string.")
     profile = load_profile(vault / ".llmwiki" / "profiles" / resolved_profile_name)
     vault_config = read_vault_config(vault)
     effective_raw_prepare_policy = raw_prepare_policy or RawPreparePolicy.auto
@@ -2875,16 +2881,6 @@ def render_preparation_review(preparation: RawPreparationArtifact) -> str:
         "## 审核备注\n\n"
         f"{preparation.review_notes or '暂无审核备注。'}\n"
     )
-
-
-def resolve_vault_profile_name(vault: Path, profile_name: str | None) -> str:
-    if profile_name:
-        return profile_name
-    config = read_yaml(vault / ".llmwiki" / "config.yaml")
-    configured = config.get("profile")
-    if not isinstance(configured, str) or not configured:
-        raise _errors.PipelineError(".llmwiki/config.yaml profile must be a non-empty string.")
-    return configured
 
 
 def _structured_call(
