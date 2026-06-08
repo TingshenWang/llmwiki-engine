@@ -3230,9 +3230,6 @@ def complete_review_step(
     step.review_decision_ref = review_decision_ref
 
 
-# M3 helper implementations.
-
-
 def backfill_missing_candidate_resolution_items(
     artifact: CandidateResolutionArtifact,
     digest: SourceDigestArtifact,

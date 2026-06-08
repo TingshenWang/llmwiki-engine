@@ -9,17 +9,6 @@ SYSTEM_CONTRACT_ERROR = (
 )
 
 
-ZH_LABELS = {
-    "summary": "摘要",
-    "detail": "详情",
-    "examples": "例子",
-    "value_points": "价值点",
-    "additional_notes": "补充观察",
-    "related": "相关页面",
-    "open_questions": "矛盾与未决问题",
-}
-
-
 def ensure_system_pages(vault: Path) -> None:
     wiki = vault / "wiki"
     (wiki / "logs").mkdir(parents=True, exist_ok=True)
@@ -105,7 +94,7 @@ def render_index(
 
 def render_log_index(*, date: str, operation_id: str, source: str, existing_text: str | None = None) -> str:
     date_link = f"[[logs/{date}]]"
-    rows = _top_level_rows(existing_text)
+    rows = _table_rows(existing_text or "")
     merged = _upsert_log_index_row(rows, [date_link, "1", f"`{source}`"], source)
     table = format_markdown_table(["日期", "操作数", "来源"], merged or [[date_link, "1", f"`{source}`"]])
     return (
@@ -128,7 +117,7 @@ def render_daily_log(
     existing_text: str | None = None,
 ) -> str:
     rows = _upsert_rows(
-        _top_level_rows(existing_text),
+        _table_rows(existing_text or ""),
         [[f"`{operation_id}`", f"`{raw_path}`", str(created), str(updated), str(noop), str(needs_human)]],
     )
     table = format_markdown_table(["操作", "原始材料", "新建数", "实际更新数", "未改动数", "人工决策阻断数"], rows)
@@ -162,10 +151,6 @@ def _page_type_heading(page_type: str) -> str:
         "idea": "想法",
         "open_question": "未决问题页",
     }.get(page_type, page_type.replace("_", " ").title())
-
-
-def _top_level_rows(text: str | None) -> list[list[str]]:
-    return _table_rows(text or "")
 
 
 def _table_rows(text: str) -> list[list[str]]:
