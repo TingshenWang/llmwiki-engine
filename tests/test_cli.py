@@ -1026,7 +1026,7 @@ def test_providers_check_bad_yaml_reports_single_line_error(tmp_path: Path) -> N
     assert "Provider Check" not in result.output
 
 
-def test_providers_check_cli_redacts_fallback_failure(monkeypatch, tmp_path: Path) -> None:
+def test_providers_check_cli_redacts_live_json_mode_failure(monkeypatch, tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     config_path = vault / ".llmwiki" / "config.yaml"
@@ -1043,9 +1043,7 @@ def test_providers_check_cli_redacts_fallback_failure(monkeypatch, tmp_path: Pat
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        if len(seen) == 1:
-            return httpx.Response(422, json={"error": {"message": "json_object response_format unsupported"}})
-        raise httpx.ConnectError("fallback boom sk-cli-secret", request=request)
+        return httpx.Response(422, text="json_object response_format unsupported sk-cli-secret", request=request)
 
     def fake_check_providers(vault_path: Path, *, live: bool = False):
         return check_providers_impl(
@@ -1060,7 +1058,7 @@ def test_providers_check_cli_redacts_fallback_failure(monkeypatch, tmp_path: Pat
     result = runner.invoke(app, ["providers", "check", str(vault), "--live"])
 
     assert result.exit_code == 1
-    assert len(seen) == 2
+    assert len(seen) == 1
     assert "sk-cli-secret" not in result.output
     assert "[REDACTED]" in result.output
 

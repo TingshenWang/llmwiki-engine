@@ -127,8 +127,7 @@ providers:
 
 `max_retries` and `retry_backoff_seconds` are optional and only apply to
 `openai_compatible` ingest calls. `max_retries` is one shared transient retry
-budget per logical model call. JSON-mode compatibility fallback may add a
-prompt-only request and uses only the remaining retry budget. Retry covers
+budget per logical model call. Retry covers
 transient transport failures, 408/409/425/429, and 5xx-like responses, but does
 not retry ordinary bad requests.
 
@@ -258,9 +257,9 @@ uv run llmwiki providers check "$VAULT" --live
 
 - `temperature=0`
 - `max_tokens=512`
-- preferred `response_format={"type": "json_object"}`
+- sends `response_format={"type": "json_object"}`
 
-`max_tokens=512` is a completion cap, not a fixed cost. Thinking models usually stop earlier, but may consume up to that limit. If JSON mode is unsupported, the check falls back once with a prompt-only JSON probe and reports a warning if that succeeds. The live probe itself does not use transient retry, so provider checks stay quick. `temperature=0` does not promise deterministic behavior for every thinking model.
+`max_tokens=512` is a completion cap, not a fixed cost. Thinking models usually stop earlier, but may consume up to that limit. JSON mode support is required; unsupported JSON mode makes the live check fail, matching normal ingest behavior. The live probe itself does not use transient retry, so provider checks stay quick. `temperature=0` does not promise deterministic behavior for every thinking model.
 
 ## `llmwiki ingest run`
 

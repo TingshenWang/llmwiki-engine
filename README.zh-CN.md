@@ -75,11 +75,10 @@ llmwiki providers check /path/to/vault
 llmwiki providers check /path/to/vault --live
 ```
 
-`--live` 会发起一次小型 JSON-mode 真实模型探针；如果 API 明确不支持 JSON mode，
-则 fallback 一次到 prompt-only JSON probe，并给出 warning。它不会使用 transient
-retry。正式 ingest 调用会对 OpenAI-compatible provider 的超时、连接重置、408/409/425/429
+`--live` 会发起一次小型 JSON-mode 真实模型探针；如果 API 不支持 JSON mode，
+会直接失败，和正式 ingest 的 provider 契约保持一致。它不会使用 transient retry。
+正式 ingest 调用会对 OpenAI-compatible provider 的超时、连接重置、408/409/425/429
 和 5xx 做 transient retry；`max_retries` 是每个逻辑模型调用共享的一组
-retry budget。JSON-mode 兼容 fallback 可能额外增加一次 prompt-only 请求，但只使用剩余
 retry budget。
 
 Embedding 召回配置写在 `.llmwiki/config.json`，不写在 provider YAML 里。新 vault

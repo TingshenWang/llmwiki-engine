@@ -165,19 +165,17 @@ def test_openai_compatible_generate_raw_defaults_to_five_minute_timeout() -> Non
     assert "Arrays must contain JSON objects" in system_prompt
 
 
-def test_openai_compatible_generate_raw_falls_back_when_json_mode_is_unsupported() -> None:
+def test_openai_compatible_generate_raw_requires_json_mode() -> None:
     seen: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
         seen.append(body)
-        if len(seen) == 1:
-            return httpx.Response(
-                400,
-                json={"error": {"message": "response_format is not supported"}},
-                request=request,
-            )
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
+        return httpx.Response(
+            400,
+            json={"error": {"message": "response_format is not supported"}},
+            request=request,
+        )
 
     provider = OpenAICompatibleProvider(
         "model-test",
@@ -186,77 +184,13 @@ def test_openai_compatible_generate_raw_falls_back_when_json_mode_is_unsupported
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
-    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
-    assert len(seen) == 2
-    assert provider.last_http_attempt_count == 2
+    with pytest.raises(ProviderError, match="response_format is not supported") as exc:
+        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
+    assert exc.value.status_code == 400
+    assert exc.value.attempt_count == 1
+    assert len(seen) == 1
+    assert provider.last_http_attempt_count == 1
     assert seen[0]["response_format"] == {"type": "json_object"}
-    assert "response_format" not in seen[1]
-
-
-def test_openai_compatible_generate_raw_shares_retry_budget_with_json_mode_fallback() -> None:
-    seen: list[dict[str, object]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        seen.append(body)
-        if len(seen) == 1:
-            return httpx.Response(503, text="temporary overload", request=request)
-        if len(seen) == 2:
-            return httpx.Response(
-                400,
-                json={"error": {"message": "response_format is not supported"}},
-                request=request,
-            )
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
-
-    provider = OpenAICompatibleProvider(
-        "model-test",
-        "https://example.test/v1/chat/completions",
-        "secret-key",
-        max_retries=1,
-        retry_backoff_seconds=0,
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
-    assert len(seen) == 3
-    assert provider.last_http_attempt_count == 3
-    assert "response_format" in seen[0]
-    assert "response_format" in seen[1]
-    assert "response_format" not in seen[2]
-    assert "response_format" in seen[0]
-    assert "response_format" in seen[1]
-    assert "response_format" not in seen[2]
-
-
-def test_openai_compatible_generate_raw_allows_fallback_to_use_remaining_retry_budget() -> None:
-    seen: list[dict[str, object]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        seen.append(body)
-        if len(seen) == 1:
-            return httpx.Response(
-                400,
-                json={"error": {"message": "response_format is not supported"}},
-                request=request,
-            )
-        if len(seen) == 2:
-            return httpx.Response(503, text="temporary overload", request=request)
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]}, request=request)
-
-    provider = OpenAICompatibleProvider(
-        "model-test",
-        "https://example.test/v1/chat/completions",
-        "secret-key",
-        max_retries=1,
-        retry_backoff_seconds=0,
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    assert provider.generate_raw("source_digest", {}, SourceDigestArtifact) == '{"ok": true}'
-    assert len(seen) == 3
-    assert provider.last_http_attempt_count == 3
 
 
 def test_openai_compatible_generate_raw_resets_http_attempt_count_between_calls() -> None:
@@ -318,7 +252,7 @@ def test_structured_model_call_persists_http_attempt_count_for_provider_retry(tm
     assert attempt["http_attempt_count"] == 2
 
 
-def test_openai_compatible_generate_raw_does_not_fallback_after_transient_retry_exhaustion() -> None:
+def test_openai_compatible_generate_raw_keeps_json_mode_after_transient_retry_exhaustion() -> None:
     seen: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -338,41 +272,8 @@ def test_openai_compatible_generate_raw_does_not_fallback_after_transient_retry_
     with pytest.raises(ProviderError, match="after 2 attempts"):
         provider.generate_raw("source_digest", {}, SourceDigestArtifact)
     assert len(seen) == 2
+    assert provider.last_http_attempt_count == 2
     assert all("response_format" in body for body in seen)
-
-
-def test_openai_compatible_generate_raw_combines_attempts_when_fallback_fails() -> None:
-    seen: list[dict[str, object]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        seen.append(body)
-        if len(seen) == 1:
-            return httpx.Response(503, text="temporary overload", request=request)
-        if len(seen) == 2:
-            return httpx.Response(
-                400,
-                json={"error": {"message": "response_format is not supported"}},
-                request=request,
-            )
-        return httpx.Response(503, text="fallback overloaded", request=request)
-
-    provider = OpenAICompatibleProvider(
-        "model-test",
-        "https://example.test/v1/chat/completions",
-        "secret-key",
-        max_retries=1,
-        retry_backoff_seconds=0,
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    with pytest.raises(ProviderError) as exc:
-        provider.generate_raw("source_digest", {}, SourceDigestArtifact)
-    assert len(seen) == 3
-    assert exc.value.status_code == 503
-    assert exc.value.attempt_count == 3
-    assert str(exc.value).endswith("(after 3 attempts)")
-    assert str(exc.value).count("after") == 1
 
 
 def test_openai_compatible_generate_raw_retries_transient_http_error() -> None:
@@ -614,24 +515,6 @@ def test_structured_model_call_accepts_current_field_names(tmp_path: Path) -> No
     assert result.json_repair_applied is False
     report = json.loads((tmp_path / "structured_repair_report.json").read_text(encoding="utf-8"))
     assert report["repair_count"] == 0
-
-
-def test_openai_compatible_live_check_can_skip_json_mode() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["body"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
-
-    provider = OpenAICompatibleProvider(
-        "model-test",
-        "https://example.test/v1/chat/completions",
-        "secret-key",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    assert provider.check_live(use_json_mode=False) == '{"ok": true}'
-    assert "response_format" not in seen["body"]
 
 
 def test_structured_model_call_redacts_provider_result(tmp_path: Path) -> None:

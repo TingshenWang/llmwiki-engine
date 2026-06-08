@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from email.utils import parsedate_to_datetime
 from random import random
 import time
@@ -18,7 +17,6 @@ DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES = 2
 DEFAULT_OPENAI_COMPATIBLE_RETRY_BACKOFF_SECONDS = 1.0
 OPENAI_COMPATIBLE_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS = 30.0
-RETRY_ATTEMPT_SUFFIX_RE = re.compile(r" \(after \d+ attempts?\)$")
 
 
 class ProviderError(RuntimeError):
@@ -108,34 +106,13 @@ class OpenAICompatibleProvider:
         }
         try:
             data = self._post_chat(body)
-            self.last_http_attempt_count = max(1, self._last_post_chat_attempt_count)
-            return _extract_openai_compatible_content(data)
         except ProviderError as exc:
-            primary_attempts = max(1, exc.attempt_count, self._last_post_chat_attempt_count)
-            self.last_http_attempt_count = primary_attempts
-            if not _is_json_mode_unsupported(exc):
-                raise
-            body_without_json_mode = dict(body)
-            body_without_json_mode.pop("response_format", None)
-            consumed_retry_budget = max(0, primary_attempts - 1)
-            fallback_retries = max(0, self.max_retries - consumed_retry_budget)
-            try:
-                data = self._post_chat(body_without_json_mode, max_retries=fallback_retries)
-                fallback_attempts = max(1, self._last_post_chat_attempt_count)
-                self.last_http_attempt_count = primary_attempts + fallback_attempts
-                return _extract_openai_compatible_content(data)
-            except ProviderError as fallback_exc:
-                fallback_attempts = max(1, fallback_exc.attempt_count, self._last_post_chat_attempt_count)
-                combined_attempts = primary_attempts + fallback_attempts
-                self.last_http_attempt_count = combined_attempts
-                message = _retry_exhausted_message(_strip_retry_attempt_suffix(str(fallback_exc)), combined_attempts)
-                raise ProviderError(
-                    message,
-                    status_code=fallback_exc.status_code,
-                    attempt_count=combined_attempts,
-                ) from fallback_exc
+            self.last_http_attempt_count = max(1, exc.attempt_count, self._last_post_chat_attempt_count)
+            raise
+        self.last_http_attempt_count = max(1, self._last_post_chat_attempt_count)
+        return _extract_openai_compatible_content(data)
 
-    def check_live(self, *, use_json_mode: bool = True) -> str:
+    def check_live(self) -> str:
         body = {
             "model": self.model,
             "messages": [
@@ -144,9 +121,8 @@ class OpenAICompatibleProvider:
             ],
             "temperature": 0,
             "max_tokens": 512,
+            "response_format": {"type": "json_object"},
         }
-        if use_json_mode:
-            body["response_format"] = {"type": "json_object"}
         return _extract_openai_compatible_content(self._post_chat(body, timeout=20.0, max_retries=0))
 
     def _post_chat(
@@ -285,23 +261,6 @@ def _extract_openai_compatible_content(data: dict[str, Any]) -> str:
     raise ProviderError("OpenAI-compatible message content must be text.")
 
 
-def _is_json_mode_unsupported(exc: ProviderError) -> bool:
-    if exc.status_code not in {400, 422}:
-        return False
-    message = str(exc).lower()
-    json_mode_terms = ("response_format", "json_object", "json mode")
-    unsupported_terms = (
-        "unsupported",
-        "not support",
-        "does not support",
-        "unrecognized",
-        "unknown parameter",
-        "invalid parameter",
-        "not allowed",
-    )
-    return any(term in message for term in json_mode_terms) and any(term in message for term in unsupported_terms)
-
-
 def _is_transient_httpx_error(exc: httpx.HTTPError) -> bool:
     return isinstance(
         exc,
@@ -320,10 +279,6 @@ def _retry_exhausted_message(message: str, attempts: int) -> str:
     if attempts <= 1:
         return message
     return f"{message} (after {attempts} attempts)"
-
-
-def _strip_retry_attempt_suffix(message: str) -> str:
-    return RETRY_ATTEMPT_SUFFIX_RE.sub("", message)
 
 
 def _retry_delay_seconds(

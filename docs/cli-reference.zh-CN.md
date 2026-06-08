@@ -127,8 +127,7 @@ providers:
 
 `max_retries` 和 `retry_backoff_seconds` 是可选项，只对 `openai_compatible`
 的正式 ingest 调用生效。`max_retries` 是每个逻辑模型调用共享的一组 transient retry
-budget；JSON-mode 兼容 fallback 可能额外增加一次 prompt-only 请求，但只使用剩余
-retry budget。retry 只覆盖 transient transport failure、408/409/425/429 和 5xx 类响应，不会
+budget。retry 只覆盖 transient transport failure、408/409/425/429 和 5xx 类响应，不会
 重试普通 bad request。
 
 API key 允许明文保存在本地 config 中，但不会写入 manifest、events、provider_result、status JSON、applied receipt 或 CLI 输出。
@@ -258,11 +257,11 @@ uv run llmwiki providers check "$VAULT" --live
 
 - `temperature=0`
 - `max_tokens=512`
-- 优先使用 `response_format={"type": "json_object"}`
+- 发送 `response_format={"type": "json_object"}`
 
 `max_tokens=512` 是 completion 上限，不代表固定消耗；thinking 模型通常会提前停止，
-但最多可能用到这个上限。JSON mode 不支持时，会 fallback 一次到 prompt-only JSON probe，
-通过后仍会给 warning。live probe 本身不使用 transient retry，所以 provider 检查仍然保持轻量。
+但最多可能用到这个上限。JSON mode 是必需能力；不支持 JSON mode 会让 live check 失败，
+和正式 ingest 行为保持一致。live probe 本身不使用 transient retry，所以 provider 检查仍然保持轻量。
 `temperature=0` 也不承诺所有 thinking 模型都完全确定性。
 
 ## `llmwiki ingest run`

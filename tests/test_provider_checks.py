@@ -165,7 +165,7 @@ def test_providers_check_reports_tracked_llmwiki_in_parent_git_repo(tmp_path: Pa
         lambda request: httpx.ReadTimeout("timeout sk-live-secret", request=request),
     ],
 )
-def test_providers_check_live_does_not_fallback_for_network_errors_and_redacts(
+def test_providers_check_live_reports_network_errors_and_redacts(
     tmp_path: Path, exception_factory
 ) -> None:
     vault = tmp_path / "vault"
@@ -245,7 +245,7 @@ def test_providers_check_live_reports_invalid_responses(tmp_path: Path, body, me
     assert any(message in error for error in result.errors)
 
 
-def test_providers_check_live_falls_back_when_json_mode_is_unsupported(tmp_path: Path) -> None:
+def test_providers_check_live_fails_when_json_mode_is_unsupported(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault)
     _write_default_openai_config(vault)
@@ -254,34 +254,7 @@ def test_providers_check_live_falls_back_when_json_mode_is_unsupported(tmp_path:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
         seen.append(body)
-        if len(seen) == 1:
-            return httpx.Response(400, json={"error": {"message": "response_format is not supported"}})
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
-
-    result = check_providers(
-        vault,
-        live=True,
-        http_client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    assert result.ok
-    assert len(seen) == 2
-    assert seen[0]["response_format"] == {"type": "json_object"}
-    assert "response_format" not in seen[1]
-    assert any("prompt-only JSON live check" in warning for warning in result.warnings)
-
-
-def test_providers_check_live_reports_fallback_failure_redacted(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault)
-    _write_default_openai_config(vault)
-    seen: list[dict] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(json.loads(request.content.decode("utf-8")))
-        if len(seen) == 1:
-            return httpx.Response(422, json={"error": {"message": "json_object response_format unsupported"}})
-        raise httpx.ConnectError("fallback boom sk-live-secret", request=request)
+        return httpx.Response(400, json={"error": {"message": "response_format is not supported"}})
 
     result = check_providers(
         vault,
@@ -290,14 +263,38 @@ def test_providers_check_live_reports_fallback_failure_redacted(tmp_path: Path) 
     )
 
     assert not result.ok
-    assert len(seen) == 2
+    assert len(seen) == 1
+    assert seen[0]["response_format"] == {"type": "json_object"}
+    assert any("response_format is not supported" in error for error in result.errors)
+
+
+def test_providers_check_live_redacts_json_mode_failure(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    _write_default_openai_config(vault)
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(422, text="json_object response_format unsupported sk-live-secret", request=request)
+
+    result = check_providers(
+        vault,
+        live=True,
+        http_client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert not result.ok
+    assert len(seen) == 1
+    assert "sk-live-secret" not in "\n".join(result.errors)
+    assert any("[REDACTED]" in error for error in result.errors)
+
     rendered = json.dumps(result, default=lambda item: item.__dict__, ensure_ascii=False)
     assert "sk-live-secret" not in rendered
     assert "[REDACTED]" in rendered
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 429, 500])
-def test_providers_check_live_does_not_fallback_for_non_json_mode_errors(
+def test_providers_check_live_reports_non_json_mode_errors(
     tmp_path: Path, status_code: int
 ) -> None:
     vault = tmp_path / "vault"
@@ -324,7 +321,7 @@ def test_providers_check_live_does_not_fallback_for_non_json_mode_errors(
     assert "sk-live-secret" not in rendered
 
 
-def test_providers_check_live_does_not_fallback_for_plain_response_format_400(tmp_path: Path) -> None:
+def test_providers_check_live_reports_plain_response_format_400(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault)
     _write_default_openai_config(vault)

@@ -84,13 +84,12 @@ llmwiki providers check /path/to/vault
 llmwiki providers check /path/to/vault --live
 ```
 
-`--live` sends a small JSON-mode real-model probe, then falls back once to a
-prompt-only JSON probe with a warning when JSON mode is clearly unsupported. It
-does not use transient retry. Normal ingest calls retry transient
+`--live` sends a small JSON-mode real-model probe and fails when JSON mode is not
+supported, matching the normal ingest provider contract. It does not use
+transient retry. Normal ingest calls retry transient
 OpenAI-compatible provider failures such as timeouts, connection resets, 429,
 408/409/425, and 5xx responses; `max_retries` is one shared transient retry
-budget per logical model call. JSON-mode compatibility fallback may add a
-prompt-only request and uses only the remaining retry budget.
+budget per logical model call.
 
 Embedding retrieval is configured in `.llmwiki/config.json`, not provider YAML.
 New vaults default to local CPU `sentence_transformers` with
