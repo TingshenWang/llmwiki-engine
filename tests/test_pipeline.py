@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
+import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.run_metrics as run_metrics_module
 import llmwiki_engine.steps as steps_module
@@ -33,7 +34,9 @@ from llmwiki_engine.models import (
     CandidateContextHit,
     CandidateContextItem,
     CandidateContextsArtifact,
+    DraftGroundingReview,
     DraftRenderingArtifact,
+    GroundingClaim,
     OperationStatus,
     RawPreparePolicy,
     SourceBasis,
@@ -618,6 +621,10 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(source_records_module, "frontmatter_list")
     assert not hasattr(source_records_module, "parse_frontmatter")
     assert not hasattr(pipeline_module, "parse_frontmatter")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_GROUNDING_RISK_RULES")
+    assert not hasattr(pipeline_module, "build_draft_grounding_review")
+    assert not hasattr(pipeline_module, "quote_supported_by_text")
+    assert not hasattr(pipeline_module, "render_draft_grounding_review")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -3912,7 +3919,7 @@ def test_draft_aux_report_writes_only_when_active(tmp_path: Path) -> None:
             "rewrite_count": 0,
             "pages": [],
         },
-        renderer=pipeline_module.render_grounding_paraphrase_rewrite_report,
+        renderer=draft_grounding.render_grounding_paraphrase_rewrite_report,
         count_keys=["rewrite_count"],
     )
 
@@ -3927,15 +3934,36 @@ def test_draft_aux_report_writes_only_when_active(tmp_path: Path) -> None:
             "schema_version": "grounding_paraphrase_rewrite_report.v1",
             "changed": False,
             "rewrite_count": 1,
-            "pages": [],
+            "pages": [
+                {
+                    "page_plan_id": "PP-1",
+                    "target_path": "concepts/Concept_Test.md",
+                    "fields": [
+                        {
+                            "field": "summary",
+                            "rewrites": [
+                                {
+                                    "original_quote": "旧引号短语",
+                                    "replacement": "改成来源内表述",
+                                    "source_sentence": "来源里有这一句。",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
         },
-        renderer=pipeline_module.render_grounding_paraphrase_rewrite_report,
+        renderer=draft_grounding.render_grounding_paraphrase_rewrite_report,
         count_keys=["rewrite_count"],
     )
 
     assert written is not None
     assert (output_dir / "grounding_paraphrase_rewrite_report.json").exists()
     assert (output_dir / "grounding_paraphrase_rewrite_report.md").exists()
+    markdown = (output_dir / "grounding_paraphrase_rewrite_report.md").read_text(encoding="utf-8")
+    assert "旧引号短语" in markdown
+    assert "改成来源内表述" in markdown
+    assert "summary" in markdown
 
 
 def test_merge_update_section_absorbs_live_brain_hands_summary_across_sections() -> None:
@@ -4959,7 +4987,7 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
 
     assert extracted is not None
     assert "ABC123" in extracted.pages[0].body_markdown
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         extracted,
         plan.model_copy(update={"items": [ok_item]}),
         snapshot,
@@ -5524,14 +5552,14 @@ def test_cleanup_open_question_unsupported_scope_claims_moves_fact_to_question()
         ]
     )
 
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "记忆召回结果需要确认。")
-    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "记忆召回结果需要确认。")
+    cleaned, report = draft_grounding.cleanup_open_question_unsupported_scope_claims(
         draft,
         plan,
         snapshot,
         "记忆召回结果需要确认。",
     )
-    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
+    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
 
     assert review_before.requires_review is False
     assert review_before.warnings
@@ -5540,7 +5568,7 @@ def test_cleanup_open_question_unsupported_scope_claims_moves_fact_to_question()
     assert report["relocation_count"] == 0
     assert not review_after.requires_review
 
-    cleaned_again, report_again = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+    cleaned_again, report_again = draft_grounding.cleanup_open_question_unsupported_scope_claims(
         cleaned,
         plan,
         snapshot,
@@ -5585,7 +5613,7 @@ def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
         ]
     )
 
-    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+    cleaned, report = draft_grounding.cleanup_open_question_unsupported_scope_claims(
         draft,
         plan,
         snapshot,
@@ -5598,7 +5626,7 @@ def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
     assert report["relocation_count"] == 0
     assert "导致错误响应" in page.body_markdown
     assert page.open_questions.count(duplicate_question) == 1
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
 
 
 def test_cleanup_open_question_scope_claim_uses_reason_marker_after_sentence_split() -> None:
@@ -5635,8 +5663,8 @@ def test_cleanup_open_question_scope_claim_uses_reason_marker_after_sentence_spl
         ]
     )
 
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "记忆召回结果需要确认。")
-    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "记忆召回结果需要确认。")
+    cleaned, report = draft_grounding.cleanup_open_question_unsupported_scope_claims(
         draft,
         plan,
         snapshot,
@@ -5648,7 +5676,7 @@ def test_cleanup_open_question_scope_claim_uses_reason_marker_after_sentence_spl
     assert cleaned == draft
     assert report["changed"] is False
     assert report["relocation_count"] == 0
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
 
 
 def test_open_question_scope_cleanup_claim_requires_reason_marker_in_text() -> None:
@@ -5663,7 +5691,7 @@ def test_open_question_scope_cleanup_claim_requires_reason_marker_in_text() -> N
         section_plans={"summary": "摘要"},
         reason="test",
     )
-    claim = pipeline_module.GroundingClaim(
+    claim = GroundingClaim(
         page_plan_id="PP-OQ",
         target_path="open_questions/Open_Question_记忆准确性.md",
         section_key="examples",
@@ -5674,7 +5702,7 @@ def test_open_question_scope_cleanup_claim_requires_reason_marker_in_text() -> N
         reason="新增影响范围/受影响对象推测 `涉及` 未被 raw 或 inspected wiki 同句级支撑；请删除该推测。",
     )
 
-    assert not pipeline_module.open_question_scope_cleanup_claim(claim, item)
+    assert not draft_grounding.open_question_scope_cleanup_claim(claim, item)
 
 
 def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts() -> None:
@@ -5710,7 +5738,7 @@ def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts(
         ]
     )
 
-    cleaned, report = pipeline_module.cleanup_open_question_unsupported_scope_claims(
+    cleaned, report = draft_grounding.cleanup_open_question_unsupported_scope_claims(
         draft,
         plan,
         snapshot,
@@ -5719,7 +5747,7 @@ def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts(
 
     assert cleaned == draft
     assert report["changed"] is False
-    review = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
+    review = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。")
     assert review.requires_review is False
     assert review.warnings
 
@@ -7619,7 +7647,7 @@ def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts()
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(draft, pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]), snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]), snapshot, "")
 
     assert review.requires_review is False
     assert {claim.claim_type for claim in review.claims} == {"inference"}
@@ -7670,9 +7698,9 @@ def build_examples_grounding_case(
     return draft, plan, snapshot
 
 
-def build_examples_grounding_review(examples: str) -> pipeline_module.DraftGroundingReview:
+def build_examples_grounding_review(examples: str) -> DraftGroundingReview:
     draft, plan, snapshot = build_examples_grounding_case(examples)
-    return pipeline_module.build_draft_grounding_review(
+    return draft_grounding.build_draft_grounding_review(
         draft,
         plan,
         snapshot,
@@ -7696,16 +7724,16 @@ def test_grounding_examples_allow_user_preference_placeholder() -> None:
 
 def test_cleanup_unsupported_example_literals_replaces_identifier_placeholder() -> None:
     draft, plan, snapshot = build_examples_grounding_case("- 例如可以用 “ABC123” 表示一个构建编号。")
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
         "",
         review=review_before,
     )
-    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
+    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "")
 
     assert review_before.requires_review is False
     assert [claim.text for claim in review_before.warnings] == ["ABC123"]
@@ -7717,9 +7745,9 @@ def test_cleanup_unsupported_example_literals_replaces_identifier_placeholder() 
 
 def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder() -> None:
     draft, plan, snapshot = build_examples_grounding_case("- 例子里的时间可以写成 “2025年第三季度”。")
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7730,14 +7758,14 @@ def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder()
     assert report["changed"] is False
     assert report["replacement_count"] == 0
     assert "2025年第三季度" in cleaned.pages[0].body_markdown
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 def test_cleanup_unsupported_example_literals_replaces_user_id_leaf_placeholder() -> None:
     draft, plan, snapshot = build_examples_grounding_case('- 示例用户参数可以写成 “user123”。')
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7748,14 +7776,14 @@ def test_cleanup_unsupported_example_literals_replaces_user_id_leaf_placeholder(
     assert cleaned == draft
     assert report["changed"] is False
     assert report["replacement_count"] == 0
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() -> None:
     draft, plan, snapshot = build_examples_grounding_case('- `recall("张三的工单 1234")`')
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7766,14 +7794,14 @@ def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() ->
     assert cleaned == draft
     assert report["changed"] is False
     assert report["replacement_count"] == 0
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 def test_cleanup_unsupported_example_literals_preserves_inline_command_syntax() -> None:
     draft, plan, snapshot = build_examples_grounding_case('- `mem0 add --user-id "user123" --text "用户喜欢蓝色"`')
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7784,7 +7812,7 @@ def test_cleanup_unsupported_example_literals_preserves_inline_command_syntax() 
     assert cleaned == draft
     assert report["changed"] is False
     assert report["replacement_count"] == 0
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
@@ -7792,9 +7820,9 @@ def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
         "- 例子区没有具体值。",
         detail="详情里出现 “ABC123” 时仍应交给 grounding review。",
     )
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7805,7 +7833,7 @@ def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
     assert cleaned == draft
     assert report["changed"] is False
     assert report["skipped_count"] == 0
-    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
+    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "")
     assert review_after.requires_review is False
     assert review_after.warnings
 
@@ -7813,9 +7841,9 @@ def test_cleanup_unsupported_example_literals_does_not_touch_detail() -> None:
 def test_cleanup_unsupported_example_literals_keeps_source_supported_literal() -> None:
     draft, plan, snapshot = build_examples_grounding_case("- 来源里的构建编号是 “ABC123”。")
     approved_raw = "本段来源明确提到构建编号 ABC123。"
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7830,9 +7858,9 @@ def test_cleanup_unsupported_example_literals_keeps_source_supported_literal() -
 
 def test_cleanup_unsupported_example_literals_skips_repeated_literals() -> None:
     draft, plan, snapshot = build_examples_grounding_case("- “ABC123” 和 “ABC123” 都是具体构建编号。")
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7847,9 +7875,9 @@ def test_cleanup_unsupported_example_literals_skips_repeated_literals() -> None:
 
 def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> None:
     draft, plan, snapshot = build_examples_grounding_case("- “销量增长三倍” 不是安全的示例占位符。")
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7860,7 +7888,7 @@ def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> Non
     assert cleaned == draft
     assert report["changed"] is False
     assert report["skipped"] == []
-    assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
+    assert not draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
 @pytest.mark.parametrize(
@@ -7881,9 +7909,9 @@ def test_cleanup_unsupported_example_literals_skips_metric_outcome_fact() -> Non
 )
 def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case(f"- “{literal}” 不应被整体替成占位符。")
-    review_before = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review_before = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    cleaned, report = pipeline_module.cleanup_unsupported_example_literals(
+    cleaned, report = draft_grounding.cleanup_unsupported_example_literals(
         draft,
         plan,
         snapshot,
@@ -7893,7 +7921,7 @@ def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal:
 
     assert cleaned == draft
     assert report["changed"] is False
-    review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
+    review_after = draft_grounding.build_draft_grounding_review(cleaned, plan, snapshot, "")
     assert report["skipped"] == []
     assert not review_after.requires_review
 
@@ -7956,7 +7984,7 @@ def test_grounding_detail_sensitive_dynamic_query_does_not_block_ingest() -> Non
         "暂无相关例子记录。",
         detail="语义缓存可以处理常见问题，例如“忘记密码怎么办”。",
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8012,7 +8040,7 @@ def test_grounding_detail_sensitive_dynamic_query_does_not_block_ingest() -> Non
 )
 def test_grounding_detail_memory_examples_sensitive_dynamic_queries_do_not_block_ingest(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8034,7 +8062,7 @@ def test_grounding_body_markdown_sensitive_dynamic_query_does_not_block_ingest()
             )
         ]
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8067,7 +8095,7 @@ def test_grounding_body_markdown_high_risk_domain_advice_does_not_block_ingest(
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8091,7 +8119,7 @@ def test_grounding_body_markdown_high_risk_domain_advice_allows_source_supported
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, sentence)
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, sentence)
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8114,7 +8142,7 @@ def test_grounding_open_questions_high_risk_domain_gap_is_not_blocked_as_fact() 
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
 
@@ -8136,7 +8164,7 @@ def test_grounding_low_risk_open_question_quote_warns_without_review() -> None:
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == ["AGI后PM是否必要？"]
@@ -8159,7 +8187,7 @@ def test_grounding_low_risk_body_quote_warns_without_review() -> None:
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == ["好的产品判断往往来自长期实践中形成的经验直觉"]
@@ -8189,7 +8217,7 @@ def test_grounding_severe_factual_relationship_quote_warns_without_raw_contradic
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == [expected]
@@ -8219,7 +8247,7 @@ def test_grounding_severe_factual_relationship_unquoted_warns_without_raw_contra
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == [expected]
@@ -8241,7 +8269,7 @@ def test_grounding_severe_factual_relationship_quote_warning_is_not_duplicated_b
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == ["OpenAI 收购了 Anthropic"]
@@ -8263,7 +8291,7 @@ def test_grounding_severe_factual_relationship_blocks_when_raw_contradicts() -> 
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 收购了 OpenAI。")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 收购了 OpenAI。")
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic。"]
@@ -8286,7 +8314,7 @@ def test_grounding_scans_body_markdown_heading_text_for_contradictions() -> None
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 收购了 OpenAI。")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 收购了 OpenAI。")
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic"]
@@ -8309,7 +8337,7 @@ def test_grounding_role_relationship_blocks_when_raw_names_different_org() -> No
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Sam Altman 担任 OpenAI CEO。")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "Sam Altman 担任 OpenAI CEO。")
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["Sam Altman 担任 Anthropic CEO。"]
@@ -8331,7 +8359,7 @@ def test_grounding_severe_factual_relationship_blocks_explicit_raw_negation() ->
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "OpenAI 没有收购 Anthropic。")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "OpenAI 没有收购 Anthropic。")
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic。"]
@@ -8353,7 +8381,7 @@ def test_grounding_creator_relationship_blocks_same_object_different_creator() -
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 创建了 Claude。")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 创建了 Claude。")
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 创建了 Claude。"]
@@ -8375,7 +8403,7 @@ def test_grounding_release_relationship_same_subject_different_object_only_warns
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "OpenAI 发布了 ChatGPT。")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "OpenAI 发布了 ChatGPT。")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8410,7 +8438,7 @@ def test_grounding_by_actor_relationship_blocks_same_object_different_actor(
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == [expected]
@@ -8442,7 +8470,7 @@ def test_grounding_active_passive_paraphrase_does_not_count_as_raw_contradiction
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8465,7 +8493,7 @@ def test_grounding_severe_factual_relationship_unquoted_allows_source_supported_
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, sentence)
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, sentence)
 
     assert review.requires_review is False
     assert [claim.action for claim in review.claims if claim.text == sentence] == ["kept"]
@@ -8495,7 +8523,7 @@ def test_grounding_weak_technical_relationships_do_not_require_review(body_markd
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8528,7 +8556,7 @@ def test_grounding_wiki_operation_create_and_question_flow_do_not_require_review
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8558,7 +8586,7 @@ def test_grounding_technical_support_capabilities_do_not_require_review(body_mar
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8598,7 +8626,7 @@ def test_grounding_qwen_agent_technical_documentation_does_not_require_review(bo
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8612,7 +8640,7 @@ def test_grounding_allows_placeholder_api_key_in_configuration_example() -> None
             "`{'model': 'qwen3-32b', 'model_type': 'qwen_dashscope', 'api_key': '<DASHSCOPE_API_KEY>'}`。"
         ),
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
 
@@ -8622,7 +8650,7 @@ def test_grounding_blocks_real_api_key_literal_in_configuration_example() -> Non
         "暂无相关例子记录。",
         detail="示例配置里写了 api_key: sk-live-secret-value。",
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8637,7 +8665,7 @@ def test_grounding_blocks_real_api_key_literal_in_configuration_example() -> Non
 )
 def test_grounding_placeholder_secret_does_not_hide_real_secret(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8671,7 +8699,7 @@ def test_grounding_real_create_and_propose_relationships_warn_without_raw_contra
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8698,7 +8726,7 @@ def test_grounding_security_sandbox_advice_does_not_require_review() -> None:
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8720,7 +8748,7 @@ def test_grounding_quote_uses_sentence_context_without_blocking_high_risk_domain
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8755,7 +8783,7 @@ def test_grounding_high_risk_domain_meta_statements_do_not_require_review(body_m
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8797,14 +8825,14 @@ def test_grounding_high_risk_domain_actionable_can_statements_do_not_block_inges
         ]
     )
 
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
 
 
 def test_render_draft_grounding_review_shows_warning_section() -> None:
-    claim = pipeline_module.GroundingClaim(
+    claim = GroundingClaim(
         page_plan_id="PP-WARN",
         target_path="concepts/Concept_Warn.md",
         section_key="detail",
@@ -8814,9 +8842,9 @@ def test_render_draft_grounding_review_shows_warning_section() -> None:
         action="warn",
         reason="低风险未支撑引号内容仅记录为 warning，不阻塞自动 ingest；如需严谨可人工回看来源。",
     )
-    review = pipeline_module.DraftGroundingReview(warnings=[claim], claims=[claim], requires_review=False)
+    review = DraftGroundingReview(warnings=[claim], claims=[claim], requires_review=False)
 
-    markdown = pipeline_module.render_draft_grounding_review(review)
+    markdown = draft_grounding.render_draft_grounding_review(review)
 
     assert "- 结果：通过，有非阻塞提醒" in markdown
     assert "- 非阻塞提醒数量：1" in markdown
@@ -8848,7 +8876,7 @@ def test_render_draft_grounding_review_shows_warning_section() -> None:
 )
 def test_grounding_detail_unquoted_dynamic_user_scenarios_do_not_block_ingest(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8866,7 +8894,7 @@ def test_grounding_sensitive_dynamic_query_passes_when_source_supported() -> Non
         "暂无相关例子记录。",
         detail="客服文档原文示例是“忘记密码怎么办”。",
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "忘记密码怎么办")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "忘记密码怎么办")
 
     assert review.requires_review is False
     assert any(claim.text == "忘记密码怎么办" and claim.support == "raw" for claim in review.claims)
@@ -8886,7 +8914,7 @@ def test_grounding_sensitive_dynamic_query_short_quote_passes_when_source_suppor
         "暂无相关例子记录。",
         detail=detail,
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, raw)
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, raw)
 
     assert review.requires_review is False
     assert any(claim.text == raw and claim.support == "raw" for claim in review.claims)
@@ -8895,7 +8923,7 @@ def test_grounding_sensitive_dynamic_query_short_quote_passes_when_source_suppor
 def test_grounding_unquoted_dynamic_user_scenario_passes_when_source_supported() -> None:
     detail = "例如，在 AI 代理的客服场景中，用户反复询问与某个订单状态相关的相似问题时，语义缓存可识别语义相似性。"
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, detail)
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, detail)
 
     assert review.requires_review is False
     assert review.unsupported_new_facts == []
@@ -8941,7 +8969,7 @@ def test_grounding_examples_still_allow_safe_technical_query_template_after_sens
 )
 def test_grounding_detail_allows_safe_technical_troubleshooting_queries(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
 
@@ -8959,7 +8987,7 @@ def test_grounding_unquoted_dynamic_scenario_scanner_ignores_open_questions_sect
     draft = draft.model_copy(
         update={"pages": [page.model_copy(update={"open_questions": "- 待补来源：用户订单状态场景是否适合语义缓存？"})]}
     )
-    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
+    review = draft_grounding.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
 
@@ -9186,7 +9214,7 @@ def test_grounding_examples_hard_facts_warn_without_support() -> None:
         ],
     )
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9241,7 +9269,7 @@ def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match()
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9289,7 +9317,7 @@ def test_grounding_memory_example_questions_do_not_require_raw_exact_match() -> 
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9340,7 +9368,7 @@ def test_grounding_detail_memory_examples_do_not_require_raw_exact_match() -> No
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9394,7 +9422,7 @@ def test_grounding_short_concept_phrases_do_not_require_raw_exact_match() -> Non
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9443,7 +9471,7 @@ def test_grounding_short_concept_phrases_in_body_markdown_do_not_require_raw_exa
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9493,7 +9521,7 @@ def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
         ],
     )
     raw = "Cat Wu指出，评估的重要性因功能而异。"
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9508,7 +9536,7 @@ def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
 
 
 def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None:
-    claim = pipeline_module.GroundingClaim(
+    claim = GroundingClaim(
         page_plan_id="PP-REDIS",
         target_path="concepts/Concept_Redis.md",
         section_key="detail",
@@ -9519,7 +9547,7 @@ def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None
         reason="新增外部背书/强事实标记 `广泛使用` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
     )
 
-    message = pipeline_module.grounding_issue_message(claim)
+    message = draft_grounding.grounding_issue_message(claim)
 
     assert "非阻塞提醒" in message
     assert "adoption/authority 表达最好有来源意识" in message
@@ -9528,7 +9556,7 @@ def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None
 
 
 def test_grounding_external_backing_issue_message_neutralizes_open_question_premise() -> None:
-    claim = pipeline_module.GroundingClaim(
+    claim = GroundingClaim(
         page_plan_id="PP-SEARCH",
         target_path="open_questions/Open_Question_混合搜索策略.md",
         section_key="open_questions",
@@ -9539,7 +9567,7 @@ def test_grounding_external_backing_issue_message_neutralizes_open_question_prem
         reason="新增外部背书/强事实标记 `公认` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
     )
 
-    message = pipeline_module.grounding_issue_message(claim)
+    message = draft_grounding.grounding_issue_message(claim)
 
     assert "中性的 `待补来源` 问题" in message
     assert "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提" in message
@@ -9613,7 +9641,7 @@ def test_grounding_external_backing_detects_adoption_and_best_practice_real_path
     )
     raw = "Redis 可以作为缓存和消息代理使用。材料讨论了混合搜索与向量搜索的融合策略需要继续验证。"
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[concept_item, question_item]),
         snapshot,
@@ -9682,7 +9710,7 @@ def test_grounding_external_backing_quote_only_detail_does_not_bypass_as_concept
         ],
     )
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9732,7 +9760,7 @@ def test_grounding_external_backing_supported_quote_does_not_hide_later_unsuppor
         ],
     )
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9794,7 +9822,7 @@ def test_grounding_external_backing_supported_quote_does_not_hide_different_late
         ],
     )
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9843,7 +9871,7 @@ def test_grounding_external_backing_does_not_flag_internal_multiple_components()
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9855,7 +9883,7 @@ def test_grounding_external_backing_does_not_flag_internal_multiple_components()
 
 
 def test_grounding_external_backing_still_flags_multiple_community_claim() -> None:
-    assert pipeline_module.unsupported_backing_marker("该方案被多个社区引用。") == "被多个"
+    assert draft_grounding.unsupported_backing_marker("该方案被多个社区引用。") == "被多个"
 
 
 def test_grounding_flags_unsupported_scope_speculation() -> None:
@@ -9897,7 +9925,7 @@ def test_grounding_flags_unsupported_scope_speculation() -> None:
     )
     raw = "Claude Code 的源代码泄露被归因于人为错误。Cowork 是另一款知识工作产品。"
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9951,7 +9979,7 @@ def test_grounding_scope_speculation_allows_open_question() -> None:
         ],
     )
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -9963,7 +9991,7 @@ def test_grounding_scope_speculation_allows_open_question() -> None:
 
 
 def test_grounding_open_question_repair_message_moves_speculation_to_open_questions() -> None:
-    claim = pipeline_module.GroundingClaim(
+    claim = GroundingClaim(
         page_plan_id="PP-QUESTION",
         target_path="wiki/open_questions/Open_Question_记忆可信度.md",
         section_key="examples",
@@ -9974,7 +10002,7 @@ def test_grounding_open_question_repair_message_moves_speculation_to_open_questi
         reason="新增影响范围/受影响对象推测 `导致` 未被 raw 或 inspected wiki 同句级支撑；请删除该推测，或改写为来源明确陈述。",
     )
 
-    message = pipeline_module.grounding_issue_message(claim)
+    message = draft_grounding.grounding_issue_message(claim)
 
     assert "open_questions" in message
     assert "改写成问题" in message
@@ -10025,7 +10053,7 @@ def test_grounding_external_backing_accepts_english_widely_used_anchor() -> None
         "To evaluate these agents, CTF benchmarks have become the de-facto standard. "
         "These benchmarks have also been widely used in evaluating recent LLM models."
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10076,7 +10104,7 @@ def test_grounding_external_backing_accepts_widely_across_tasks_anchor() -> None
     )
     raw = "For example, Claude Code is an excellent harness that we use widely across tasks."
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10126,7 +10154,7 @@ def test_grounding_external_backing_accepts_retained_existing_fact_with_bridge_p
         ],
     )
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10179,7 +10207,7 @@ def test_grounding_external_backing_uses_same_line_pronoun_context() -> None:
         "NYU CTF Bench was the first benchmark to use CTF problems for evaluating cybersecurity agents. "
         "These benchmarks have also been widely used in evaluating recent LLM models."
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10228,7 +10256,7 @@ def test_grounding_external_backing_requires_specific_anchor_not_only_generic_wi
         ],
     )
     raw = "These benchmarks have also been widely used in evaluating recent LLM models."
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10277,7 +10305,7 @@ def test_grounding_quoted_conceptual_release_process_is_not_direct_quote() -> No
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10327,7 +10355,7 @@ def test_grounding_quoted_product_choice_label_context_is_not_direct_quote() -> 
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10377,7 +10405,7 @@ def test_grounding_concept_label_after_broad_mention_is_not_direct_quote() -> No
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10428,8 +10456,8 @@ def test_grounding_attributed_concept_label_is_not_dequoted_or_bypassed() -> Non
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10481,8 +10509,8 @@ def test_grounding_attributed_concept_label_with_punctuation_is_not_bypassed() -
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10533,7 +10561,7 @@ def test_grounding_quoted_abstract_trend_label_context_is_not_direct_quote() -> 
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10582,7 +10610,7 @@ def test_grounding_explicit_direct_quote_mismatch_warns_without_review() -> None
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10637,7 +10665,7 @@ def test_grounding_direct_quote_accepts_normalized_source_match() -> None:
         "Based on MemEngine (Zhang et al., 2025 ), we implement seven memory mechanisms, "
         "using Qwen2.5-7B as the base model for the agent applications on our benchmark."
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10691,7 +10719,7 @@ def test_grounding_direct_quote_accepts_time_range_transcript_variant() -> None:
         "Boris 非常擅长设定方向，比如这就是产品在3个月、6个月后需要成为的样子。"
         "而我的很多职责是弄清楚从今天到那个3到6个月后的愿景之间的路径是什么。"
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10707,28 +10735,28 @@ def test_grounding_direct_quote_accepts_paired_month_enumeration_as_range() -> N
     quote = "产品在3-6个月后需要成为的样子"
     raw = "Boris 非常擅长设定方向，比如这就是产品在3个月、6个月后需要成为的样子。"
 
-    assert pipeline_module.quote_supported_by_text(quote, raw) is True
+    assert draft_grounding.quote_supported_by_text(quote, raw) is True
 
 
 def test_grounding_direct_quote_paired_month_enumeration_requires_same_numbers() -> None:
     quote = "产品在3-9个月后需要成为的样子"
     raw = "Boris 非常擅长设定方向，比如这就是产品在3个月、6个月后需要成为的样子。"
 
-    assert pipeline_module.quote_supported_by_text(quote, raw) is False
+    assert draft_grounding.quote_supported_by_text(quote, raw) is False
 
 
 def test_grounding_direct_quote_does_not_collapse_three_item_timeline() -> None:
     quote = "产品在3-6个月后需要成为的样子"
     raw = "路线图分别记录产品在3个月、6个月、9个月后需要成为的样子。"
 
-    assert pipeline_module.quote_supported_by_text(quote, raw) is False
+    assert draft_grounding.quote_supported_by_text(quote, raw) is False
 
 
 def test_grounding_direct_quote_range_does_not_match_partial_numeric_token() -> None:
     quote = "产品在3-6个月后需要成为的样子"
     raw = "Boris 讨论的是产品在13个月、6个月后需要成为的样子。"
 
-    assert pipeline_module.quote_supported_by_text(quote, raw) is False
+    assert draft_grounding.quote_supported_by_text(quote, raw) is False
 
 
 def test_grounding_direct_quote_time_range_variant_requires_same_numbers() -> None:
@@ -10770,7 +10798,7 @@ def test_grounding_direct_quote_time_range_variant_requires_same_numbers() -> No
         ],
     )
     raw = "我的职责是弄清楚从今天到那个3到6个月后的愿景之间的路径是什么。"
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10821,7 +10849,7 @@ def test_grounding_short_domain_quote_accepts_normalized_source_match() -> None:
     )
     raw = "例如，**Claude Code** 是一个出色的 **harness（适配框架）**，我们在各种任务中广泛使用它。"
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10873,7 +10901,7 @@ def test_grounding_domain_quote_accepts_source_match_with_parenthetical_translat
     )
     raw = "例如，**Claude Code** 是一个出色的 **harness（适配框架）**，我们在各种任务中广泛使用它。"
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10925,7 +10953,7 @@ def test_grounding_short_numeric_quote_accepts_exact_numeric_source_match() -> N
     )
     raw = '我觉得我们大概80%是心灵融合，然后有20%的事情我更在意，我就多推动那些。'
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -10977,7 +11005,7 @@ def test_grounding_short_numeric_quote_does_not_match_decimal_collapse() -> None
     )
     raw = "我觉得我们大概95%是心灵融合。"
 
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11030,7 +11058,7 @@ def test_grounding_ascii_closing_quote_is_not_treated_as_new_quote_start() -> No
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11079,7 +11107,7 @@ def test_grounding_quoted_evaluation_question_template_is_not_direct_quote() -> 
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11134,7 +11162,7 @@ def test_grounding_quoted_compact_paraphrase_uses_nearby_source_support() -> Non
         "我们这个功能要解决的主要问题可能是权限提示太多了，人们感到疲劳。"
         "我们的用例是：我们希望企业里的专业开发者能够安全地实现零权限提示。"
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11191,7 +11219,7 @@ def test_grounding_quoted_method_goal_paraphrase_uses_nearby_source_support() ->
         "我们怎样才能创建一个产品套件的概念角落，让工程师或 PM 有一个想法，"
         "到周末就能把功能交到用户手中。"
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11244,7 +11272,7 @@ def test_grounding_quoted_method_goal_paraphrase_warns_without_nearby_support() 
         ],
     )
     raw = "我们怎样才能找到最快把东西推出去的方法？这里没有说明最终交付给谁。"
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11294,9 +11322,9 @@ def test_grounding_numeric_reliability_paraphrase_rewrites_to_source_sentence() 
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, raw)
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, raw)
     body = rewritten.pages[0].body_markdown
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11349,8 +11377,8 @@ def test_grounding_numeric_reliability_paraphrase_warns_without_source_sentence(
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "AI工具需要继续提升可靠性。")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "AI工具需要继续提升可靠性。")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11377,7 +11405,7 @@ def test_grounding_rewrite_translates_known_english_harness_quote() -> None:
         ]
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
     body = rewritten.pages[0].body_markdown
 
     assert report["changed"] is True
@@ -11424,9 +11452,9 @@ def test_grounding_rewrite_dequotes_internal_digest_paraphrase() -> None:
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
     body = rewritten.pages[0].body_markdown
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11479,8 +11507,8 @@ def test_grounding_rewrite_dequotes_non_explicit_scope_paraphrase() -> None:
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11534,8 +11562,8 @@ def test_grounding_rewrite_dequotes_long_non_explicit_paraphrase_with_fact_marke
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11586,8 +11614,8 @@ def test_grounding_rewrite_dequotes_open_question_quote_with_growth_marker() -> 
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11638,8 +11666,8 @@ def test_grounding_rewrite_dequotes_source_local_context_window_paraphrase() -> 
         ],
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    review = pipeline_module.build_draft_grounding_review(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "")
+    review = draft_grounding.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11667,7 +11695,7 @@ def test_grounding_rewrite_dequotes_short_slogan_label() -> None:
         ]
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(
         draft,
         "Meta 的文化是速度驱动的。Move fast and break things。你不需要完美的文档。",
     )
@@ -11693,7 +11721,7 @@ def test_grounding_rewrite_does_not_dequote_short_hard_fact_label() -> None:
         ]
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "源材料没有这句话。")
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, "源材料没有这句话。")
 
     assert report["changed"] is False
     assert f"“{quote}”" in rewritten.pages[0].body_markdown
@@ -11715,7 +11743,7 @@ def test_grounding_numeric_reliability_rewrite_does_not_match_decimal_percent() 
         ]
     )
 
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(
         draft,
         "95%的自动化真的没什么价值。",
     )
@@ -11766,13 +11794,13 @@ def test_grounding_attributed_paraphrase_warns_without_exact_match() -> None:
         "我们怎样才能找到最快把东西推出去的方法？"
         "让工程师或 PM 有一个想法，到周末就能把功能交到用户手中。"
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
         raw,
     )
-    rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, raw)
+    rewritten, report = draft_grounding.rewrite_grounding_sensitive_paraphrases(draft, raw)
 
     assert report["changed"] is False
     assert rewritten.pages[0].body_markdown == draft.pages[0].body_markdown
@@ -11818,7 +11846,7 @@ def test_grounding_named_tool_concept_label_with_digits_is_not_direct_quote() ->
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11868,7 +11896,7 @@ def test_grounding_named_tool_label_with_numeric_fact_warns_without_support() ->
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11918,7 +11946,7 @@ def test_grounding_quoted_compact_paraphrase_warns_without_support_for_each_part
         ],
     )
     raw = "团队原则中写到，核心用户是专业开发者。"
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -11966,7 +11994,7 @@ def test_grounding_short_fact_phrases_warn_without_exact_match() -> None:
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -12014,7 +12042,7 @@ def test_grounding_quoted_release_event_warns_without_exact_match() -> None:
             )
         ],
     )
-    review = pipeline_module.build_draft_grounding_review(
+    review = draft_grounding.build_draft_grounding_review(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,

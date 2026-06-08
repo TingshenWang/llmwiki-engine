@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import errors as _errors
 from .hash_utils import sha256_file
-from .models import WikiContextSnapshot
+from .models import WikiContextEntry, WikiContextSnapshot
 from .retrieval import build_knowledge_pool, candidate_pool_sha256
+
+
+def snapshot_entry(snapshot: WikiContextSnapshot, path: str) -> WikiContextEntry:
+    for entry in snapshot.entries:
+        if entry.path == path:
+            return entry
+    raise _errors.PipelineError(f"snapshot missing path: {path}")
 
 
 def wiki_context_drift_messages(vault: Path, snapshot: WikiContextSnapshot) -> list[str]:
