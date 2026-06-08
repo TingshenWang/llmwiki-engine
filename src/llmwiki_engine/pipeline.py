@@ -18,7 +18,9 @@ from pydantic import BaseModel
 
 from . import __version__
 from . import markdown_utils as _markdown_utils
+from . import open_questions as _open_questions
 from . import page_sections as _page_sections
+from . import section_merge as _section_merge
 from . import source_excerpt as _source_excerpt
 from . import update_preservation as _update_preservation
 from .events import EventLogger, format_duration
@@ -265,40 +267,6 @@ DRAFT_SELF_TALK_MARKERS = (
     "创建后可与",
     "创建后可和",
     "创建后可互链",
-)
-OPEN_QUESTION_SEMANTIC_CLUSTERS = (
-    (
-        "semantic:agi_pm_role_necessity",
-        (("agi",), ("pm", "产品经理"), ("消失", "必要", "取代", "替代", "还有价值", "是否需要", "需要")),
-    ),
-    (
-        "semantic:model_capability_product_function_boundary",
-        (("模型能力",), ("产品功能", "产品边界"), ("吞噬", "吞掉", "取代", "替代", "边界")),
-    ),
-    (
-        "semantic:product_judgement_training",
-        (("产品品味", "产品判断"), ("训练", "提升", "培养", "系统化")),
-    ),
-    (
-        "semantic:ai_pm_role_evolution",
-        (("ai", "agi", "agent"), ("pm", "产品经理"), ("演变", "变化", "转型", "未来")),
-    ),
-    (
-        "semantic:claude_code_product_experience_harness_boundary",
-        (("claudecode", "claude code"), ("产品体验", "体验"), ("harness", "安全边界"), ("掩盖", "重要性")),
-    ),
-    (
-        "semantic:rapid_iteration_quality_safety_research_preview",
-        (("快速发布", "快速迭代"), ("质量", "安全"), ("研究预览", "用户预期", "长期产品一致性")),
-    ),
-    (
-        "semantic:model_progress_feature_lifecycle",
-        (("模型", "模型能力", "模型进步"), ("功能", "产品功能", "ui元素"), ("保留", "移除", "废弃", "过时", "存废", "淘汰")),
-    ),
-    (
-        "semantic:agent_hand_transfer_mechanism",
-        (("大脑", "brain"), ("传递", "pass", "handoff"), ("双手", "hand", "hands"), ("机制", "实现细节", "高效")),
-    ),
 )
 SOURCE_DIGEST_BUDGET_GROUP_ORDER = ("concepts", "designs", "comparisons", "open_questions", "entities")
 SOURCE_DIGEST_AGGREGATION_MIN_CANDIDATES = 2
@@ -2026,7 +1994,7 @@ def empty_vault_create_merge_planning_shortcut_report(
 
 
 def source_basis_candidate_refs(source_basis: SourceBasis) -> list[str]:
-    return _dedupe_strings(
+    return _markdown_utils.dedupe_strings(
         [
             str(ref).strip()
             for ref in [*source_basis.source_candidate_ids, *source_basis.prepared_discovered_candidates]
@@ -4667,7 +4635,7 @@ def source_digest_candidate_dedupe_key(group_name: str, candidate: SourceDigestC
         or candidate.name
         or candidate.one_sentence_summary
     )
-    key = open_question_key(basis)
+    key = _open_questions.open_question_key(basis)
     return f"open_questions:{key}" if key and len(key) >= 6 else ""
 
 
@@ -4824,7 +4792,7 @@ def merge_source_digest_duplicate_candidate(
     )
     return canonical.model_copy(
         update={
-            "related_candidates": _dedupe_strings(
+            "related_candidates": _markdown_utils.dedupe_strings(
                 [*canonical.related_candidates, duplicate.candidate_id, *duplicate.related_candidates]
             ),
             "resolution_hint": _markdown_utils.merge_markdown_blocks(canonical.resolution_hint, note),
@@ -4918,8 +4886,8 @@ def source_digest_candidate_topic_similarity(
     right: SourceDigestCandidate,
 ) -> float:
     if group_name == "open_questions":
-        left_key = open_question_key(left.open_question_or_tension or left.suggested_page_title or left.name)
-        right_key = open_question_key(right.open_question_or_tension or right.suggested_page_title or right.name)
+        left_key = _open_questions.open_question_key(left.open_question_or_tension or left.suggested_page_title or left.name)
+        right_key = _open_questions.open_question_key(right.open_question_or_tension or right.suggested_page_title or right.name)
         if left_key and right_key and left_key == right_key:
             return 1.0
     left_anchors = source_digest_candidate_topic_anchor_terms(left)
@@ -5047,8 +5015,8 @@ def deferred_aggregation_digest_candidate(
     candidate_ids = [candidate.candidate_id for candidate in candidates]
     related_candidate_ids = [candidate_id for candidate_id in candidate_ids if candidate_id != replaced_candidate_id]
     candidate_id = f"AGG-{group_name.replace('_', '-')}-{sha256_bytes('|'.join(candidate_ids).encode('utf-8'))[:8]}"
-    source_locators = _dedupe_strings([candidate.source_locator for candidate in candidates if candidate.source_locator])[:6]
-    tensions = _dedupe_strings([candidate.open_question_or_tension for candidate in candidates if candidate.open_question_or_tension])[:4]
+    source_locators = _markdown_utils.dedupe_strings([candidate.source_locator for candidate in candidates if candidate.source_locator])[:6]
+    tensions = _markdown_utils.dedupe_strings([candidate.open_question_or_tension for candidate in candidates if candidate.open_question_or_tension])[:4]
     title = str(aggregation["suggested_title"])
     summary = str(aggregation["coverage_summary"])
     wiki_value = str(aggregation.get("wiki_value_summary") or "") or str(aggregation["suggested_action"])
@@ -5178,9 +5146,9 @@ def build_deferred_candidate_aggregations(
         label = DEFERRED_AGGREGATION_GROUP_LABELS.get(group_name, group_name)
         names = [candidate.suggested_page_title or candidate.name for candidate in candidates]
         representative = candidates[:5]
-        source_locators = _dedupe_strings([candidate.source_locator for candidate in candidates if candidate.source_locator])[:6]
-        tensions = _dedupe_strings([candidate.open_question_or_tension for candidate in candidates if candidate.open_question_or_tension])[:4]
-        wiki_values = _dedupe_strings([candidate.wiki_value for candidate in candidates if candidate.wiki_value])[:4]
+        source_locators = _markdown_utils.dedupe_strings([candidate.source_locator for candidate in candidates if candidate.source_locator])[:6]
+        tensions = _markdown_utils.dedupe_strings([candidate.open_question_or_tension for candidate in candidates if candidate.open_question_or_tension])[:4]
+        wiki_values = _markdown_utils.dedupe_strings([candidate.wiki_value for candidate in candidates if candidate.wiki_value])[:4]
         aggregations.append(
             {
                 "group": group_name,
@@ -7198,7 +7166,7 @@ def _resolve_single_model_related(
     self_path: str,
     fallback_reason: str,
 ) -> RelatedPageRef | None:
-    for raw in _dedupe_strings([suggestion.target_path, suggestion.display_title]):
+    for raw in _markdown_utils.dedupe_strings([suggestion.target_path, suggestion.display_title]):
         target_path = _normalize_related_path(raw)
         if target_path:
             current = current_by_path.get(target_path)
@@ -7293,14 +7261,6 @@ def _normalize_related_path(value: str) -> str | None:
 
 def _related_debug_label(suggestion: RelatedPageRef) -> str:
     return f"{suggestion.display_title or '<untitled>'} -> {suggestion.target_path or '<no path>'}"
-
-
-def _dedupe_strings(values: list[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value and value not in result:
-            result.append(value)
-    return result
 
 
 def finalize_wiki_merge_plan(
@@ -7440,10 +7400,10 @@ def finalize_wiki_merge_plan(
                 update={
                     "action": action,
                     "model_action": model_action,
-                    "finalization_reason": "；".join(_dedupe_strings([*finalization_notes, item.finalization_reason])) or "模型动作已按冻结 wiki context 校验。",
+                    "finalization_reason": "；".join(_markdown_utils.dedupe_strings([*finalization_notes, item.finalization_reason])) or "模型动作已按冻结 wiki context 校验。",
                     "canonical_target_path": canonical,
                     "matched_page": matched_page,
-                    "inspected_context_paths": _dedupe_strings([*item.inspected_context_paths, *inspected_paths]),
+                    "inspected_context_paths": _markdown_utils.dedupe_strings([*item.inspected_context_paths, *inspected_paths]),
                     "strongest_overlap": strongest_overlap,
                     "why_not_update": item.why_not_update,
                     "why_create_or_update": item.why_create_or_update or item.reason,
@@ -7461,7 +7421,7 @@ def finalize_wiki_merge_plan(
     for item in preliminary:
         resolution_item = resolution_by_id[item.page_plan_id]
         related_pages, related_unresolved = resolve_model_related_pages(item, resolution_item, preliminary, resolution_by_id, snapshot)
-        unresolved = _dedupe_strings([*item.related_unresolved, *item.unresolved_related, *related_unresolved])
+        unresolved = _markdown_utils.dedupe_strings([*item.related_unresolved, *item.unresolved_related, *related_unresolved])
         related_absence_reason = item.related_absence_reason
         if not related_pages and related_absence_reason is None:
             related_absence_reason = "cap_cutoff" if related_unresolved else ("no_candidate" if not item.inspected_context_paths else "low_confidence")
@@ -7557,7 +7517,7 @@ def merge_update_noop_same_targets(items: list[WikiMergePlanItem]) -> list[WikiM
             continue
         covered_noops = noop_by_target[item.canonical_target_path]
         source_basis = SourceBasis(
-            source_candidate_ids=_dedupe_strings(
+            source_candidate_ids=_markdown_utils.dedupe_strings(
                 [
                     *item.source_basis.source_candidate_ids,
                     *[
@@ -7567,7 +7527,7 @@ def merge_update_noop_same_targets(items: list[WikiMergePlanItem]) -> list[WikiM
                     ],
                 ]
             ),
-            prepared_discovered_candidates=_dedupe_strings(
+            prepared_discovered_candidates=_markdown_utils.dedupe_strings(
                 [
                     *item.source_basis.prepared_discovered_candidates,
                     *[
@@ -7593,7 +7553,7 @@ def merge_update_noop_same_targets(items: list[WikiMergePlanItem]) -> list[WikiM
             if len(deduped_related) >= FINAL_RELATED_LIMIT:
                 break
         noop_ids = [noop.page_plan_id for noop in covered_noops]
-        merged_ids = _dedupe_strings([*item.merged_page_plan_ids, item.page_plan_id, *noop_ids])
+        merged_ids = _markdown_utils.dedupe_strings([*item.merged_page_plan_ids, item.page_plan_id, *noop_ids])
         reason = f"同一 canonical target 出现 update + noop；{', '.join(noop_ids)} 已由 update `{item.page_plan_id}` 覆盖。"
         merged.append(
             item.model_copy(
@@ -7788,8 +7748,8 @@ def duplicate_canonical_rank(item: WikiMergePlanItem) -> tuple[int, int, str]:
 
 def absorb_duplicate_create(canonical: WikiMergePlanItem, suppressed: WikiMergePlanItem) -> WikiMergePlanItem:
     source_basis = SourceBasis(
-        source_candidate_ids=_dedupe_strings([*canonical.source_basis.source_candidate_ids, *suppressed.source_basis.source_candidate_ids]),
-        prepared_discovered_candidates=_dedupe_strings(
+        source_candidate_ids=_markdown_utils.dedupe_strings([*canonical.source_basis.source_candidate_ids, *suppressed.source_basis.source_candidate_ids]),
+        prepared_discovered_candidates=_markdown_utils.dedupe_strings(
             [*canonical.source_basis.prepared_discovered_candidates, *suppressed.source_basis.prepared_discovered_candidates]
         ),
         source_locator=canonical.source_basis.source_locator or suppressed.source_basis.source_locator,
@@ -7820,14 +7780,14 @@ def absorb_duplicate_create(canonical: WikiMergePlanItem, suppressed: WikiMergeP
             "source_basis": source_basis,
             "section_plans": section_plans,
             "related_pages": merged_related,
-            "value_points": _dedupe_strings([*canonical.value_points, *suppressed.value_points]),
-            "reuse_scenarios": _dedupe_strings([*canonical.reuse_scenarios, *suppressed.reuse_scenarios]),
-            "merged_page_plan_ids": _dedupe_strings(
+            "value_points": _markdown_utils.dedupe_strings([*canonical.value_points, *suppressed.value_points]),
+            "reuse_scenarios": _markdown_utils.dedupe_strings([*canonical.reuse_scenarios, *suppressed.reuse_scenarios]),
+            "merged_page_plan_ids": _markdown_utils.dedupe_strings(
                 [*canonical.merged_page_plan_ids, canonical.page_plan_id, suppressed.page_plan_id, *suppressed.merged_page_plan_ids]
             ),
             "merge_reason": _markdown_utils.merge_markdown_blocks(canonical.merge_reason, absorbed_note),
             "finalization_reason": _markdown_utils.merge_markdown_blocks(canonical.finalization_reason, absorbed_note),
-            "quality_risks": _dedupe_strings(
+            "quality_risks": _markdown_utils.dedupe_strings(
                 [
                     *canonical.quality_risks,
                     *suppressed.quality_risks,
@@ -8982,395 +8942,6 @@ def draft_body_heading_title_should_scan(title: str, section_key: str) -> bool:
     )
 
 
-def merge_update_section(
-    section_key: str,
-    old: str,
-    new: str,
-    *,
-    absorption_context: str | None = None,
-) -> tuple[str, SectionMergeChange]:
-    old = old.strip()
-    new = new.strip()
-    if section_key == "open_questions":
-        return merge_update_open_questions_section(old, new)
-    retained: list[str] = []
-    added: list[str] = []
-    removed: list[str] = []
-    preserved_old: list[str] = []
-    removal_reason = ""
-    needs_manual_resolution = False
-    absorbed, matched_phrases, _ = _update_preservation.update_section_absorption(old, new) if old and new else (False, [], [])
-    context_absorbed = False
-    context_matched_phrases: list[str] = []
-    if old and new and not absorbed and absorption_context and update_merge_should_preserve_old_section(section_key, old):
-        context_text = absorption_context.strip()
-        if context_text and context_text != new:
-            context_absorbed, context_matched_phrases, _ = _update_preservation.update_section_absorption(old, context_text)
-            absorbed = context_absorbed
-    if section_key == "additional_notes":
-        absorbed = False
-        context_absorbed = False
-        matched_phrases = []
-        context_matched_phrases = []
-    if old and new and absorbed:
-        retained.append(old)
-    if new and not _markdown_utils.is_empty_placeholder(new):
-        added.append(new)
-    if old and not retained and old != new and not _markdown_utils.is_empty_placeholder(old):
-        if section_key == "additional_notes":
-            preserved_notes, removed_notes, absorbed_notes = split_high_signal_old_additional_notes(
-                old,
-                new,
-                absorption_context=absorption_context or "",
-            )
-            if preserved_notes:
-                new = _markdown_utils.merge_markdown_blocks(new, preserved_old_additional_notes_block(preserved_notes))
-                retained.extend([*absorbed_notes, *preserved_notes])
-                preserved_old.extend(preserved_notes)
-                removed.extend(removed_notes)
-                removal_reason = (
-                    "高信号旧补充观察已自动保留为 legacy note；无需阻塞审批，建议后续按需整理。"
-                    "低信号或已覆盖的旧补充观察不机械保留。"
-                )
-            elif absorbed_notes:
-                retained.extend(absorbed_notes)
-                removed.extend(removed_notes)
-                removal_reason = "高信号旧补充观察已被新草稿吸收；低信号旧补充观察不机械保留。"
-            elif removed_notes:
-                removed.extend(removed_notes)
-                removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
-            else:
-                removed.append(old)
-                removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
-        elif update_merge_should_preserve_old_section(section_key, old):
-            preserved = preserved_old_section_block(old)
-            new = _markdown_utils.merge_markdown_blocks(new, preserved)
-            retained.append(old)
-            preserved_old.append(old)
-            needs_manual_resolution = True
-            removal_reason = "模型完整重写后未显式吸收该旧段落；系统已临时保留为旧页保留观察，draft review 需消化、改写或确认删除。"
-        else:
-            removed.append(old)
-            removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
-    elif old and retained and old != new and old not in new:
-        if context_absorbed:
-            matched = context_matched_phrases[:4]
-            removal_reason = (
-                f"模型已在新草稿其他章节吸收旧段落关键短语/概念义务：{', '.join(matched)}。"
-                if matched
-                else "模型已在新草稿其他章节吸收旧段落概念义务。"
-            )
-        elif matched_phrases:
-            removal_reason = f"模型已通过关键短语/概念义务吸收旧段落：{', '.join(matched_phrases[:4])}。"
-    return (
-        new,
-        SectionMergeChange(
-            section_key=section_key,
-            retained=retained,
-            added=added,
-            removed=removed,
-            preserved_old=preserved_old,
-            needs_manual_resolution=needs_manual_resolution,
-            removal_reason=removal_reason,
-        ),
-    )
-
-
-def split_high_signal_old_additional_notes(
-    old: str,
-    new: str,
-    *,
-    absorption_context: str,
-) -> tuple[list[str], list[str], list[str]]:
-    preserved: list[str] = []
-    removed: list[str] = []
-    absorbed: list[str] = []
-    for note in old_additional_note_units(old):
-        if not old_additional_note_is_high_signal_boundary(note):
-            removed.append(note)
-            continue
-        if old_additional_note_superseded(note, new) or old_additional_note_superseded(note, absorption_context):
-            removed.append(note)
-            continue
-        if old_additional_note_absorbed(note, new) or old_additional_note_absorbed(note, absorption_context):
-            absorbed.append(note)
-            continue
-        preserved.append(note)
-    return _dedupe_strings(preserved), _dedupe_strings(removed), _dedupe_strings(absorbed)
-
-
-def old_additional_note_units(text: str) -> list[str]:
-    units: list[str] = []
-    paragraph: list[str] = []
-    for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            if paragraph:
-                units.append(" ".join(paragraph).strip())
-                paragraph = []
-            continue
-        bullet = re.match(r"^(?:[-*+]|\d+[.)、])\s+(?P<body>.+)$", stripped)
-        if bullet:
-            if paragraph:
-                units.append(" ".join(paragraph).strip())
-                paragraph = []
-            units.append(bullet.group("body").strip())
-            continue
-        paragraph.append(stripped)
-    if paragraph:
-        units.append(" ".join(paragraph).strip())
-    normalized_units = [strip_old_additional_note_label(unit) for unit in units]
-    return [unit for unit in _dedupe_strings(normalized_units) if unit and not _markdown_utils.is_empty_placeholder(unit)]
-
-
-def strip_old_additional_note_label(text: str) -> str:
-    stripped = text.strip()
-    while True:
-        next_value = re.sub(r"^(?:旧页补充观察|旧页保留观察)[:：]\s*", "", stripped).strip()
-        if next_value == stripped:
-            break
-        stripped = next_value
-    return stripped.strip()
-
-
-def old_additional_note_is_high_signal_boundary(note: str) -> bool:
-    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note))
-    if len(normalized) < 12:
-        return False
-    if re.search(r"[?？]$", normalized) or normalized.startswith(("如何", "是否", "为什么", "能否", "有没有")):
-        return False
-    if re.search(r"(?:需要|待|尚需|仍需)?确认是否|待确认|尚需确认|仍需确认|是否存在|待验证|待补来源", normalized):
-        return False
-    if any(marker in normalized for marker in ["暂无", "没有明确", "可与", "关联阅读", "后续可以继续补充"]):
-        return False
-    strong_markers = (
-        "应视为",
-        "不能视为",
-        "不可视为",
-        "并非绝对真实",
-        "不是绝对真实",
-        "用户确认",
-        "需要确认",
-        "必须确认",
-        "重要决定",
-        "重大决策",
-        "不可逆",
-        "安全风险",
-        "可靠性风险",
-        "隐私风险",
-        "成本约束",
-        "权限边界",
-        "隔离边界",
-    )
-    if any(marker in normalized for marker in strong_markers):
-        return True
-    risk_or_boundary = any(marker in normalized for marker in ["风险", "边界", "限制", "约束"])
-    domain_signal = any(
-        marker in normalized
-        for marker in ["安全", "可靠性", "准确性", "一致性", "成本", "权限", "隔离", "隐私", "审计", "确认"]
-    )
-    modal_signal = any(marker in normalized for marker in ["需要", "应该", "应当", "不能", "不应", "必须"])
-    return risk_or_boundary and domain_signal and modal_signal
-
-
-def old_additional_note_absorbed(note: str, target: str) -> bool:
-    if not note.strip() or not target.strip():
-        return False
-    normalized_note = _source_excerpt.normalized_source_match_text(note)
-    normalized_target = _source_excerpt.normalized_source_match_text(target)
-    if normalized_note and normalized_note in normalized_target:
-        return True
-    return old_additional_note_boundary_paraphrase_absorbed(note, target)
-
-
-def old_additional_note_boundary_paraphrase_absorbed(note: str, target: str) -> bool:
-    note_norm = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note.lower()))
-    target_norm = re.sub(r"\s+", "", unicodedata.normalize("NFKC", target.lower()))
-    obligations: list[str] = []
-    if "用户确认" in note_norm:
-        obligations.append("user_confirmation")
-    if "召回记忆" in note_norm and any(marker in note_norm for marker in ["不能只依赖", "不能依赖", "绝对真实", "上下文"]):
-        obligations.append("memory_context_boundary")
-    if not obligations:
-        return False
-    for obligation in obligations:
-        if obligation == "user_confirmation" and not old_additional_note_target_has_user_confirmation_boundary(target_norm):
-            return False
-        if obligation == "memory_context_boundary" and not old_additional_note_target_has_memory_context_boundary(target_norm):
-            return False
-    return True
-
-
-def old_additional_note_target_has_user_confirmation_boundary(target_norm: str) -> bool:
-    decision_markers = ("重要决定", "重要决策", "重大决策")
-    positive_markers = ("需要", "仍需", "仍需要", "应由", "必须", "由用户确认")
-    negative_markers = ("不需要", "无需", "不必", "不再需要", "免于")
-    for clause in old_additional_note_supersession_clauses(target_norm):
-        if "用户确认" not in clause or not any(marker in clause for marker in decision_markers):
-            continue
-        if any(re.search(rf"{marker}.{{0,8}}用户确认|用户确认.{{0,8}}{marker}", clause) for marker in negative_markers):
-            continue
-        if any(marker in clause for marker in positive_markers):
-            return True
-    return False
-
-
-def old_additional_note_target_has_memory_context_boundary(target_norm: str) -> bool:
-    boundary_markers = ("辅助上下文", "有帮助的上下文", "作为上下文", "只能作为", "不能只依赖", "不能依赖", "不是绝对真实", "非绝对真实")
-    for clause in old_additional_note_supersession_clauses(target_norm):
-        if not re.search(r"召回的?记忆|记忆召回", clause):
-            continue
-        if old_additional_note_clause_negates_memory_context(clause):
-            continue
-        if any(marker in clause for marker in boundary_markers):
-            return True
-    return False
-
-
-def old_additional_note_clause_negates_memory_context(clause: str) -> bool:
-    negative = ("不是", "并非", "不作为", "不能作为", "不应作为", "不再作为")
-    context_terms = ("辅助上下文", "有帮助的上下文", "上下文")
-    return any(re.search(rf"{marker}.{{0,8}}{term}", clause) for marker in negative for term in context_terms)
-
-
-def old_additional_note_superseded(note: str, target: str) -> bool:
-    if not note.strip() or not target.strip():
-        return False
-    anchors = old_additional_note_supersession_anchors(note)
-    if not anchors:
-        return False
-    for sentence in old_additional_note_supersession_sentences(target):
-        if not any(anchor in sentence for anchor in anchors):
-            continue
-        if old_additional_note_sentence_supersedes_anchor(sentence, anchors):
-            return True
-    return False
-
-
-def old_additional_note_supersession_anchors(note: str) -> list[str]:
-    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", note.lower()))
-    anchors = [
-        "用户确认",
-        "不可逆",
-        "绝对真实",
-        "召回记忆",
-        "权限边界",
-        "隔离边界",
-        "安全风险",
-        "可靠性风险",
-        "隐私风险",
-        "成本约束",
-    ]
-    return [anchor for anchor in anchors if anchor in normalized]
-
-
-def old_additional_note_supersession_sentences(text: str) -> list[str]:
-    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text.lower()))
-    return [sentence for sentence in re.split(r"[。！？!?；;\n]+", normalized) if sentence]
-
-
-def old_additional_note_supersession_clauses(sentence: str) -> list[str]:
-    return [clause for clause in re.split(r"[，,、]|但|不过|然而|而|同时|并且", sentence) if clause]
-
-
-def old_additional_note_clause_preserves_anchor(clause: str, anchor: str) -> bool:
-    preservation_markers = ("仍", "仍然", "继续", "依然", "还是")
-    for marker in preservation_markers:
-        if re.search(rf"{marker}.{{0,8}}{re.escape(anchor)}|{re.escape(anchor)}.{{0,8}}{marker}", clause):
-            return True
-    return False
-
-
-def old_additional_note_sentence_supersedes_anchor(sentence: str, anchors: list[str]) -> bool:
-    for clause in old_additional_note_supersession_clauses(sentence):
-        for anchor in anchors:
-            if anchor not in clause:
-                continue
-            if old_additional_note_clause_preserves_anchor(clause, anchor):
-                continue
-            if old_additional_note_clause_is_capability_change(clause, anchor):
-                continue
-            if old_additional_note_clause_supersedes_anchor(clause, anchor):
-                return True
-    return False
-
-
-def old_additional_note_clause_is_capability_change(clause: str, anchor: str) -> bool:
-    capability_terms = r"(?:元数据|字段|日志|api|接口|能力|属性|参数)"
-    if re.search(r"(?:已)?改为(?:支持|提供|记录|返回|包含)", clause) and re.search(capability_terms, clause):
-        return True
-    if re.search(r"(?:已)?改为", clause) and re.search(rf"{re.escape(anchor)}.{{0,8}}{capability_terms}", clause):
-        return True
-    return False
-
-
-def old_additional_note_clause_supersedes_anchor(clause: str, anchor: str) -> bool:
-    escaped = re.escape(anchor)
-    strong_markers = ("不再需要", "不需要", "无需", "不必", "不再依赖", "不适用", "免于", "deprecated", "废弃", "已废弃")
-    if any(re.search(rf"{marker}.{{0,8}}{escaped}|{escaped}.{{0,8}}{marker}", clause) for marker in strong_markers):
-        return True
-    if re.search(rf"{escaped}.{{0,12}}(?:已)?改为|(?:已)?改为.{{0,12}}{escaped}", clause):
-        return True
-    if re.search(rf"{escaped}.{{0,12}}替代|替代.{{0,12}}{escaped}", clause):
-        return True
-    return False
-
-
-def preserved_old_additional_notes_block(notes: list[str]) -> str:
-    if len(notes) == 1:
-        return f"旧页补充观察：{notes[0]}"
-    lines = "\n".join(f"- {note}" for note in notes)
-    return f"旧页补充观察：\n{lines}"
-
-
-def merge_update_open_questions_section(old: str, new: str) -> tuple[str, SectionMergeChange]:
-    old_questions = [
-        question
-        for question in meaningful_open_question_lines(old)
-        if not is_low_signal_open_question(question)
-    ]
-    new_questions = meaningful_open_question_lines(new)
-    seen_keys = {open_question_key(question) for question in new_questions}
-    retained_old_questions: list[str] = []
-    for question in old_questions:
-        key = open_question_key(question)
-        if not key or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        retained_old_questions.append(question)
-    merged_questions = [*new_questions, *retained_old_questions]
-    merged = "\n".join(f"- {question}" for question in merged_questions).strip()
-    if not merged:
-        merged = new if not _markdown_utils.is_empty_placeholder(new) else "暂无矛盾与未决问题记录。"
-    reason = ""
-    if old_questions:
-        reason = "旧 open_questions 默认按问题粒度 union/dedupe 保留；占位/低信号问题不机械保留。"
-    return (
-        merged,
-        SectionMergeChange(
-            section_key="open_questions",
-            retained=retained_old_questions,
-            added=new_questions,
-            removed=[],
-            preserved_old=[],
-            needs_manual_resolution=False,
-            removal_reason=reason,
-        ),
-    )
-
-
-def update_merge_should_preserve_old_section(section_key: str, old_text: str) -> bool:
-    if section_key not in {"summary", "detail", "core_content"}:
-        return False
-    phrases = _update_preservation.update_preservation_phrases(old_text)
-    concepts = _update_preservation.update_preservation_concepts(old_text)
-    return not _update_preservation.update_preservation_section_is_low_value(section_key, old_text, phrases, concepts)
-
-
-def preserved_old_section_block(old: str) -> str:
-    return f"旧页保留观察（来自更新前页面，模型本轮未显式吸收，先保留待审）：\n\n{old.strip()}"
-
-
 def grounding_issue_message(claim: GroundingClaim) -> str:
     reason = claim.reason or "unsupported new_fact"
     text = re.sub(r"\s+", " ", claim.text).strip()
@@ -9455,7 +9026,7 @@ def external_backing_supported_by_context(
 def external_backing_supported_by_retained_existing_fact(text: str, marker: str, existing_wiki_text: str) -> bool:
     if not text or not marker or not existing_wiki_text:
         return False
-    marker_equivalents = _dedupe_strings(
+    marker_equivalents = _markdown_utils.dedupe_strings(
         [_source_excerpt.normalized_source_match_text(marker), *[_source_excerpt.normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
     )
     specific_anchors, generic_anchors = external_backing_topic_anchors(text)
@@ -9492,7 +9063,7 @@ def external_backing_supported_by_retained_existing_fact(text: str, marker: str,
 def external_backing_supported_by_text(text: str, marker: str, source_text: str) -> bool:
     if not text or not marker or not source_text:
         return False
-    marker_equivalents = _dedupe_strings(
+    marker_equivalents = _markdown_utils.dedupe_strings(
         [_source_excerpt.normalized_source_match_text(marker), *[_source_excerpt.normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
     )
     specific_anchors, generic_anchors = external_backing_topic_anchors(text)
@@ -9797,7 +9368,7 @@ def severe_factual_entities_in_text_order(text: str) -> list[str]:
         if index >= 0:
             entities.append((index, entity))
     entities.sort(key=lambda item: (item[0], -len(item[1]), item[1]))
-    return _dedupe_strings([entity for _index, entity in entities])
+    return _markdown_utils.dedupe_strings([entity for _index, entity in entities])
 
 
 def severe_factual_relations_contradict(
@@ -10109,7 +9680,7 @@ def severe_factual_named_entities(text: str) -> list[str]:
     for entity in re.findall(r"[\u4e00-\u9fff]{2,}(?:公司|团队|模型|系统|产品|CEO|CTO|创始人)", text):
         if any(known_entity in entity for known_entity in chinese_known_entities):
             entities.append(entity)
-    return _dedupe_strings(entities)
+    return _markdown_utils.dedupe_strings(entities)
 
 
 def rewrite_grounding_sensitive_paraphrases(
@@ -10857,7 +10428,7 @@ def normalized_quote_support_variants(text: str) -> list[str]:
         variants.append(_source_excerpt.normalized_source_match_text(stripped))
     if re.search(r"\d", unicodedata.normalize("NFKC", text)):
         variants.extend(normalized_direct_quote_elision_variant(variant) for variant in list(variants))
-    return _dedupe_strings([variant for variant in variants if variant])
+    return _markdown_utils.dedupe_strings([variant for variant in variants if variant])
 
 
 def normalize_numeric_range_connectors(text: str) -> str:
@@ -11930,8 +11501,8 @@ def cleanup_open_question_unsupported_scope_claims(
         body_markdown = page.body_markdown
         open_questions = page.open_questions
         existing_question_keys = {
-            open_question_key(question)
-            for question in meaningful_open_question_lines(open_questions)
+            _open_questions.open_question_key(question)
+            for question in _open_questions.meaningful_open_question_lines(open_questions)
         }
         page_report = {
             "page_plan_id": page.page_plan_id,
@@ -11954,7 +11525,7 @@ def cleanup_open_question_unsupported_scope_claims(
                 skipped_count += 1
                 continue
             relocated_question = questionize_open_question_scope_claim(claim.text)
-            question_key = open_question_key(relocated_question)
+            question_key = _open_questions.open_question_key(relocated_question)
             duplicate_question = question_key in existing_question_keys
             if not duplicate_question and added_count >= OPEN_QUESTION_SCOPE_CLEANUP_LIMIT:
                 page_report["skipped"].append(
@@ -12502,20 +12073,20 @@ def assemble_knowledge_page(
             for section in [summary, core, questions]
             if section.strip()
         )
-        summary, summary_change = merge_update_section(
+        summary, summary_change = _section_merge.merge_update_section(
             "summary",
             existing_sections.get("summary", ""),
             summary,
             absorption_context=update_absorption_context,
         )
         old_core = _page_sections.existing_core_content_from_sections(existing_sections)
-        core, core_change = merge_update_section(
+        core, core_change = _section_merge.merge_update_section(
             "core_content",
             old_core,
             core,
             absorption_context=update_absorption_context,
         )
-        questions, questions_change = merge_update_section(
+        questions, questions_change = _section_merge.merge_update_section(
             "open_questions",
             existing_sections.get("open_questions", ""),
             questions,
@@ -12765,7 +12336,7 @@ def build_open_question_rows_with_report(
         metadata = entry.metadata
         if entry.expected_state != "present" or metadata is None or metadata.llmwiki_type.lower() == "source":
             continue
-        for question in extract_open_questions(entry.content):
+        for question in _open_questions.extract_open_questions(entry.content):
             candidates.append({
                 "question": question,
                 "page": obsidian_link(metadata.path, clean_display_title(metadata.title)),
@@ -12779,7 +12350,7 @@ def build_open_question_rows_with_report(
         item = plan_by_id.get(page.page_plan_id)
         if item is None:
             continue
-        for question in meaningful_open_question_lines(draft_page_open_questions(page)):
+        for question in _open_questions.meaningful_open_question_lines(draft_page_open_questions(page)):
             candidates.append({
                 "question": question,
                 "page": obsidian_link(item.canonical_target_path, item.display_title),
@@ -12788,19 +12359,19 @@ def build_open_question_rows_with_report(
                 "page_type": item.page_type,
                 "source": "draft",
             })
-    by_key = group_open_question_candidates(candidates)
+    by_key = _open_questions.group_open_question_candidates(candidates)
     rows: list[dict[str, str]] = []
     report_items: list[dict[str, Any]] = []
     for key, grouped in sorted(by_key.items()):
-        representative = max(grouped, key=open_question_representative_sort_key)
-        low_signal = is_low_signal_open_question(representative["question"])
+        representative = max(grouped, key=_open_questions.open_question_representative_sort_key)
+        low_signal = _open_questions.is_low_signal_open_question(representative["question"])
         repeated_gap = len(grouped) >= 2 and low_signal
         keep = (
             any(item["page_type"] == "open_question" for item in grouped)
             or repeated_gap
             or not low_signal
         )
-        pages = _dedupe_strings([item["page"] for item in sorted(grouped, key=lambda item: item["updated"], reverse=True)])[:3]
+        pages = _markdown_utils.dedupe_strings([item["page"] for item in sorted(grouped, key=lambda item: item["updated"], reverse=True)])[:3]
         decision = "kept" if keep else "filtered"
         reason = "open_question_page" if any(item["page_type"] == "open_question" for item in grouped) else ""
         if not reason:
@@ -12834,141 +12405,6 @@ def build_open_question_rows_with_report(
     }
 
 
-def open_question_representative_sort_key(item: dict[str, str]) -> tuple[int, str, tuple[int, int, int]]:
-    question = item["question"]
-    non_low_signal = 0 if is_low_signal_open_question(question) else 1
-    return (non_low_signal, item["updated"], open_question_representative_score(question))
-
-
-def open_question_key(question: str) -> str:
-    text = strip_open_question_marker(question)
-    text = re.sub(r"^(待补来源|待补充来源|需要来源|缺少来源)\s*[:：]\s*", "", text)
-    text = unicodedata.normalize("NFKC", text).lower()
-    normalized = re.sub(r"[\s，。；;：:、,.!?！？（）()【】\[\]\"'“”‘’]+", "", text)
-    semantic_key = semantic_open_question_key(normalized)
-    return semantic_key or normalized
-
-
-def strip_open_question_marker(question: str) -> str:
-    text = re.sub(r"^\s*[-*]\s+", "", question.strip())
-    return re.sub(r"^\s*\d+\s*[.)、．]\s*", "", text).strip()
-
-
-def group_open_question_candidates(candidates: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
-    groups: dict[str, list[dict[str, str]]] = {}
-    for candidate in candidates:
-        key = open_question_key(candidate["question"])
-        merge_key = next(
-            (
-                existing_key
-                for existing_key, grouped in groups.items()
-                if open_question_keys_should_merge(key, existing_key, candidate, grouped)
-            ),
-            None,
-        )
-        groups.setdefault(merge_key or key, []).append(candidate)
-    return groups
-
-
-def open_question_keys_should_merge(
-    key: str,
-    existing_key: str,
-    candidate: dict[str, str],
-    grouped: list[dict[str, str]],
-) -> bool:
-    if key == existing_key:
-        return True
-    if existing_key.startswith("semantic:") and key.startswith("semantic:"):
-        candidate_norm = open_question_similarity_text(candidate["question"])
-        return any(
-            candidate.get("path") == existing.get("path")
-            and open_question_token_overlap(candidate_norm, open_question_similarity_text(existing["question"])) >= 0.60
-            for existing in grouped
-        )
-    if open_question_key_contains_other(key, existing_key):
-        return True
-    candidate_norm = open_question_similarity_text(candidate["question"])
-    if not candidate_norm:
-        return False
-    for existing in grouped:
-        existing_norm = open_question_similarity_text(existing["question"])
-        if not existing_norm:
-            continue
-        same_path = candidate.get("path") == existing.get("path")
-        if open_question_key_contains_other(candidate_norm, existing_norm):
-            return True
-        if same_path and open_question_token_overlap(candidate_norm, existing_norm) >= 0.62:
-            return True
-    return False
-
-
-def open_question_key_contains_other(left: str, right: str) -> bool:
-    if len(left) < 12 or len(right) < 12:
-        return False
-    return left in right or right in left
-
-
-def open_question_similarity_text(question: str) -> str:
-    text = strip_open_question_marker(question)
-    text = unicodedata.normalize("NFKC", text).lower()
-    return re.sub(r"[\s，。；;：:、,.!?！？（）()【】\[\]\"'“”‘’]+", "", text)
-
-
-def open_question_token_overlap(left: str, right: str) -> float:
-    left_tokens = open_question_similarity_tokens(left)
-    right_tokens = open_question_similarity_tokens(right)
-    if not left_tokens or not right_tokens:
-        return 0.0
-    intersection = left_tokens & right_tokens
-    return len(intersection) / min(len(left_tokens), len(right_tokens))
-
-
-def open_question_similarity_tokens(normalized: str) -> set[str]:
-    text = normalized
-    for stop in ["如何", "是否", "能否", "会不会", "为什么", "什么", "哪些", "是否可能", "可能", "应该", "需要"]:
-        text = text.replace(stop, "")
-    tokens = set(re.findall(r"[a-z][a-z0-9_/-]{1,}", text))
-    cjk = "".join(char for char in text if "\u4e00" <= char <= "\u9fff")
-    for size in (4, 3):
-        for index in range(0, max(0, len(cjk) - size + 1)):
-            token = cjk[index : index + size]
-            if open_question_similarity_token_is_noise(token):
-                continue
-            tokens.add(token)
-    return tokens
-
-
-def open_question_similarity_token_is_noise(token: str) -> bool:
-    if all(char in "的了和与及或是否如何什么为什么可能需要应该能否会不会" for char in token):
-        return True
-    return token in {"产品", "功能", "用户", "团队", "问题", "未来", "影响", "风险"}
-
-
-def open_question_representative_score(question: str) -> tuple[int, int, int]:
-    stripped = strip_open_question_marker(question)
-    single_question = 1 if stripped.count("？") + stripped.count("?") <= 1 else 0
-    has_source_gap = 1 if is_low_signal_open_question(stripped) else 0
-    return (single_question, -has_source_gap, -len(stripped))
-
-
-def semantic_open_question_key(normalized: str) -> str:
-    for key, required_groups in OPEN_QUESTION_SEMANTIC_CLUSTERS:
-        if all(any(term in normalized for term in group) for group in required_groups):
-            return key
-    return ""
-
-
-def is_low_signal_open_question(question: str) -> bool:
-    normalized = open_question_key(question)
-    if len(normalized) < 10:
-        return True
-    low_signal_markers = ["待补来源", "待补充来源", "需要来源", "缺少来源", "source needed", "citation needed"]
-    if any(marker in question.lower() for marker in low_signal_markers):
-        return True
-    source_gap_markers = ["具体引用", "具体来源", "出处", "引用链接", "原始证据"]
-    return any(marker in question for marker in source_gap_markers)
-
-
 def render_index_open_questions_report(report: dict[str, Any]) -> str:
     rows = [
         [
@@ -12988,29 +12424,6 @@ def render_index_open_questions_report(report: dict[str, Any]) -> str:
         + (format_markdown_table(["决策", "原因", "问题", "关联页面", "次数"], rows) if rows else "暂无未决问题。")
         + "\n"
     )
-
-
-def extract_open_questions(markdown: str) -> list[str]:
-    match = re.search(r"(?ms)^##\s+矛盾与未决问题\s*$\n(?P<body>.*?)(?=^##\s+|\Z)", markdown)
-    if not match:
-        return []
-    return meaningful_open_question_lines(match.group("body"))
-
-
-def meaningful_open_question_lines(text: str) -> list[str]:
-    results: list[str] = []
-    for raw_line in text.splitlines():
-        line = strip_open_question_marker(raw_line)
-        line = line.strip("。；; ")
-        if not line:
-            continue
-        normalized = re.sub(r"\s+", "", line)
-        if any(marker in normalized for marker in ["暂无", "没有", "无未决", "无矛盾", "不适用", "N/A", "na"]):
-            continue
-        if len(normalized) < 4:
-            continue
-        results.append(line)
-    return _dedupe_strings(results)
 
 
 def render_related_pages(

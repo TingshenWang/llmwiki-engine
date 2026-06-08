@@ -14,8 +14,10 @@ from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.steps as steps_module
+from llmwiki_engine import open_questions as open_questions_module
 from llmwiki_engine import page_sections as page_sections_module
 from llmwiki_engine import retrieval as retrieval_module
+from llmwiki_engine import section_merge as section_merge_module
 from llmwiki_engine import update_preservation as update_preservation_module
 from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.hash_utils import sha256_file
@@ -3811,7 +3813,7 @@ def test_merge_update_section_semantic_absorption_avoids_old_observation() -> No
     old = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
     new = "新版页面补充产品视角，同时保留 Managed Agents、harness、安全边界、隔离容器、工具权限和会话对象这些架构约束。"
 
-    merged, change = pipeline_module.merge_update_section("detail", old, new)
+    merged, change = section_merge_module.merge_update_section("detail", old, new)
 
     assert "旧页保留观察" not in merged
     assert change.retained == [old]
@@ -3828,7 +3830,7 @@ def test_merge_update_section_cross_section_absorption_avoids_old_observation() 
         "模型负责推理和规划，工具执行通过工具权限、隔离容器和会话对象来承接。"
     )
 
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "summary",
         old,
         new_summary,
@@ -3925,7 +3927,7 @@ def test_merge_update_section_absorbs_live_brain_hands_summary_across_sections()
 
     concepts = update_preservation_module.update_preservation_concepts(old)
     concept_names = {str(concept["name"]) for concept in concepts}
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "summary",
         old,
         new_summary,
@@ -3946,7 +3948,7 @@ def test_merge_update_section_cross_section_absorption_still_requires_core_conce
     new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
     shallow_context = "新版详情只顺带提到 Managed Agents 和 harness。"
 
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "summary",
         old,
         new_summary,
@@ -3966,7 +3968,7 @@ def test_merge_update_section_live_brain_hands_summary_rejects_shallow_context()
     new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
     shallow_context = "新版详情只顺带提到 Managed Agents、harness 和模型意图。"
 
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "summary",
         old,
         new_summary,
@@ -3986,7 +3988,7 @@ def test_merge_update_section_live_brain_hands_summary_rejects_broad_intent_phra
     new_summary = "新版摘要补充 Claude Code 的产品发布速度和团队协作视角。"
     broad_context = "新版详情提到 Managed Agents 中模型意图通过更清晰的产品界面表达。"
 
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "summary",
         old,
         new_summary,
@@ -4002,7 +4004,7 @@ def test_merge_update_section_requires_old_concept_obligations_not_shallow_terms
     old = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
     new = "新版页面补充产品视角，只顺带提到 Managed Agents 和 harness。"
 
-    merged, change = pipeline_module.merge_update_section("detail", old, new)
+    merged, change = section_merge_module.merge_update_section("detail", old, new)
 
     assert "旧页保留观察" in merged
     assert old in change.preserved_old
@@ -4013,7 +4015,7 @@ def test_merge_update_section_does_not_preserve_non_core_old_section() -> None:
     old = "来源在文章末尾提及：Claude Code is an excellent harness。"
     new = "新版例子讨论 CLI、桌面版和 Cowork 的使用场景。"
 
-    merged, change = pipeline_module.merge_update_section("examples", old, new)
+    merged, change = section_merge_module.merge_update_section("examples", old, new)
 
     assert "旧页保留观察" not in merged
     assert change.retained == []
@@ -4028,7 +4030,7 @@ def test_merge_update_section_does_not_cross_absorb_non_core_old_section() -> No
     new = "新版例子讨论 CLI、桌面版和 Cowork 的使用场景。"
     context = "详情保留 harness、工具权限和隔离容器等架构视角。"
 
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "examples",
         old,
         new,
@@ -4049,7 +4051,7 @@ def test_merge_update_section_open_questions_unions_old_questions() -> None:
     )
     new = "- 如何设计用户确认交互？"
 
-    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+    merged, change = section_merge_module.merge_update_section("open_questions", old, new)
 
     assert merged.splitlines() == [
         "- 如何设计用户确认交互？",
@@ -4070,7 +4072,7 @@ def test_merge_update_section_open_questions_dedupes_semantic_repeats() -> None:
     old = "- AGI后PM是否必要？\n- 记忆回滚机制如何设计？"
     new = "- AGI到来后PM角色是否会消失？"
 
-    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+    merged, change = section_merge_module.merge_update_section("open_questions", old, new)
 
     assert "AGI后PM是否必要" not in merged
     assert "AGI到来后PM角色是否会消失" in merged
@@ -4082,7 +4084,7 @@ def test_merge_update_section_open_questions_filters_placeholders_and_low_signal
     old = "- 暂无矛盾与未决问题记录。\n- 待补来源：需要继续确认。"
     new = "- 如何设计用户确认交互？"
 
-    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+    merged, change = section_merge_module.merge_update_section("open_questions", old, new)
 
     assert merged == "- 如何设计用户确认交互？"
     assert change.retained == []
@@ -4094,7 +4096,7 @@ def test_merge_update_section_open_questions_filters_placeholders_and_low_signal
 def test_merge_update_section_open_questions_does_not_fallback_to_low_signal_old(new: str) -> None:
     old = "- 待补来源：需要继续确认。"
 
-    merged, change = pipeline_module.merge_update_section("open_questions", old, new)
+    merged, change = section_merge_module.merge_update_section("open_questions", old, new)
 
     assert merged == "暂无矛盾与未决问题记录。"
     assert "待补来源：需要继续确认" not in merged
@@ -4107,7 +4109,7 @@ def test_merge_update_section_additional_notes_preserves_high_signal_boundary_no
     old = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
     new = "本页面补充 Redis 等实现方式。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4124,7 +4126,7 @@ def test_merge_update_section_additional_notes_keeps_only_high_signal_units() ->
     old = f"- {low}\n- {high}"
     new = "本页面补充通用记忆架构。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert high in merged
     assert low not in merged
@@ -4138,7 +4140,7 @@ def test_merge_update_section_additional_notes_does_not_preserve_low_signal_note
     old = "本页面从通用概念出发，可与 Redis 页面联动阅读。"
     new = "本页面补充通用记忆架构。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert change.retained == []
@@ -4152,7 +4154,7 @@ def test_merge_update_section_additional_notes_does_not_duplicate_absorbed_note(
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = f"本页延续旧边界：{old}"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert "旧页补充观察" not in merged
@@ -4165,7 +4167,7 @@ def test_merge_update_section_additional_notes_does_not_duplicate_paraphrased_bo
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "召回的记忆只能作为辅助上下文，重要决策仍应由用户确认。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert "旧页补充观察" not in merged
@@ -4178,7 +4180,7 @@ def test_merge_update_section_additional_notes_scattered_signals_do_not_absorb_b
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "用户确认邮箱后才能登录。产品决策由团队流程处理。记忆召回作为上下文用于推荐。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4189,7 +4191,7 @@ def test_merge_update_section_additional_notes_login_confirmation_does_not_absor
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "系统决定需要用户确认邮箱后才能登录，召回的记忆只能作为辅助上下文。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4200,7 +4202,7 @@ def test_merge_update_section_additional_notes_negative_memory_context_does_not_
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "重要决策仍应由用户确认，召回的记忆不是辅助上下文。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4211,7 +4213,7 @@ def test_merge_update_section_additional_notes_does_not_keep_question_like_note(
     old = "是否需要为召回记忆设计用户确认机制？"
     new = "本页面补充通用记忆架构。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert change.retained == []
@@ -4224,7 +4226,7 @@ def test_merge_update_section_additional_notes_does_not_keep_confirm_whether_not
     old = "需要确认是否存在记忆回滚或修正机制。"
     new = "本页面补充通用记忆架构。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert change.retained == []
@@ -4236,7 +4238,7 @@ def test_merge_update_section_additional_notes_does_not_keep_generic_must_note()
     old = "本页面必须与 Redis 页面联动阅读。"
     new = "本页面补充通用记忆架构。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert change.retained == []
@@ -4248,7 +4250,7 @@ def test_merge_update_section_additional_notes_does_not_reintroduce_superseded_n
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "新版系统已改为自动校验召回记忆，重要决定不再需要用户确认。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert "旧页补充观察" not in merged
@@ -4261,7 +4263,7 @@ def test_merge_update_section_additional_notes_user_confirmation_deprecated_is_s
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "用户确认机制已废弃，系统改为自动校验。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert "旧页补充观察" not in merged
@@ -4273,7 +4275,7 @@ def test_merge_update_section_additional_notes_unrelated_no_longer_needed_clause
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "重要决定需要用户确认，但旧 API 不再需要。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4284,7 +4286,7 @@ def test_merge_update_section_additional_notes_unrelated_approval_change_preserv
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "重要决定不再需要额外审批，但仍需要用户确认。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4295,7 +4297,7 @@ def test_merge_update_section_additional_notes_superseded_anchor_not_hidden_by_p
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "重要决定不再需要用户确认，但召回记忆仍可作为上下文。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert "旧页补充观察" not in merged
@@ -4307,7 +4309,7 @@ def test_merge_update_section_additional_notes_negative_confirmation_is_supersed
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "重要决定不需要用户确认，召回的记忆只能作为辅助上下文。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert "旧页补充观察" not in merged
@@ -4321,7 +4323,7 @@ def test_merge_update_section_additional_notes_strips_legacy_label_before_preser
     old = f"旧页补充观察：旧页补充观察：{note}"
     new = "本页面补充 Redis 等实现方式。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged.count("旧页补充观察") == 1
     assert f"旧页补充观察：{note}" in merged
@@ -4335,7 +4337,7 @@ def test_merge_update_section_additional_notes_keeps_boundary_even_when_open_que
     new = "本页面补充通用记忆架构。"
     context = f"{new}\n\n- 重要决定是否需要用户确认？"
 
-    merged, change = pipeline_module.merge_update_section(
+    merged, change = section_merge_module.merge_update_section(
         "additional_notes",
         old,
         new,
@@ -4353,7 +4355,7 @@ def test_merge_update_section_additional_notes_generic_new_version_does_not_supe
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "新版页面补充通用记忆架构。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4364,7 +4366,7 @@ def test_merge_update_section_additional_notes_unrelated_replacement_does_not_su
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "新版 API 已改为支持记忆元数据。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4375,7 +4377,7 @@ def test_merge_update_section_additional_notes_unrelated_replacement_with_anchor
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "新版 API 已改为支持用户记忆元数据。重要决定仍需要用户确认。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4386,7 +4388,7 @@ def test_merge_update_section_additional_notes_recall_memory_metadata_change_pre
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "新版 API 已改为支持召回记忆元数据。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4397,7 +4399,7 @@ def test_merge_update_section_additional_notes_recall_memory_field_rename_preser
     old = "重要决定需要用户确认，不能只依赖召回记忆。"
     new = "召回记忆字段已改为 memories。"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert "旧页补充观察" in merged
     assert old in merged
@@ -4410,7 +4412,7 @@ def test_merge_update_section_additional_notes_reports_absorbed_and_removed_unit
     old = f"- {absorbed}\n- {low}"
     new = f"本页延续旧边界：{absorbed}"
 
-    merged, change = pipeline_module.merge_update_section("additional_notes", old, new)
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
 
     assert merged == new
     assert change.retained == [absorbed]
@@ -7171,8 +7173,8 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
 
 
 def test_index_open_questions_keeps_pm_necessity_and_evolution_separate() -> None:
-    necessity = pipeline_module.open_question_key("AGI到来后PM角色会消失吗？")
-    evolution = pipeline_module.open_question_key("AI 时代 PM 角色会如何演变？")
+    necessity = open_questions_module.open_question_key("AGI到来后PM角色会消失吗？")
+    evolution = open_questions_module.open_question_key("AI 时代 PM 角色会如何演变？")
 
     assert necessity == "semantic:agi_pm_role_necessity"
     assert evolution == "semantic:ai_pm_role_evolution"

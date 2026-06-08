@@ -25,3 +25,11 @@ def merge_markdown_blocks(existing: str, addition: str) -> str:
 def is_empty_placeholder(text: str) -> bool:
     normalized = re.sub(r"\s+", "", text)
     return not normalized or any(marker in normalized for marker in ["暂无", "没有相关", "无相关", "N/A"])
+
+
+def dedupe_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
