@@ -76,11 +76,6 @@ def init(vault: Path, profile: str = "project_basic") -> None:
 def ingest_run(
     vault: Path,
     raw: Path,
-    fixture_dir: Optional[Path] = typer.Option(
-        None,
-        "--fixture-dir",
-        help="Fixture directory for mock:fixture providers; does not override configured live providers.",
-    ),
     mock_fixture_dir: Optional[Path] = typer.Option(
         None,
         "--mock-fixture-dir",
@@ -97,13 +92,10 @@ def ingest_run(
 ) -> None:
     """Run simplified Ingest through draft generation."""
     try:
-        if fixture_dir is not None and mock_fixture_dir is not None:
-            raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
         run_console = Console(file=io.StringIO()) if json_output else console
         manifest = run_simplified_ingest(
             vault=vault,
             raw_file=raw,
-            fixture_dir=fixture_dir,
             mock_fixture_dir=mock_fixture_dir,
             profile_name=profile,
             slug=slug,
@@ -195,11 +187,6 @@ def ingest_run_next(
     vault: Path,
     include_changed: bool = typer.Option(False, "--include-changed", help="Allow changed raw files when no unprocessed raw is available."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the selected raw file without running ingest."),
-    fixture_dir: Optional[Path] = typer.Option(
-        None,
-        "--fixture-dir",
-        help="Fixture directory for mock:fixture providers; does not override configured live providers.",
-    ),
     mock_fixture_dir: Optional[Path] = typer.Option(
         None,
         "--mock-fixture-dir",
@@ -216,8 +203,6 @@ def ingest_run_next(
 ) -> None:
     """Run ingest for the next safe raw candidate."""
     try:
-        if fixture_dir is not None and mock_fixture_dir is not None:
-            raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
         prepare_cli_suffix = _raw_prepare_command_suffix(
             prepare=prepare,
         )
@@ -252,7 +237,6 @@ def ingest_run_next(
         manifest = run_simplified_ingest(
             vault=Path(report.vault),
             raw_file=raw_abs,
-            fixture_dir=fixture_dir,
             mock_fixture_dir=mock_fixture_dir,
             profile_name=profile,
             slug=slug,

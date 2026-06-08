@@ -148,7 +148,7 @@ cp tests/fixtures/simple_project/raw_project_note.md "$VAULT/raw/"
 RAW="$VAULT/raw/raw_project_note.md"
 
 uv run llmwiki providers check "$VAULT"
-uv run llmwiki ingest run "$VAULT" "$RAW" --fixture-dir "$FIXTURE" --slug manual
+uv run llmwiki ingest run "$VAULT" "$RAW" --mock-fixture-dir "$FIXTURE" --slug manual
 
 OP="$(ls -1 "$VAULT/.llmwiki/runs/ingest" | tail -n 1)"
 
@@ -163,8 +163,8 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 llmwiki init <vault> [--profile project_basic]
 llmwiki providers list
 llmwiki providers check <vault> [--live]
-llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
-llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
+llmwiki ingest run <vault> <raw> [--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
+llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest inspect <vault> [operation_id] [--json]
 llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
@@ -239,13 +239,13 @@ It checks:
 Common warning:
 
 ```text
-mock provider ... has no fixture_dir; ingest will require --fixture-dir.
+mock provider ... has no fixture_dir; configure fixture_dir or use --mock-fixture-dir to force all model-backed steps to mock.
 ```
 
-This is not a failure. It means config does not include the mock answer directory, so a real `ingest run` must pass:
+This is not a failure. It means config does not include the mock answer directory. Add `fixture_dir` to provider config, or force all model-backed steps to mock with:
 
 ```bash
---fixture-dir "$FIXTURE"
+--mock-fixture-dir "$FIXTURE"
 ```
 
 With `--live`, openai-compatible providers receive a minimal connectivity probe:
@@ -267,14 +267,13 @@ uv run llmwiki providers check "$VAULT" --live
 Start an ingest operation.
 
 ```bash
-uv run llmwiki ingest run "$VAULT" "$RAW" --fixture-dir "$FIXTURE" --slug manual
+uv run llmwiki ingest run "$VAULT" "$RAW" --mock-fixture-dir "$FIXTURE" --slug manual
 ```
 
 Arguments and options:
 
 - `VAULT`: vault path.
 - `RAW`: raw file path. It must be under `VAULT/raw/`.
-- `--fixture-dir PATH`: mock provider fixture directory. Real providers do not need it.
 - `--mock-fixture-dir PATH`: force all model-backed steps to use `mock:fixture` with this fixture directory.
 - `--profile NAME`: temporarily override the vault config profile.
 - `--slug TEXT`: readable suffix for the operation ID.
@@ -475,7 +474,7 @@ uv run llmwiki eval report eval_runs/<run_id>.json
 The mock provider has no fixture directory. Pass:
 
 ```bash
---fixture-dir "$FIXTURE"
+--mock-fixture-dir "$FIXTURE"
 ```
 
 or put it in config:

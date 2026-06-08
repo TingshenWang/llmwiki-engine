@@ -20,15 +20,16 @@ drafts, and produces an apply preview:
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
-llmwiki ingest run /path/to/vault raw/project_note.md --prepare auto --fixture-dir tests/fixtures/simple_project/mock
+llmwiki ingest run /path/to/vault raw/project_note.md --prepare auto --mock-fixture-dir tests/fixtures/simple_project/mock
 llmwiki providers check /path/to/vault
 llmwiki ingest status /path/to/vault <operation_id>
 llmwiki ingest apply /path/to/vault <operation_id>
 ```
 
-The default runtime is deterministic: model-backed modules use fixture-backed
-`MockProvider` outputs so the pipeline, artifacts, validators, logs, profiles,
-and drafts can be tested before real models are introduced.
+Mock/fixture runs are deterministic when provider YAML includes `fixture_dir`,
+or when a run is forced with `--mock-fixture-dir`. This lets the pipeline,
+artifacts, validators, logs, profiles, and drafts be tested before real models
+are introduced.
 
 ## Design Principles
 

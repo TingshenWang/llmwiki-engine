@@ -463,7 +463,6 @@ def run_simplified_ingest(
     *,
     vault: Path,
     raw_file: Path,
-    fixture_dir: Path | None = None,
     mock_fixture_dir: Path | None = None,
     profile_name: str | None = None,
     slug: str | None = None,
@@ -490,7 +489,6 @@ def run_simplified_ingest(
     provider_execution_context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
-        fixture_dir=fixture_dir,
         mock_fixture_dir=mock_fixture_dir,
         source="initial_run",
         from_step=None,
@@ -558,7 +556,6 @@ def resume_ingest(
         provider_execution_context = build_provider_execution_context(
             vault=vault,
             manifest_contexts=manifest.provider_contexts,
-            fixture_dir=None,
             mock_fixture_dir=mock_fixture_dir,
             source="resume_current_config",
             from_step=start,

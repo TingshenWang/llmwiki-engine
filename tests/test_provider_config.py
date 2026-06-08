@@ -44,7 +44,6 @@ def test_global_provider_default_and_vault_whole_step_override(tmp_path: Path) -
     context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
-        fixture_dir=None,
         source="initial_run",
         from_step=None,
         tasks=["raw_prepare", "source_digest"],
@@ -65,7 +64,6 @@ def test_global_config_rejects_vault_only_fields(tmp_path: Path) -> None:
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=tmp_path,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -96,7 +94,6 @@ def test_config_yaml_parse_error_includes_source(tmp_path: Path, source: str, ex
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=tmp_path,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -129,7 +126,6 @@ def test_config_root_must_be_mapping_error_includes_source(tmp_path: Path, sourc
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=tmp_path,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -152,7 +148,6 @@ def test_vault_unknown_provider_key_error_includes_source(tmp_path: Path) -> Non
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=tmp_path,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -180,7 +175,6 @@ def test_provider_unknown_field_error_includes_source_and_key(tmp_path: Path) ->
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-        fixture_dir=tmp_path,
         source="initial_run",
         from_step=None,
         tasks=["source_digest"],
@@ -209,7 +203,6 @@ def test_openai_missing_required_field_error_includes_source_and_key(tmp_path: P
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -238,7 +231,6 @@ def test_openai_compatible_context_omits_api_key(tmp_path: Path) -> None:
     context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
-        fixture_dir=None,
         source="initial_run",
         from_step=None,
         tasks=["raw_prepare"],
@@ -276,7 +268,6 @@ def test_openai_compatible_context_keeps_retry_config_and_provider_uses_it(tmp_p
     context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
-        fixture_dir=None,
         source="initial_run",
         from_step=None,
         tasks=["raw_prepare"],
@@ -327,7 +318,6 @@ def test_openai_compatible_rejects_invalid_retry_config(
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -354,7 +344,6 @@ def test_mock_provider_rejects_retry_config(tmp_path: Path) -> None:
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -373,7 +362,6 @@ def test_human_provider_name_is_rejected(tmp_path: Path) -> None:
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -397,7 +385,6 @@ def test_endpoint_guard_rejects_userinfo_and_secret_query(tmp_path: Path) -> Non
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],
@@ -409,7 +396,6 @@ def test_endpoint_guard_rejects_userinfo_and_secret_query(tmp_path: Path) -> Non
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=["raw_prepare"],

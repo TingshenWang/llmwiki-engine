@@ -147,7 +147,7 @@ cp tests/fixtures/simple_project/raw_project_note.md "$VAULT/raw/"
 RAW="$VAULT/raw/raw_project_note.md"
 
 uv run llmwiki providers check "$VAULT"
-uv run llmwiki ingest run "$VAULT" "$RAW" --fixture-dir "$FIXTURE" --slug manual
+uv run llmwiki ingest run "$VAULT" "$RAW" --mock-fixture-dir "$FIXTURE" --slug manual
 
 OP="$(ls -1 "$VAULT/.llmwiki/runs/ingest" | tail -n 1)"
 
@@ -162,8 +162,8 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 llmwiki init <vault> [--profile project_basic]
 llmwiki providers list
 llmwiki providers check <vault> [--live]
-llmwiki ingest run <vault> <raw> [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
-llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--fixture-dir PATH|--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
+llmwiki ingest run <vault> <raw> [--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
+llmwiki ingest run-next <vault> [--include-changed] [--dry-run] [--mock-fixture-dir PATH] [--profile NAME] [--slug TEXT] [--prepare auto|skip|force] [--json]
 llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest inspect <vault> [operation_id] [--json]
 llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
@@ -238,13 +238,13 @@ uv run llmwiki providers check "$VAULT"
 常见 warning：
 
 ```text
-mock provider ... has no fixture_dir; ingest will require --fixture-dir.
+mock provider ... has no fixture_dir; configure fixture_dir or use --mock-fixture-dir to force all model-backed steps to mock.
 ```
 
-这不是失败。意思是 config 里没有写 mock 答案目录，真实 `ingest run` 时需要传：
+这不是失败。意思是 config 里没有写 mock 答案目录。可以把 `fixture_dir` 写进 provider config，或用下面的参数强制所有模型步骤走 mock：
 
 ```bash
---fixture-dir "$FIXTURE"
+--mock-fixture-dir "$FIXTURE"
 ```
 
 加 `--live` 会对 `openai_compatible` 发一个最小连通性请求：
@@ -270,14 +270,13 @@ uv run llmwiki providers check "$VAULT" --live
 启动一次 ingest operation。
 
 ```bash
-uv run llmwiki ingest run "$VAULT" "$RAW" --fixture-dir "$FIXTURE" --slug manual
+uv run llmwiki ingest run "$VAULT" "$RAW" --mock-fixture-dir "$FIXTURE" --slug manual
 ```
 
 参数：
 
 - `VAULT`：vault 路径。
 - `RAW`：raw 文件路径，必须在 `VAULT/raw/` 下。
-- `--fixture-dir PATH`：mock provider 的 fixture 目录。真实 provider 不需要。
 - `--mock-fixture-dir PATH`：强制所有模型步骤使用指定目录的 `mock:fixture`。
 - `--profile NAME`：临时覆盖 vault config 里的 profile。
 - `--slug TEXT`：operation ID 的可读后缀，方便手动测试辨认。
@@ -472,10 +471,10 @@ uv run llmwiki eval report eval_runs/<run_id>.json
 
 `mock provider ... has no fixture_dir`
 
-mock provider 没有配置 fixture 目录。可以在 `ingest run` 里加：
+mock provider 没有配置 fixture 目录。可以在 `ingest run` 里强制 mock：
 
 ```bash
---fixture-dir "$FIXTURE"
+--mock-fixture-dir "$FIXTURE"
 ```
 
 或写进 config：

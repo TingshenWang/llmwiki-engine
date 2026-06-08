@@ -1579,7 +1579,7 @@ def test_raw_link_cleanup_normalizes_only_obsidian_text_wikilinks(tmp_path: Path
     )
 
     fixture_dir = make_variant_fixture(tmp_path, "raw/links.md", "cleanup")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="cleanup")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="cleanup")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     cleaned = raw.read_text(encoding="utf-8")
     cleanup = read_json(run_dir / "raw_link_cleanup" / "raw_link_cleanup.json")
@@ -1628,7 +1628,7 @@ def test_changed_raw_link_cleanup_cannot_resume_from_cleanup_but_keeps_artifact_
             },
         },
     )
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="cleanup-resume")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="cleanup-resume")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     cleanup_report = run_dir / "raw_link_cleanup" / "raw_link_cleanup.json"
     assert cleanup_report.exists()
@@ -1646,7 +1646,7 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
+        mock_fixture_dir=FIXTURE_ROOT / "mock",
         profile_name="project_basic",
         slug="test",
     )
@@ -1838,7 +1838,7 @@ def test_ingest_run_uses_vault_config_profile_by_default(tmp_path: Path) -> None
         if name == "draft_rendering.json":
             data["pages"][1]["canonical_target_path"] = "concepts/Concept_简化 Ingest 草稿流程.md"
         write_json(fixture_dir / name, data)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="profile")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="profile")
     assert manifest.profile == "research_basic"
 
 
@@ -1849,7 +1849,7 @@ def test_resume_after_failed_step(tmp_path: Path) -> None:
     for name in ["raw_prepare.json"]:
         (broken_fixture / name).write_text((FIXTURE_ROOT / "mock" / name).read_text(encoding="utf-8"), encoding="utf-8")
     with pytest.raises(Exception):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=broken_fixture, slug="broken")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=broken_fixture, slug="broken")
     operation_id = next(RunStore(vault).runs_root.iterdir()).name
     manifest = status(vault, operation_id)
     assert manifest.status == OperationStatus.failed
@@ -1917,13 +1917,17 @@ def test_ingest_requires_vault_config_json(tmp_path: Path) -> None:
     (vault / ".llmwiki" / "config.json").unlink()
 
     with pytest.raises(RuntimeError, match="config.json is missing"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-config")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="missing-config")
 
 
 def test_provider_construction_failure_records_attempt_provider(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
+    config["providers"]["default"] = {
+        "spec": "mock:fixture",
+        "fixture_dir": str(FIXTURE_ROOT / "mock"),
+    }
     config["providers"]["source_digest"] = {
         "spec": "openai_compatible:planner",
         "endpoint": "http://127.0.0.1:1/v1/chat/completions",
@@ -1932,7 +1936,7 @@ def test_provider_construction_failure_records_attempt_provider(tmp_path: Path) 
     write_yaml(config_path, config)
 
     with pytest.raises(Exception):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="provider-build")
+        run_simplified_ingest(vault=vault, raw_file=raw, slug="provider-build")
     operation_id = next(RunStore(vault).runs_root.iterdir()).name
     manifest = status(vault, operation_id)
     failed_step = [step for step in manifest.steps if step.status == StepStatus.failed][0]
@@ -1945,7 +1949,7 @@ def test_provider_construction_failure_records_attempt_provider(tmp_path: Path) 
 
 def test_model_step_attempts_record_provider_context(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="attempts")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="attempts")
     for step in manifest.steps:
         attempt = step.attempts[-1]
         if step.name in MODEL_BACKED_STEPS:
@@ -2080,7 +2084,7 @@ def test_raw_prepare_skip_policy_writes_local_passthrough_without_model_fixture(
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=fixture_dir,
+        mock_fixture_dir=fixture_dir,
         slug="skip-prepare-local-passthrough",
         raw_prepare_policy=RawPreparePolicy.skip,
     )
@@ -2109,7 +2113,7 @@ def test_raw_prepare_skip_policy_rejects_empty_markdown_without_provider_fallbac
         run_simplified_ingest(
             vault=vault,
             raw_file=raw,
-            fixture_dir=FIXTURE_ROOT / "mock",
+            mock_fixture_dir=FIXTURE_ROOT / "mock",
             slug="skip-prepare-empty",
             raw_prepare_policy=RawPreparePolicy.skip,
         )
@@ -2124,7 +2128,7 @@ def test_raw_prepare_skip_policy_rejects_non_markdown_without_provider_fallback(
         run_simplified_ingest(
             vault=vault,
             raw_file=raw,
-            fixture_dir=FIXTURE_ROOT / "mock",
+            mock_fixture_dir=FIXTURE_ROOT / "mock",
             slug="skip-prepare-non-markdown",
             raw_prepare_policy=RawPreparePolicy.skip,
         )
@@ -2138,7 +2142,7 @@ def test_vault_config_raw_prepare_policy_is_not_an_input(tmp_path: Path) -> None
     write_json(config_path, config)
 
     with pytest.raises(ValidationError, match="raw_prepare_policy"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="vault-config-policy")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="vault-config-policy")
 
 
 def test_default_raw_prepare_policy_is_auto_and_recorded_in_snapshot(
@@ -2190,7 +2194,7 @@ def test_resume_from_raw_prepare_uses_explicit_or_snapshot_prepare_policy(
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
+        mock_fixture_dir=FIXTURE_ROOT / "mock",
         slug=slug,
         raw_prepare_policy=initial_policy,
     )
@@ -2216,7 +2220,7 @@ def test_resume_from_raw_prepare_uses_explicit_or_snapshot_prepare_policy(
 
 def test_resume_prepare_override_requires_rerunning_raw_prepare(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="late-prepare")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="late-prepare")
 
     with pytest.raises(PipelineError, match="raw prepare override only applies"):
         resume_ingest(
@@ -2233,7 +2237,7 @@ def test_prepared_raw_review_for_skip_policy_is_plain_auto_approval(tmp_path: Pa
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
+        mock_fixture_dir=FIXTURE_ROOT / "mock",
         slug="skip-prepare-review",
         raw_prepare_policy=RawPreparePolicy.skip,
     )
@@ -3197,7 +3201,7 @@ def test_candidate_resolution_backfills_missed_open_question_candidates(tmp_path
 
 def test_resume_from_deletes_downstream_step_dirs(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="rerun")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="rerun")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     assert (run_dir / "prepared_raw_review" / "approved_prepared.md").exists()
     assert (run_dir / "source_digest" / "source_digest.json").exists()
@@ -3250,7 +3254,7 @@ def test_resume_from_deletes_downstream_step_dirs(tmp_path: Path) -> None:
 
 def test_resume_can_force_mock_fixture_over_live_config(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="resume-force-mock")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="resume-force-mock")
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
     config["providers"] = {
@@ -3338,7 +3342,7 @@ def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts
 
 def test_resume_invalid_provider_config_does_not_delete_outputs(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="invalid")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="invalid")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     digest = run_dir / "source_digest" / "source_digest.json"
     assert digest.exists()
@@ -3352,7 +3356,7 @@ def test_resume_invalid_provider_config_does_not_delete_outputs(tmp_path: Path) 
 
 def test_invalid_task_provider_config_does_not_fallback_to_default(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="bad-fallback")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="bad-fallback")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     digest = run_dir / "source_digest" / "source_digest.json"
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
@@ -3370,7 +3374,7 @@ def test_invalid_task_provider_config_does_not_fallback_to_default(tmp_path: Pat
 
 def test_resume_from_outputless_step_does_not_require_provider_context(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="no-model-resume")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="no-model-resume")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     apply_preview = run_dir / "apply_preview" / "apply_preview.json"
     assert apply_preview.exists()
@@ -3382,14 +3386,14 @@ def test_resume_from_outputless_step_does_not_require_provider_context(tmp_path:
 
 def test_resume_mock_provider_requires_current_fixture_dir(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="mock-resume")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="mock-resume")
     with pytest.raises(Exception, match="requires fixture_dir"):
         resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="source_digest")
 
 
 def test_provider_config_rejects_unknown_field_before_deleting_outputs(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="secret")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="secret")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     digest = run_dir / "source_digest" / "source_digest.json"
     assert digest.exists()
@@ -3405,7 +3409,7 @@ def test_resume_current_config_records_provider_on_failed_attempt(tmp_path: Path
     vault, raw = make_vault(tmp_path)
     empty_fixture = tmp_path / "empty-fixture"
     empty_fixture.mkdir()
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="provider-fail")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="provider-fail")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
     config["providers"]["default"] = {
@@ -3435,28 +3439,28 @@ def test_resume_current_config_records_provider_on_failed_attempt(tmp_path: Path
 
 def test_resume_can_rerun_from_step_without_mode_parameter(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="resume")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="resume")
     resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="validation")
     assert resumed.status == OperationStatus.drafted
 
 
 def test_raw_and_artifact_drift_block_resume(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="drift")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="drift")
     raw.write_text(raw.read_text(encoding="utf-8") + "\nchanged", encoding="utf-8")
     with pytest.raises(VerifyError) as raw_error:
         resume_ingest(vault=vault, operation_id=manifest.operation_id)
     assert raw_error.value.result.issues[0].code == VerificationStatus.raw_changed
 
     vault2, raw2 = make_vault(tmp_path / "second")
-    manifest2 = run_simplified_ingest(vault=vault2, raw_file=raw2, fixture_dir=FIXTURE_ROOT / "mock", slug="artifact")
+    manifest2 = run_simplified_ingest(vault=vault2, raw_file=raw2, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="artifact")
     digest = RunStore(vault2).run_dir(manifest2.operation_id) / "source_digest" / "source_digest.json"
     digest.write_text(digest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(VerifyError):
         resume_ingest(vault=vault2, operation_id=manifest2.operation_id)
 
     vault3, raw3 = make_vault(tmp_path / "third")
-    manifest3 = run_simplified_ingest(vault=vault3, raw_file=raw3, fixture_dir=FIXTURE_ROOT / "mock", slug="artifact-dir")
+    manifest3 = run_simplified_ingest(vault=vault3, raw_file=raw3, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="artifact-dir")
     digest_dir = RunStore(vault3).run_dir(manifest3.operation_id) / "source_digest" / "source_digest.json"
     digest_dir.unlink()
     digest_dir.mkdir()
@@ -3467,14 +3471,14 @@ def test_raw_and_artifact_drift_block_resume(tmp_path: Path) -> None:
 
 def test_apply_preimage_repeat_and_applied_resume_block(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="apply")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="apply")
     target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
     target.write_text("user edit", encoding="utf-8")
     with pytest.raises(ApplyError):
         apply_operation(vault, manifest.operation_id)
 
     vault2, raw2 = make_vault(tmp_path / "clean")
-    manifest2 = run_simplified_ingest(vault=vault2, raw_file=raw2, fixture_dir=FIXTURE_ROOT / "mock", slug="apply")
+    manifest2 = run_simplified_ingest(vault=vault2, raw_file=raw2, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="apply")
     apply_operation(vault2, manifest2.operation_id)
     with pytest.raises(ApplyError):
         apply_operation(vault2, manifest2.operation_id)
@@ -3484,7 +3488,7 @@ def test_apply_preimage_repeat_and_applied_resume_block(tmp_path: Path) -> None:
 
 def test_applied_operation_rejects_review_mutations(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="review-immutable")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="review-immutable")
     apply_operation(vault, manifest.operation_id)
 
     with pytest.raises(PipelineError, match="Applied operations are immutable"):
@@ -3495,7 +3499,7 @@ def test_applied_operation_rejects_review_mutations(tmp_path: Path) -> None:
 
 def test_review_approve_requires_awaiting_review_state(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="review-state")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="review-state")
 
     with pytest.raises(PipelineError, match="merge_plan_review is not awaiting_review"):
         approve_review(vault, manifest.operation_id, "merge_plan_review")
@@ -3530,7 +3534,7 @@ def test_model_related_pages_are_deterministically_resolved_before_rendering(tmp
             ]
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="related-resolve")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="related-resolve")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
     first = plan["items"][0]
@@ -3820,7 +3824,7 @@ def test_blocked_apply_eligibility_stops_at_merge_plan_review(tmp_path: Path) ->
             data["items"][0]["blocked_reason"] = "需要先人工确认该主题是否应该写入。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="blocked")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="blocked")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
 
@@ -3843,7 +3847,7 @@ def test_wiki_merge_planning_rejects_duplicate_writable_targets(tmp_path: Path) 
         write_json(fixture_dir / name, data)
 
     with pytest.raises(PipelineError, match="duplicate writable target paths"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="duplicate-target")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="duplicate-target")
 
 
 def test_wiki_merge_planning_rejects_source_graph_links_in_merge_fields(tmp_path: Path) -> None:
@@ -3857,7 +3861,7 @@ def test_wiki_merge_planning_rejects_source_graph_links_in_merge_fields(tmp_path
         write_json(fixture_dir / name, data)
 
     with pytest.raises(PipelineError, match="must not contain source graph links"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="source-graph")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="source-graph")
 
 
 def test_m3_update_target_auto_approves_when_no_review_risks(tmp_path: Path) -> None:
@@ -3866,7 +3870,7 @@ def test_m3_update_target_auto_approves_when_no_review_risks(tmp_path: Path) -> 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("existing knowledge\n", encoding="utf-8")
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="existing")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="existing")
 
     assert target.read_text(encoding="utf-8") == "existing knowledge\n"
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
@@ -3943,7 +3947,7 @@ def test_update_preserves_and_reports_existing_summary_detail_and_index_title(tm
             data["pages"][0]["change_summary"] = "补充并澄清旧工程骨架页面，将新材料中的 MVP 编译重点整合进完整替换草稿。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="update-core")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="update-core")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     draft_path = run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md"
     draft_text = draft_path.read_text(encoding="utf-8")
@@ -7687,7 +7691,7 @@ def test_create_draft_with_raw_contradiction_stops_at_draft_review(tmp_path: Pat
             data["pages"][0]["body_markdown"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="grounding")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="grounding")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     grounding = read_json(run_dir / "draft_rendering" / "draft_grounding_review.json")
     repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
@@ -7721,7 +7725,7 @@ def test_create_draft_with_raw_contradiction_stops_at_draft_review(tmp_path: Pat
 
 def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="stale-grounding")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="stale-grounding")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     draft_manifest_path = run_dir / "draft_rendering" / "draft_write_manifest.json"
     stale_manifest = read_json(draft_manifest_path)
@@ -12242,7 +12246,7 @@ def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path:
     write_json(fixture_dir / "draft_rendering.1.json", bad_draft)
     write_json(fixture_dir / "draft_rendering.2.json", read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json"))
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-repair")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="draft-repair")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
     manifest_after = status(vault, manifest.operation_id)
@@ -12269,7 +12273,7 @@ def test_draft_rendering_create_change_summary_is_filled_without_repair(tmp_path
             data["pages"][0]["change_summary"] = ""
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-change-summary")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="draft-change-summary")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
     draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
@@ -12291,7 +12295,7 @@ def test_draft_rendering_create_english_change_summary_is_filled_without_repair(
             )
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-english-change-summary")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="draft-english-change-summary")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
     draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
@@ -12313,7 +12317,7 @@ def test_draft_rendering_create_english_source_coverage_notes_is_filled_without_
             )
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-english-source-coverage")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="draft-english-source-coverage")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     repair_report = read_json(run_dir / "draft_rendering" / "structured_repair_report.json")
     draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
@@ -12430,7 +12434,7 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     write_json(fixture_dir / "draft_rendering.2.json", bad_second_batch)
     write_json(fixture_dir / "draft_rendering.3.json", {"schema_version": "draft_rendering.v3", "pages": draft_pages[4:]})
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-batch")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="draft-batch")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     batch_report = read_json(run_dir / "draft_rendering" / "draft_rendering_batch_report.json")
     draft_artifact = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
@@ -12550,7 +12554,7 @@ def test_candidate_resolution_sanitizes_weak_noise_formal_item_without_repair(tm
     write_json(fixture_dir / "candidate_resolution.1.json", bad_resolution)
     write_json(fixture_dir / "candidate_resolution.2.json", read_json(FIXTURE_ROOT / "mock" / "candidate_resolution.json"))
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="candidate-noise")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="candidate-noise")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     repair_report = read_json(run_dir / "candidate_resolution" / "structured_repair_report.json")
     resolution = read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
@@ -12798,7 +12802,7 @@ def test_wiki_merge_planning_normalizes_model_wiki_prefix_on_update_target(tmp_p
             data["items"][0]["matched_page"] = "wiki/concepts/Concept_知识编译工程骨架.md"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="wiki-prefixed-target")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="wiki-prefixed-target")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
     first = plan["items"][0]
@@ -13063,7 +13067,7 @@ def test_source_recorded_operation_cannot_resume(tmp_path: Path) -> None:
             data["pages"] = []
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="source-recorded")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="source-recorded")
     apply_operation(vault, manifest.operation_id)
 
     assert status(vault, manifest.operation_id).status == OperationStatus.source_recorded
@@ -13098,7 +13102,7 @@ def test_update_draft_preserves_existing_provenance_frontmatter(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="provenance")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="provenance")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     draft_text = (run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md").read_text(
         encoding="utf-8"
@@ -13144,7 +13148,7 @@ def test_resume_cannot_skip_awaiting_draft_review(tmp_path: Path, from_step: str
             data["pages"][0]["body_markdown"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
-    run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug=f"skip-{from_step}")
+    run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug=f"skip-{from_step}")
     operation_id = latest_operation(vault)
     assert operation_id is not None
     before = read_json(RunStore(vault).manifest_path(operation_id))
@@ -13172,7 +13176,7 @@ def test_merge_plan_review_pending_can_be_approved_after_manual_edit(tmp_path: P
             data["items"][0]["blocked_reason"] = "需要人工决定是否创建。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="needs-human")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="needs-human")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     assert manifest.status == OperationStatus.awaiting_review
     assert [step for step in manifest.steps if step.status == StepStatus.awaiting_review][0].name == "merge_plan_review"
@@ -13228,7 +13232,7 @@ def test_review_approval_rejects_upstream_artifact_replaced_by_directory(tmp_pat
             data["items"][0]["blocked_reason"] = "需要人工决定是否创建。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="review-artifact-dir")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="review-artifact-dir")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan_path = run_dir / "wiki_merge_planning" / "wiki_merge_plan.json"
     plan_path.unlink()
@@ -13250,7 +13254,7 @@ def test_revise_review_archives_pending_artifacts_before_reset(tmp_path: Path) -
             data["items"][0]["blocked_reason"] = "需要人工决定是否创建。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="review-archive")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="review-archive")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
     revised = revise_review(vault, manifest.operation_id, "merge_plan_review")
@@ -13267,7 +13271,7 @@ def test_revise_review_archives_pending_artifacts_before_reset(tmp_path: Path) -
 
 def test_apply_rejects_incomplete_steps_even_if_manifest_is_marked_drafted(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="tampered")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="tampered")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data["status"] = "drafted"
@@ -13285,7 +13289,7 @@ def test_apply_rejects_incomplete_steps_even_if_manifest_is_marked_drafted(tmp_p
 
 def test_apply_rejects_empty_preview_targets(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="empty-preview")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="empty-preview")
     preview_path = RunStore(vault).run_dir(manifest.operation_id) / "apply_preview" / "apply_preview.json"
     preview = read_json(preview_path)
     preview["targets"] = []
@@ -13317,7 +13321,7 @@ def test_source_digest_english_user_text_fails_for_zh_cn_vault(tmp_path: Path) -
         write_json(fixture_dir / name, data)
 
     with pytest.raises(PipelineError, match="must be Chinese"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="english-digest")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="english-digest")
 
     manifest = status(vault, latest_operation(vault) or "")
     failed_step = [step for step in manifest.steps if step.status == StepStatus.failed][0]
@@ -13338,7 +13342,7 @@ def test_source_page_neutralizes_model_generated_graph_links(tmp_path: Path) -> 
             ]
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="source-links")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="source-links")
     source_text = (
         RunStore(vault).run_dir(manifest.operation_id)
         / "draft_rendering"
@@ -13371,7 +13375,7 @@ def test_display_title_strips_type_prefix_without_changing_target_path(tmp_path:
             data["pages"][0]["canonical_target_path"] = "concepts/Concept_Prefixed Title.md"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="prefixed")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="prefixed")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     resolution = read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
     item = [item for item in resolution["items"] if "CAND001" in item["source_basis"]["source_candidate_ids"]][0]
@@ -13407,7 +13411,7 @@ def test_cross_type_title_prefix_does_not_pollute_target_path(tmp_path: Path) ->
             data["pages"][0]["canonical_target_path"] = "entities/Entity_Foo.md"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="cross-prefix")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="cross-prefix")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     resolution = read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
     item = [item for item in resolution["items"] if "CAND001" in item["source_basis"]["source_candidate_ids"]][0]
@@ -13422,7 +13426,7 @@ def test_blocks_overwriting_unsupported_system_page(tmp_path: Path) -> None:
     (vault / "wiki" / "index.md").write_text("# My human index\n", encoding="utf-8")
 
     with pytest.raises(PipelineError, match="system page is not supported by this engine"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="human-index")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="human-index")
 
     assert (vault / "wiki" / "index.md").read_text(encoding="utf-8") == "# My human index\n"
 
@@ -13435,7 +13439,7 @@ def test_blocks_old_system_marker(tmp_path: Path) -> None:
     )
 
     with pytest.raises(PipelineError, match="system page is not supported by this engine"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v1-index")
+        run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="v1-index")
 
 
 def test_wiki_context_snapshot_includes_source_daily_target_and_existing_metadata(tmp_path: Path) -> None:
@@ -14573,7 +14577,7 @@ def test_wiki_merge_planning_locally_fills_missing_medium_create_reason(tmp_path
     initial_plan["items"][0].pop("why_not_update", None)
     write_json(fixture_dir / "wiki_merge_planning.json", initial_plan)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="repair-why")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="repair-why")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
 
@@ -14888,7 +14892,7 @@ def test_index_rebuilds_from_snapshot_metadata_and_drops_stale_rows(tmp_path: Pa
         encoding="utf-8",
     )
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="merge-system")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="merge-system")
     apply_operation(vault, manifest.operation_id)
 
     index_text = (vault / "wiki" / "index.md").read_text(encoding="utf-8")
@@ -14911,7 +14915,7 @@ def test_index_rebuilds_from_snapshot_metadata_and_drops_stale_rows(tmp_path: Pa
 
 def test_wiki_context_drift_blocks_rerender_from_stale_plan(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="context")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="context")
     (vault / "wiki" / "index.md").write_text("changed after planning\n", encoding="utf-8")
 
     with pytest.raises(PipelineError, match="wiki context changed after planning"):
@@ -14923,8 +14927,8 @@ def test_multiple_drafts_apply_requires_latest_wiki_context(tmp_path: Path) -> N
     raw_b = vault / "raw" / "second_project_note.md"
     raw_b.write_text(raw.read_text(encoding="utf-8") + "\nSecond raw variant.\n", encoding="utf-8")
     fixture_b = make_variant_fixture(tmp_path, "raw/second_project_note.md", "Second")
-    first = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="first")
-    second = run_simplified_ingest(vault=vault, raw_file=raw_b, fixture_dir=fixture_b, slug="second")
+    first = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="first")
+    second = run_simplified_ingest(vault=vault, raw_file=raw_b, mock_fixture_dir=fixture_b, slug="second")
 
     apply_operation(vault, first.operation_id)
 
@@ -14964,7 +14968,7 @@ def test_wiki_context_drift_detects_changed_appeared_and_disappeared(
     message: str,
 ) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug=f"drift-{mutation}")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug=f"drift-{mutation}")
     plan = read_json(RunStore(vault).run_dir(manifest.operation_id) / "wiki_merge_planning" / "wiki_merge_plan.json")
     target = vault / path.format(log_date=plan["log_date"])
     if mutation == "changed":
@@ -14984,7 +14988,7 @@ def test_wiki_context_drift_detects_changed_appeared_and_disappeared(
 def test_log_date_is_pinned_by_merge_plan_for_downstream_rendering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     vault, raw = make_vault(tmp_path)
     monkeypatch.setattr(pipeline_module, "local_date", lambda: "2026-06-03")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="pinned-date")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="pinned-date")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
     assert plan["log_date"] == "2026-06-03"
@@ -15016,7 +15020,7 @@ def test_log_date_is_pinned_by_merge_plan_for_downstream_rendering(tmp_path: Pat
 
 def test_apply_rejects_preview_paths_outside_expected_roots(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="bad-path")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="bad-path")
     preview_path = RunStore(vault).run_dir(manifest.operation_id) / "apply_preview" / "apply_preview.json"
     preview = read_json(preview_path)
     preview["targets"][0]["target_path"] = "../outside.md"
@@ -15038,7 +15042,7 @@ def test_apply_rejects_preview_paths_outside_expected_roots(tmp_path: Path) -> N
 
 def test_apply_rejects_draft_missing_grounding_sidecar(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-sidecar")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="missing-sidecar")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     missing = run_dir / "draft_rendering" / "draft_grounding_review.json"
     missing.unlink()
@@ -15060,7 +15064,7 @@ def test_apply_rejects_draft_missing_grounding_sidecar(tmp_path: Path) -> None:
 
 def test_plain_apply_records_apply_failed_on_write_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="rollback")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="rollback")
     preview = read_json(RunStore(vault).run_dir(manifest.operation_id) / "apply_preview" / "apply_preview.json")
     real_write = apply_module._write_bytes_atomic
     calls = {"count": 0}
@@ -15089,7 +15093,7 @@ def test_plain_apply_records_apply_failed_on_write_failure(tmp_path: Path, monke
 
 def test_plain_apply_records_apply_failed_on_receipt_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="receipt-failure")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="receipt-failure")
     preview = read_json(RunStore(vault).run_dir(manifest.operation_id) / "apply_preview" / "apply_preview.json")
 
     def fail_append(*args, **kwargs):
@@ -15110,7 +15114,7 @@ def test_plain_apply_records_apply_failed_on_receipt_failure(tmp_path: Path, mon
 
 def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="invalid-schema")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="invalid-schema")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data["schema_version"] = "operation_manifest.invalid"
@@ -15130,7 +15134,7 @@ def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path
 )
 def test_manifest_step_topology_must_match_current_engine(tmp_path: Path, mutator) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="topology")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="topology")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     steps_by_name = {step["name"]: step for step in data["steps"]}
@@ -15145,7 +15149,7 @@ def test_manifest_step_topology_must_match_current_engine(tmp_path: Path, mutato
 @pytest.mark.parametrize("missing_key", ["status", "provider_contexts", "updated_at"])
 def test_manifest_v10_requires_persisted_top_level_fields(tmp_path: Path, missing_key: str) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-field")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="missing-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data.pop(missing_key)
@@ -15157,7 +15161,7 @@ def test_manifest_v10_requires_persisted_top_level_fields(tmp_path: Path, missin
 
 def test_manifest_v10_rejects_extra_top_level_fields_with_engine_message(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="extra-field")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="extra-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data["unexpected_status_summary"] = {"unexpected": True}
@@ -15169,7 +15173,7 @@ def test_manifest_v10_rejects_extra_top_level_fields_with_engine_message(tmp_pat
 
 def test_manifest_reader_rejects_non_object_json_with_engine_message(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="bad-root")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="bad-root")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     manifest_path.write_text("[]\n", encoding="utf-8")
 

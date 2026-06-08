@@ -121,6 +121,18 @@ def test_providers_check_live_does_not_call_http_for_mock_providers(tmp_path: Pa
     assert factory_calls == 0
 
 
+def test_providers_check_warns_for_mock_without_fixture_dir(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+
+    result = check_providers(vault)
+
+    assert result.ok
+    assert any("configure fixture_dir" in warning for warning in result.warnings)
+    assert any("--mock-fixture-dir" in warning for warning in result.warnings)
+    assert all("--fixture-dir" not in warning for warning in result.warnings)
+
+
 def test_providers_check_reports_tracked_llmwiki_in_git_repo(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault)

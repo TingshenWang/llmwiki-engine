@@ -51,7 +51,6 @@ def check_providers(
         execution_context = build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],
-            fixture_dir=None,
             source="initial_run",
             from_step=None,
             tasks=list(MODEL_BACKED_STEPS),
@@ -101,7 +100,10 @@ def check_providers(
         provider_name = runtime.spec.partition(":")[0]
         if provider_name == "mock":
             if runtime.fixture_dir is None:
-                result.warn(f"mock provider for {task} has no fixture_dir; ingest will require --fixture-dir.")
+                result.warn(
+                    f"mock provider for {task} has no fixture_dir; configure fixture_dir or use "
+                    "--mock-fixture-dir to force all model-backed steps to mock."
+                )
             elif not Path(runtime.fixture_dir).is_dir():
                 result.warn(f"mock fixture_dir for {task} does not exist: {runtime.fixture_dir}")
     if live and result.ok:

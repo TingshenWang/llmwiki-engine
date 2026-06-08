@@ -165,7 +165,6 @@ def build_provider_execution_context(
     *,
     vault: Path,
     manifest_contexts: list[ProviderContextRecord],
-    fixture_dir: Path | None,
     mock_fixture_dir: Path | None = None,
     source: Literal["initial_run", "resume_current_config"],
     from_step: str | None,
@@ -188,7 +187,6 @@ def build_provider_execution_context(
             runtime, credential = provider_runtime_spec_for_task(
                 task,
                 entry,
-                fixture_dir=fixture_dir,
                 require_mock_fixture=require_mock_fixture,
             )
         providers[task] = runtime
@@ -212,7 +210,6 @@ def provider_runtime_spec_for_task(
     task: str,
     entry: ProviderConfigEntry,
     *,
-    fixture_dir: Path | None,
     require_mock_fixture: bool,
 ) -> tuple[ProviderRuntimeSpec, str | None]:
     value = entry.value
@@ -284,11 +281,7 @@ def provider_runtime_spec_for_task(
         raise _provider_error(entry, task, f"mock provider for {task} does not support endpoint or api_key.")
     if max_retries is not None or retry_backoff_seconds is not None:
         raise _provider_error(entry, task, f"mock provider for {task} does not support max_retries or retry_backoff_seconds.")
-    resolved_fixture_dir = None
-    if fixture_dir is not None:
-        resolved_fixture_dir = fixture_dir.resolve()
-    elif config_fixture_dir:
-        resolved_fixture_dir = _resolve_config_path(entry.base_dir, config_fixture_dir)
+    resolved_fixture_dir = _resolve_config_path(entry.base_dir, config_fixture_dir) if config_fixture_dir else None
     if resolved_fixture_dir is None and require_mock_fixture:
         raise _provider_error(entry, task, f"mock provider for {task} requires fixture_dir")
     return (

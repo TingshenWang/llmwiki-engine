@@ -18,15 +18,15 @@ digest 做候选页面规划、冻结带本地 embedding 召回证据的 wiki co
 
 ```bash
 llmwiki init /path/to/vault --profile project_basic
-llmwiki ingest run /path/to/vault raw/project_note.md --prepare auto --fixture-dir tests/fixtures/simple_project/mock
+llmwiki ingest run /path/to/vault raw/project_note.md --prepare auto --mock-fixture-dir tests/fixtures/simple_project/mock
 llmwiki providers check /path/to/vault
 llmwiki ingest status /path/to/vault <operation_id>
 llmwiki ingest apply /path/to/vault <operation_id>
 ```
 
-默认运行时是确定性的：模型相关模块使用 fixture 驱动的 `MockProvider` 输出，
-这样可以在接入真实模型前测试 pipeline、artifacts、validators、logs、profiles
-和 drafts。
+配置了 provider YAML 的 `fixture_dir`，或运行时使用 `--mock-fixture-dir` 强制
+mock 后，Mock/fixture run 是确定性的。这样可以在接入真实模型前测试 pipeline、
+artifacts、validators、logs、profiles 和 drafts。
 
 ## 设计原则
 

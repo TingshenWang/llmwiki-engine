@@ -40,7 +40,7 @@ def test_status_verify_exit_codes(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="cli")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="cli")
     runner = CliRunner()
     ok = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id, "--verify"])
     assert ok.exit_code == 0
@@ -161,7 +161,7 @@ def test_resume_refresh_providers_option_is_removed(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="cli-refresh")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="cli-refresh")
     runner = CliRunner()
     result = runner.invoke(app, ["ingest", "resume", str(vault), manifest.operation_id, "--refresh-providers"])
     assert result.exit_code != 0
@@ -207,7 +207,7 @@ def test_ingest_run_reports_awaiting_review_instead_of_ready(tmp_path: Path) -> 
             "run",
             str(vault),
             str(raw),
-            "--fixture-dir",
+            "--mock-fixture-dir",
             str(fixture_dir),
             "--slug",
             "awaiting-review",
@@ -260,30 +260,6 @@ def test_run_mock_fixture_dir_forces_mock_provider_over_live_config(tmp_path: Pa
     assert {runtime["fixture_dir"] for runtime in providers.values()} == {(FIXTURE_ROOT / "mock").resolve().as_posix()}
 
 
-def test_run_rejects_fixture_dir_and_mock_fixture_dir_together(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    runner = CliRunner()
-
-    result = runner.invoke(
-        app,
-        [
-            "ingest",
-            "run",
-            str(vault),
-            str(raw),
-            "--fixture-dir",
-            str(FIXTURE_ROOT / "mock"),
-            "--mock-fixture-dir",
-            str(FIXTURE_ROOT / "mock"),
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "Use either --fixture-dir or --mock-fixture-dir" in result.output
-
-
 @pytest.mark.parametrize(
     ("prepare", "expected"),
     [
@@ -323,7 +299,7 @@ def test_status_labels_skip_policy_as_local_provider(tmp_path: Path) -> None:
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
+        mock_fixture_dir=FIXTURE_ROOT / "mock",
         slug="skip-prepare-status",
         raw_prepare_policy=RawPreparePolicy.skip,
     )
@@ -357,7 +333,7 @@ def test_resume_invalid_from_step_reports_single_line_error(tmp_path: Path) -> N
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="cli-from")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="cli-from")
     runner = CliRunner()
     result = runner.invoke(app, ["ingest", "resume", str(vault), manifest.operation_id, "--from", "not_a_step"])
     assert result.exit_code != 0
@@ -395,7 +371,7 @@ def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="invalid-schema")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="invalid-schema")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data["schema_version"] = "operation_manifest.invalid"
@@ -422,7 +398,7 @@ def test_manifest_step_topology_reports_single_line_error_for_user_commands(tmp_
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="topology-cli")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="topology-cli")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     steps_by_name = {step["name"]: step for step in data["steps"]}
@@ -442,7 +418,7 @@ def test_verify_drift_reports_single_line_error_for_resume_and_apply(tmp_path: P
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="drift-cli")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="drift-cli")
     raw.write_text(raw.read_text(encoding="utf-8") + "\nchanged", encoding="utf-8")
 
     runner = CliRunner()
@@ -457,7 +433,7 @@ def test_apply_wiki_context_drift_reports_fixed_chinese_message(tmp_path: Path) 
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="wiki-drift-cli")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="wiki-drift-cli")
     (vault / "wiki" / "index.md").write_text("changed after planning\n", encoding="utf-8")
 
     runner = CliRunner()
@@ -496,7 +472,7 @@ def test_drafted_status_prompts_manual_apply(tmp_path: Path) -> None:
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
+        mock_fixture_dir=FIXTURE_ROOT / "mock",
         slug="single-mode-next",
     )
 
@@ -961,8 +937,6 @@ def test_ingest_run_raw_outside_vault_reports_single_line_error(tmp_path: Path) 
             "run",
             str(vault),
             str(outside_raw),
-            "--fixture-dir",
-            str(FIXTURE_ROOT / "mock"),
         ],
     )
     assert result.exit_code != 0
@@ -982,8 +956,6 @@ def test_ingest_run_missing_raw_reports_single_line_error(tmp_path: Path) -> Non
             "run",
             str(vault),
             str(missing_raw),
-            "--fixture-dir",
-            str(FIXTURE_ROOT / "mock"),
         ],
     )
     assert result.exit_code != 0
