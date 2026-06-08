@@ -79,7 +79,7 @@ def import_raw_url(
         if existing is not None:
             return _existing_url_result(vault, url, fetch_url, existing, final_url=str(response.url))
 
-    content_type = _content_type(response)
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     fetched_text = response.text
     inferred_title = (title or "").strip()
     source_format = _source_format(url, content_type, fetched_text)
@@ -89,7 +89,7 @@ def import_raw_url(
         body = _html_to_markdown(fetched_text)
     elif source_format == "text":
         inferred_title = inferred_title or _title_from_markdown(fetched_text) or _title_from_url(url)
-        body = _normalize_text(fetched_text)
+        body = fetched_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     else:
         raise RawUrlImportError(
             f"Unsupported content type {content_type!r}; only HTML, Markdown, and plain text URLs are supported."
@@ -256,11 +256,6 @@ def _read_limited_response(url: str, response: httpx.Response, *, max_bytes: int
     )
 
 
-def _content_type(response: httpx.Response) -> str:
-    value = response.headers.get("content-type", "")
-    return value.split(";", 1)[0].strip().lower()
-
-
 def _source_format(url: str, content_type: str, text: str) -> str:
     suffix = Path(urlparse(url).path).suffix.lower()
     if content_type in {"text/html", "application/xhtml+xml"} or suffix in {".html", ".htm"}:
@@ -365,10 +360,6 @@ def _html_to_markdown(text: str) -> str:
     parser = _HTMLMarkdownParser()
     parser.feed(text)
     return _cleanup_html_markdown_noise(parser.markdown())
-
-
-def _normalize_text(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _looks_like_html(text: str) -> bool:
