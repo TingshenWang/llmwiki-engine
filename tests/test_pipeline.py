@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
+import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.steps as steps_module
 from llmwiki_engine import open_questions as open_questions_module
@@ -3482,7 +3483,7 @@ def test_draft_rendering_model_output_is_canonicalized_for_internal_pipeline() -
         {"schema_version": "draft_rendering.v3", "pages": [page]}
     )
 
-    finalized = pipeline_module.canonicalize_draft_artifact(draft, qwen_related_block_plan())
+    finalized = draft_validation_module.canonicalize_draft_artifact(draft, qwen_related_block_plan())
     first_page = finalized.pages[0]
 
     assert first_page.summary == page["summary"]
@@ -3514,7 +3515,7 @@ def test_validate_draft_rendering_accepts_freeform_body_markdown() -> None:
         ]
     )
 
-    pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+    draft_validation_module.validate_draft_rendering(draft, plan, language="zh-CN")
 
 
 def test_finalize_draft_rendering_preserves_freeform_body_markdown() -> None:
@@ -3581,9 +3582,9 @@ def test_validate_draft_rendering_strips_system_heading_inside_body_markdown() -
         ]
     )
 
-    canonical = pipeline_module.canonicalize_draft_artifact(draft, plan)
+    canonical = draft_validation_module.canonicalize_draft_artifact(draft, plan)
 
-    pipeline_module.validate_draft_rendering(canonical, plan, language="zh-CN")
+    draft_validation_module.validate_draft_rendering(canonical, plan, language="zh-CN")
     assert "相关页面" not in canonical.pages[0].body_markdown
     assert "Entity_Qwen-Agent" not in canonical.pages[0].body_markdown
 
@@ -4485,7 +4486,7 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
     assert finalized.pages[0].change_summary == "创建 Boris 相关页面。"
     assert finalized.pages[0].source_coverage_notes == "Boris 与 Cat Wu 的访谈。"
     assert "Cat Wu 是 Claude Code 产品负责人" in related
-    assert pipeline_module.normalize_stable_brand_typos("Borrison builds Clade Codebase tools") == "Borrison builds Clade Codebase tools"
+    assert draft_validation_module.normalize_stable_brand_typos("Borrison builds Clade Codebase tools") == "Borrison builds Clade Codebase tools"
 
 
 def test_validate_draft_rendering_rejects_model_self_talk() -> None:
@@ -4519,8 +4520,8 @@ def test_validate_draft_rendering_rejects_model_self_talk() -> None:
         ]
     )
 
-    pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
-    issues = pipeline_module.draft_self_talk_issues(draft)
+    draft_validation_module.validate_draft_rendering(draft, plan, language="zh-CN")
+    issues = draft_validation_module.draft_self_talk_issues(draft)
 
     assert [issue.issue_code for issue in issues] == ["model_self_talk_leak"]
     assert issues[0].field_path == "pages.PP-SELF-TALK.body_markdown"
@@ -4542,7 +4543,7 @@ def test_validate_draft_rendering_rejects_wiki_state_leak() -> None:
         ]
     )
 
-    issues = pipeline_module.draft_self_talk_issues(draft)
+    issues = draft_validation_module.draft_self_talk_issues(draft)
 
     assert [issue.issue_code for issue in issues] == ["model_self_talk_leak"]
     assert issues[0].field_path == "pages.PP-STATE-LEAK.body_markdown"
@@ -4580,7 +4581,7 @@ def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
         ]
     )
 
-    pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+    draft_validation_module.validate_draft_rendering(draft, plan, language="zh-CN")
 
 
 def qwen_related_block_plan() -> pipeline_module.WikiMergePlanArtifact:
@@ -4626,7 +4627,7 @@ def test_validate_draft_rendering_rejects_related_block_inside_content() -> None
     )
 
     with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+        draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
     assert exc_info.value.issues[0].field_path == "pages.PP-QWEN.body_markdown"
@@ -4638,7 +4639,7 @@ def test_validate_draft_rendering_rejects_decorated_related_markdown_links_insid
     )
 
     with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+        draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
 
@@ -4651,7 +4652,7 @@ def test_validate_draft_rendering_rejects_related_markdown_link_bullets_inside_c
     )
 
     with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+        draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
 
@@ -4660,7 +4661,7 @@ def test_validate_draft_rendering_rejects_self_wikilink_inside_content() -> None
     draft = qwen_related_block_draft("可与 [[entities/Entity_Qwen-Agent.md|Qwen-Agent]] 页面保持一致。")
 
     with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+        draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
 
@@ -4669,7 +4670,7 @@ def test_validate_draft_rendering_rejects_basename_self_wikilink_inside_content(
     draft = qwen_related_block_draft("可与 [[Entity_Qwen-Agent.md|Qwen-Agent]] 页面保持一致。")
 
     with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+        draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
 
@@ -4678,7 +4679,7 @@ def test_validate_draft_rendering_rejects_display_title_self_wikilink_inside_con
     draft = qwen_related_block_draft("可与 [[Qwen-Agent|Qwen-Agent]] 页面保持一致。")
 
     with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+        draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
 
@@ -4689,7 +4690,7 @@ def test_validate_draft_rendering_allows_external_markdown_link_with_display_tit
         "这里它只是外部参考链接，不是指向当前 wiki 页面的自链。"
     )
 
-    pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+    draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
 
 def test_validate_draft_rendering_allows_related_word_without_link_block() -> None:
@@ -4698,7 +4699,7 @@ def test_validate_draft_rendering_allows_related_word_without_link_block() -> No
         "这里补充说明框架适合用来观察工具调用、规划和记忆抽象之间的边界。"
     )
 
-    pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+    draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
 
 def test_canonicalize_draft_rendering_strips_system_sections_from_free_body() -> None:
@@ -4725,10 +4726,10 @@ def test_canonicalize_draft_rendering_strips_system_sections_from_free_body() ->
         ]
     )
 
-    canonical = pipeline_module.canonicalize_draft_artifact(draft, plan)
+    canonical = draft_validation_module.canonicalize_draft_artifact(draft, plan)
     body = canonical.pages[0].body_markdown
 
-    pipeline_module.validate_draft_rendering(canonical, plan, language="zh-CN")
+    draft_validation_module.validate_draft_rendering(canonical, plan, language="zh-CN")
     assert "相关页面" not in body
     assert "矛盾与未决问题" not in body
     assert "Concept_Agent 开发框架" not in body
@@ -4746,7 +4747,7 @@ def test_validate_draft_rendering_allows_tilde_fenced_related_markdown_example()
         "示例外的正文继续说明 Qwen-Agent 的页面内容边界。"
     )
 
-    pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+    draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
 
 def test_stray_related_links_issue_is_page_scoped_repairable() -> None:
@@ -5240,7 +5241,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         def generate_raw(self, task: str, payload: dict[str, object], output_model: type[object]) -> str:
             self.payloads.append(payload)
             output = self.outputs[len(self.payloads) - 1]
-            output = pipeline_module.canonicalize_draft_artifact(output, merge_plan)
+            output = draft_validation_module.canonicalize_draft_artifact(output, merge_plan)
             return json.dumps(output.model_dump(mode="json"), ensure_ascii=False)
 
     class NoopRedactor:

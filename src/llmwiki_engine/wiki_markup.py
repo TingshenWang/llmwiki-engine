@@ -4,6 +4,7 @@ from pathlib import Path
 
 __all__ = (
     "clean_display_title",
+    "normalize_related_candidate_path",
     "obsidian_alias_link",
     "obsidian_link",
     "obsidian_link_label",
@@ -16,6 +17,25 @@ def clean_display_title(title: str) -> str:
         if stripped.lower().startswith(prefix.lower()):
             return stripped[len(prefix) :].strip()
     return stripped
+
+
+def normalize_related_candidate_path(value: str) -> str | None:
+    text = value.strip().strip("`").replace("\\", "/")
+    if not text:
+        return None
+    text = text.split("#", 1)[0]
+    while text.startswith("./"):
+        text = text[2:]
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    if path.parts and path.parts[0] == "wiki":
+        path = Path(*path.parts[1:])
+    if not path.parts or path.parts[0] in {"sources", "logs"} or path.as_posix() in {"index.md", "log.md"}:
+        return None
+    if path.suffix != ".md":
+        path = path.with_suffix(".md")
+    return path.as_posix()
 
 
 def obsidian_link(path: str, title: str | None = None) -> str:
