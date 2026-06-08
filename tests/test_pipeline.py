@@ -16,6 +16,7 @@ import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.run_metrics as run_metrics_module
+import llmwiki_engine.source_digest_budget as source_digest_budget
 import llmwiki_engine.steps as steps_module
 from llmwiki_engine import open_questions as open_questions_module
 from llmwiki_engine import page_sections as page_sections_module
@@ -625,6 +626,9 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "build_draft_grounding_review")
     assert not hasattr(pipeline_module, "quote_supported_by_text")
     assert not hasattr(pipeline_module, "render_draft_grounding_review")
+    assert not hasattr(pipeline_module, "augment_source_digest_anchor_entities")
+    assert not hasattr(pipeline_module, "cap_source_digest_candidates")
+    assert not hasattr(pipeline_module, "render_source_digest_budget_report")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -649,7 +653,7 @@ def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
         entities=[candidate("E1", "实体一")],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 4)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 4)
 
     assert [item.candidate_id for item in capped.concepts] == ["C1"]
     assert [item.candidate_id for item in capped.designs] == ["D1"]
@@ -670,7 +674,7 @@ def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
     assert report["deferred_aggregations"][0]["suggested_page_type"] == "concept_overview"
     assert "概念二" in report["deferred_aggregations"][0]["suggested_title"]
     assert report["deferred_aggregations"][-1]["group"] == "entities"
-    markdown = pipeline_module.render_source_digest_budget_report(report)
+    markdown = source_digest_budget.render_source_digest_budget_report(report)
     assert "## 延后候选详情" in markdown
     assert "实体一 可复用。" in markdown
     assert "## 后续处理批次" in markdown
@@ -702,7 +706,7 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
         ],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 2)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 2)
 
     assert len(capped.concepts) == 2
     assert capped.concepts[0].candidate_id == "C1"
@@ -740,7 +744,7 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
     assert all(candidate_id in projected_lookup for candidate_id in aggregate.related_candidates)
     assert report["selected_count"] == 2
     assert report["deferred_count"] == 2
-    markdown = pipeline_module.render_source_digest_budget_report(report)
+    markdown = source_digest_budget.render_source_digest_budget_report(report)
     assert "## 本轮已选聚合候选" in markdown
     assert aggregate.candidate_id in markdown
 
@@ -803,13 +807,13 @@ def test_source_digest_anchor_entities_are_added_before_page_budget() -> None:
         ],
     )
 
-    augmented = pipeline_module.augment_source_digest_anchor_entities(digest, text)
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
     assert [item.suggested_page_title for item in augmented.entities[:2]] == ["Managed Agents", "Claude Code"]
     assert augmented.entities[0].candidate_id == "auto-ent-managedagents"
     assert augmented.entities[1].source_locator.startswith("L")
     assert "deterministic_source_anchor_entity" in augmented.entities[1].resolution_hint
 
-    capped, report = pipeline_module.cap_source_digest_candidates(augmented, 12)
+    capped, report = source_digest_budget.cap_source_digest_candidates(augmented, 12)
 
     selected_titles = [item.suggested_page_title for item in capped.entities]
     assert "Managed Agents" in selected_titles
@@ -847,8 +851,8 @@ def test_source_digest_anchor_entities_do_not_duplicate_parenthetical_translatio
         "Managed Agents can host Claude Code as an excellent harness.\n"
     )
 
-    augmented = pipeline_module.augment_source_digest_anchor_entities(digest, text)
-    capped, report = pipeline_module.cap_source_digest_candidates(augmented, 12)
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
+    capped, report = source_digest_budget.cap_source_digest_candidates(augmented, 12)
 
     assert [item.candidate_id for item in augmented.entities if item.suggested_page_title.startswith("Managed Agents")] == ["c001"]
     assert [item.suggested_page_title for item in capped.entities] == ["Claude Code", "Managed Agents（托管智能体）"]
@@ -859,7 +863,7 @@ def test_source_digest_anchor_entities_ignore_weak_single_mentions() -> None:
     digest = SourceDigestArtifact(source_raw_path="raw/sample.md", summary="普通摘要。")
     text = "这篇材料只是随口提了一次 Claude Code，没有说明产品、harness 或团队上下文。"
 
-    augmented = pipeline_module.augment_source_digest_anchor_entities(digest, text)
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
 
     assert augmented.entities == []
 
@@ -892,7 +896,7 @@ def test_source_digest_candidate_budget_promotes_multiple_topic_aggregations_wit
         ],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 4)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 4)
 
     assert report["selected_count"] == 4
     assert report["deferred_count"] == 4
@@ -950,7 +954,7 @@ def test_source_digest_deferred_aggregation_does_not_replace_unrelated_selected_
         ],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 3)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 3)
 
     assert [item.candidate_id for item in capped.concepts] == ["CON-001", "CON-002", "CON-003"]
     assert report["selected_deferred_aggregations"] == []
@@ -975,9 +979,9 @@ def test_deferred_topic_clusters_do_not_merge_on_single_broad_anchor() -> None:
     model_eval = concept("C3", "模型评估方法", "模型评估需要离线指标和人工检查。")
     model_boundary = concept("C4", "模型产品边界", "模型进入产品后会改变功能边界。")
 
-    assert pipeline_module.source_digest_candidate_topic_similarity("concepts", agi_org, agi_investment) == 0.0
-    assert pipeline_module.source_digest_candidate_topic_similarity("concepts", model_eval, model_boundary) == 0.0
-    assert pipeline_module.deferred_candidate_topic_clusters("concepts", [agi_org, agi_investment, model_eval, model_boundary]) == []
+    assert source_digest_budget.source_digest_candidate_topic_similarity("concepts", agi_org, agi_investment) == 0.0
+    assert source_digest_budget.source_digest_candidate_topic_similarity("concepts", model_eval, model_boundary) == 0.0
+    assert source_digest_budget.deferred_candidate_topic_clusters("concepts", [agi_org, agi_investment, model_eval, model_boundary]) == []
 
 
 def test_draft_source_excerpt_pack_expands_aggregation_child_candidate_cues() -> None:
@@ -1234,7 +1238,7 @@ def test_source_digest_candidate_budget_semantically_dedupes_open_questions_befo
         ],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 12)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 12)
 
     assert [item.candidate_id for item in capped.open_questions] == ["O1", "O4"]
     assert capped.open_questions[0].related_candidates == ["O2", "O3"]
@@ -1245,7 +1249,7 @@ def test_source_digest_candidate_budget_semantically_dedupes_open_questions_befo
     assert report["deduped_count"] == 2
     assert report["dedupe_applied"] is True
     assert [item["merged_candidate_id"] for item in report["deduped_candidates"]] == ["O2", "O3"]
-    markdown = pipeline_module.render_source_digest_budget_report(report)
+    markdown = source_digest_budget.render_source_digest_budget_report(report)
     assert "## 语义去重候选" in markdown
     assert "semantic:agi_pm_role_necessity" in markdown
     assert "O2" in markdown
@@ -1274,7 +1278,7 @@ def test_source_digest_open_question_dedupe_prefers_tension_over_generic_title()
         ],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 12)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 12)
 
     assert [item.candidate_id for item in capped.open_questions] == ["O1"]
     assert capped.open_questions[0].related_candidates == ["O2"]
@@ -1305,7 +1309,7 @@ def test_source_digest_candidate_budget_semantically_dedupes_similar_concepts_be
         ],
     )
 
-    capped, report = pipeline_module.cap_source_digest_candidates(digest, 12)
+    capped, report = source_digest_budget.cap_source_digest_candidates(digest, 12)
 
     assert [item.candidate_id for item in capped.concepts] == ["C1", "C3"]
     assert capped.concepts[0].related_candidates == ["C2"]
