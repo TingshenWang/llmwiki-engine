@@ -274,7 +274,7 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
 def grounding_external_backing_issue(claim: GroundingClaim) -> bool:
     return (
         claim.support == "unsupported"
-        and claim.action in {"needs_review", "warn"}
+        and claim.action == "warn"
         and "新增外部背书/强事实标记" in claim.reason
     )
 

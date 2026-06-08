@@ -9134,7 +9134,7 @@ def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
     assert "非阻塞提醒" in review.warnings[0].reason
 
 
-def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None:
+def test_grounding_external_backing_issue_message_warns_with_source_local_guidance() -> None:
     claim = GroundingClaim(
         page_plan_id="PP-REDIS",
         target_path="concepts/Concept_Redis.md",
@@ -9142,8 +9142,8 @@ def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None
         claim_type="new_fact",
         text="Redis最初作为高性能缓存、分析和消息代理广泛使用。",
         support="unsupported",
-        action="needs_review",
-        reason="新增外部背书/强事实标记 `广泛使用` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
+        action="warn",
+        reason="新增外部背书/强事实标记 `广泛使用` 未在 raw 或 inspected wiki 中出现；作为非阻塞提醒保留，必要时可改写为 source-local 表达。",
     )
 
     message = draft_grounding.grounding_issue_message(claim)
