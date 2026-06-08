@@ -307,21 +307,6 @@ def retrieval_sort_components_for_values(
     }
 
 
-def retrieval_sort_explanation(
-    hit: CandidateContextHit,
-    item: CandidateResolutionItem,
-    entry_by_path: dict[str, WikiKnowledgePoolEntry],
-) -> str:
-    return retrieval_sort_explanation_for_values(
-        score=hit.score,
-        strength=hit.strength,
-        match_basis=hit.match_basis,
-        path=hit.path,
-        item=item,
-        entry=entry_by_path.get(hit.path),
-    )
-
-
 def retrieval_sort_explanation_for_values(
     *,
     score: float,

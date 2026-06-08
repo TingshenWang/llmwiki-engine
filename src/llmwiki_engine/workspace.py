@@ -92,15 +92,6 @@ def llmwiki_git_state(vault: Path) -> LlmwikiGitState:
     return LlmwikiGitState(is_git_repo=True, tracked=tracked, staged=staged, root=root)
 
 
-def assert_llmwiki_not_tracked_or_staged(vault: Path) -> None:
-    state = llmwiki_git_state(vault)
-    if not state.is_git_repo:
-        raise WorkspaceError("Cannot commit because vault is not a Git repository.")
-    if state.tracked or state.staged:
-        paths = ", ".join(sorted(set(state.tracked + state.staged)))
-        raise WorkspaceError(f".llmwiki/ must not be tracked or staged by Git: {paths}")
-
-
 def _git_paths(vault: Path, args: list[str]) -> list[str]:
     result = subprocess.run(args, cwd=vault, check=False, capture_output=True)
     if result.returncode != 0:

@@ -7,7 +7,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import unified_diff
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, TypeVar
@@ -6925,10 +6925,6 @@ def first_source_basis_candidate(
     return None
 
 
-def existing_knowledge_page_paths(vault: Path) -> set[str]:
-    return {entry.rel_path for entry in build_knowledge_pool(vault)}
-
-
 def parse_frontmatter(text: str) -> dict[str, Any] | None:
     if not text.startswith("---\n"):
         return None
@@ -8533,41 +8529,6 @@ def ensure_snapshot_within_limit(snapshot: WikiContextSnapshot, max_context_char
     total = sum(len(entry.content) for entry in snapshot.entries)
     if total > max_context_chars:
         raise PipelineError(f"wiki_context_snapshot exceeds max_context_chars ({total} > {max_context_chars}); retry with a smaller vault or higher limit.")
-
-
-def read_wiki_page_metadata(vault: Path, rel_path: str) -> WikiPageMetadata | None:
-    path = vault / rel_path
-    if not path.exists() or path.suffix != ".md":
-        return None
-    frontmatter = parse_frontmatter(path.read_text(encoding="utf-8"))
-    if frontmatter is None:
-        return None
-    llmwiki_type = frontmatter.get("llmwiki_type")
-    title = frontmatter.get("title")
-    summary = frontmatter.get("summary")
-    created = frontmatter.get("created", "")
-    updated = frontmatter.get("updated")
-    if isinstance(created, (datetime, date)):
-        created = created.isoformat()
-    if isinstance(updated, (datetime, date)):
-        updated = updated.isoformat()
-    if not all(isinstance(value, str) and value.strip() for value in [llmwiki_type, title, summary, updated]):
-        return None
-    aliases_raw = frontmatter.get("aliases", [])
-    aliases = [item for item in aliases_raw if isinstance(item, str)] if isinstance(aliases_raw, list) else []
-    return WikiPageMetadata(
-        path=rel_path.removeprefix("wiki/"),
-        llmwiki_type=llmwiki_type,
-        title=title,
-        summary=summary,
-        created=created if isinstance(created, str) else "",
-        updated=updated,
-        aliases=aliases,
-        source_raw_paths=_frontmatter_list(frontmatter, "source_raw_paths"),
-        source_raw_hashes=_frontmatter_list(frontmatter, "source_raw_hashes"),
-        source_prepared_hashes=_frontmatter_list(frontmatter, "source_prepared_hashes"),
-        source_operation_ids=_frontmatter_list(frontmatter, "source_operation_ids"),
-    )
 
 
 def resolve_model_related_pages(
@@ -12022,32 +11983,6 @@ def plausible_ascii_open_quote(body: str, quote_start: int) -> bool:
     return previous.isspace() or previous in "([{<（【《:：,，;；.。!！?？\n\r\t-—"
 
 
-UNQUOTED_DYNAMIC_SCENARIO_SECTIONS = {"detail", "examples", "additional_notes"}
-
-
-def unquoted_dynamic_sensitive_scenario_marker(text: str, *, section_key: str, page_type: str) -> str | None:
-    if section_key == "open_questions":
-        return None
-    if section_key not in UNQUOTED_DYNAMIC_SCENARIO_SECTIONS:
-        return None
-    scan_text = redact_dynamic_sensitive_placeholder_secrets(remove_grounding_quote_spans_for_scan(text))
-    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", scan_text))
-    marker = dynamic_sensitive_query_marker_text(compact, scan_text)
-    if marker and dynamic_sensitive_secret_marker(marker):
-        return marker
-    if not unquoted_dynamic_scenario_context(scan_text, section_key=section_key, page_type=page_type):
-        return None
-    if not marker:
-        marker = unquoted_dynamic_sensitive_extra_marker(compact, scan_text)
-    if not marker:
-        return None
-    if unquoted_dynamic_scenario_technical_field_context(scan_text) and not unquoted_dynamic_user_action_context(scan_text):
-        if dynamic_sensitive_secret_marker(marker):
-            return marker
-        return None
-    return marker
-
-
 def remove_grounding_quote_spans_for_scan(text: str) -> str:
     if not text:
         return text
@@ -12057,145 +11992,6 @@ def remove_grounding_quote_spans_for_scan(text: str) -> str:
         for index in range(max(0, quote_start), quote_end):
             chars[index] = " "
     return "".join(chars)
-
-
-def unquoted_dynamic_scenario_context(text: str, *, section_key: str, page_type: str) -> bool:
-    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
-    lowered = unicodedata.normalize("NFKC", text).lower()
-    context_markers = [
-        "例如",
-        "比如",
-        "示例",
-        "例子",
-        "场景",
-        "假设",
-        "用户",
-        "客户",
-        "客服",
-        "问题",
-        "查询",
-        "请求",
-        "询问",
-        "反复",
-    ]
-    if any(marker in compact for marker in context_markers):
-        return True
-    if page_type == "open_question" and section_key in {"detail", "examples"}:
-        if any(marker in compact for marker in ["如果", "是否", "如何"]):
-            return True
-    return bool(re.search(r"\b(?:example|scenario|user|customer|support|question|query|request|asks?|asked)\b", lowered))
-
-
-def unquoted_dynamic_scenario_technical_field_context(text: str) -> bool:
-    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
-    lowered = unicodedata.normalize("NFKC", text).lower()
-    technical_markers = [
-        "字段",
-        "schema",
-        "Schema",
-        "表结构",
-        "数据表",
-        "列名",
-        "配置项",
-        "配置",
-        "配置文件",
-        "配置问题",
-        "接口",
-        "端点",
-        "路由",
-        "参数",
-    ]
-    if any(marker in compact for marker in technical_markers):
-        return True
-    return bool(
-        re.search(
-            r"\b(?:schema|field|column|config|configuration|api|endpoint|route|service account)\b",
-            lowered,
-        )
-    )
-
-
-def redact_dynamic_sensitive_placeholder_secrets(text: str) -> str:
-    placeholder = r"<[^>\n]{0,48}(?:api[_\-. ]?key|token|secret|密钥|令牌|凭证)[^>\n]{0,48}>"
-    assignment_key = r"(?:api[_\-. ]?key|token|secret|credential|credentials|密钥|令牌|凭证)"
-    text = re.sub(
-        rf"(?i)\b{assignment_key}\b\s*['\"]?\s*[:=]\s*['\"]?{placeholder}['\"]?",
-        " ",
-        text,
-    )
-    return re.sub(placeholder, "<placeholder>", text, flags=re.IGNORECASE)
-
-
-def dynamic_sensitive_secret_marker(marker: str) -> bool:
-    marker_lower = marker.lower()
-    return bool(
-        re.search(r"(?:api[_\-. ]?key|token|secret|credential|credentials)", marker_lower, re.IGNORECASE)
-    )
-
-
-def unquoted_dynamic_user_action_context(text: str) -> bool:
-    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
-    lowered = unicodedata.normalize("NFKC", text).lower()
-    user_markers = ["用户", "客户", "客服", "某个用户", "某个客户"]
-    action_markers = [
-        "询问",
-        "查询",
-        "请求",
-        "修改",
-        "更改",
-        "更新",
-        "处理",
-        "反复",
-        "想",
-        "需要",
-        "查看",
-        "获取",
-        "读取",
-        "搜索",
-        "查找",
-        "检查",
-        "申请",
-        "取消",
-        "退款",
-        "支付",
-        "付款",
-    ]
-    if any(marker in compact for marker in user_markers) and any(marker in compact for marker in action_markers):
-        return True
-    return bool(
-        re.search(r"\b(?:user|customer|support)\b", lowered)
-        and re.search(
-            r"\b(?:asks?|asked|asking|quer(?:y|ies|ied|ying)|requests?|requested|requesting|"
-            r"changes?|changed|changing|updates?|updated|updating|modif(?:y|ies|ied|ying)|"
-            r"handles?|handled|handling|checks?|checked|checking|views?|viewed|viewing|"
-            r"looks?\s+up|looked\s+up|looking\s+up|lookups?|gets?|got|getting|"
-            r"finds?|found|finding|search(?:es|ed|ing)?|cancels?|cancelled|canceled|"
-            r"cancelling|canceling|refunds?|refunded|refunding|pays?|paid|paying|payment|repeatedly)\b",
-            lowered,
-        )
-    )
-
-
-def unquoted_dynamic_sensitive_extra_marker(compact: str, original: str = "") -> str | None:
-    patterns = [
-        r"(?:订单|工单|票据).{0,8}(?:信息|详情|内容|地址|收货地址)",
-        r"(?:修改|更改|更新).{0,8}(?:订单|工单|票据).{0,8}(?:地址|收货地址|信息|详情|内容)",
-        r"(?:用户|客户|某个用户|某个客户).{0,12}(?:订单|工单|票据).{0,8}(?:信息|详情|内容|地址|收货地址|状态|进度)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, compact, re.IGNORECASE)
-        if match:
-            return match.group(0)
-    lowered = unicodedata.normalize("NFKC", original).lower()
-    english_patterns = [
-        r"\b(?:order|ticket|issue)\s+(?:details?|info|information|address|addresses|status|progress)\b",
-        r"\b(?:change|update|modify)\s+(?:the\s+|a\s+)?(?:order|ticket|issue).{0,24}\b(?:address|info|information|details?)\b",
-    ]
-    for pattern in english_patterns:
-        match = re.search(pattern, lowered, re.IGNORECASE)
-        if match:
-            return match.group(0)
-    return None
 
 
 def collect_grounding_claims(
@@ -14456,11 +14252,6 @@ def build_index_rows(profile: Any, plan: WikiMergePlanArtifact, draft: DraftRend
     rows.sort(key=lambda row: row["page"])
     rows.sort(key=lambda row: row["updated"], reverse=True)
     rows.sort(key=lambda row: type_order.index(row["type"]) if row["type"] in type_order else len(type_order))
-    return rows
-
-
-def build_open_question_rows(plan: WikiMergePlanArtifact, draft: DraftRenderingArtifact, snapshot: WikiContextSnapshot) -> list[dict[str, str]]:
-    rows, _ = build_open_question_rows_with_report(plan, draft, snapshot)
     return rows
 
 
