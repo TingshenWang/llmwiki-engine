@@ -23,6 +23,7 @@ from . import page_sections as _page_sections
 from . import section_merge as _section_merge
 from . import source_excerpt as _source_excerpt
 from . import update_preservation as _update_preservation
+from . import wiki_markup as _wiki_markup
 from .events import EventLogger, format_duration
 from .hash_utils import artifact_ref, sha256_bytes, sha256_file
 from .io import read_json, read_model, read_yaml, write_json, write_yaml
@@ -4006,7 +4007,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     if knowledge_changed_paths:
         assert_system_page_can_be_overwritten(ctx.vault, "wiki/index.md")
         index = draft_root / "index.md"
-        open_question_rows, open_question_report = build_open_question_rows_with_report(merge_plan, draft_artifact, snapshot)
+        open_question_rows, open_question_report = _open_questions.build_open_question_rows_with_report(merge_plan, draft_artifact, snapshot)
         index.write_text(
             render_index(
                 knowledge_rows=build_index_rows(ctx.profile, merge_plan, draft_artifact, snapshot),
@@ -4018,7 +4019,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         open_question_report_path = step_root / "index_open_questions_report.json"
         open_question_report_md = step_root / "index_open_questions_report.md"
         write_json(open_question_report_path, open_question_report)
-        open_question_report_md.write_text(render_index_open_questions_report(open_question_report), encoding="utf-8")
+        open_question_report_md.write_text(_open_questions.render_index_open_questions_report(open_question_report), encoding="utf-8")
         outputs.append(index)
         outputs.extend([open_question_report_path, open_question_report_md])
         index_entry = snapshot_entry(snapshot, "wiki/index.md")
@@ -5561,7 +5562,7 @@ def resolve_related_pages(
             if metadata is not None and metadata.path != item.candidate_target_path:
                 resolved = RelatedPageRef(
                     target_path=metadata.path,
-                    display_title=clean_display_title(metadata.title),
+                    display_title=_wiki_markup.clean_display_title(metadata.title),
                     source="wiki_context",
                     reason=f"已有 wiki 页面标题或别名精确匹配 `{raw}`，可作为理解本页的相关背景。",
                 )
@@ -5591,14 +5592,6 @@ def assert_system_page_can_be_overwritten(vault: Path, target_path: str) -> None
         assert_current_system_page(path)
     except RuntimeError as exc:
         raise PipelineError(f"{exc}: {target_path}") from exc
-
-
-def clean_display_title(title: str) -> str:
-    stripped = title.strip()
-    for prefix in ["Concept_", "Entity_", "Design_", "Comparison_", "Overview_", "Event_", "Memory_", "Idea_", "Open_Question_"]:
-        if stripped.lower().startswith(prefix.lower()):
-            return stripped[len(prefix) :].strip()
-    return stripped
 
 
 def yaml_scalar(value: str) -> str:
@@ -6960,7 +6953,7 @@ def finalize_candidate_resolution(
         )
     for item in artifact.items:
         page_type = item.page_type
-        display_title = clean_display_title(item.display_title) or item.display_title.strip()
+        display_title = _wiki_markup.clean_display_title(item.display_title) or item.display_title.strip()
         source_fingerprint = source_basis_fingerprint(item.source_basis)
         page_plan_id = stable_page_plan_id(page_type, display_title, source_fingerprint)
         stem = unicode_safe_stem(display_title)
@@ -7181,9 +7174,9 @@ def _resolve_single_model_related(
             if metadata is not None and metadata.path != self_path:
                 return RelatedPageRef(
                     target_path=metadata.path,
-                    display_title=clean_display_title(metadata.title),
+                    display_title=_wiki_markup.clean_display_title(metadata.title),
                     source="wiki_context",
-                    reason=chinese_related_reason(fallback_reason, f"召回旧页 `{clean_display_title(metadata.title)}` 与该主题存在可复用背景。"),
+                    reason=chinese_related_reason(fallback_reason, f"召回旧页 `{_wiki_markup.clean_display_title(metadata.title)}` 与该主题存在可复用背景。"),
                 )
         key = normalize_related_key(raw)
         current_matches = current_by_title.get(key, [])
@@ -7200,7 +7193,7 @@ def _resolve_single_model_related(
             metadata = metadata_matches[0]
             return RelatedPageRef(
                 target_path=metadata.path,
-                display_title=clean_display_title(metadata.title),
+                display_title=_wiki_markup.clean_display_title(metadata.title),
                 source="wiki_context",
                 reason=chinese_related_reason(fallback_reason, f"已有 wiki 页面标题或别名匹配 `{raw}`，可作为相关背景。"),
             )
@@ -7237,7 +7230,7 @@ def related_reason_has_internal_reference(reason: str) -> bool:
 
 
 def related_public_fallback(source: str, title: str) -> str:
-    clean_title = clean_display_title(title)
+    clean_title = _wiki_markup.clean_display_title(title)
     if source == "wiki_context":
         return f"`{clean_title}` 可作为当前主题的背景补充。"
     if source == "existing_wiki":
@@ -7411,7 +7404,7 @@ def finalize_wiki_merge_plan(
                     "page_plan_id": resolution_item.page_plan_id,
                     "source_basis": resolution_item.source_basis,
                     "page_type": resolution_item.page_type,
-                    "display_title": clean_display_title(item.display_title or resolution_item.display_title),
+                    "display_title": _wiki_markup.clean_display_title(item.display_title or resolution_item.display_title),
                     "apply_eligibility": apply_eligibility,
                     "blocked_reason": blocked_reason,
                 }
@@ -7450,9 +7443,9 @@ def synthesize_medium_create_why_not_update(
     old_path = strongest_hit.path if strongest_hit is not None else ""
     old_entry = snapshot_entry(snapshot, f"wiki/{old_path}") if old_path else WikiContextEntry(path="", expected_state="missing")
     old_title = (
-        clean_display_title(old_entry.metadata.title)
+        _wiki_markup.clean_display_title(old_entry.metadata.title)
         if old_entry.metadata is not None
-        else clean_display_title(strongest_hit.display_title if strongest_hit is not None else "已召回旧页")
+        else _wiki_markup.clean_display_title(strongest_hit.display_title if strongest_hit is not None else "已召回旧页")
     )
     old_summary = old_entry.metadata.summary if old_entry.metadata is not None else ""
     old_scope = _markdown_utils.compact_payload_text(old_summary or old_title or old_path, 120)
@@ -7474,7 +7467,7 @@ def synthesize_medium_create_why_not_update(
     page_kind = chinese_page_type_label(resolution_item.page_type)
     return (
         "本地补充：scope_delta："
-        f"新页《{clean_display_title(resolution_item.display_title)}》按 `{resolution_item.candidate_target_path}` 独立沉淀为{page_kind}，"
+        f"新页《{_wiki_markup.clean_display_title(resolution_item.display_title)}》按 `{resolution_item.candidate_target_path}` 独立沉淀为{page_kind}，"
         f"核心范围是「{new_scope}」；最像旧页《{old_title}》位于 `{old_path}`，旧页范围是「{old_scope}」。"
         "source_delta："
         f"本轮来源增量是「{source_delta}」。"
@@ -7933,7 +7926,7 @@ def medium_create_generic_old_title_review_reason(item: WikiMergePlanItem, *, ol
         return ""
     if not merge_reason_dismisses_old_as_specific_or_new_as_generic(item.why_not_update):
         return ""
-    old_display = old_display_title.strip() or clean_display_title(Path(item.strongest_overlap.path).stem)
+    old_display = old_display_title.strip() or _wiki_markup.clean_display_title(Path(item.strongest_overlap.path).stem)
     return (
         f"召回到中等相关旧页 `{item.strongest_overlap.path}`，旧页标题《{old_display}》像通用概念页，"
         "但模型选择 create 的理由把旧页归为具体平台/产品/实现或把新页归为通用概念；"
@@ -7943,7 +7936,7 @@ def medium_create_generic_old_title_review_reason(item: WikiMergePlanItem, *, ol
 
 def merge_overlap_old_label(item: WikiMergePlanItem, *, old_display_title: str = "") -> str:
     path = item.strongest_overlap.path
-    path_stem = clean_display_title(Path(path).stem) if path else ""
+    path_stem = _wiki_markup.clean_display_title(Path(path).stem) if path else ""
     return " ".join(part for part in [old_display_title.strip(), path, path_stem] if part)
 
 
@@ -8499,18 +8492,6 @@ def core_body_system_heading(body: str) -> str | None:
     return None
 
 
-def draft_page_summary(page: DraftPageItem) -> str:
-    return page.summary.strip()
-
-
-def draft_page_core_markdown(page: DraftPageItem) -> str:
-    return page.body_markdown.strip()
-
-
-def draft_page_open_questions(page: DraftPageItem) -> str:
-    return page.open_questions.strip()
-
-
 def normalize_stable_brand_typos(text: str) -> str:
     replacements = [
         ("Clade Code", "Claude Code"),
@@ -8542,15 +8523,15 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
         display_title = plan_item.display_title if plan_item is not None else ""
         if not page.canonical_target_path.strip():
             raise_draft_issue("missing_field", f"{page.page_plan_id} canonical_target_path must not be empty", field_path="canonical_target_path")
-        if not draft_page_summary(page):
+        if not _update_preservation.draft_page_summary(page):
             raise_draft_issue("missing_field", f"{page.page_plan_id} summary must not be empty", field_path="summary")
-        if not draft_page_core_markdown(page):
+        if not _update_preservation.draft_page_core_markdown(page):
             raise_draft_issue("missing_field", f"{page.page_plan_id} body_markdown must not be empty", field_path="body_markdown")
         if not page.change_summary.strip():
             raise_draft_issue("missing_field", f"{page.page_plan_id} change_summary must not be empty", field_path="change_summary")
         if not page.source_coverage_notes.strip():
             raise_draft_issue("missing_field", f"{page.page_plan_id} source_coverage_notes must not be empty", field_path="source_coverage_notes")
-        system_heading = core_body_system_heading(draft_page_core_markdown(page))
+        system_heading = core_body_system_heading(_update_preservation.draft_page_core_markdown(page))
         if system_heading:
             raise_draft_issue(
                 "forbidden_system_section_in_core",
@@ -8561,9 +8542,9 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
                 field_path="body_markdown",
             )
         for field_name, body in [
-            ("summary", draft_page_summary(page)),
-            ("body_markdown", draft_page_core_markdown(page)),
-            ("open_questions", draft_page_open_questions(page)),
+            ("summary", _update_preservation.draft_page_summary(page)),
+            ("body_markdown", _update_preservation.draft_page_core_markdown(page)),
+            ("open_questions", _update_preservation.draft_page_open_questions(page)),
         ]:
             if "---\n" in body or body.lstrip().startswith("# ") or contains_source_graph_link(body):
                 raise_draft_issue(
@@ -8603,8 +8584,8 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
 
 
 def validate_digestive_quality(page: DraftPageItem, item: WikiMergePlanItem) -> None:
-    summary = draft_page_summary(page)
-    core = draft_page_core_markdown(page)
+    summary = _update_preservation.draft_page_summary(page)
+    core = _update_preservation.draft_page_core_markdown(page)
     if not is_substantive_digestive_text(core) or normalized_digest_text(summary) == normalized_digest_text(core):
         raise_draft_issue(
             "thin_digestive_content",
@@ -8626,9 +8607,9 @@ def draft_self_talk_issues(artifact: DraftRenderingArtifact) -> list[StructuredI
     issues: list[StructuredIssue] = []
     for page in artifact.pages:
         for field_name, body in [
-            ("summary", draft_page_summary(page)),
-            ("body_markdown", draft_page_core_markdown(page)),
-            ("open_questions", draft_page_open_questions(page)),
+            ("summary", _update_preservation.draft_page_summary(page)),
+            ("body_markdown", _update_preservation.draft_page_core_markdown(page)),
+            ("open_questions", _update_preservation.draft_page_open_questions(page)),
         ]:
             marker = draft_self_talk_marker(body)
             if not marker:
@@ -8828,9 +8809,9 @@ def snapshot_entry(snapshot: WikiContextSnapshot, path: str) -> WikiContextEntry
 
 
 def draft_grounding_sections(page: DraftPageItem) -> list[tuple[str, str]]:
-    sections: list[tuple[str, str]] = [("summary", draft_page_summary(page))]
-    sections.extend(body_markdown_grounding_sections(draft_page_core_markdown(page)))
-    sections.append(("open_questions", draft_page_open_questions(page)))
+    sections: list[tuple[str, str]] = [("summary", _update_preservation.draft_page_summary(page))]
+    sections.extend(body_markdown_grounding_sections(_update_preservation.draft_page_core_markdown(page)))
+    sections.append(("open_questions", _update_preservation.draft_page_open_questions(page)))
     return [(section_key, body) for section_key, body in sections if body.strip()]
 
 
@@ -12056,9 +12037,9 @@ def assemble_knowledge_page(
     approved_raw_text: str = "",
 ) -> str:
     existing_sections = _page_sections.parse_existing_sections(existing_entry.content)
-    summary = draft_page_summary(page) or item.new_understanding
-    core = draft_page_core_markdown(page) or item.knowledge_delta or item.new_understanding
-    questions = draft_page_open_questions(page) or "暂无矛盾与未决问题记录。"
+    summary = _update_preservation.draft_page_summary(page) or item.new_understanding
+    core = _update_preservation.draft_page_core_markdown(page) or item.knowledge_delta or item.new_understanding
+    questions = _update_preservation.draft_page_open_questions(page) or "暂无矛盾与未决问题记录。"
     metadata = existing_entry.metadata
     is_update = item.action == "update" and metadata is not None
     final_title = metadata.title if is_update and metadata.title else item.display_title
@@ -12292,8 +12273,8 @@ def build_index_rows(profile: Any, plan: WikiMergePlanArtifact, draft: DraftRend
         if metadata is None or metadata.llmwiki_type.lower() == "source":
             continue
         rows_by_path[metadata.path] = {
-            "title": clean_display_title(metadata.title),
-            "page": obsidian_link(metadata.path),
+            "title": _wiki_markup.clean_display_title(metadata.title),
+            "page": _wiki_markup.obsidian_link(metadata.path),
             "type": metadata.llmwiki_type,
             "summary": metadata.summary,
             "updated": metadata.updated,
@@ -12305,15 +12286,15 @@ def build_index_rows(profile: Any, plan: WikiMergePlanArtifact, draft: DraftRend
         if item.page_type.lower() == "source":
             continue
         page = page_by_id.get(item.page_plan_id)
-        summary = draft_page_summary(page) if page else item.new_understanding
+        summary = _update_preservation.draft_page_summary(page) if page else item.new_understanding
         title = item.display_title
         if item.action == "update":
             entry = next((entry for entry in snapshot.entries if entry.path == f"wiki/{item.canonical_target_path}"), None)
             if entry is not None and entry.metadata is not None:
-                title = clean_display_title(entry.metadata.title)
+                title = _wiki_markup.clean_display_title(entry.metadata.title)
         rows_by_path[item.canonical_target_path] = {
             "title": title,
-            "page": obsidian_link(item.canonical_target_path),
+            "page": _wiki_markup.obsidian_link(item.canonical_target_path),
             "type": item.page_type,
             "summary": summary or item.new_understanding,
             "updated": plan.log_date,
@@ -12324,106 +12305,6 @@ def build_index_rows(profile: Any, plan: WikiMergePlanArtifact, draft: DraftRend
     rows.sort(key=lambda row: row["updated"], reverse=True)
     rows.sort(key=lambda row: type_order.index(row["type"]) if row["type"] in type_order else len(type_order))
     return rows
-
-
-def build_open_question_rows_with_report(
-    plan: WikiMergePlanArtifact,
-    draft: DraftRenderingArtifact,
-    snapshot: WikiContextSnapshot,
-) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    candidates: list[dict[str, str]] = []
-    for entry in snapshot.entries:
-        metadata = entry.metadata
-        if entry.expected_state != "present" or metadata is None or metadata.llmwiki_type.lower() == "source":
-            continue
-        for question in _open_questions.extract_open_questions(entry.content):
-            candidates.append({
-                "question": question,
-                "page": obsidian_link(metadata.path, clean_display_title(metadata.title)),
-                "path": metadata.path,
-                "updated": metadata.updated,
-                "page_type": metadata.llmwiki_type,
-                "source": "existing_wiki",
-            })
-    plan_by_id = {item.page_plan_id: item for item in plan.items}
-    for page in draft.pages:
-        item = plan_by_id.get(page.page_plan_id)
-        if item is None:
-            continue
-        for question in _open_questions.meaningful_open_question_lines(draft_page_open_questions(page)):
-            candidates.append({
-                "question": question,
-                "page": obsidian_link(item.canonical_target_path, item.display_title),
-                "path": item.canonical_target_path,
-                "updated": plan.log_date,
-                "page_type": item.page_type,
-                "source": "draft",
-            })
-    by_key = _open_questions.group_open_question_candidates(candidates)
-    rows: list[dict[str, str]] = []
-    report_items: list[dict[str, Any]] = []
-    for key, grouped in sorted(by_key.items()):
-        representative = max(grouped, key=_open_questions.open_question_representative_sort_key)
-        low_signal = _open_questions.is_low_signal_open_question(representative["question"])
-        repeated_gap = len(grouped) >= 2 and low_signal
-        keep = (
-            any(item["page_type"] == "open_question" for item in grouped)
-            or repeated_gap
-            or not low_signal
-        )
-        pages = _markdown_utils.dedupe_strings([item["page"] for item in sorted(grouped, key=lambda item: item["updated"], reverse=True)])[:3]
-        decision = "kept" if keep else "filtered"
-        reason = "open_question_page" if any(item["page_type"] == "open_question" for item in grouped) else ""
-        if not reason:
-            reason = "repeated_source_gap" if repeated_gap else ("low_signal_or_source_gap" if low_signal else "high_signal")
-        report_items.append(
-            {
-                "normalized_key": key,
-                "question": representative["question"],
-                "decision": decision,
-                "reason": reason,
-                "pages": pages,
-                "occurrences": len(grouped),
-            }
-        )
-        if not keep:
-            continue
-        rows.append(
-            {
-                "question": representative["question"],
-                "page": ", ".join(pages),
-                "updated": max(item["updated"] for item in grouped),
-            }
-        )
-    rows.sort(key=lambda row: (row["updated"], row["page"], row["question"]), reverse=True)
-    return rows, {
-        "schema_version": "index_open_questions_report.v1",
-        "kept_count": sum(1 for item in report_items if item["decision"] == "kept"),
-        "filtered_count": sum(1 for item in report_items if item["decision"] == "filtered"),
-        "deduped_count": sum(max(0, item["occurrences"] - 1) for item in report_items if item["decision"] == "kept"),
-        "items": report_items,
-    }
-
-
-def render_index_open_questions_report(report: dict[str, Any]) -> str:
-    rows = [
-        [
-            item["decision"],
-            item["reason"],
-            item["question"],
-            ", ".join(item["pages"]),
-            str(item["occurrences"]),
-        ]
-        for item in report.get("items", [])
-    ]
-    return (
-        "# Index 未决问题筛选报告\n\n"
-        f"- 保留：{report.get('kept_count', 0)}\n"
-        f"- 过滤：{report.get('filtered_count', 0)}\n\n"
-        f"- 合并重复：{report.get('deduped_count', 0)}\n\n"
-        + (format_markdown_table(["决策", "原因", "问题", "关联页面", "次数"], rows) if rows else "暂无未决问题。")
-        + "\n"
-    )
 
 
 def render_related_pages(
@@ -12456,7 +12337,7 @@ def render_related_pages(
     seen: set[str] = set()
     for candidate in candidates:
         path = normalize_related_candidate_path(candidate["target_path"])
-        title = candidate["display_title"].strip() or clean_display_title(Path(candidate["target_path"]).stem)
+        title = candidate["display_title"].strip() or _wiki_markup.clean_display_title(Path(candidate["target_path"]).stem)
         reason = normalize_stable_brand_typos(
             public_related_reason(candidate["reason"], related_public_fallback(str(candidate.get("source") or ""), title))
         )
@@ -12486,7 +12367,7 @@ def render_related_pages(
         if reject_reason or path is None:
             continue
         seen.add(path)
-        rows.append(f"- {obsidian_alias_link(path, title)}：{reason}")
+        rows.append(f"- {_wiki_markup.obsidian_alias_link(path, title)}：{reason}")
     if not rows:
         if report_list is not None:
             report_list.append(
@@ -12517,7 +12398,7 @@ def parse_existing_related_candidates(markdown: str) -> list[dict[str, str]]:
             candidates.append(
                 {
                     "target_path": path or target.strip(),
-                    "display_title": alias.strip() or clean_display_title(Path(target).stem),
+                    "display_title": alias.strip() or _wiki_markup.clean_display_title(Path(target).stem),
                     "reason": "旧 Related 作为候选重新参与排序。",
                     "source": "existing_related",
                     "priority": 0,
@@ -12680,25 +12561,6 @@ def render_draft_grounding_review(review: DraftGroundingReview) -> str:
         format_markdown_table(["页面计划", "目标", "段落", "类型", "支持", "处理", "原因", "文本"], rows) if rows else "暂无分类记录。",
     ]
     return "\n".join(sections).rstrip() + "\n"
-
-
-def obsidian_link(path: str, title: str | None = None) -> str:
-    target = Path(path)
-    if target.parts and target.parts[0] == "wiki":
-        target = Path(*target.parts[1:])
-    return f"[[{target.with_suffix('').as_posix()}]]"
-
-
-def obsidian_alias_link(path: str, title: str) -> str:
-    target = Path(path)
-    if target.parts and target.parts[0] == "wiki":
-        target = Path(*target.parts[1:])
-    return f"[[{target.with_suffix('').as_posix()}|{obsidian_link_label(title)}]]"
-
-
-def obsidian_link_label(value: str) -> str:
-    label = " ".join(value.replace("|", "/").replace("]", "").split())
-    return label or "Untitled"
 
 
 def render_update_diff(old: str, new: str, old_name: str, new_name: str) -> str:

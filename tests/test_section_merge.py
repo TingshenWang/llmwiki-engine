@@ -16,3 +16,15 @@ def test_pipeline_does_not_reexport_open_question_helpers() -> None:
     assert not hasattr(pipeline_module, "is_low_signal_open_question")
     assert not hasattr(pipeline_module, "extract_open_questions")
     assert not hasattr(pipeline_module, "OPEN_QUESTION_SEMANTIC_CLUSTERS")
+
+
+def test_pipeline_does_not_reexport_open_question_index_or_wiki_markup_helpers() -> None:
+    assert not hasattr(pipeline_module, "build_open_question_rows_with_report")
+    assert not hasattr(pipeline_module, "render_index_open_questions_report")
+    assert not hasattr(pipeline_module, "clean_display_title")
+    assert not hasattr(pipeline_module, "obsidian_link")
+    assert not hasattr(pipeline_module, "obsidian_alias_link")
+    assert not hasattr(pipeline_module, "obsidian_link_label")
+    assert not hasattr(pipeline_module, "draft_page_summary")
+    assert not hasattr(pipeline_module, "draft_page_core_markdown")
+    assert not hasattr(pipeline_module, "draft_page_open_questions")

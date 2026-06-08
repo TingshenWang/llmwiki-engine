@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Any
 
 from .markdown_utils import dedupe_strings
+from .models import DraftRenderingArtifact, WikiContextSnapshot, WikiMergePlanArtifact
+from .system_pages import format_markdown_table
+from .wiki_markup import clean_display_title, obsidian_link
 
 
 __all__ = (
+    "build_open_question_rows_with_report",
     "extract_open_questions",
     "group_open_question_candidates",
     "is_low_signal_open_question",
     "meaningful_open_question_lines",
     "open_question_key",
     "open_question_representative_sort_key",
+    "render_index_open_questions_report",
 )
 
 
@@ -208,3 +214,103 @@ def meaningful_open_question_lines(text: str) -> list[str]:
             continue
         results.append(line)
     return dedupe_strings(results)
+
+
+def build_open_question_rows_with_report(
+    plan: WikiMergePlanArtifact,
+    draft: DraftRenderingArtifact,
+    snapshot: WikiContextSnapshot,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    candidates: list[dict[str, str]] = []
+    for entry in snapshot.entries:
+        metadata = entry.metadata
+        if entry.expected_state != "present" or metadata is None or metadata.llmwiki_type.lower() == "source":
+            continue
+        for question in extract_open_questions(entry.content):
+            candidates.append({
+                "question": question,
+                "page": obsidian_link(metadata.path, clean_display_title(metadata.title)),
+                "path": metadata.path,
+                "updated": metadata.updated,
+                "page_type": metadata.llmwiki_type,
+                "source": "existing_wiki",
+            })
+    plan_by_id = {item.page_plan_id: item for item in plan.items}
+    for page in draft.pages:
+        item = plan_by_id.get(page.page_plan_id)
+        if item is None:
+            continue
+        for question in meaningful_open_question_lines(page.open_questions.strip()):
+            candidates.append({
+                "question": question,
+                "page": obsidian_link(item.canonical_target_path, item.display_title),
+                "path": item.canonical_target_path,
+                "updated": plan.log_date,
+                "page_type": item.page_type,
+                "source": "draft",
+            })
+    by_key = group_open_question_candidates(candidates)
+    rows: list[dict[str, str]] = []
+    report_items: list[dict[str, Any]] = []
+    for key, grouped in sorted(by_key.items()):
+        representative = max(grouped, key=open_question_representative_sort_key)
+        low_signal = is_low_signal_open_question(representative["question"])
+        repeated_gap = len(grouped) >= 2 and low_signal
+        keep = (
+            any(item["page_type"] == "open_question" for item in grouped)
+            or repeated_gap
+            or not low_signal
+        )
+        pages = dedupe_strings([item["page"] for item in sorted(grouped, key=lambda item: item["updated"], reverse=True)])[:3]
+        decision = "kept" if keep else "filtered"
+        reason = "open_question_page" if any(item["page_type"] == "open_question" for item in grouped) else ""
+        if not reason:
+            reason = "repeated_source_gap" if repeated_gap else ("low_signal_or_source_gap" if low_signal else "high_signal")
+        report_items.append(
+            {
+                "normalized_key": key,
+                "question": representative["question"],
+                "decision": decision,
+                "reason": reason,
+                "pages": pages,
+                "occurrences": len(grouped),
+            }
+        )
+        if not keep:
+            continue
+        rows.append(
+            {
+                "question": representative["question"],
+                "page": ", ".join(pages),
+                "updated": max(item["updated"] for item in grouped),
+            }
+        )
+    rows.sort(key=lambda row: (row["updated"], row["page"], row["question"]), reverse=True)
+    return rows, {
+        "schema_version": "index_open_questions_report.v1",
+        "kept_count": sum(1 for item in report_items if item["decision"] == "kept"),
+        "filtered_count": sum(1 for item in report_items if item["decision"] == "filtered"),
+        "deduped_count": sum(max(0, item["occurrences"] - 1) for item in report_items if item["decision"] == "kept"),
+        "items": report_items,
+    }
+
+
+def render_index_open_questions_report(report: dict[str, Any]) -> str:
+    rows = [
+        [
+            item["decision"],
+            item["reason"],
+            item["question"],
+            ", ".join(item["pages"]),
+            str(item["occurrences"]),
+        ]
+        for item in report.get("items", [])
+    ]
+    return (
+        "# Index 未决问题筛选报告\n\n"
+        f"- 保留：{report.get('kept_count', 0)}\n"
+        f"- 过滤：{report.get('filtered_count', 0)}\n\n"
+        f"- 合并重复：{report.get('deduped_count', 0)}\n\n"
+        + (format_markdown_table(["决策", "原因", "问题", "关联页面", "次数"], rows) if rows else "暂无未决问题。")
+        + "\n"
+    )

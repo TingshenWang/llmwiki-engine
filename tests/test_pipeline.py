@@ -7010,7 +7010,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
     plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[])
     draft = pipeline_module.DraftRenderingArtifact(pages=[])
 
-    rows, report = pipeline_module.build_open_question_rows_with_report(plan, draft, snapshot)
+    rows, report = open_questions_module.build_open_question_rows_with_report(plan, draft, snapshot)
     questions = [row["question"] for row in rows]
 
     assert questions.count("产品品味能否通过系统化训练提升？") == 1
@@ -7054,7 +7054,7 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
         ],
     )
 
-    rows, report = pipeline_module.build_open_question_rows_with_report(
+    rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         pipeline_module.DraftRenderingArtifact(pages=[]),
         snapshot,
@@ -7112,7 +7112,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
             ),
         ],
     )
-    rows, report = pipeline_module.build_open_question_rows_with_report(
+    rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         pipeline_module.DraftRenderingArtifact(pages=[]),
         snapshot,
@@ -7159,7 +7159,7 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
             ),
         ],
     )
-    rows, report = pipeline_module.build_open_question_rows_with_report(
+    rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         pipeline_module.DraftRenderingArtifact(pages=[]),
         snapshot,
@@ -7291,7 +7291,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
         ]
     )
 
-    rows, report = pipeline_module.build_open_question_rows_with_report(plan, draft, snapshot)
+    rows, report = open_questions_module.build_open_question_rows_with_report(plan, draft, snapshot)
     questions = [row["question"] for row in rows]
 
     assert sum(1 for question in questions if "harness" in question and "安全边界" in question) == 1
@@ -7344,7 +7344,7 @@ def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_
             ),
         ],
     )
-    rows, report = pipeline_module.build_open_question_rows_with_report(
+    rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         pipeline_module.DraftRenderingArtifact(pages=[]),
         snapshot,
