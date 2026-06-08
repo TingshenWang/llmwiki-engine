@@ -1901,13 +1901,7 @@ def run_single_draft_rendering_model_call(
             candidate,
             approved_prepared_text,
         )
-        cleaned_candidate, _open_question_cleanup_report = _draft_grounding.cleanup_open_question_unsupported_scope_claims(
-            rewritten_candidate,
-            merge_plan,
-            snapshot,
-            approved_prepared_text,
-        )
-        grounding_review = _draft_grounding.build_draft_grounding_review(cleaned_candidate, merge_plan, snapshot, approved_prepared_text)
+        grounding_review = _draft_grounding.build_draft_grounding_review(rewritten_candidate, merge_plan, snapshot, approved_prepared_text)
         if grounding_review.requires_review:
             repair_issues.extend(
                 [
@@ -2012,20 +2006,6 @@ def run_single_draft_rendering_model_call(
         report=grounding_rewrite_report,
         renderer=_draft_grounding.render_grounding_paraphrase_rewrite_report,
         count_keys=["rewrite_count"],
-    )
-    draft_artifact, open_question_cleanup_report = _draft_grounding.cleanup_open_question_unsupported_scope_claims(
-        draft_artifact,
-        merge_plan,
-        snapshot,
-        approved_prepared_text,
-    )
-    redacted_open_question_cleanup_report = ctx.execution_context.redactor.redact(open_question_cleanup_report)
-    write_draft_aux_report_if_active(
-        output_dir=output_dir,
-        stem="open_question_grounding_cleanup_report",
-        report=redacted_open_question_cleanup_report,
-        renderer=_draft_grounding.render_open_question_grounding_cleanup_report,
-        count_keys=["relocation_count", "skipped_count"],
     )
     return draft_artifact
 
@@ -2236,8 +2216,6 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         step_root / "update_preservation_reinforcement_report.md",
         step_root / "grounding_paraphrase_rewrite_report.json",
         step_root / "grounding_paraphrase_rewrite_report.md",
-        step_root / "open_question_grounding_cleanup_report.json",
-        step_root / "open_question_grounding_cleanup_report.md",
     ]:
         if optional_sidecar.exists():
             outputs.append(optional_sidecar)
@@ -3116,8 +3094,6 @@ def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: 
             schema = "update_preservation_reinforcement_report.v1"
         elif path.name == "grounding_paraphrase_rewrite_report.json":
             schema = "grounding_paraphrase_rewrite_report.v1"
-        elif path.name == "open_question_grounding_cleanup_report.json":
-            schema = "open_question_grounding_cleanup_report.v1"
         refs.append(_ref(run_dir, path, step_name, artifact_kind_for_path(path), schema, required_for_resume=required))
     return refs
 
@@ -3138,7 +3114,6 @@ def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactR
         "update_preservation_pack.json": "update_preservation_pack.v1",
         "update_preservation_reinforcement_report.json": "update_preservation_reinforcement_report.v1",
         "grounding_paraphrase_rewrite_report.json": "grounding_paraphrase_rewrite_report.v1",
-        "open_question_grounding_cleanup_report.json": "open_question_grounding_cleanup_report.v1",
         "draft_write_manifest.json": "draft_write_manifest.v1",
         "update_merge_report.json": "update_merge_report.v1",
         "related_merge_report.json": "related_merge_report.v1",

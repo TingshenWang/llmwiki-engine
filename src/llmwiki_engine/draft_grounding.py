@@ -6,7 +6,6 @@ from typing import Any
 
 from . import draft_validation as _draft_validation
 from . import markdown_utils as _markdown_utils
-from . import open_questions as _open_questions
 from . import page_sections as _page_sections
 from . import source_excerpt as _source_excerpt
 from . import update_preservation as _update_preservation
@@ -134,64 +133,6 @@ def render_grounding_paraphrase_rewrite_report(report: dict[str, Any]) -> str:
         )
         + "\n"
     )
-
-
-def render_open_question_grounding_cleanup_report(report: dict[str, Any]) -> str:
-    relocation_rows: list[list[Any]] = []
-    skipped_rows: list[list[Any]] = []
-    for page in report.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for item in page.get("relocations", []):
-            if not isinstance(item, dict):
-                continue
-            relocation_rows.append(
-                [
-                    page.get("page_plan_id", ""),
-                    page.get("target_path", ""),
-                    item.get("section_key", ""),
-                    item.get("text", ""),
-                    item.get("question", ""),
-                    item.get("append_decision", ""),
-                ]
-            )
-        for item in page.get("skipped", []):
-            if not isinstance(item, dict):
-                continue
-            skipped_rows.append(
-                [
-                    page.get("page_plan_id", ""),
-                    page.get("target_path", ""),
-                    item.get("section_key", ""),
-                    item.get("reason", ""),
-                    item.get("text", ""),
-                ]
-            )
-    sections = [
-        "# Open Question Grounding Cleanup Report",
-        "",
-        f"- Changed: `{str(bool(report.get('changed'))).lower()}`",
-        f"- Relocations: `{report.get('relocation_count', 0)}`",
-        f"- Skipped: `{report.get('skipped_count', 0)}`",
-        "",
-        "## Relocated Claims",
-        "",
-        (
-            format_markdown_table(["页面计划", "目标", "原段落", "原文本", "转成的问题", "追加决策"], relocation_rows)
-            if relocation_rows
-            else "_无需移动。_"
-        ),
-        "",
-        "## Skipped Claims",
-        "",
-        (
-            format_markdown_table(["页面计划", "目标", "段落", "原因", "文本"], skipped_rows)
-            if skipped_rows
-            else "_无跳过项。_"
-        ),
-        "",
-    ]
-    return "\n".join(sections)
 
 
 def draft_grounding_sections(page: DraftPageItem) -> list[tuple[str, str]]:
@@ -2836,114 +2777,6 @@ def draft_page_for_grounding(page: DraftPageItem) -> DraftPageItem:
     )
 
 
-OPEN_QUESTION_SCOPE_CLEANUP_SECTIONS = {"detail", "examples", "value_points", "additional_notes"}
-OPEN_QUESTION_SCOPE_CLEANUP_REASON_PREFIX = "新增影响范围/受影响对象推测"
-OPEN_QUESTION_SCOPE_CLEANUP_LIMIT = 3
-
-
-def cleanup_open_question_unsupported_scope_claims(
-    artifact: DraftRenderingArtifact,
-    plan: WikiMergePlanArtifact,
-    snapshot: WikiContextSnapshot,
-    approved_raw_text: str,
-) -> tuple[DraftRenderingArtifact, dict[str, Any]]:
-    plan_by_id = {item.page_plan_id: item for item in plan.items}
-    review = build_draft_grounding_review(artifact, plan, snapshot, approved_raw_text)
-    claims_by_page_id: dict[str, list[GroundingClaim]] = {}
-    for claim in review.unsupported_new_facts:
-        item = plan_by_id.get(claim.page_plan_id)
-        if not open_question_scope_cleanup_claim(claim, item):
-            continue
-        claims_by_page_id.setdefault(claim.page_plan_id, []).append(claim)
-
-    rewritten_pages: list[DraftPageItem] = []
-    report_pages: list[dict[str, Any]] = []
-    relocation_count = 0
-    skipped_count = 0
-    for page in artifact.pages:
-        page_claims = claims_by_page_id.get(page.page_plan_id)
-        if not page_claims:
-            rewritten_pages.append(page)
-            continue
-        body_markdown = page.body_markdown
-        open_questions = page.open_questions
-        existing_question_keys = {
-            _open_questions.open_question_key(question)
-            for question in _open_questions.meaningful_open_question_lines(open_questions)
-        }
-        page_report = {
-            "page_plan_id": page.page_plan_id,
-            "target_path": page.canonical_target_path,
-            "relocations": [],
-            "skipped": [],
-        }
-        added_count = 0
-        for claim in page_claims:
-            body = body_markdown if claim.section_key != "open_questions" else open_questions
-            updated_body, removal_status = remove_grounding_claim_exact_once(body, claim.text)
-            if removal_status != "removed":
-                page_report["skipped"].append(
-                    {
-                        "section_key": claim.section_key,
-                        "text": claim.text,
-                        "reason": removal_status,
-                    }
-                )
-                skipped_count += 1
-                continue
-            relocated_question = questionize_open_question_scope_claim(claim.text)
-            question_key = _open_questions.open_question_key(relocated_question)
-            duplicate_question = question_key in existing_question_keys
-            if not duplicate_question and added_count >= OPEN_QUESTION_SCOPE_CLEANUP_LIMIT:
-                page_report["skipped"].append(
-                    {
-                        "section_key": claim.section_key,
-                        "text": claim.text,
-                        "reason": "skipped_limit",
-                        "question": relocated_question,
-                    }
-                )
-                skipped_count += 1
-                continue
-            if claim.section_key == "open_questions":
-                open_questions = updated_body
-            else:
-                body_markdown = updated_body if updated_body.strip() else open_question_scope_cleanup_section_placeholder(claim.section_key)
-            append_decision = "skipped_duplicate_question"
-            if not duplicate_question:
-                open_questions = append_open_question_line(open_questions, relocated_question)
-                existing_question_keys.add(question_key)
-                added_count += 1
-                append_decision = "appended"
-            relocation_count += 1
-            page_report["relocations"].append(
-                {
-                    "section_key": claim.section_key,
-                    "text": claim.text,
-                    "question": relocated_question,
-                    "reason": claim.reason,
-                    "append_decision": append_decision,
-                }
-            )
-        if page_report["relocations"]:
-            rewritten_pages.append(page.model_copy(update={"body_markdown": body_markdown, "open_questions": open_questions}))
-        else:
-            rewritten_pages.append(page)
-        if page_report["relocations"] or page_report["skipped"]:
-            report_pages.append(page_report)
-
-    report = {
-        "schema_version": "open_question_grounding_cleanup_report.v1",
-        "changed": relocation_count > 0,
-        "relocation_count": relocation_count,
-        "skipped_count": skipped_count,
-        "pages": report_pages,
-    }
-    if relocation_count == 0:
-        return artifact, report
-    return artifact.model_copy(update={"pages": rewritten_pages}), report
-
-
 def looks_like_mixed_unsupported_example_fact(text: str) -> bool:
     normalized = unicodedata.normalize("NFKC", text).strip()
     compact = re.sub(r"\s+", "", normalized)
@@ -3045,66 +2878,6 @@ def looks_like_metric_or_outcome_literal(compact: str) -> bool:
         "上亿",
     ]
     return any(marker in compact for marker in metric_markers)
-
-
-def open_question_scope_cleanup_claim(claim: GroundingClaim, item: WikiMergePlanItem | None) -> bool:
-    marker = open_question_scope_cleanup_reason_marker(claim.reason)
-    return bool(
-        item is not None
-        and item.page_type == "open_question"
-        and claim.support == "unsupported"
-        and claim.action == "needs_review"
-        and claim.section_key in OPEN_QUESTION_SCOPE_CLEANUP_SECTIONS
-        and marker
-        and marker in claim.text
-    )
-
-
-def open_question_scope_cleanup_reason_marker(reason: str) -> str:
-    if not reason.startswith(OPEN_QUESTION_SCOPE_CLEANUP_REASON_PREFIX):
-        return ""
-    match = re.match(rf"^{re.escape(OPEN_QUESTION_SCOPE_CLEANUP_REASON_PREFIX)} `([^`]+)`", reason)
-    return match.group(1).strip() if match else ""
-
-
-def remove_grounding_claim_exact_once(body: str, text: str) -> tuple[str, str]:
-    if not text or text not in body:
-        return body, "skipped_missing_exact_text"
-    if body.count(text) != 1:
-        return body, "skipped_ambiguous_repeated_text"
-    updated = body.replace(text, "", 1)
-    updated = re.sub(r"[ \t]+", " ", updated)
-    updated = re.sub(r"\s+([。！？；;，,])", r"\1", updated)
-    updated = re.sub(r"^[\s。；;，,、]+", "", updated)
-    updated = re.sub(r"[\s。；;，,、]+$", "", updated)
-    updated = re.sub(r"\n{3,}", "\n\n", updated)
-    return updated.strip(), "removed"
-
-
-def questionize_open_question_scope_claim(text: str) -> str:
-    normalized = re.sub(r"\s+", "", text)
-    if any(marker in normalized for marker in ["偏好", "喜好"]):
-        return "待补来源：召回到不准确的用户偏好时，系统应如何确认与纠正？"
-    if any(marker in normalized for marker in ["支付", "付款", "删除", "下单", "不可逆", "高风险"]):
-        return "待补来源：不准确的记忆在高风险或不可逆操作中是否会造成错误结果？需要补充来源确认。"
-    if any(marker in normalized for marker in ["隐私", "污染", "混杂", "隔离", "命名空间"]):
-        return "待补来源：记忆隔离或命名空间配置不当会带来哪些风险？需要补充来源确认。"
-    return "待补来源：记忆不准确会带来什么后果，系统应如何确认与纠正？"
-
-
-def open_question_scope_cleanup_section_placeholder(section_key: str) -> str:
-    if section_key == "examples":
-        return "暂无来源内可确认的具体例子；相关风险已转入未决问题。"
-    if section_key == "value_points":
-        return "用于整理仍需来源确认的风险判断和产品设计边界。"
-    return "相关未证实风险已转入未决问题，等待补充来源。"
-
-
-def append_open_question_line(existing: str, question: str) -> str:
-    lines = [line.rstrip() for line in existing.splitlines() if line.strip()]
-    prefix = "- " if not question.lstrip().startswith(("-", "*")) else ""
-    lines.append(f"{prefix}{question}")
-    return "\n".join(lines)
 
 
 def draft_grounding_review_from_claims(claims: list[GroundingClaim]) -> DraftGroundingReview:
