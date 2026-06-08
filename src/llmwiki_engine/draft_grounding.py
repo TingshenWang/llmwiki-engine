@@ -266,21 +266,9 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
             "采用度、流行度、行业共识或最佳实践这类 adoption/authority 表达最好有来源意识；"
             "如果想更严谨，可以改成 source-local 表达（如 本材料提到、访谈中讨论、材料将其作为例子）。"
         )
-        if claim.action == "needs_review" and (claim.section_key == "open_questions" or grounding_claim_targets_open_question(claim)):
-            reason = (
-                f"{reason} 在 open_questions 里请改成中性的 `待补来源` 问题，"
-                "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提。"
-            )
     if not text:
         return reason
     return f"{reason} 触发文本：{text[:240]}"
-
-
-def grounding_claim_targets_open_question(claim: GroundingClaim) -> bool:
-    target_path = claim.target_path.strip().replace("\\", "/")
-    if target_path.startswith("wiki/"):
-        target_path = target_path[5:]
-    return target_path.startswith("open_questions/")
 
 
 def grounding_external_backing_issue(claim: GroundingClaim) -> bool:

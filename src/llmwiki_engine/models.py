@@ -609,7 +609,7 @@ class GroundingClaim(StrictModel):
     claim_type: Literal["new_fact", "retained_fact", "inference", "needs_source"]
     text: str
     support: Literal["raw", "wiki_context", "existing_wiki", "inference", "unsupported"] = "unsupported"
-    action: Literal["kept", "removed", "warn", "needs_review"] = "kept"
+    action: Literal["kept", "warn", "needs_review"] = "kept"
     reason: str = ""
 
 

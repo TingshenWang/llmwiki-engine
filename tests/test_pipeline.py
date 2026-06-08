@@ -9154,26 +9154,6 @@ def test_grounding_external_backing_issue_message_rejects_synonym_swap() -> None
     assert "触发文本：Redis最初作为高性能缓存、分析和消息代理广泛使用。" in message
 
 
-def test_grounding_external_backing_issue_message_neutralizes_open_question_premise() -> None:
-    claim = GroundingClaim(
-        page_plan_id="PP-SEARCH",
-        target_path="open_questions/Open_Question_混合搜索策略.md",
-        section_key="open_questions",
-        claim_type="new_fact",
-        text="目前是否存在公认的最佳融合策略？",
-        support="unsupported",
-        action="needs_review",
-        reason="新增外部背书/强事实标记 `公认` 未在 raw 或 inspected wiki 中出现；请删除该背书词，或改写为 source-local 表达。",
-    )
-
-    message = draft_grounding.grounding_issue_message(claim)
-
-    assert "中性的 `待补来源` 问题" in message
-    assert "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提" in message
-    assert "非阻塞提醒" in message
-    assert "触发文本：目前是否存在公认的最佳融合策略？" in message
-
-
 def test_grounding_external_backing_detects_adoption_and_best_practice_real_path() -> None:
     concept_item = pipeline_module.WikiMergePlanItem(
         page_plan_id="PP-REDIS",
