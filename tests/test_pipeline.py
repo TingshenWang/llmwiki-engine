@@ -16,6 +16,7 @@ import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.draft_outputs as draft_outputs_module
 import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
+import llmwiki_engine.draft_reviewing as draft_reviewing_module
 import llmwiki_engine.merge_reporting as merge_reporting_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.planning_payloads as planning_payloads_module
@@ -700,6 +701,8 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "merge_plan_create_overlap_risk_items")
     moved_pipeline_exports = {"FINAL_RELATED_LIMIT", "render_related_pages", "assemble_knowledge_page", "render_source_page", "build_index_rows", "render_update_merge_report", "render_related_merge_report", "render_update_diff"}
     assert not any(hasattr(pipeline_module, name) for name in moved_pipeline_exports)
+    moved_review_exports = {"build_draft_approval", "render_draft_review_prompt", "draft_review_reason", "draft_review_requires_manual", "update_manual_resolution_count", "update_reinforcement_count", "update_reinforcement_report_ref", "draft_diff_ref", "draft_change_summary", "build_apply_preview"}
+    assert not any(hasattr(pipeline_module, name) for name in moved_review_exports)
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -4065,7 +4068,7 @@ def test_draft_review_prompt_points_to_batch_reinforcement_report(tmp_path: Path
     )
     (draft_root / "draft_rendering_batch_report.md").write_text("# Draft Rendering 分批报告\n", encoding="utf-8")
 
-    prompt = pipeline_module.render_draft_review_prompt(
+    prompt = draft_reviewing_module.render_draft_review_prompt(
         run_dir,
         pipeline_module.DraftWriteManifest(targets=[]),
     )

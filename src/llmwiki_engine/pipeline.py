@@ -15,10 +15,12 @@ from pydantic import BaseModel
 
 from . import __version__
 from . import apply_guards as _apply_guards
+from . import apply_preview as _apply_preview
 from . import diff_utils as _diff_utils
 from . import draft_grounding as _draft_grounding
 from . import draft_outputs as _draft_outputs
 from . import draft_rendering_payloads as _draft_rendering_payloads
+from . import draft_reviewing as _draft_reviewing
 from . import draft_validation as _draft_validation
 from . import errors as _errors
 from . import markdown_utils as _markdown_utils
@@ -54,12 +56,9 @@ from .manifest import (
     write_manifest,
 )
 from .models import (
-    ApplyPreview,
-    ApplyTarget,
     ArtifactRef,
     CandidateResolutionArtifact,
     CandidateResolutionItem,
-    DraftApproval,
     DraftPageItem,
     DraftRenderingArtifact,
     DraftWriteManifest,
@@ -2579,7 +2578,7 @@ def _run_apply_preview(ctx: StepRunContext) -> None:
     step_name = "apply_preview"
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
     ensure_wiki_context_current(ctx.vault, snapshot)
-    preview = build_apply_preview(ctx.vault, ctx.run_dir)
+    preview = _apply_preview.build_apply_preview(ctx.vault, ctx.run_dir)
     out = require_step_output_dir(ctx.run_dir, step_name) / "apply_preview.json"
     write_json(out, preview)
     complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "apply_preview.v2")])
@@ -2641,10 +2640,10 @@ def _run_draft_review(ctx: StepRunContext) -> None:
     approved_manifest_path = step_root / "approved_write_manifest.json"
     approval_path = step_root / "draft_approval.json"
     prompt_path = step_root / "review_prompt.md"
-    prompt_path.write_text(render_draft_review_prompt(ctx.run_dir, draft_manifest), encoding="utf-8")
+    prompt_path.write_text(_draft_reviewing.render_draft_review_prompt(ctx.run_dir, draft_manifest), encoding="utf-8")
     if draft_manifest.source_only_noop:
         write_json(approved_manifest_path, draft_manifest)
-        approval = build_draft_approval(
+        approval = _draft_reviewing.build_draft_approval(
             ctx.run_dir,
             approved_manifest_path,
             decision="approved",
@@ -2663,14 +2662,14 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
         )
         return
-    if not draft_review_requires_manual(ctx.run_dir, draft_manifest):
+    if not _draft_reviewing.draft_review_requires_manual(ctx.run_dir, draft_manifest):
         write_json(approved_manifest_path, draft_manifest)
         notes = (
             "纯 create operation，当前运行自动批准。"
             if not draft_manifest.has_updates
             else "update operation 未发现 grounding 或旧页保留观察风险；本地旧知识补强已写入审计报告，当前运行自动批准。"
         )
-        approval = build_draft_approval(
+        approval = _draft_reviewing.build_draft_approval(
             ctx.run_dir,
             approved_manifest_path,
             decision="approved",
@@ -2691,12 +2690,8 @@ def _run_draft_review(ctx: StepRunContext) -> None:
         return
     pending_manifest = step_root / "pending_write_manifest.json"
     write_json(pending_manifest, draft_manifest)
-    review_reason = draft_review_reason(ctx.run_dir, draft_manifest)
-    approval = DraftApproval(
-        decision="pending",
-        auto_approved=False,
-        notes=review_reason,
-    )
+    review_reason = _draft_reviewing.draft_review_reason(ctx.run_dir, draft_manifest)
+    approval = _draft_reviewing.pending_draft_approval(review_reason)
     write_json(approval_path, approval)
     mark_step_awaiting_review(
         ctx.manifest,
@@ -2708,13 +2703,6 @@ def _run_draft_review(ctx: StepRunContext) -> None:
         ],
         reason=review_reason,
         review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
-    )
-
-
-def draft_review_requires_manual(run_dir: Path, draft_manifest: DraftWriteManifest) -> bool:
-    return bool(
-        draft_manifest.requires_grounding_review
-        or update_manual_resolution_count(run_dir)
     )
 
 
@@ -3080,7 +3068,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                 raise _errors.PipelineError("draft_review has no pending write manifest to approve.")
             approved = step_root / "approved_write_manifest.json"
             approved.write_text(pending.read_text(encoding="utf-8"), encoding="utf-8")
-            approval = build_draft_approval(
+            approval = _draft_reviewing.build_draft_approval(
                 run_dir,
                 approved,
                 decision="approved",
@@ -4600,239 +4588,3 @@ def finalize_draft_rendering(
             )
         )
     return DraftRenderingArtifact(pages=pages)
-
-
-def build_draft_approval(
-    run_dir: Path,
-    approved_manifest_path: Path,
-    *,
-    decision: Literal["approved", "pending", "rejected"],
-    auto_approved: bool,
-    notes: str,
-) -> DraftApproval:
-    _apply_guards.require_draft_rendering_sidecars(run_dir)
-    approved_manifest = read_model(approved_manifest_path, DraftWriteManifest)
-    markdown_hashes: dict[str, str] = {}
-    for target in approved_manifest.targets:
-        draft = run_dir / target.draft_path
-        if draft.suffix == ".md" and draft.exists():
-            markdown_hashes[target.draft_path] = sha256_file(draft)
-    for rel_path in _apply_guards.REQUIRED_DRAFT_RENDERING_SIDECARS:
-        path = run_dir / rel_path
-        markdown_hashes[rel_path] = sha256_file(path)
-    return DraftApproval(
-        decision=decision,
-        auto_approved=auto_approved,
-        approved_draft_json_sha256=sha256_file(approved_manifest_path),
-        approved_markdown_sha256=markdown_hashes,
-        notes=notes,
-    )
-
-
-def render_draft_review_prompt(run_dir: Path, draft_manifest: DraftWriteManifest) -> str:
-    manual_resolution_count = update_manual_resolution_count(run_dir)
-    reinforcement_count = update_reinforcement_count(run_dir)
-    manual_resolution_note = (
-        f"是（{manual_resolution_count} 段旧页保留观察需人工消化、改写或确认删除）"
-        if manual_resolution_count
-        else "否"
-    )
-    reinforcement_note = f"是（{reinforcement_count} 段旧页知识已由系统本地补强并记录）" if reinforcement_count else "否"
-    warning = (
-        "## 旧页保留观察警示\n\n"
-        f"Update 合并报告包含 {manual_resolution_count} 段旧页保留观察。批准前需要人工消化："
-        "把仍有价值的旧知识自然改写进新页，或明确确认删除。\n\n"
-        if manual_resolution_count
-        else ""
-    )
-    reinforcement_report_ref = update_reinforcement_report_ref(run_dir)
-    reinforcement_warning = (
-        "## 本地旧知识补强提示\n\n"
-        f"Draft rendering 本地补强了 {reinforcement_count} 段旧页知识，并记录在 {reinforcement_report_ref}。"
-        "如本轮还因其他问题进入人工审核，"
-        "可顺手检查这些桥接语是否自然。\n\n"
-        if reinforcement_count
-        else ""
-    )
-    rows = [
-        [
-            target.action,
-            f"`{target.target_path}`",
-            f"`{target.draft_path}`",
-            draft_diff_ref(run_dir, target),
-            draft_change_summary(run_dir, target),
-            target.expected_state,
-            target.preimage_sha256 or "",
-        ]
-        for target in draft_manifest.targets
-    ]
-    return (
-        "# 草稿审核\n\n"
-        "审查这一步回答：具体写什么、是否应批准写入。\n\n"
-        f"- 需要 Grounding 人工确认：{'是' if draft_manifest.requires_grounding_review else '否'}\n"
-        f"- 旧页保留观察需人工消化：{manual_resolution_note}\n"
-        f"- 本地旧知识补强已执行：{reinforcement_note}\n\n"
-        f"{warning}"
-        f"{reinforcement_warning}"
-        "## 核心判断\n\n"
-        "- create/update 的正文是否忠实于 raw 和已召回旧页？\n"
-        "- update diff 是否符合你的理解，没有覆盖掉旧页中仍然重要的内容？\n"
-        "- 未被来源支持的细节是否放在“矛盾与未决问题/待补来源”，而不是写成事实？\n"
-        "- Related 是否少而准，单页主动连接不超过 3 条？\n\n"
-        "## 下一步命令\n\n"
-        "- 批准：`uv run llmwiki ingest approve \"$VAULT\" \"$OP\" draft_review`\n"
-        "- 重新生成/修订：`uv run llmwiki ingest revise \"$VAULT\" \"$OP\" draft_review`\n"
-        "- 批准后继续：`uv run llmwiki ingest resume \"$VAULT\" \"$OP\"`\n"
-        "- Apply：`uv run llmwiki ingest apply \"$VAULT\" \"$OP\"`\n\n"
-        "## 关键文件\n\n"
-        "- Update 合并报告：`draft_rendering/update_merge_report.md`\n"
-        "- Grounding 审查：`draft_rendering/draft_grounding_review.md`\n"
-        "- Related 合并报告：`draft_rendering/related_merge_report.md`\n"
-        "- 草稿目录：`draft_rendering/draft_pages/`\n"
-        "- Diff 目录：`draft_rendering/diffs/`\n\n"
-        "## 草稿清单\n\n"
-        + format_markdown_table(
-            ["动作", "目标", "草稿", "Diff", "变更摘要", "预期状态", "Preimage"],
-            rows,
-        )
-        + "\n"
-    )
-
-
-def draft_review_reason(run_dir: Path, draft_manifest: DraftWriteManifest) -> str:
-    reasons: list[str] = []
-    if draft_manifest.requires_grounding_review:
-        reasons.append("Grounding review 发现 unsupported new_fact，需要人工确认。")
-    manual_resolution_count = update_manual_resolution_count(run_dir)
-    reinforcement_count = update_reinforcement_count(run_dir)
-    if manual_resolution_count:
-        reasons.append(f"Update 合并报告包含 {manual_resolution_count} 段旧页保留观察，需人工消化、改写或确认删除。")
-    return " ".join(reasons) or "草稿需要显式人工批准。"
-
-
-def update_manual_resolution_count(run_dir: Path) -> int:
-    report_path = run_dir / "draft_rendering" / "update_merge_report.json"
-    if not report_path.exists():
-        return 0
-    try:
-        report = read_model(report_path, UpdateMergeReport)
-    except Exception:
-        return 0
-    return sum(1 for page in report.pages for section in page.sections if section.needs_manual_resolution)
-
-
-def update_reinforcement_count(run_dir: Path) -> int:
-    draft_root = run_dir / "draft_rendering"
-    report_path = draft_root / "update_preservation_reinforcement_report.json"
-    if report_path.exists():
-        try:
-            report = read_json(report_path)
-            return int(report.get("reinforced_section_count", 0))
-        except Exception:
-            return 0
-    batch_report_path = draft_root / "draft_rendering_batch_report.json"
-    if not batch_report_path.exists():
-        return 0
-    try:
-        report = read_json(batch_report_path)
-        return sum(int(batch.get("reinforced_section_count", 0)) for batch in report.get("batches", []))
-    except Exception:
-        return 0
-
-
-def update_reinforcement_report_ref(run_dir: Path) -> str:
-    draft_root = run_dir / "draft_rendering"
-    root_report = draft_root / "update_preservation_reinforcement_report.md"
-    if root_report.exists():
-        return "`draft_rendering/update_preservation_reinforcement_report.md`"
-    batch_report = draft_root / "draft_rendering_batch_report.md"
-    if batch_report.exists():
-        return "`draft_rendering/draft_rendering_batch_report.md`"
-    return "`draft_rendering/`"
-
-
-def draft_diff_ref(run_dir: Path, target: DraftWriteTarget) -> str:
-    if not target.page_plan_id:
-        return ""
-    diff = run_dir / "draft_rendering" / "diffs" / f"{target.page_plan_id}.diff"
-    return f"`{diff.relative_to(run_dir).as_posix()}`" if diff.exists() else ""
-
-
-def draft_change_summary(run_dir: Path, target: DraftWriteTarget) -> str:
-    if not target.page_plan_id:
-        return ""
-    draft_json = run_dir / "draft_rendering" / "draft_rendering.json"
-    if not draft_json.exists():
-        return ""
-    try:
-        draft = read_model(draft_json, DraftRenderingArtifact)
-    except Exception:
-        return ""
-    for page in draft.pages:
-        if page.page_plan_id == target.page_plan_id:
-            return page.change_summary
-    return ""
-
-
-def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
-    operation_id = run_dir.name
-    manifest_path = require_step_output_dir(run_dir, "draft_review") / "approved_write_manifest.json"
-    draft_manifest = read_model(manifest_path, DraftWriteManifest)
-    target_paths = [item.target_path for item in draft_manifest.targets]
-    if len(target_paths) != len(set(target_paths)):
-        raise _errors.PipelineError("draft_write_manifest contains duplicate target_path values")
-    targets: list[ApplyTarget] = []
-    source_targets: list[str] = []
-    log_targets: list[str] = []
-    index_targets: list[str] = []
-    for item in draft_manifest.targets:
-        target_path = item.target_path
-        current = vault / target_path
-        current_sha = sha256_file(current) if current.exists() else None
-        if item.action == "source":
-            source_targets.append(target_path)
-        if item.action in {"global_log", "daily_log"}:
-            log_targets.append(target_path)
-        if item.action == "index":
-            index_targets.append(target_path)
-        targets.append(
-            ApplyTarget(
-                action=item.action,
-                target_path=target_path,
-                draft_path=item.draft_path,
-                expected_state=item.expected_state,
-                preimage_sha256=item.preimage_sha256,
-                current_sha256=current_sha,
-                will_write=True,
-                approved_draft_ref=manifest_path.relative_to(run_dir).as_posix(),
-                page_plan_id=item.page_plan_id,
-            )
-        )
-    write_set_payload = {
-        "approved_manifest_sha256": sha256_file(manifest_path),
-        "targets": [
-            {
-                "target_path": target.target_path,
-                "draft_path": target.draft_path,
-                "preimage_sha256": target.preimage_sha256,
-                "expected_state": target.expected_state,
-                "draft_sha256": sha256_file(run_dir / target.draft_path),
-            }
-            for target in targets
-        ],
-    }
-    write_set_sha = sha256_bytes(json.dumps(write_set_payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-    requires_manual_draft_review = draft_review_requires_manual(run_dir, draft_manifest)
-    return ApplyPreview(
-        operation_id=operation_id,
-        operation_applyable=bool(targets),
-        requires_draft_review=requires_manual_draft_review,
-        has_updates=draft_manifest.has_updates,
-        has_noops=draft_manifest.has_noops,
-        blocked_reasons=[],
-        write_set_sha256=write_set_sha,
-        targets=targets,
-        source_targets=source_targets,
-        log_targets=log_targets,
-        index_targets=index_targets,
-    )
