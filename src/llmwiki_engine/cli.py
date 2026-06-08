@@ -991,11 +991,10 @@ def _verify_exit_code(result) -> int:
 def ingest_apply(
     vault: Path,
     operation_id: str,
-    commit: bool = typer.Option(False, "--commit", help="Disabled in this MVP."),
 ) -> None:
     """Apply draft pages into the vault wiki."""
     try:
-        written = apply_operation(vault, operation_id, commit=commit)
+        written = apply_operation(vault, operation_id)
     except (ApplyError, VerifyError, WorkspaceError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"[green]Applied[/] {len(written)} draft pages")

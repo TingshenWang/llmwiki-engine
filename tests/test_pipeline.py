@@ -13221,32 +13221,6 @@ def test_apply_rejects_empty_preview_targets(tmp_path: Path) -> None:
         apply_operation(vault, manifest.operation_id)
 
 
-def test_source_digest_v2_strips_formal_candidate_suggested_action(tmp_path: Path) -> None:
-    vault, raw = make_vault(tmp_path)
-    fixture_dir = tmp_path / "fixture"
-    fixture_dir.mkdir()
-    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
-        data = read_json(FIXTURE_ROOT / "mock" / name)
-        if name == "source_digest.json":
-            data["concepts"][0]["suggested_action"] = "update"
-        write_json(fixture_dir / name, data)
-
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="update")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    digest = read_json(run_dir / "source_digest" / "source_digest.json")
-    approved_digest = read_json(run_dir / "source_digest_review" / "approved_digest.json")
-    resolution = read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
-    plan = read_json(run_dir / "wiki_merge_planning" / "wiki_merge_plan.json")
-    digest_markdown = (run_dir / "source_digest" / "source_digest.md").read_text(encoding="utf-8")
-
-    assert digest["schema_version"] == "source_digest.v2"
-    assert "suggested_action" not in digest["concepts"][0]
-    assert "suggested_action" not in approved_digest["concepts"][0]
-    assert "Suggested" not in digest_markdown
-    assert "action" not in resolution["items"][0]
-    assert plan["items"][0]["action"] == "create"
-
-
 def test_source_digest_english_user_text_fails_for_zh_cn_vault(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "english-digest-fixture"
@@ -14997,24 +14971,6 @@ def test_apply_rejects_old_v8_draft_missing_m42_sidecar(tmp_path: Path) -> None:
         apply_operation(vault, manifest.operation_id)
 
 
-def test_apply_commit_is_disabled_before_verify_or_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="commit")
-    target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
-    assert not target.exists()
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("verify should not run for disabled commit apply")
-
-    monkeypatch.setattr(apply_module, "require_verified", fail_if_called)
-    with pytest.raises(ApplyError, match="apply --commit is disabled"):
-        apply_operation(vault, manifest.operation_id, commit=True)
-
-    assert not target.exists()
-    assert read_json(RunStore(vault).manifest_path(manifest.operation_id))["status"] == "drafted"
-    assert read_jsonl(vault / ".llmwiki" / "applied" / "operations.jsonl") == []
-
-
 def test_plain_apply_records_apply_failed_on_write_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="rollback")
@@ -15065,7 +15021,7 @@ def test_plain_apply_records_apply_failed_on_receipt_failure(tmp_path: Path, mon
     assert read_jsonl(vault / ".llmwiki" / "applied" / "operations.jsonl") == []
 
 
-def test_standard_apply_and_commit_are_rejected_before_writing(tmp_path: Path) -> None:
+def test_standard_apply_is_rejected_before_writing(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(
         vault=vault,
@@ -15077,8 +15033,6 @@ def test_standard_apply_and_commit_are_rejected_before_writing(tmp_path: Path) -
     target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
     with pytest.raises(ApplyError, match="standard mode does not allow manual apply"):
         apply_operation(vault, manifest.operation_id)
-    with pytest.raises(ApplyError, match="apply --commit is disabled"):
-        apply_operation(vault, manifest.operation_id, commit=True)
     assert not target.exists()
 
 

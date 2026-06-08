@@ -30,7 +30,6 @@ from .pipeline import build_source_duplicate_guard_artifact, refresh_run_metrics
 from .wiki_context import wiki_context_drift_messages
 from .workspace import RunStore, apply_lock, run_lock
 
-APPLY_COMMIT_DISABLED_MESSAGE = "apply --commit is disabled for this MVP; use plain dev apply."
 STANDARD_APPLY_DISABLED_MESSAGE = "standard mode does not allow manual apply in this MVP."
 WIKI_CONTEXT_DRIFT_MESSAGE = "当前 operation 的 apply plan 已过期，因为 wiki 在 plan 生成后发生变化。请 resume 后再 apply。"
 
@@ -40,13 +39,11 @@ class ApplyError(RuntimeError):
         self.details = details or []
 
 
-def apply_operation(vault: Path, operation_id: str, *, commit: bool = False) -> list[Path]:
+def apply_operation(vault: Path, operation_id: str) -> list[Path]:
     store = RunStore(vault)
     run_dir = store.run_dir(operation_id)
     with apply_lock(vault), run_lock(vault, operation_id):
         manifest = read_manifest(store.manifest_path(operation_id))
-        if commit:
-            raise ApplyError(APPLY_COMMIT_DISABLED_MESSAGE)
         if manifest.run_mode == RunMode.standard:
             raise ApplyError(STANDARD_APPLY_DISABLED_MESSAGE)
         if manifest.status == OperationStatus.applied:

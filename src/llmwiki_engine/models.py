@@ -279,27 +279,6 @@ class SourceDigestArtifact(StrictModel):
     budget_deferred_candidates: list[SourceDigestCandidate] = Field(default_factory=list)
     weak_or_noise_items: list[WeakOrNoiseItem] = Field(default_factory=list)
 
-    @model_validator(mode="before")
-    @classmethod
-    def strip_legacy_suggested_action(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        if value.get("schema_version") == "source_digest.v1":
-            raise ValueError("source_digest.v1 is incompatible with current MVP pipeline; rerun ingest")
-        data = dict(value)
-        for group_name in ["entities", "concepts", "designs", "comparisons", "open_questions"]:
-            group = data.get(group_name)
-            if not isinstance(group, list):
-                continue
-            cleaned_group = []
-            for item in group:
-                if isinstance(item, dict) and "suggested_action" in item:
-                    item = dict(item)
-                    item.pop("suggested_action", None)
-                cleaned_group.append(item)
-            data[group_name] = cleaned_group
-        return data
-
     def ingest_candidates(self) -> list[SourceDigestCandidate]:
         return [*self.entities, *self.concepts, *self.designs, *self.comparisons, *self.open_questions]
 

@@ -15,20 +15,20 @@ def test_eval_run_writes_report(tmp_path: Path) -> None:
     assert (tmp_path / f"{result.run_id}.json").exists()
 
 
-def test_source_digest_eval_schema_validation_rejects_v1(tmp_path: Path) -> None:
+def test_source_digest_eval_schema_validation_rejects_wrong_schema(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     case = dataset / "case1"
     case.mkdir(parents=True)
     source = Path(__file__).parent / "fixtures" / "evals" / "source_digest" / "case1" / "actual.json"
     data = read_json(source)
-    data["schema_version"] = "source_digest.v1"
+    data["schema_version"] = "source_digest.invalid"
     write_json(case / "actual.json", data)
 
     result = run_eval("source_digest", dataset, tmp_path / "out")
 
     assert result.results[0].parse_success is True
     assert result.results[0].schema_valid is False
-    assert "source_digest.v1 is incompatible" in result.results[0].errors[0]
+    assert "source_digest.v2" in result.results[0].errors[0]
 
 
 def test_source_digest_eval_schema_validation_rejects_invalid_expected(tmp_path: Path) -> None:
@@ -38,7 +38,7 @@ def test_source_digest_eval_schema_validation_rejects_invalid_expected(tmp_path:
     source = Path(__file__).parent / "fixtures" / "evals" / "source_digest" / "case1" / "actual.json"
     actual = read_json(source)
     expected = dict(actual)
-    expected["schema_version"] = "source_digest.v1"
+    expected["schema_version"] = "source_digest.invalid"
     write_json(case / "actual.json", actual)
     write_json(case / "expected.json", expected)
 
@@ -46,7 +46,7 @@ def test_source_digest_eval_schema_validation_rejects_invalid_expected(tmp_path:
 
     assert result.results[0].parse_success is True
     assert result.results[0].schema_valid is False
-    assert "source_digest.v1 is incompatible" in result.results[0].errors[0]
+    assert "source_digest.v2" in result.results[0].errors[0]
 
 
 def test_source_digest_eval_schema_validation_rejects_extra_field(tmp_path: Path) -> None:

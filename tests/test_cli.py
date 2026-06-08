@@ -678,40 +678,6 @@ def test_raw_candidates_all_includes_processed_and_table_gives_next_command(tmp_
     assert "raw/unprocessed.md" in table_result.output
 
 
-def test_raw_candidates_treats_legacy_sources_frontmatter_as_processed(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    legacy_raw = vault / "raw" / "legacy.md"
-    legacy_raw.write_text("# Legacy\n", encoding="utf-8")
-    source = vault / "wiki" / "sources" / "来源_legacy.md"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_text(
-        "---\n"
-        "title: Legacy source\n"
-        "type: source\n"
-        "sources:\n"
-        "  - raw/legacy.md\n"
-        "---\n\n"
-        "# Legacy source\n",
-        encoding="utf-8",
-    )
-
-    runner = CliRunner()
-    default_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--json"])
-    all_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--all", "--json"])
-
-    assert default_result.exit_code == 0
-    default_report = json.loads(default_result.output)
-    assert default_report["items"] == []
-    assert default_report["processed_count"] == 1
-    assert all_result.exit_code == 0
-    all_item = json.loads(all_result.output)["items"][0]
-    assert all_item["status"] == "processed"
-    assert all_item["matched_by"] == "path"
-    assert all_item["source_pages"] == ["wiki/sources/来源_legacy.md"]
-    assert "legacy source frontmatter" in all_item["reason"]
-
-
 def test_run_next_dry_run_selects_unprocessed_raw(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")

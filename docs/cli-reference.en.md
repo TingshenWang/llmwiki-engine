@@ -51,10 +51,6 @@ The execution source for model-backed steps. Public provider specs are:
 
 Write draft pages from a run into `vault/wiki/`.
 
-`apply --commit`
-
-Disabled in this MVP. The flag is retained for CLI compatibility and fails before any verify or wiki write.
-
 `staged`
 
 Git's index. After `git add file`, the file is staged and a normal `git commit` would include it.
@@ -439,14 +435,6 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 
 Plain `apply` is currently available only for `dev` operations. It does not touch Git and does not require the vault to be a Git repository.
 
-`--commit` is disabled in this MVP:
-
-```bash
-uv run llmwiki ingest apply "$VAULT" "$OP" --commit
-```
-
-It fails before verify, preimage checks, manifest writes, receipt writes, or wiki writes. Target-scoped Git transaction support is a later follow-up.
-
 ## `profile` Commands
 
 List built-in profiles:
@@ -534,5 +522,3 @@ The current MVP pipeline changed. Old development runs are not migrated; start a
 `.gitignore` prevents `.llmwiki/` from being added by default.
 
 Plain `apply` does not check Git and does not commit.
-
-`apply --commit` is disabled in this MVP and fails before writing. Future auto-apply/commit support will use a target-scoped Git transaction.

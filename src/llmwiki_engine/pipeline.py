@@ -8045,7 +8045,7 @@ def scan_raw_ingest_candidates(
             status = "processed"
             matched_by = "path"
             matched_records = path_records
-            reason = "same raw path is recorded by legacy source frontmatter; content hash is unavailable"
+            reason = "same raw path is recorded in source frontmatter; content hash is unavailable"
         elif path_records:
             status = "changed"
             matched_by = "path"
@@ -8186,10 +8186,6 @@ def _frontmatter_raw_paths(frontmatter: dict[str, Any]) -> list[str]:
     for value in _frontmatter_list(frontmatter, "source_raw_paths"):
         normalized = normalize_vault_path(value)
         if normalized:
-            raw_paths.append(normalized)
-    for value in _frontmatter_list(frontmatter, "sources"):
-        normalized = normalize_vault_path(value)
-        if normalized.startswith("raw/") and normalized not in raw_paths:
             raw_paths.append(normalized)
     return raw_paths
 

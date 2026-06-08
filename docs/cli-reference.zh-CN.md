@@ -51,10 +51,6 @@ source_digest.json
 
 把 run 里的 draft pages 写入 `vault/wiki/`。
 
-`apply --commit`
-
-本轮 MVP 禁用。CLI 暂时保留这个 flag，但会在任何 verify 或 wiki 写入前失败。
-
 `staged`
 
 Git 的暂存区。`git add file` 后，文件就是 staged，默认会被下一次普通 `git commit` 提交。
@@ -439,14 +435,6 @@ uv run llmwiki ingest apply "$VAULT" "$OP"
 
 普通 `apply` 目前只对 `dev` operation 可用。不碰 Git，不要求 vault 是 Git repo。
 
-`--commit` 在本轮 MVP 禁用：
-
-```bash
-uv run llmwiki ingest apply "$VAULT" "$OP" --commit
-```
-
-它会在 verify、preimage 校验、manifest 写入、receipt 写入、wiki 写入之前失败。target-scoped Git transaction 是后续计划。
-
 ## `profile` 命令
 
 列出内置 profile：
@@ -534,5 +522,3 @@ run artifact 被修改过或损坏，resume/apply 会阻止继续。
 `.gitignore` 负责让 `.llmwiki/` 默认不进入 Git。
 
 普通 `apply` 不检查 Git repo，也不提交。
-
-`apply --commit` 在本轮 MVP 禁用，并且会在写入前失败。未来 auto-apply/commit 会采用 target-scoped Git transaction。

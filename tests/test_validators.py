@@ -128,19 +128,19 @@ def test_source_digest_accepts_model_style_weak_noise_fields() -> None:
     assert "ignore" not in weak_section
 
 
-def test_source_digest_rejects_explicit_v1_schema() -> None:
+def test_source_digest_rejects_wrong_schema_version() -> None:
     data = _digest().model_dump(mode="json")
-    data["schema_version"] = "source_digest.v1"
+    data["schema_version"] = "source_digest.invalid"
 
-    with pytest.raises(Exception, match="source_digest.v1 is incompatible"):
+    with pytest.raises(Exception, match="source_digest.v2"):
         SourceDigestArtifact.model_validate(data)
 
 
-def test_source_digest_strips_only_formal_candidate_suggested_action_extra() -> None:
+def test_source_digest_rejects_formal_candidate_suggested_action_extra() -> None:
     data = _digest().model_dump(mode="json")
     data["concepts"][0]["suggested_action"] = "update"
-    digest = SourceDigestArtifact.model_validate(data)
-    assert "suggested_action" not in digest.concepts[0].model_dump()
+    with pytest.raises(Exception, match="Extra inputs are not permitted"):
+        SourceDigestArtifact.model_validate(data)
 
     data = _digest().model_dump(mode="json")
     data["concepts"][0]["unexpected"] = "blocked"
