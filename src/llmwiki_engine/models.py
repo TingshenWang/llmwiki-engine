@@ -68,8 +68,11 @@ class VaultConfig(StrictModel):
     wiki_language: Literal["zh-CN"] = "zh-CN"
     max_context_chars: int = 800_000
     max_ingest_candidates: int = 12
-    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto
     embedding_retrieval: "EmbeddingRetrievalConfig" = Field(default_factory=lambda: EmbeddingRetrievalConfig())
+
+
+class OperationConfigSnapshot(VaultConfig):
+    raw_prepare_policy: RawPreparePolicy = RawPreparePolicy.auto
 
 
 class EmbeddingRetrievalConfig(StrictModel):
@@ -747,7 +750,7 @@ class OperationManifest(StrictModel):
     engine_version: str
     profile: str
     profile_version: str
-    vault_config_snapshot: VaultConfig = Field(default_factory=VaultConfig)
+    vault_config_snapshot: OperationConfigSnapshot = Field(default_factory=OperationConfigSnapshot)
     workspace: str
     raw_bindings: list[RawBinding] = Field(default_factory=list)
     provider_contexts: list[ProviderContextRecord] = Field(default_factory=list)

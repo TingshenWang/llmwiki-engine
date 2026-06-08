@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
@@ -212,7 +213,7 @@ def test_init_creates_workspace_layout_and_gitignore(tmp_path: Path) -> None:
     assert config_json["embedding_retrieval"]["local_files_only"] is True
     assert config_json["embedding_retrieval"]["cache_dir"] == "~/.llmwiki/cache/embeddings"
     assert config_json["max_ingest_candidates"] == 12
-    assert config_json["raw_prepare_policy"] == "auto"
+    assert "raw_prepare_policy" not in config_json
     gitignore_lines = (vault / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".llmwiki/" in gitignore_lines
     assert ".llmwiki/runs/" not in gitignore_lines
@@ -2129,44 +2130,22 @@ def test_raw_prepare_skip_policy_rejects_non_markdown_without_provider_fallback(
         )
 
 
-def test_vault_config_raw_prepare_policy_skip_uses_local_passthrough(tmp_path: Path) -> None:
+def test_vault_config_raw_prepare_policy_is_not_an_input(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     config_path = vault / ".llmwiki" / "config.json"
     config = read_json(config_path)
     config["raw_prepare_policy"] = "skip"
     write_json(config_path, config)
-    fixture_dir = tmp_path / "mock-without-raw-prepare"
-    fixture_dir.mkdir()
-    for name in ["source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
-        write_json(fixture_dir / name, read_json(FIXTURE_ROOT / "mock" / name))
 
-    manifest = run_simplified_ingest(
-        vault=vault,
-        raw_file=raw,
-        fixture_dir=fixture_dir,
-        slug="vault-config-skip",
-    )
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    manifest_data = read_json(RunStore(vault).manifest_path(manifest.operation_id))
-
-    assert manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip
-    assert manifest_data["vault_config_snapshot"]["raw_prepare_policy"] == "skip"
-    assert "raw_prepare" not in manifest.provider_contexts[0].providers
-    assert read_json(run_dir / "raw_prepare" / "raw_preparation.json")["operations_applied"] == [
-        "user_skip_markdown_passthrough"
-    ]
-    assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
+    with pytest.raises(ValidationError, match="raw_prepare_policy"):
+        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="vault-config-policy")
 
 
-def test_vault_config_raw_prepare_policy_force_uses_model_cleanup(
+def test_default_raw_prepare_policy_is_auto_and_recorded_in_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vault, raw = make_vault(tmp_path)
-    config_path = vault / ".llmwiki" / "config.json"
-    config = read_json(config_path)
-    config["raw_prepare_policy"] = "force"
-    write_json(config_path, config)
     provider_config_path = vault / ".llmwiki" / "config.yaml"
     provider_config = read_yaml(provider_config_path)
     provider_config["providers"] = {
@@ -2186,12 +2165,66 @@ def test_vault_config_raw_prepare_policy_force_uses_model_cleanup(
 
     monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="vault-config-force")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="default-prepare-auto")
     manifest_data = read_json(RunStore(vault).manifest_path(manifest.operation_id))
 
-    assert manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.force
-    assert manifest_data["vault_config_snapshot"]["raw_prepare_policy"] == "force"
-    assert captured_payloads["raw_prepare"]["raw_prepare_policy"] == "force"
+    assert manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.auto
+    assert manifest_data["vault_config_snapshot"]["raw_prepare_policy"] == "auto"
+    assert captured_payloads["raw_prepare"]["raw_prepare_policy"] == "auto"
+
+
+@pytest.mark.parametrize(
+    ("initial_policy", "resume_policy", "slug"),
+    [
+        (None, RawPreparePolicy.skip, "resume-to-skip"),
+        (RawPreparePolicy.skip, None, "resume-reuse-skip"),
+    ],
+)
+def test_resume_from_raw_prepare_uses_explicit_or_snapshot_prepare_policy(
+    tmp_path: Path,
+    initial_policy: RawPreparePolicy | None,
+    resume_policy: RawPreparePolicy | None,
+    slug: str,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=FIXTURE_ROOT / "mock",
+        slug=slug,
+        raw_prepare_policy=initial_policy,
+    )
+    config = read_yaml(vault / ".llmwiki" / "config.yaml")
+    config["providers"]["default"] = {
+        "spec": "mock:fixture",
+        "fixture_dir": str(FIXTURE_ROOT / "mock"),
+    }
+    write_yaml(vault / ".llmwiki" / "config.yaml", config)
+
+    resumed = resume_ingest(
+        vault=vault,
+        operation_id=manifest.operation_id,
+        from_step="raw_prepare",
+        raw_prepare_policy=resume_policy,
+    )
+    raw_prepare_step = [step for step in resumed.steps if step.name == "raw_prepare"][0]
+
+    assert resumed.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip
+    assert "raw_prepare" not in resumed.provider_contexts[-1].providers
+    assert raw_prepare_step.attempts[-1].provider_spec is None
+
+
+def test_resume_prepare_override_requires_rerunning_raw_prepare(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="late-prepare")
+
+    with pytest.raises(PipelineError, match="raw prepare override only applies"):
+        resume_ingest(
+            vault=vault,
+            operation_id=manifest.operation_id,
+            from_step="source_digest",
+            raw_prepare_policy=RawPreparePolicy.skip,
+        )
 
 
 def test_prepared_raw_review_for_skip_policy_is_plain_auto_approval(tmp_path: Path) -> None:
@@ -5133,7 +5166,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
     ctx = types.SimpleNamespace(
         profile=profile,
-        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.VaultConfig()),
+        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.OperationConfigSnapshot()),
     )
     digest = SourceDigestArtifact(
         source_raw_path="raw/sample.md",
@@ -5443,7 +5476,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         run_dir=tmp_path / "run",
         raw_path=raw_path,
         profile=profile,
-        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.VaultConfig()),
+        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.OperationConfigSnapshot()),
         execution_context=types.SimpleNamespace(redactor=NoopRedactor()),
     )
 
@@ -5480,7 +5513,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
     ctx = types.SimpleNamespace(
         profile=profile,
-        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.VaultConfig()),
+        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.OperationConfigSnapshot()),
     )
     digest = SourceDigestArtifact(
         source_raw_path="raw/sample.md",

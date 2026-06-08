@@ -49,6 +49,7 @@ from .models import (
     DraftWriteManifest,
     DraftWriteTarget,
     GroundingClaim,
+    OperationConfigSnapshot,
     OperationManifest,
     OperationStatus,
     ProviderResult,
@@ -477,11 +478,14 @@ def run_simplified_ingest(
     resolved_profile_name = resolve_vault_profile_name(vault, profile_name)
     profile = load_profile(vault / ".llmwiki" / "profiles" / resolved_profile_name)
     vault_config = read_vault_config(vault)
-    if raw_prepare_policy is not None:
-        vault_config.raw_prepare_policy = raw_prepare_policy
+    effective_raw_prepare_policy = raw_prepare_policy or RawPreparePolicy.auto
+    vault_config_snapshot = OperationConfigSnapshot(
+        **vault_config.model_dump(),
+        raw_prepare_policy=effective_raw_prepare_policy,
+    )
     model_steps = model_steps_for_raw_prepare_policy(
         list(MODEL_BACKED_STEPS),
-        raw_prepare_policy=vault_config.raw_prepare_policy,
+        raw_prepare_policy=effective_raw_prepare_policy,
     )
     provider_execution_context = build_provider_execution_context(
         vault=vault,
@@ -501,7 +505,7 @@ def run_simplified_ingest(
             engine_version=__version__,
             profile=profile.name,
             profile_version=profile.version,
-            vault_config_snapshot=vault_config,
+            vault_config_snapshot=vault_config_snapshot,
             workspace=relative_to_vault(vault, run_dir),
             raw_bindings=[RawBinding(relative_path=raw_rel, sha256=raw_hash, size_bytes=raw_size)],
             provider_contexts=[provider_execution_context.record] if provider_execution_context.record else [],
