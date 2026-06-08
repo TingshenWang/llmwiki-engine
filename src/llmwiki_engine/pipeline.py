@@ -109,6 +109,7 @@ from .retrieval import (
     metadata_from_text,
     resolve_cache_dir,
 )
+from . import run_metrics as _run_metrics
 from .steps import (
     MODEL_BACKED_STEPS,
     STEP_NAMES,
@@ -525,20 +526,20 @@ def execute_ingest(
             message = execution_context.redactor.redact_text(str(exc))
             fail_step(manifest, step_name, message)
             write_manifest(store.manifest_path(operation_id), manifest)
-            refresh_run_metrics(vault, run_dir, manifest, warning_console=console)
+            _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
             logger.emit(step_name, "failed", status="failed", message=message, duration_ms=last_attempt_duration_ms(manifest, step_name))
             raise _errors.PipelineError(message) from exc
         write_manifest(store.manifest_path(operation_id), manifest)
-        refresh_run_metrics(vault, run_dir, manifest, warning_console=console)
+        _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
         if get_step(manifest, step_name).status == StepStatus.awaiting_review:
             manifest.status = OperationStatus.awaiting_review
             write_manifest(store.manifest_path(operation_id), manifest)
-            refresh_run_metrics(vault, run_dir, manifest, warning_console=console)
+            _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
             return manifest
     ensure_pipeline_completed(manifest)
     manifest.status = OperationStatus.drafted
     write_manifest(store.manifest_path(operation_id), manifest)
-    refresh_run_metrics(vault, run_dir, manifest, warning_console=console)
+    _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
     return manifest
 
 
@@ -2639,10 +2640,10 @@ def run_draft_rendering_model(
         grounding_rewrite_report = read_json(grounding_rewrite_path) if grounding_rewrite_path.exists() else {}
         example_cleanup_path = job["batch_dir"] / "example_concrete_cleanup_report.json"
         example_cleanup_report = read_json(example_cleanup_path) if example_cleanup_path.exists() else {}
-        batch_payload_char_count = provider_results_payload_char_count(
+        batch_payload_char_count = _run_metrics.provider_results_payload_char_count(
             [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
         )
-        batch_http_attempt_count = provider_results_http_attempt_count(
+        batch_http_attempt_count = _run_metrics.provider_results_http_attempt_count(
             [job["batch_dir"] / attempt.provider_result_ref for attempt in report.attempts]
         )
         batch_items = job["batch_items"]
@@ -5713,389 +5714,6 @@ def step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
     return f"raw 已规范化: {cleanup.raw_path}，清理 {cleanup.cleaned_link_count} 个 Obsidian 文本链接"
 
 
-def refresh_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest, *, warning_console: Console | None = None) -> None:
-    try:
-        metrics = build_run_metrics(vault, run_dir, manifest)
-        write_json(run_dir / "run_metrics.json", metrics)
-        (run_dir / "run_metrics.md").write_text(render_run_metrics_markdown(metrics), encoding="utf-8")
-    except Exception as exc:
-        if warning_console is not None:
-            warning_console.print(f"[yellow]warning:[/] run_metrics refresh failed: {exc}")
-
-
-def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -> dict[str, Any]:
-    steps = []
-    model_durations: dict[str, int] = {}
-    retry_count = 0
-    internal_model_call_count = 0
-    repair_count = 0
-    local_json_repair_count = 0
-    repair_duration_ms = 0
-    provider_result_count = 0
-    http_attempt_count = 0
-    model_payload_char_count = 0
-    archived_internal_model_call_count = 0
-    archived_repair_count = 0
-    archived_local_json_repair_count = 0
-    archived_repair_duration_ms = 0
-    archived_provider_result_count = 0
-    archived_http_attempt_count = 0
-    archived_model_payload_char_count = 0
-    for step in manifest.steps:
-        durations = [attempt.duration_ms for attempt in step.attempts if attempt.duration_ms is not None]
-        total = sum(durations)
-        provider_spec = step.attempts[-1].provider_spec if step.attempts else None
-        provider = provider_spec or ("local:auto_review" if step.name.endswith("_review") else "local")
-        retry_count += max(0, len(step.attempts) - 1)
-        repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=False)
-        total_repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=True)
-        archived_repair_metrics = subtract_repair_metrics(total_repair_metrics, repair_metrics)
-        internal_model_call_count += repair_metrics["attempt_count"]
-        repair_count += repair_metrics["repair_count"]
-        local_json_repair_count += repair_metrics["json_repair_count"]
-        repair_duration_ms += repair_metrics["duration_ms"]
-        provider_result_count += repair_metrics["provider_result_count"]
-        http_attempt_count += repair_metrics["http_attempt_count"]
-        model_payload_char_count += repair_metrics["payload_char_count"]
-        archived_internal_model_call_count += archived_repair_metrics["attempt_count"]
-        archived_repair_count += archived_repair_metrics["repair_count"]
-        archived_local_json_repair_count += archived_repair_metrics["json_repair_count"]
-        archived_repair_duration_ms += archived_repair_metrics["duration_ms"]
-        archived_provider_result_count += archived_repair_metrics["provider_result_count"]
-        archived_http_attempt_count += archived_repair_metrics["http_attempt_count"]
-        archived_model_payload_char_count += archived_repair_metrics["payload_char_count"]
-        row = {
-            "name": step.name,
-            "status": step.status.value,
-            "attempts": len(step.attempts),
-            "last_duration_ms": durations[-1] if durations else None,
-            "total_duration_ms": total,
-            "provider": provider,
-        }
-        if repair_metrics["attempt_count"]:
-            row["internal_model_call_count"] = repair_metrics["attempt_count"]
-            row["repair_count"] = repair_metrics["repair_count"]
-            row["local_json_repair_count"] = repair_metrics["json_repair_count"]
-            row["repair_duration_ms"] = repair_metrics["duration_ms"]
-            row["provider_result_count"] = repair_metrics["provider_result_count"]
-            row["http_attempt_count"] = repair_metrics["http_attempt_count"]
-            row["payload_char_count"] = repair_metrics["payload_char_count"]
-        if archived_repair_metrics["attempt_count"]:
-            row["archived_internal_model_call_count"] = archived_repair_metrics["attempt_count"]
-            row["archived_repair_count"] = archived_repair_metrics["repair_count"]
-            row["archived_local_json_repair_count"] = archived_repair_metrics["json_repair_count"]
-            row["archived_repair_duration_ms"] = archived_repair_metrics["duration_ms"]
-            row["archived_provider_result_count"] = archived_repair_metrics["provider_result_count"]
-            row["archived_http_attempt_count"] = archived_repair_metrics["http_attempt_count"]
-            row["archived_payload_char_count"] = archived_repair_metrics["payload_char_count"]
-            row["total_internal_model_call_count"] = total_repair_metrics["attempt_count"]
-            row["total_repair_count"] = total_repair_metrics["repair_count"]
-            row["total_local_json_repair_count"] = total_repair_metrics["json_repair_count"]
-            row["total_repair_duration_ms"] = total_repair_metrics["duration_ms"]
-            row["total_provider_result_count"] = total_repair_metrics["provider_result_count"]
-            row["total_http_attempt_count"] = total_repair_metrics["http_attempt_count"]
-            row["total_payload_char_count"] = total_repair_metrics["payload_char_count"]
-        shortcut_report = run_dir / step.name / "merge_planning_shortcut_report.json"
-        if shortcut_report.exists():
-            try:
-                shortcut_data = json.loads(shortcut_report.read_text(encoding="utf-8"))
-                row["local_shortcut"] = bool(shortcut_data.get("used"))
-                row["local_shortcut_rule"] = shortcut_data.get("shortcut", "")
-            except Exception:
-                row["local_shortcut"] = False
-        waiting_ms = awaiting_review_duration_ms(step)
-        if waiting_ms is not None:
-            row["awaiting_review_duration_ms"] = waiting_ms
-        steps.append(row)
-        if step.attempts and step.attempts[-1].provider_spec:
-            model_durations[step.name] = total
-    payload_steps = [
-        {
-            "name": str(row["name"]),
-            "payload_char_count": int(row.get("payload_char_count", 0) or 0),
-            "provider_result_count": int(row.get("provider_result_count", 0) or 0),
-            "http_attempt_count": int(row.get("http_attempt_count", 0) or 0),
-            "repair_count": int(row.get("repair_count", 0) or 0),
-            "local_json_repair_count": int(row.get("local_json_repair_count", 0) or 0),
-            "duration_ms": int(row.get("repair_duration_ms", 0) or 0),
-        }
-        for row in steps
-        if int(row.get("payload_char_count", 0) or 0) > 0
-    ]
-    payload_steps.sort(key=lambda row: (-int(row["payload_char_count"]), str(row["name"])))
-    largest_payload = payload_steps[0] if payload_steps else None
-    cleanup_count = 0
-    preserved_media_count = 0
-    cleanup_path = run_dir / "raw_link_cleanup" / "raw_link_cleanup.json"
-    if cleanup_path.exists():
-        cleanup = read_model(cleanup_path, RawLinkCleanupArtifact)
-        cleanup_count = cleanup.cleaned_link_count
-        preserved_media_count = cleanup.preserved_media_embed_count
-    created = updated = noop = 0
-    plan_path = run_dir / "merge_plan_review" / "approved_merge_plan.json"
-    if not plan_path.exists():
-        plan_path = run_dir / "wiki_merge_planning" / "wiki_merge_plan.json"
-    if plan_path.exists():
-        plan = read_model(plan_path, WikiMergePlanArtifact)
-        created = sum(1 for item in plan.items if item.action == "create")
-        updated = sum(1 for item in plan.items if item.action == "update")
-        noop = sum(1 for item in plan.items if item.action == "noop")
-    written_target_count = 0
-    preview_path = run_dir / "apply_preview" / "apply_preview.json"
-    if preview_path.exists():
-        preview = read_model(preview_path, ApplyPreview)
-        written_target_count = len([target for target in preview.targets if target.will_write])
-    current_attempt_duration_ms = sum(int(row.get("total_duration_ms") or 0) for row in steps)
-    current_model_duration_ms = repair_duration_ms
-    archived_model_duration_ms = archived_repair_duration_ms
-    budget_metrics = source_digest_budget_metrics(run_dir)
-    return {
-        "schema_version": "run_metrics.v1",
-        "operation_id": manifest.operation_id,
-        "status": manifest.status.value,
-        "steps": steps,
-        "model_durations_ms": model_durations,
-        "current_attempt_duration_ms": current_attempt_duration_ms,
-        "current_model_duration_ms": current_model_duration_ms,
-        "archived_model_duration_ms": archived_model_duration_ms,
-        "total_model_duration_ms": current_model_duration_ms + archived_model_duration_ms,
-        "retry_count": retry_count,
-        "internal_model_call_count": internal_model_call_count,
-        "repair_count": repair_count,
-        "local_json_repair_count": local_json_repair_count,
-        "repair_duration_ms": repair_duration_ms,
-        "provider_result_count": provider_result_count,
-        "http_attempt_count": http_attempt_count,
-        "internal_model_payload_char_count": model_payload_char_count,
-        "payload_by_step": payload_steps,
-        "largest_payload_step": largest_payload["name"] if largest_payload else "",
-        "largest_payload_char_count": largest_payload["payload_char_count"] if largest_payload else 0,
-        "archived_internal_model_call_count": archived_internal_model_call_count,
-        "archived_repair_count": archived_repair_count,
-        "archived_local_json_repair_count": archived_local_json_repair_count,
-        "archived_repair_duration_ms": archived_repair_duration_ms,
-        "archived_provider_result_count": archived_provider_result_count,
-        "archived_http_attempt_count": archived_http_attempt_count,
-        "archived_internal_model_payload_char_count": archived_model_payload_char_count,
-        "total_internal_model_call_count": internal_model_call_count + archived_internal_model_call_count,
-        "total_repair_count": repair_count + archived_repair_count,
-        "total_local_json_repair_count": local_json_repair_count + archived_local_json_repair_count,
-        "total_repair_duration_ms": repair_duration_ms + archived_repair_duration_ms,
-        "total_provider_result_count": provider_result_count + archived_provider_result_count,
-        "total_http_attempt_count": http_attempt_count + archived_http_attempt_count,
-        "total_internal_model_payload_char_count": model_payload_char_count + archived_model_payload_char_count,
-        "created_count": created,
-        "updated_count": updated,
-        "noop_count": noop,
-        **budget_metrics,
-        "cleaned_link_count": cleanup_count,
-        "preserved_media_embed_count": preserved_media_count,
-        "written_target_count": written_target_count,
-    }
-
-
-def render_run_metrics_markdown(metrics: dict[str, Any]) -> str:
-    payload_rows = [
-        [
-            str(row.get("name", "")),
-            f"{int(row.get('payload_char_count', 0) or 0):,}",
-            str(row.get("provider_result_count", 0)),
-            str(row.get("http_attempt_count", 0)),
-            str(row.get("repair_count", 0)),
-            str(row.get("local_json_repair_count", 0)),
-            format_duration(row.get("duration_ms")),
-        ]
-        for row in metrics.get("payload_by_step", [])
-    ]
-    step_rows = [
-        [
-            str(row.get("name", "")),
-            str(row.get("status", "")),
-            str(row.get("attempts", 0)),
-            format_duration(row.get("last_duration_ms")),
-            format_duration(row.get("total_duration_ms")),
-            f"{int(row.get('payload_char_count', 0) or 0):,}" if row.get("payload_char_count") else "",
-        ]
-        for row in metrics.get("steps", [])
-    ]
-    return (
-        "# Run Metrics\n\n"
-        f"- Operation: `{metrics.get('operation_id', '')}`\n"
-        f"- Status: `{metrics.get('status', '')}`\n"
-        f"- Current model calls: `{metrics.get('internal_model_call_count', 0)}`\n"
-        f"- Current HTTP attempts: `{metrics.get('http_attempt_count', 0)}`\n"
-        f"- Local JSON repairs: `{metrics.get('local_json_repair_count', 0)}`\n"
-        f"- Current payload chars: `{int(metrics.get('internal_model_payload_char_count', 0) or 0):,}`\n"
-        f"- Largest payload step: `{metrics.get('largest_payload_step', '') or 'none'}` "
-        f"({int(metrics.get('largest_payload_char_count', 0) or 0):,} chars)\n\n"
-        "## Payload By Step\n\n"
-        f"{format_markdown_table(['Step', 'Payload Chars', 'Provider Results', 'HTTP Attempts', 'Model Repairs', 'Local JSON Repairs', 'Model Duration'], payload_rows) if payload_rows else '_No model payloads recorded._'}\n\n"
-        "## Steps\n\n"
-        f"{format_markdown_table(['Step', 'Status', 'Attempts', 'Last Duration', 'Attempt Total', 'Payload Chars'], step_rows)}\n"
-    )
-
-
-def source_digest_budget_metrics(run_dir: Path) -> dict[str, Any]:
-    path = run_dir / "source_digest" / "source_digest_budget_report.json"
-    if not path.exists():
-        return {}
-    try:
-        report = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return {
-        "candidate_page_budget": report.get("budget", 0),
-        "candidate_count_before_dedupe": report.get("total_formal_candidates_before_dedupe", report.get("total_formal_candidates_before_budget", 0)),
-        "candidate_count_before_budget": report.get("total_formal_candidates_before_budget", 0),
-        "candidate_deduped_count": report.get("deduped_count", 0),
-        "candidate_selected_count": report.get("selected_count", 0),
-        "candidate_deferred_count": report.get("deferred_count", 0),
-        "candidate_budget_applied": bool(report.get("applied")),
-    }
-
-
-def subtract_repair_metrics(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
-    return {
-        key: max(0, left.get(key, 0) - right.get(key, 0))
-        for key in [
-            "attempt_count",
-            "repair_count",
-            "json_repair_count",
-            "duration_ms",
-            "provider_result_count",
-            "http_attempt_count",
-            "payload_char_count",
-        ]
-    }
-
-
-def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool = True) -> dict[str, int]:
-    step_dirs = [run_dir / step_name]
-    archive_root = run_dir / "attempt_archive"
-    if include_archived and archive_root.exists():
-        for archived_step in sorted(archive_root.glob(f"*/**/{step_name}")):
-            if archived_step.is_dir():
-                step_dirs.append(archived_step)
-    attempt_count = 0
-    repair_count = 0
-    json_repair_count = 0
-    duration_ms = 0
-    provider_result_count = 0
-    http_attempt_count = 0
-    payload_char_count = 0
-    for step_dir in step_dirs:
-        step_attempt_count = 0
-        attempt_result_paths: list[Path] = []
-        report_path = step_dir / "structured_repair_report.json"
-        if report_path.exists():
-            try:
-                report = read_model(report_path, StructuredRepairReport)
-                step_attempt_count = report.attempt_count
-                attempt_count += step_attempt_count
-                repair_count += report.repair_count
-                duration_ms += report.duration_ms
-                attempt_result_paths = [step_dir / attempt.provider_result_ref for attempt in report.attempts]
-            except Exception:
-                pass
-        existing_attempt_result_paths = [path for path in attempt_result_paths if path.exists()]
-        if existing_attempt_result_paths:
-            provider_result_count += len(existing_attempt_result_paths)
-            http_attempt_count += provider_results_http_attempt_count(existing_attempt_result_paths)
-            payload_char_count += provider_results_payload_char_count(existing_attempt_result_paths)
-            json_repair_count += provider_results_json_repair_count(existing_attempt_result_paths)
-            continue
-        provider_results_dir = step_dir / "provider_results"
-        if provider_results_dir.exists():
-            provider_result_paths = list(provider_results_dir.glob("attempt-*.json"))
-            provider_result_count += len(provider_result_paths)
-            http_attempt_count += provider_results_http_attempt_count(provider_result_paths)
-            payload_char_count += provider_results_payload_char_count(provider_result_paths)
-            json_repair_count += provider_results_json_repair_count(provider_result_paths)
-        elif step_attempt_count:
-            provider_result_count += step_attempt_count
-            result_paths = [step_dir / "provider_result.json"]
-            http_attempt_count += provider_results_http_attempt_count(result_paths)
-            payload_char_count += provider_results_payload_char_count(result_paths)
-            json_repair_count += provider_results_json_repair_count(result_paths)
-        elif (step_dir / "provider_result.json").exists():
-            provider_result_count += 1
-            result_paths = [step_dir / "provider_result.json"]
-            http_attempt_count += provider_results_http_attempt_count(result_paths)
-            payload_char_count += provider_results_payload_char_count(result_paths)
-            json_repair_count += provider_results_json_repair_count(result_paths)
-    if attempt_count == 0:
-        attempt_count = provider_result_count
-    return {
-        "attempt_count": attempt_count,
-        "repair_count": repair_count,
-        "json_repair_count": json_repair_count,
-        "duration_ms": duration_ms,
-        "provider_result_count": provider_result_count,
-        "http_attempt_count": http_attempt_count,
-        "payload_char_count": payload_char_count,
-    }
-
-
-def provider_results_payload_char_count(paths: list[Path]) -> int:
-    total = 0
-    for path in paths:
-        if not path.exists():
-            continue
-        try:
-            result = read_model(path, ProviderResult)
-            total += int(result.payload_char_count or 0)
-        except Exception:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                total += int(data.get("payload_char_count", 0) or 0)
-            except Exception:
-                continue
-    return total
-
-
-def provider_results_http_attempt_count(paths: list[Path]) -> int:
-    total = 0
-    for path in paths:
-        if not path.exists():
-            continue
-        try:
-            result = read_model(path, ProviderResult)
-            total += max(1, int(result.http_attempt_count or 1))
-        except Exception:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                total += max(1, int(data.get("http_attempt_count", 1) or 1))
-            except Exception:
-                continue
-    return total
-
-
-def provider_results_json_repair_count(paths: list[Path]) -> int:
-    total = 0
-    for path in paths:
-        if not path.exists():
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if data.get("json_repair_applied"):
-            total += 1
-    return total
-
-
-def awaiting_review_duration_ms(step: Any) -> int | None:
-    if step.status != StepStatus.approved or not step.completed_at or not step.attempts:
-        return None
-    attempt = step.attempts[-1]
-    if not attempt.completed_at:
-        return None
-    start = datetime.fromisoformat(attempt.completed_at)
-    end = datetime.fromisoformat(step.completed_at)
-    value = max(0, round((end - start).total_seconds() * 1000))
-    return value if value > 0 else None
-
-
 def status(vault: Path, operation_id: str) -> OperationManifest:
     return read_manifest(RunStore(vault).manifest_path(operation_id))
 
@@ -6136,7 +5754,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             delete_downstream_step_dirs(vault, operation_id, "validation")
             mark_from_pending(manifest, "validation")
             write_manifest(store.manifest_path(operation_id), manifest)
-            refresh_run_metrics(vault, run_dir, manifest)
+            _run_metrics.refresh_run_metrics(run_dir, manifest)
             return manifest
         if review_step == "merge_plan_review":
             step_root = require_step_output_dir(run_dir, "merge_plan_review")
@@ -6178,7 +5796,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
             mark_from_pending(manifest, "draft_rendering")
             write_manifest(store.manifest_path(operation_id), manifest)
-            refresh_run_metrics(vault, run_dir, manifest)
+            _run_metrics.refresh_run_metrics(run_dir, manifest)
             return manifest
         raise _errors.PipelineError(f"Unsupported review step: {review_step}")
 
@@ -6202,7 +5820,7 @@ def revise_review(vault: Path, operation_id: str, review_step: str) -> Operation
             raise _errors.PipelineError(f"Unsupported review step: {review_step}")
         manifest.status = OperationStatus.running
         write_manifest(store.manifest_path(operation_id), manifest)
-        refresh_run_metrics(vault, run_dir, manifest)
+        _run_metrics.refresh_run_metrics(run_dir, manifest)
         return manifest
 
 

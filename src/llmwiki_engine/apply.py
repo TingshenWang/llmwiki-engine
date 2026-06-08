@@ -24,7 +24,8 @@ from .models import (
 )
 from .steps import require_step_output_dir
 from .verify import require_verified
-from .pipeline import build_source_duplicate_guard_artifact, refresh_run_metrics, require_m42_draft_sidecars
+from . import run_metrics as _run_metrics
+from .pipeline import build_source_duplicate_guard_artifact, require_m42_draft_sidecars
 from .wiki_context import wiki_context_drift_messages
 from .workspace import RunStore, apply_lock, run_lock
 
@@ -104,7 +105,7 @@ def apply_operation(vault: Path, operation_id: str) -> list[Path]:
             manifest.status = final_status
             manifest.updated_at = utc_now()
             write_manifest(store.manifest_path(operation_id), manifest)
-            refresh_run_metrics(vault, run_dir, manifest)
+            _run_metrics.refresh_run_metrics(run_dir, manifest)
         except Exception as exc:
             _record_apply_failed(vault, store, run_dir, manifest, operation_id, written, exc)
             raise ApplyError(f"Apply write failed; inspect written targets before retry: {exc}") from exc
@@ -169,7 +170,7 @@ def _record_apply_failed(
         },
     )
     write_manifest(store.manifest_path(operation_id), manifest)
-    refresh_run_metrics(vault, run_dir, manifest)
+    _run_metrics.refresh_run_metrics(run_dir, manifest)
 
 
 def _optional_receipt_ref(vault: Path, path: Path, kind: str, producer_step: str) -> ArtifactRef | None:

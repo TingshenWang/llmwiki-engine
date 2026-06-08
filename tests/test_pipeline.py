@@ -14,6 +14,7 @@ from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.pipeline as pipeline_module
+import llmwiki_engine.run_metrics as run_metrics_module
 import llmwiki_engine.steps as steps_module
 from llmwiki_engine import open_questions as open_questions_module
 from llmwiki_engine import page_sections as page_sections_module
@@ -3102,8 +3103,8 @@ def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts
     write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000001Z" / "draft_rendering", 4)
     write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000002Z" / "draft_rendering", 3)
 
-    current = pipeline_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=False)
-    total = pipeline_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=True)
+    current = run_metrics_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=False)
+    total = run_metrics_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=True)
 
     assert current["attempt_count"] == 2
     assert current["provider_result_count"] == 2
