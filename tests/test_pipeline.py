@@ -14,6 +14,7 @@ from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
+import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.planning_payloads as planning_payloads_module
 import llmwiki_engine.run_metrics as run_metrics_module
@@ -670,6 +671,25 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "source_digest_candidate_lookup")
     assert not hasattr(pipeline_module, "source_digest_candidate_id_closure")
     assert not hasattr(pipeline_module, "first_source_basis_candidate")
+    assert not hasattr(pipeline_module, "build_draft_source_excerpt_pack")
+    assert not hasattr(pipeline_module, "render_draft_source_excerpt_pack_markdown")
+    assert not hasattr(pipeline_module, "build_draft_rendering_payload")
+    assert not hasattr(pipeline_module, "project_merge_plan_for_draft_rendering")
+    assert not hasattr(pipeline_module, "project_merge_plan_item_for_draft_rendering")
+    assert not hasattr(pipeline_module, "draft_rendering_relevant_wiki_paths")
+    assert not hasattr(pipeline_module, "should_include_draft_inspected_context")
+    assert not hasattr(pipeline_module, "normalize_wiki_snapshot_path")
+    assert not hasattr(pipeline_module, "compact_snapshot_for_draft_rendering")
+    assert not hasattr(pipeline_module, "compact_optional_dict")
+    assert not hasattr(pipeline_module, "project_source_digest_for_merge_plan")
+    assert not hasattr(pipeline_module, "source_digest_candidate_ids_for_merge_plan")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_TOTAL_CHAR_LIMIT")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_PER_PAGE_LIMIT")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_GLOBAL_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS")
+    assert not hasattr(pipeline_module, "DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -762,7 +782,7 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
     assert selected_aggregation["candidate_id"] == aggregate.candidate_id
     assert selected_aggregation["represented_candidate_ids"] == ["C2", "C3", "C4"]
     assert selected_aggregation["replaced_candidate_id"] == "C2"
-    projected = pipeline_module.project_source_digest_for_merge_plan(
+    projected = draft_rendering_payloads_module.project_source_digest_for_merge_plan(
         capped,
         WikiMergePlanArtifact(
             log_date="2026-06-06",
@@ -1180,7 +1200,7 @@ def test_draft_source_excerpt_pack_expands_aggregation_child_candidate_cues() ->
         "这里记录运行时边界和子候选 Beta 细节。\n"
     )
 
-    pack = pipeline_module.build_draft_source_excerpt_pack(text, digest, merge_plan, full_source_limit=10)
+    pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(text, digest, merge_plan, full_source_limit=10)
 
     item = pack["items"][0]
     assert item["expanded_source_candidate_ids"] == ["AGG-concepts-demo", "C3", "C4"]
@@ -1249,7 +1269,7 @@ def test_source_excerpt_packs_expand_prepared_discovered_budget_deferred_cues() 
         candidate_contexts=pipeline_module.CandidateContextsArtifact(retrieval_backend="exact"),
         snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
     )
-    draft_pack = pipeline_module.build_draft_source_excerpt_pack(text, digest, merge_plan, full_source_limit=10)
+    draft_pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(text, digest, merge_plan, full_source_limit=10)
     merge_item = merge_pack["source_excerpt_pack"]["items"][0]
     draft_item = draft_pack["items"][0]
 
@@ -1339,7 +1359,7 @@ def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_de
         ],
     )
 
-    projected = pipeline_module.project_source_digest_for_merge_plan(digest, merge_plan)
+    projected = draft_rendering_payloads_module.project_source_digest_for_merge_plan(digest, merge_plan)
 
     assert [candidate.candidate_id for candidate in projected.concepts] == ["C1", "AGG-concepts-demo"]
     assert projected.designs == []
@@ -1469,7 +1489,7 @@ def test_draft_source_excerpt_pack_truncates_long_source_by_page_cues() -> None:
         "简化 Ingest 不直接写入正式 wiki，而是先生成 source 和 concept 草稿，再通过 review/apply 进入知识库。\n"
     )
 
-    pack = pipeline_module.build_draft_source_excerpt_pack(
+    pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(
         approved_text,
         digest,
         merge_plan,
@@ -1489,7 +1509,7 @@ def test_draft_source_excerpt_pack_truncates_long_source_by_page_cues() -> None:
     assert "CLI、状态机、artifact 和 validator" in first_snippets
     assert "review/apply" in second_snippets
 
-    markdown = pipeline_module.render_draft_source_excerpt_pack_markdown(pack)
+    markdown = draft_rendering_payloads_module.render_draft_source_excerpt_pack_markdown(pack)
     assert "## 页面摘录索引" in markdown
     assert "## 分页摘录" in markdown
     assert "知识编译工程骨架" in markdown
@@ -2580,10 +2600,11 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "candidate_contexts" not in payload["wiki_context_snapshot"]
     assert all("content" not in entry for entry in payload["wiki_context_snapshot"]["entries"])
     assert payload["source_excerpt_pack"]["full_source_in_payload"] is False
-    assert payload["source_excerpt_pack"]["original_char_count"] > pipeline_module.DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT
+    assert payload["source_excerpt_pack"]["original_char_count"] > draft_rendering_payloads_module.DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT
     assert payload["source_excerpt_pack"]["included_char_count"] < payload["source_excerpt_pack"]["original_char_count"]
     contract_rules = " ".join(payload["contract"]["rules"])
     grounding_risk_rules = " ".join(payload["contract"]["grounding_risk_rules"])
+    assert payload["contract"]["grounding_risk_rules"] == list(draft_grounding.DRAFT_RENDERING_GROUNDING_RISK_RULES)
     assert "source_excerpt_pack" in contract_rules
     assert "satisfy update_preservation_pack in the first draft" in contract_rules
     assert "and reusable key phrases into body_markdown" in contract_rules
@@ -2720,10 +2741,10 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
             ),
         ],
     )
-    metadata_paths, content_paths = pipeline_module.draft_rendering_relevant_wiki_paths(
+    metadata_paths, content_paths = draft_rendering_payloads_module.draft_rendering_relevant_wiki_paths(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, create_item])
     )
-    projection = pipeline_module.compact_snapshot_for_draft_rendering(
+    projection = draft_rendering_payloads_module.compact_snapshot_for_draft_rendering(
         snapshot,
         metadata_paths,
         "wiki_context_snapshot/wiki_context_snapshot.json",
@@ -2732,7 +2753,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
     entries = {entry["path"]: entry for entry in projection["entries"]}
 
     assert "wiki/entities/Entity_Claude Code.md" in content_paths
-    assert pipeline_module.should_include_draft_inspected_context(update_item) is True
+    assert draft_rendering_payloads_module.should_include_draft_inspected_context(update_item) is True
     assert entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"]
     assert entries["wiki/entities/Entity_Claude Code.md"]["content_role"] == "draft_context"
     assert entries["wiki/concepts/Concept_Update_Strongest.md"]["content_excerpt"] == ""
@@ -2825,10 +2846,10 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
         ],
     )
 
-    metadata_paths, content_paths = pipeline_module.draft_rendering_relevant_wiki_paths(
+    metadata_paths, content_paths = draft_rendering_payloads_module.draft_rendering_relevant_wiki_paths(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[medium_item, strong_item])
     )
-    projection = pipeline_module.compact_snapshot_for_draft_rendering(
+    projection = draft_rendering_payloads_module.compact_snapshot_for_draft_rendering(
         snapshot,
         metadata_paths,
         "wiki_context_snapshot/wiki_context_snapshot.json",
@@ -2836,8 +2857,8 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
     )
     entries = {entry["path"]: entry for entry in projection["entries"]}
 
-    assert pipeline_module.should_include_draft_inspected_context(medium_item) is True
-    assert pipeline_module.should_include_draft_inspected_context(strong_item) is True
+    assert draft_rendering_payloads_module.should_include_draft_inspected_context(medium_item) is True
+    assert draft_rendering_payloads_module.should_include_draft_inspected_context(strong_item) is True
     assert entries["wiki/concepts/Concept_Medium_Context.md"]["content_role"] == "metadata_only"
     assert entries["wiki/concepts/Concept_Medium_Inspected.md"]["content_role"] == "metadata_only"
     assert entries["wiki/concepts/Concept_Strong_Context.md"]["content_role"] == "draft_context"
@@ -5203,7 +5224,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
         "## 通过页\n\n通过页用于验证 accepted partial pages 会被保留。\n\n"
         "## 失败页\n\n失败页用于验证 repair payload 只重写失败页面。\n"
     )
-    source_excerpt_pack = pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
+    source_excerpt_pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
     update_preservation_pack = update_preservation_module.build_update_preservation_pack(merge_plan, snapshot)
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -5462,7 +5483,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         digest=digest,
         merge_plan=merge_plan,
         snapshot=snapshot,
-        source_excerpt_pack=pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=20),
+        source_excerpt_pack=draft_rendering_payloads_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=20),
         update_preservation_pack=update_preservation_module.build_update_preservation_pack(merge_plan, snapshot),
         approved_prepared_text=raw_text,
     )
@@ -5546,7 +5567,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
         ],
     )
     raw_text = "# 测试材料\n\n## 通过页\n\n通过页。\n\n## 失败页\n\n失败页。\n"
-    source_excerpt_pack = pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
+    source_excerpt_pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
     update_preservation_pack = update_preservation_module.build_update_preservation_pack(merge_plan, snapshot)
     accepted_ok = pipeline_module.DraftPageItem(
         page_plan_id="PP-OK",
