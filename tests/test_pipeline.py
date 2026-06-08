@@ -545,7 +545,7 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
     assert selected_aggregation["candidate_id"] == aggregate.candidate_id
     assert selected_aggregation["represented_candidate_ids"] == ["C2", "C3", "C4"]
     assert selected_aggregation["replaced_candidate_id"] == "C2"
-    projected, _ = pipeline_module.project_source_digest_for_merge_plan(
+    projected = pipeline_module.project_source_digest_for_merge_plan(
         capped,
         WikiMergePlanArtifact(
             log_date="2026-06-06",
@@ -1029,56 +1029,12 @@ def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_de
         ],
     )
 
-    projected, report = pipeline_module.project_source_digest_for_merge_plan(digest, merge_plan)
+    projected = pipeline_module.project_source_digest_for_merge_plan(digest, merge_plan)
 
     assert [candidate.candidate_id for candidate in projected.concepts] == ["C1", "AGG-concepts-demo"]
     assert projected.designs == []
     assert [candidate.candidate_id for candidate in projected.budget_deferred_candidates] == ["C3", "C4"]
     assert projected.weak_or_noise_items == []
-    assert report["needed_candidate_ids"] == ["AGG-concepts-demo", "C1", "C3", "C4"]
-    assert report["unresolved_candidate_ids"] == []
-    assert report["removed_counts"]["concepts"] == 1
-    assert report["removed_counts"]["budget_deferred_candidates"] == 1
-    assert report["removed_counts"]["weak_or_noise_items"] == 1
-
-
-def test_draft_rendering_digest_projection_reports_unresolved_candidate_ids() -> None:
-    digest = SourceDigestArtifact(
-        source_raw_path="raw/sample.md",
-        summary="测试 unresolved projection。",
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="C1",
-                name="已知候选",
-                type="concept",
-                one_sentence_summary="已知候选摘要。",
-                why_matters="重要。",
-                wiki_value="可复用。",
-                suggested_page_title="已知候选",
-            )
-        ],
-    )
-    merge_plan = WikiMergePlanArtifact(
-        log_date="2026-06-06",
-        items=[
-            pipeline_module.WikiMergePlanItem(
-                page_plan_id="PP-C1",
-                source_basis=SourceBasis(source_candidate_ids=["C1", "prepared-only-topic"]),
-                action="create",
-                canonical_target_path="concepts/Concept_C1.md",
-                display_title="已知候选",
-                page_type="concept",
-                new_understanding="测试。",
-                section_plans={"summary": "摘要"},
-                reason="test",
-            )
-        ],
-    )
-
-    _, report = pipeline_module.project_source_digest_for_merge_plan(digest, merge_plan)
-
-    assert report["needed_candidate_ids"] == ["C1", "prepared-only-topic"]
-    assert report["unresolved_candidate_ids"] == ["prepared-only-topic"]
 
 
 def test_source_digest_candidate_budget_semantically_dedupes_open_questions_before_budget() -> None:
@@ -3252,22 +3208,10 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     sidecar = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
     assert sidecar["schema_version"] == "draft_source_excerpt_pack.v1"
     assert (run_dir / "draft_rendering" / "draft_source_excerpt_pack.md").exists()
-    digest_projection_report = read_json(run_dir / "draft_rendering" / "draft_digest_projection_report.json")
-    assert digest_projection_report["schema_version"] == "source_digest_projection_report.v1"
-    assert digest_projection_report["projection"] == "draft_rendering_batch"
-    assert digest_projection_report["original_counts"]["total_ingest_candidates"] >= digest_projection_report["projected_counts"][
-        "total_ingest_candidates"
-    ]
-    assert (run_dir / "draft_rendering" / "draft_digest_projection_report.md").exists()
-    merge_projection_report = read_json(run_dir / "draft_rendering" / "draft_merge_plan_projection_report.json")
-    assert merge_projection_report["schema_version"] == "draft_merge_plan_projection_report.v1"
-    assert merge_projection_report["projected_json_chars"] <= merge_projection_report["original_json_chars"]
-    assert len(payload["approved_merge_plan"]["items"]) == merge_projection_report["projected_item_count"]
-    assert (run_dir / "draft_rendering" / "draft_merge_plan_projection_report.md").exists()
-    context_projection_report = read_json(run_dir / "draft_rendering" / "draft_context_projection_report.json")
-    assert context_projection_report["schema_version"] == "draft_context_projection_report.v1"
-    assert context_projection_report["projected_json_chars"] <= context_projection_report["original_json_chars"]
-    assert (run_dir / "draft_rendering" / "draft_context_projection_report.md").exists()
+    assert len(payload["approved_merge_plan"]["items"]) == len(payload["required_page_plan_ids"])
+    assert not (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
+    assert not (run_dir / "draft_rendering" / "draft_merge_plan_projection_report.json").exists()
+    assert not (run_dir / "draft_rendering" / "draft_context_projection_report.json").exists()
     draft_step = [step for step in manifest.steps if step.name == "draft_rendering"][0]
     excerpt_ref = [
         ref
@@ -3275,24 +3219,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
         if ref.relative_path == "draft_rendering/draft_source_excerpt_pack.json"
     ][0]
     assert excerpt_ref.schema_version == "draft_source_excerpt_pack.v1"
-    digest_ref = [
-        ref
-        for ref in draft_step.outputs
-        if ref.relative_path == "draft_rendering/draft_digest_projection_report.json"
-    ][0]
-    assert digest_ref.schema_version == "source_digest_projection_report.v1"
-    merge_projection_ref = [
-        ref
-        for ref in draft_step.outputs
-        if ref.relative_path == "draft_rendering/draft_merge_plan_projection_report.json"
-    ][0]
-    assert merge_projection_ref.schema_version == "draft_merge_plan_projection_report.v1"
-    context_projection_ref = [
-        ref
-        for ref in draft_step.outputs
-        if ref.relative_path == "draft_rendering/draft_context_projection_report.json"
-    ][0]
-    assert context_projection_ref.schema_version == "draft_context_projection_report.v1"
+    assert not any("projection_report" in ref.relative_path for ref in draft_step.outputs)
 
 
 def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspected() -> None:
@@ -3379,7 +3306,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
     metadata_paths, content_paths = pipeline_module.draft_rendering_relevant_wiki_paths(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, create_item])
     )
-    projection, report = pipeline_module.compact_snapshot_for_draft_rendering(
+    projection = pipeline_module.compact_snapshot_for_draft_rendering(
         snapshot,
         metadata_paths,
         "wiki_context_snapshot/wiki_context_snapshot.json",
@@ -3387,7 +3314,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
     )
     entries = {entry["path"]: entry for entry in projection["entries"]}
 
-    assert "wiki/entities/Entity_Claude Code.md" in report["content_paths"]
+    assert "wiki/entities/Entity_Claude Code.md" in content_paths
     assert pipeline_module.should_include_draft_inspected_context(update_item) is True
     assert entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"]
     assert entries["wiki/entities/Entity_Claude Code.md"]["content_role"] == "draft_context"
@@ -3398,8 +3325,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
     assert entries["wiki/entities/Entity_Managed Agents.md"]["content_excerpt"] == ""
     assert entries["wiki/entities/Entity_Managed Agents.md"]["content_role"] == "metadata_only"
     assert "wiki/concepts/Concept_大脑与双手解耦.md" not in entries
-    assert "wiki/concepts/Concept_大脑与双手解耦.md" not in report["relevant_paths"]
-    assert report["projected_content_entry_count"] == 1
+    assert "wiki/concepts/Concept_大脑与双手解耦.md" not in metadata_paths
     assert projection["included_content_entry_count"] == 1
     assert projection["included_entry_content_chars"] == len(entries["wiki/entities/Entity_Claude Code.md"]["content_excerpt"])
 
@@ -3485,7 +3411,7 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
     metadata_paths, content_paths = pipeline_module.draft_rendering_relevant_wiki_paths(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[medium_item, strong_item])
     )
-    projection, report = pipeline_module.compact_snapshot_for_draft_rendering(
+    projection = pipeline_module.compact_snapshot_for_draft_rendering(
         snapshot,
         metadata_paths,
         "wiki_context_snapshot/wiki_context_snapshot.json",
@@ -3500,8 +3426,8 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
     assert entries["wiki/concepts/Concept_Strong_Context.md"]["content_role"] == "draft_context"
     assert entries["wiki/concepts/Concept_Strong_Context.md"]["content_excerpt"]
     assert entries["wiki/concepts/Concept_Strong_Inspected.md"]["content_role"] == "metadata_only"
-    assert "wiki/concepts/Concept_Strong_Context.md" in report["content_paths"]
-    assert "wiki/concepts/Concept_Medium_Context.md" not in report["content_paths"]
+    assert "wiki/concepts/Concept_Strong_Context.md" in content_paths
+    assert "wiki/concepts/Concept_Medium_Context.md" not in content_paths
 
 
 def test_wiki_merge_planning_payload_uses_compact_context_projection(
@@ -13226,13 +13152,13 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     assert "墙钟耗时" in batch_report_markdown
     assert "最大单批 payload" in batch_report_markdown
     assert len(draft_artifact["pages"]) == 7
-    assert (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
+    assert not (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "provider_result.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "provider_result.json").exists()
     aggregate_provider_result = read_json(run_dir / "draft_rendering" / "provider_result.json")
     assert aggregate_provider_result["http_attempt_count"] == 3
-    assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_digest_projection_report.json").exists()
-    assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_digest_projection_report.json").exists()
+    assert not (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_digest_projection_report.json").exists()
+    assert not (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json").exists()
     repair_prompt = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json")
     assert repair_prompt["repair_contract"]["mode"] == "missing_page_completion"
@@ -13250,11 +13176,7 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     draft_step = next(step for step in manifest.steps if step.name == "draft_rendering")
     assert "draft_rendering_batch_report.v1" in [ref.schema_version for ref in draft_step.outputs]
     assert any(ref.relative_path.endswith("model_batches/batch-001/provider_result.json") for ref in draft_step.outputs)
-    assert any(
-        ref.relative_path.endswith("model_batches/batch-001/draft_digest_projection_report.json")
-        and ref.schema_version == "source_digest_projection_report.v1"
-        for ref in draft_step.outputs
-    )
+    assert not any("projection_report" in ref.relative_path for ref in draft_step.outputs)
     assert any(ref.relative_path.endswith("model_batches/batch-002/structured_repair_report.json") for ref in draft_step.outputs)
     assert any(
         ref.relative_path.endswith("model_batches/batch-002/repair_prompts/attempt-2.json") and not ref.required_for_resume

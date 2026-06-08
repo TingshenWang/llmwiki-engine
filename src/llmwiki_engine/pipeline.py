@@ -5250,16 +5250,14 @@ def build_draft_rendering_missing_page_repair_payload(
         force_excerpt=True,
     )
     missing_update_preservation_pack = build_update_preservation_pack(missing_plan, snapshot)
-    missing_payload = draft_rendering_model_payload(
-        build_draft_rendering_payload(
-            ctx=ctx,
-            digest=digest,
-            merge_plan=missing_plan,
-            snapshot=snapshot,
-            source_excerpt_pack=missing_source_excerpt_pack,
-            update_preservation_pack=missing_update_preservation_pack,
-            approved_prepared_text=approved_prepared_text,
-        )
+    missing_payload = build_draft_rendering_payload(
+        ctx=ctx,
+        digest=digest,
+        merge_plan=missing_plan,
+        snapshot=snapshot,
+        source_excerpt_pack=missing_source_excerpt_pack,
+        update_preservation_pack=missing_update_preservation_pack,
+        approved_prepared_text=approved_prepared_text,
     )
     return {
         "repair_contract": {
@@ -5341,16 +5339,14 @@ def build_draft_rendering_page_repair_payload(
         force_excerpt=True,
     )
     repair_update_preservation_pack = build_update_preservation_pack(repair_plan, snapshot)
-    repair_payload = draft_rendering_model_payload(
-        build_draft_rendering_payload(
-            ctx=ctx,
-            digest=digest,
-            merge_plan=repair_plan,
-            snapshot=snapshot,
-            source_excerpt_pack=repair_source_excerpt_pack,
-            update_preservation_pack=repair_update_preservation_pack,
-            approved_prepared_text=approved_prepared_text,
-        )
+    repair_payload = build_draft_rendering_payload(
+        ctx=ctx,
+        digest=digest,
+        merge_plan=repair_plan,
+        snapshot=snapshot,
+        source_excerpt_pack=repair_source_excerpt_pack,
+        update_preservation_pack=repair_update_preservation_pack,
+        approved_prepared_text=approved_prepared_text,
     )
     accepted_page_refs = draft_repair_accepted_page_refs(partial.pages, merge_plan)
     prompt = {
@@ -5591,9 +5587,6 @@ def run_single_draft_rendering_model_call(
         update_preservation_pack=update_preservation_pack,
         approved_prepared_text=approved_prepared_text,
     )
-    write_draft_digest_projection_report(output_dir, payload["approved_digest_projection_report"])
-    write_draft_payload_projection_reports(output_dir, payload)
-    model_payload = draft_rendering_model_payload(payload)
     accepted_repair_pages_by_id: dict[str, dict[str, Any]] = {}
     active_repair_page_plan_ids: set[str] = set()
     last_merged_repair_artifact: DraftRenderingArtifact | None = None
@@ -5739,7 +5732,7 @@ def run_single_draft_rendering_model_call(
         redactor=ctx.execution_context.redactor,
     ).run(
         "draft_rendering",
-        model_payload,
+        payload,
         DraftRenderingArtifact,
         validator=validate_draft_rendering_model,
         accept_after_repair_issue_codes={"unsupported_new_fact", "old_knowledge_not_absorbed"},
@@ -5810,12 +5803,12 @@ def build_draft_rendering_payload(
 ) -> dict[str, Any]:
     approved_prepared_payload = approved_prepared_text if source_excerpt_pack["full_source_in_payload"] else ""
     draftable_count = len([item for item in merge_plan.items if item.action in {"create", "update"}])
-    projected_digest, digest_projection_report = project_source_digest_for_merge_plan(digest, merge_plan)
-    projected_merge_plan, merge_plan_projection_report = project_merge_plan_for_draft_rendering(merge_plan)
+    projected_digest = project_source_digest_for_merge_plan(digest, merge_plan)
+    projected_merge_plan = project_merge_plan_for_draft_rendering(merge_plan)
     required_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
     snapshot_ref = merge_plan.context_snapshot_ref or "wiki_context_snapshot/wiki_context_snapshot.json"
     relevant_snapshot_paths, content_snapshot_paths = draft_rendering_relevant_wiki_paths(merge_plan)
-    projected_snapshot, snapshot_projection_report = compact_snapshot_for_draft_rendering(
+    projected_snapshot = compact_snapshot_for_draft_rendering(
         snapshot,
         relevant_snapshot_paths,
         snapshot_ref,
@@ -5828,13 +5821,10 @@ def build_draft_rendering_payload(
         "update_preservation_pack": update_preservation_pack,
         "approved_digest": projected_digest.model_dump(mode="json"),
         "approved_digest_ref": "source_digest_review/approved_digest.json",
-        "approved_digest_projection_report": digest_projection_report,
         "approved_merge_plan": projected_merge_plan,
         "approved_merge_plan_ref": "merge_plan_review/approved_merge_plan.json",
-        "approved_merge_plan_projection_report": merge_plan_projection_report,
         "wiki_context_snapshot": projected_snapshot,
         "wiki_context_snapshot_ref": snapshot_ref,
-        "wiki_context_snapshot_projection_report": snapshot_projection_report,
         "profile": ctx.profile.model_dump(mode="json"),
         "language_contract": ctx.manifest.vault_config_snapshot.model_dump(mode="json"),
         "required_page_plan_ids": [item.page_plan_id for item in required_items],
@@ -5859,8 +5849,7 @@ def build_draft_rendering_payload(
                 "Do not force content into fixed sections such as examples/value_points/additional_notes. If examples, boundaries, tradeoffs, mechanisms, or observations are useful, place them naturally inside body_markdown under headings you choose.",
                 "Use open_questions only for real contradictions, uncertainties, or 待补来源 questions. If none are useful, return an empty string.",
                 "Do not put `相关页面`/`Related Pages` blocks or self wikilinks inside body_markdown or section_bodies; the system renders official related pages separately.",
-                "approved_digest is a projection for this draft batch; the full reviewed digest is available by approved_digest_ref for local audit artifacts, not for model access.",
-                "approved_merge_plan and wiki_context_snapshot are compact projections for this draft batch; full reviewed artifacts are fixed by their *_ref fields for local audit and validators.",
+                "approved_digest, approved_merge_plan, and wiki_context_snapshot are compact projections for this draft batch; full reviewed artifacts are fixed by their *_ref fields for local audit and validators.",
                 "For updates, read existing page excerpts from wiki_context_snapshot and update_preservation_pack, then produce a complete replacement core body that absorbs still-useful old knowledge naturally.",
                 "Use source_excerpt_pack as the primary source support. If approved_prepared_markdown is empty, the full approved source is intentionally omitted from this model payload and remains available only to downstream validators through approved_prepared_ref.",
                 "For updates, satisfy update_preservation_pack in the first draft: carry forward concept obligations "
@@ -5890,21 +5879,10 @@ def build_draft_rendering_payload(
     }
 
 
-def draft_rendering_model_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    model_payload = dict(payload)
-    for key in [
-        "approved_digest_projection_report",
-        "approved_merge_plan_projection_report",
-        "wiki_context_snapshot_projection_report",
-    ]:
-        model_payload.pop(key, None)
-    return model_payload
-
-
-def project_merge_plan_for_draft_rendering(merge_plan: WikiMergePlanArtifact) -> tuple[dict[str, Any], dict[str, Any]]:
+def project_merge_plan_for_draft_rendering(merge_plan: WikiMergePlanArtifact) -> dict[str, Any]:
     draftable_items = [item for item in merge_plan.items if item.action in {"create", "update"}]
     projected_items = [project_merge_plan_item_for_draft_rendering(item) for item in draftable_items]
-    projection = {
+    return {
         "schema_version": "draft_merge_plan_projection.v1",
         "source_schema_version": merge_plan.schema_version,
         "full_merge_plan_ref": "merge_plan_review/approved_merge_plan.json",
@@ -5914,20 +5892,6 @@ def project_merge_plan_for_draft_rendering(merge_plan: WikiMergePlanArtifact) ->
         "omitted_non_draft_item_count": max(0, len(merge_plan.items) - len(draftable_items)),
         "items": projected_items,
     }
-    original_payload = merge_plan.model_dump(mode="json")
-    report = {
-        "schema_version": "draft_merge_plan_projection_report.v1",
-        "projection": "draft_rendering_batch",
-        "full_merge_plan_ref": "merge_plan_review/approved_merge_plan.json",
-        "original_item_count": len(merge_plan.items),
-        "projected_item_count": len(projected_items),
-        "omitted_non_draft_item_count": max(0, len(merge_plan.items) - len(projected_items)),
-        "original_json_chars": json_char_count(original_payload),
-        "projected_json_chars": json_char_count(projection),
-        "page_plan_ids": [item.page_plan_id for item in draftable_items],
-        "target_paths": [item.canonical_target_path for item in draftable_items],
-    }
-    return projection, report
 
 
 def project_merge_plan_item_for_draft_rendering(item: WikiMergePlanItem) -> dict[str, Any]:
@@ -6036,7 +6000,7 @@ def compact_snapshot_for_draft_rendering(
     snapshot_ref: str,
     *,
     content_paths: set[str] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> dict[str, Any]:
     content_paths = content_paths or set()
     entries: list[dict[str, Any]] = []
     content_entry_count = 0
@@ -6075,7 +6039,7 @@ def compact_snapshot_for_draft_rendering(
         for pool_entry in snapshot.knowledge_metadata_pool
         if pool_entry.path in metadata_paths
     ]
-    projection = {
+    return {
         "schema_version": "wiki_context_snapshot_projection.v1",
         "source_schema_version": snapshot.schema_version,
         "full_snapshot_ref": snapshot_ref,
@@ -6094,25 +6058,6 @@ def compact_snapshot_for_draft_rendering(
         "knowledge_metadata_pool": metadata_pool,
         "entries": entries,
     }
-    original_entry_content_chars = sum(len(entry.content) for entry in snapshot.entries)
-    report = {
-        "schema_version": "draft_context_projection_report.v1",
-        "projection": "draft_rendering_batch",
-        "full_snapshot_ref": snapshot_ref,
-        "relevant_paths": sorted(relevant_paths),
-        "content_paths": sorted(content_paths),
-        "original_json_chars": json_char_count(snapshot.model_dump(mode="json")),
-        "projected_json_chars": json_char_count(projection),
-        "original_entry_count": len(snapshot.entries),
-        "projected_entry_count": len(entries),
-        "projected_content_entry_count": content_entry_count,
-        "omitted_entry_count": max(0, len(snapshot.entries) - len(entries)),
-        "original_entry_content_chars": original_entry_content_chars,
-        "projected_entry_content_chars": projection["included_entry_content_chars"],
-        "original_metadata_pool_count": len(snapshot.knowledge_metadata_pool),
-        "projected_metadata_pool_count": len(metadata_pool),
-    }
-    return projection, report
 
 
 def compact_optional_dict(value: dict[str, Any]) -> dict[str, Any]:
@@ -6126,9 +6071,8 @@ def compact_optional_dict(value: dict[str, Any]) -> dict[str, Any]:
 def project_source_digest_for_merge_plan(
     digest: SourceDigestArtifact,
     merge_plan: WikiMergePlanArtifact,
-) -> tuple[SourceDigestArtifact, dict[str, Any]]:
+) -> SourceDigestArtifact:
     needed_ids = source_digest_candidate_ids_for_merge_plan(digest, merge_plan)
-    original_counts = source_digest_candidate_counts(digest)
     projected_groups: dict[str, list[SourceDigestCandidate]] = {}
     for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
         candidates = list(getattr(digest, group_name))
@@ -6138,30 +6082,13 @@ def project_source_digest_for_merge_plan(
         for candidate in digest.budget_deferred_candidates
         if candidate.candidate_id in needed_ids
     ]
-    projected = digest.model_copy(
+    return digest.model_copy(
         update={
             **projected_groups,
             "budget_deferred_candidates": projected_deferred,
             "weak_or_noise_items": [],
         }
     )
-    projected_counts = source_digest_candidate_counts(projected)
-    candidate_by_id = source_digest_candidate_lookup(digest)
-    unresolved_candidate_ids = sorted(candidate_id for candidate_id in needed_ids if candidate_id not in candidate_by_id)
-    report = {
-        "schema_version": "source_digest_projection_report.v1",
-        "projection": "draft_rendering_batch",
-        "full_digest_ref": "source_digest_review/approved_digest.json",
-        "needed_candidate_ids": sorted(needed_ids),
-        "unresolved_candidate_ids": unresolved_candidate_ids,
-        "original_counts": original_counts,
-        "projected_counts": projected_counts,
-        "removed_counts": {
-            key: max(0, int(original_counts.get(key, 0)) - int(projected_counts.get(key, 0)))
-            for key in original_counts
-        },
-    }
-    return projected, report
 
 
 def source_digest_candidate_ids_for_merge_plan(
@@ -6204,115 +6131,6 @@ def source_digest_candidate_id_closure(
             if related_id and related_id not in seen:
                 queue.append(related_id)
     return needed
-
-
-def source_digest_candidate_counts(digest: SourceDigestArtifact) -> dict[str, int]:
-    return {
-        "entities": len(digest.entities),
-        "concepts": len(digest.concepts),
-        "designs": len(digest.designs),
-        "comparisons": len(digest.comparisons),
-        "open_questions": len(digest.open_questions),
-        "budget_deferred_candidates": len(digest.budget_deferred_candidates),
-        "weak_or_noise_items": len(digest.weak_or_noise_items),
-        "total_ingest_candidates": len(digest.ingest_candidates()),
-    }
-
-
-def write_draft_digest_projection_report(output_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
-    json_path = output_dir / "draft_digest_projection_report.json"
-    md_path = output_dir / "draft_digest_projection_report.md"
-    write_json(json_path, report)
-    rows = []
-    original_counts = report.get("original_counts", {})
-    projected_counts = report.get("projected_counts", {})
-    removed_counts = report.get("removed_counts", {})
-    for key in [
-        "entities",
-        "concepts",
-        "designs",
-        "comparisons",
-        "open_questions",
-        "budget_deferred_candidates",
-        "weak_or_noise_items",
-        "total_ingest_candidates",
-    ]:
-        rows.append(
-            [
-                key,
-                str(original_counts.get(key, 0)),
-                str(projected_counts.get(key, 0)),
-                str(removed_counts.get(key, 0)),
-            ]
-        )
-    needed = report.get("needed_candidate_ids", [])
-    unresolved = report.get("unresolved_candidate_ids", [])
-    md_path.write_text(
-        "# Draft Digest Projection Report\n\n"
-        f"- Projection: `{report.get('projection', '')}`\n"
-        f"- Full digest ref: `{report.get('full_digest_ref', '')}`\n"
-        f"- Needed candidate ids: {', '.join(f'`{candidate_id}`' for candidate_id in needed) if needed else '_none_'}\n\n"
-        f"- Unresolved candidate ids: {', '.join(f'`{candidate_id}`' for candidate_id in unresolved) if unresolved else '_none_'}\n\n"
-        "## Counts\n\n"
-        f"{format_markdown_table(['Group', 'Original', 'Projected', 'Removed'], rows)}\n",
-        encoding="utf-8",
-    )
-    return json_path, md_path
-
-
-def write_draft_payload_projection_reports(output_dir: Path, payload: dict[str, Any]) -> list[Path]:
-    written: list[Path] = []
-    merge_report = payload.get("approved_merge_plan_projection_report")
-    if isinstance(merge_report, dict):
-        written.extend(write_draft_merge_plan_projection_report(output_dir, merge_report))
-    context_report = payload.get("wiki_context_snapshot_projection_report")
-    if isinstance(context_report, dict):
-        written.extend(write_draft_context_projection_report(output_dir, context_report))
-    return written
-
-
-def write_draft_merge_plan_projection_report(output_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
-    json_path = output_dir / "draft_merge_plan_projection_report.json"
-    md_path = output_dir / "draft_merge_plan_projection_report.md"
-    write_json(json_path, report)
-    rows = [
-        ["items", report.get("original_item_count", 0), report.get("projected_item_count", 0)],
-        ["json_chars", report.get("original_json_chars", 0), report.get("projected_json_chars", 0)],
-        ["omitted_non_draft", report.get("omitted_non_draft_item_count", 0), 0],
-    ]
-    md_path.write_text(
-        "# Draft Merge Plan Projection Report\n\n"
-        f"- Projection: `{report.get('projection', '')}`\n"
-        f"- Full merge plan ref: `{report.get('full_merge_plan_ref', '')}`\n"
-        f"- Page plan ids: {', '.join(f'`{page_id}`' for page_id in report.get('page_plan_ids', [])) or '_none_'}\n\n"
-        "## Payload Budget\n\n"
-        f"{format_markdown_table(['Object', 'Original', 'Projected'], rows)}\n",
-        encoding="utf-8",
-    )
-    return json_path, md_path
-
-
-def write_draft_context_projection_report(output_dir: Path, report: dict[str, Any]) -> tuple[Path, Path]:
-    json_path = output_dir / "draft_context_projection_report.json"
-    md_path = output_dir / "draft_context_projection_report.md"
-    write_json(json_path, report)
-    rows = [
-        ["snapshot_json_chars", report.get("original_json_chars", 0), report.get("projected_json_chars", 0)],
-        ["entries", report.get("original_entry_count", 0), report.get("projected_entry_count", 0)],
-        ["entry_content_chars", report.get("original_entry_content_chars", 0), report.get("projected_entry_content_chars", 0)],
-        ["metadata_pool", report.get("original_metadata_pool_count", 0), report.get("projected_metadata_pool_count", 0)],
-    ]
-    relevant_paths = report.get("relevant_paths", [])
-    md_path.write_text(
-        "# Draft Context Projection Report\n\n"
-        f"- Projection: `{report.get('projection', '')}`\n"
-        f"- Full snapshot ref: `{report.get('full_snapshot_ref', '')}`\n"
-        f"- Relevant paths: {', '.join(f'`{path}`' for path in relevant_paths) if relevant_paths else '_none_'}\n\n"
-        "## Payload Budget\n\n"
-        f"{format_markdown_table(['Object', 'Original', 'Projected'], rows)}\n",
-        encoding="utf-8",
-    )
-    return json_path, md_path
 
 
 def write_draft_rendering_batch_reports(
@@ -6503,8 +6321,6 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         root_model_input_sidecars.extend(
             [source_excerpt_pack_path, source_excerpt_pack_md, update_preservation_pack_path, update_preservation_pack_md]
         )
-    _, digest_projection_report = project_source_digest_for_merge_plan(digest, merge_plan)
-    write_draft_digest_projection_report(step_root, digest_projection_report)
     draft_artifact = run_draft_rendering_model(
         ctx=ctx,
         step_root=step_root,
@@ -6520,13 +6336,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     write_json(draft_artifact_path, draft_artifact)
     draft_root = step_root / "draft_pages"
     outputs: list[Path] = list(root_model_input_sidecars)
-    for digest_projection_sidecar in [
-        step_root / "draft_digest_projection_report.json",
-        step_root / "draft_digest_projection_report.md",
-        step_root / "draft_merge_plan_projection_report.json",
-        step_root / "draft_merge_plan_projection_report.md",
-        step_root / "draft_context_projection_report.json",
-        step_root / "draft_context_projection_report.md",
+    for optional_sidecar in [
         step_root / "update_preservation_reinforcement_report.json",
         step_root / "update_preservation_reinforcement_report.md",
         step_root / "grounding_paraphrase_rewrite_report.json",
@@ -6536,8 +6346,8 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         step_root / "example_concrete_cleanup_report.json",
         step_root / "example_concrete_cleanup_report.md",
     ]:
-        if digest_projection_sidecar.exists():
-            outputs.append(digest_projection_sidecar)
+        if optional_sidecar.exists():
+            outputs.append(optional_sidecar)
     for batch_sidecar in [step_root / "draft_rendering_batch_report.json", step_root / "draft_rendering_batch_report.md"]:
         if batch_sidecar.exists():
             outputs.append(batch_sidecar)
@@ -9071,12 +8881,6 @@ def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: 
             schema = "open_question_grounding_cleanup_report.v1"
         elif path.name == "example_concrete_cleanup_report.json":
             schema = "example_concrete_cleanup_report.v1"
-        elif path.name == "draft_digest_projection_report.json":
-            schema = "source_digest_projection_report.v1"
-        elif path.name == "draft_merge_plan_projection_report.json":
-            schema = "draft_merge_plan_projection_report.v1"
-        elif path.name == "draft_context_projection_report.json":
-            schema = "draft_context_projection_report.v1"
         refs.append(_ref(run_dir, path, step_name, artifact_kind_for_path(path), schema, required_for_resume=required))
     return refs
 
@@ -9099,9 +8903,6 @@ def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactR
         "grounding_paraphrase_rewrite_report.json": "grounding_paraphrase_rewrite_report.v1",
         "open_question_grounding_cleanup_report.json": "open_question_grounding_cleanup_report.v1",
         "example_concrete_cleanup_report.json": "example_concrete_cleanup_report.v1",
-        "draft_digest_projection_report.json": "source_digest_projection_report.v1",
-        "draft_merge_plan_projection_report.json": "draft_merge_plan_projection_report.v1",
-        "draft_context_projection_report.json": "draft_context_projection_report.v1",
         "draft_write_manifest.json": "draft_write_manifest.v1",
         "update_merge_report.json": "update_merge_report.v1",
         "related_merge_report.json": "related_merge_report.v1",
