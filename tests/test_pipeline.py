@@ -188,6 +188,7 @@ def test_init_creates_workspace_layout_and_gitignore(tmp_path: Path) -> None:
     assert config_json["embedding_retrieval"]["local_files_only"] is True
     assert config_json["embedding_retrieval"]["cache_dir"] == "~/.llmwiki/cache/embeddings"
     assert config_json["max_ingest_candidates"] == 12
+    assert config_json["raw_prepare_policy"] == "auto"
     gitignore_lines = (vault / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".llmwiki/" in gitignore_lines
     assert ".llmwiki/runs/" not in gitignore_lines
@@ -1615,7 +1616,7 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "## 派生知识页" in source_text
     assert "`concepts/Concept_知识编译工程骨架.md`" in source_text
     assert "[[concepts/" not in source_text
-    assert loaded.schema_version == "operation_manifest.v9"
+    assert loaded.schema_version == "operation_manifest.v10"
     assert [ref.schema_version for ref in loaded.steps[0].outputs if ref.kind == "json"] == ["raw_link_cleanup.v1"]
     assert "raw_preparation.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
     assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
@@ -1917,7 +1918,7 @@ def test_model_artifacts_are_redacted(tmp_path: Path, monkeypatch: pytest.Monkey
     ("raw_prepare_policy", "expected_policy_value"),
     [
         (RawPreparePolicy.auto, "auto"),
-        (RawPreparePolicy.force_model, "force-model"),
+        (RawPreparePolicy.force, "force"),
     ],
 )
 def test_raw_prepare_auto_and_force_use_model_cleanup(
@@ -1949,7 +1950,7 @@ def test_raw_prepare_auto_and_force_use_model_cleanup(
     manifest = run_simplified_ingest(
         vault=vault,
         raw_file=raw,
-        slug=f"raw-prepare-{expected_policy_value.replace('-', '-')}",
+        slug=f"raw-prepare-{expected_policy_value}",
         raw_prepare_policy=raw_prepare_policy,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
@@ -1964,7 +1965,7 @@ def test_raw_prepare_auto_and_force_use_model_cleanup(
     assert (run_dir / "raw_prepare" / "provider_result.json").exists()
 
 
-def test_raw_prepare_skip_prepare_writes_local_passthrough_without_model_fixture(tmp_path: Path) -> None:
+def test_raw_prepare_skip_policy_writes_local_passthrough_without_model_fixture(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "mock-without-raw-prepare"
     fixture_dir.mkdir()
@@ -1976,7 +1977,7 @@ def test_raw_prepare_skip_prepare_writes_local_passthrough_without_model_fixture
         raw_file=raw,
         fixture_dir=fixture_dir,
         slug="skip-prepare-local-passthrough",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     loaded = status(vault, manifest.operation_id)
@@ -1988,14 +1989,14 @@ def test_raw_prepare_skip_prepare_writes_local_passthrough_without_model_fixture
     assert raw_prepare_step.attempts[-1].provider_spec is None
     assert raw_prepare_metrics["provider"] == "local"
     assert "raw_prepare" not in manifest.provider_contexts[0].providers
-    assert preparation["operations_applied"] == ["user_skip_model_markdown_passthrough"]
+    assert preparation["operations_applied"] == ["user_skip_markdown_passthrough"]
     assert preparation["requires_human_review"] is False
     assert (run_dir / "raw_prepare" / "prepared.md").read_text(encoding="utf-8") == raw.read_text(encoding="utf-8").rstrip() + "\n"
     assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
     assert not (run_dir / "raw_prepare" / "structured_repair_report.json").exists()
 
 
-def test_raw_prepare_skip_prepare_rejects_empty_markdown_without_provider_fallback(tmp_path: Path) -> None:
+def test_raw_prepare_skip_policy_rejects_empty_markdown_without_provider_fallback(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     raw.write_text("", encoding="utf-8")
 
@@ -2005,11 +2006,11 @@ def test_raw_prepare_skip_prepare_rejects_empty_markdown_without_provider_fallba
             raw_file=raw,
             fixture_dir=FIXTURE_ROOT / "mock",
             slug="skip-prepare-empty",
-            raw_prepare_policy=RawPreparePolicy.skip_model,
+            raw_prepare_policy=RawPreparePolicy.skip,
         )
 
 
-def test_raw_prepare_skip_prepare_rejects_non_markdown_without_provider_fallback(tmp_path: Path) -> None:
+def test_raw_prepare_skip_policy_rejects_non_markdown_without_provider_fallback(tmp_path: Path) -> None:
     vault, _ = make_vault(tmp_path)
     raw = vault / "raw" / "note.txt"
     raw.write_text("Plain text raw should use model prepare, not skip passthrough.\n", encoding="utf-8")
@@ -2020,11 +2021,96 @@ def test_raw_prepare_skip_prepare_rejects_non_markdown_without_provider_fallback
             raw_file=raw,
             fixture_dir=FIXTURE_ROOT / "mock",
             slug="skip-prepare-non-markdown",
-            raw_prepare_policy=RawPreparePolicy.skip_model,
+            raw_prepare_policy=RawPreparePolicy.skip,
         )
 
 
-def test_prepared_raw_review_for_skip_prepare_is_plain_auto_approval(tmp_path: Path) -> None:
+def test_vault_config_raw_prepare_policy_skip_uses_local_passthrough(tmp_path: Path) -> None:
+    vault, raw = make_vault(tmp_path)
+    config_path = vault / ".llmwiki" / "config.json"
+    config = read_json(config_path)
+    config["raw_prepare_policy"] = "skip"
+    write_json(config_path, config)
+    fixture_dir = tmp_path / "mock-without-raw-prepare"
+    fixture_dir.mkdir()
+    for name in ["source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
+        write_json(fixture_dir / name, read_json(FIXTURE_ROOT / "mock" / name))
+
+    manifest = run_simplified_ingest(
+        vault=vault,
+        raw_file=raw,
+        fixture_dir=fixture_dir,
+        slug="vault-config-skip",
+    )
+    run_dir = RunStore(vault).run_dir(manifest.operation_id)
+    manifest_data = read_json(RunStore(vault).manifest_path(manifest.operation_id))
+
+    assert manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip
+    assert manifest_data["vault_config_snapshot"]["raw_prepare_policy"] == "skip"
+    assert "raw_prepare" not in manifest.provider_contexts[0].providers
+    assert read_json(run_dir / "raw_prepare" / "raw_preparation.json")["operations_applied"] == [
+        "user_skip_markdown_passthrough"
+    ]
+    assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
+
+
+def test_vault_config_raw_prepare_policy_force_uses_model_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    config_path = vault / ".llmwiki" / "config.json"
+    config = read_json(config_path)
+    config["raw_prepare_policy"] = "force"
+    write_json(config_path, config)
+    provider_config_path = vault / ".llmwiki" / "config.yaml"
+    provider_config = read_yaml(provider_config_path)
+    provider_config["providers"] = {
+        "default": {
+            "spec": "openai_compatible:test-model",
+            "endpoint": "https://example.test/v1/chat/completions",
+            "api_key": "sk-test",
+        }
+    }
+    write_yaml(provider_config_path, provider_config)
+    captured_payloads: dict[str, dict] = {}
+
+    def fake_generate_raw(self, task, payload, output_model):
+        captured_payloads[task] = payload
+        data = read_json(FIXTURE_ROOT / "mock" / f"{task}.json")
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_raw", fake_generate_raw)
+
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, slug="vault-config-force")
+    manifest_data = read_json(RunStore(vault).manifest_path(manifest.operation_id))
+
+    assert manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.force
+    assert manifest_data["vault_config_snapshot"]["raw_prepare_policy"] == "force"
+    assert captured_payloads["raw_prepare"]["raw_prepare_policy"] == "force"
+
+
+@pytest.mark.parametrize("raw_prepare_policy", ["skip-model", "force-model"])
+def test_vault_config_rejects_removed_raw_prepare_policy_values(
+    tmp_path: Path,
+    raw_prepare_policy: str,
+) -> None:
+    vault, raw = make_vault(tmp_path)
+    config_path = vault / ".llmwiki" / "config.json"
+    config = read_json(config_path)
+    config["raw_prepare_policy"] = raw_prepare_policy
+    write_json(config_path, config)
+
+    with pytest.raises(Exception, match="raw_prepare_policy|Input should be"):
+        run_simplified_ingest(
+            vault=vault,
+            raw_file=raw,
+            fixture_dir=FIXTURE_ROOT / "mock",
+            slug="removed-raw-prepare-policy",
+        )
+
+
+def test_prepared_raw_review_for_skip_policy_is_plain_auto_approval(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
 
     manifest = run_simplified_ingest(
@@ -2032,7 +2118,7 @@ def test_prepared_raw_review_for_skip_prepare_is_plain_auto_approval(tmp_path: P
         raw_file=raw,
         fixture_dir=FIXTURE_ROOT / "mock",
         slug="skip-prepare-review",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     prompt = (run_dir / "prepared_raw_review" / "review_prompt.md").read_text(encoding="utf-8")
@@ -2126,7 +2212,7 @@ def test_source_digest_payload_includes_readme_source_kind_hints(
         vault=vault,
         raw_file=raw,
         slug="readme-kind-hints",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     hints = captured_payloads["source_digest"]["source_kind_hints"]
@@ -2279,7 +2365,7 @@ def test_source_digest_payload_uses_source_map_for_long_prepared_source(
         vault=vault,
         raw_file=raw,
         slug="source-digest-map",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
@@ -2345,7 +2431,7 @@ def test_candidate_resolution_payload_uses_excerpt_pack_for_long_prepared_source
         vault=vault,
         raw_file=raw,
         slug="candidate-resolution-pack",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
@@ -2405,7 +2491,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
         vault=vault,
         raw_file=raw,
         slug="long-draft-payload",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
@@ -2745,7 +2831,7 @@ def test_wiki_merge_planning_payload_uses_compact_context_projection(
         vault=vault,
         raw_file=raw,
         slug="planning-projection",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
@@ -14895,7 +14981,10 @@ def test_plain_apply_records_apply_failed_on_receipt_failure(tmp_path: Path, mon
     assert read_jsonl(vault / ".llmwiki" / "applied" / "operations.jsonl") == []
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v10"])
+@pytest.mark.parametrize(
+    "schema_version",
+    ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v9", "operation_manifest.v11"],
+)
 def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v2")
@@ -14931,7 +15020,7 @@ def test_manifest_step_topology_must_match_current_mvp_pipeline(tmp_path: Path, 
 
 
 @pytest.mark.parametrize("missing_key", ["status", "provider_contexts", "updated_at"])
-def test_manifest_v9_requires_persisted_top_level_fields(tmp_path: Path, missing_key: str) -> None:
+def test_manifest_v10_requires_persisted_top_level_fields(tmp_path: Path, missing_key: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
@@ -14943,12 +15032,25 @@ def test_manifest_v9_requires_persisted_top_level_fields(tmp_path: Path, missing
         read_manifest(manifest_path)
 
 
-def test_manifest_v9_rejects_extra_top_level_fields_with_mvp_message(tmp_path: Path) -> None:
+def test_manifest_v10_rejects_extra_top_level_fields_with_mvp_message(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="extra-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data["legacy_status_summary"] = {"old": True}
+    write_json(manifest_path, data)
+
+    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
+        read_manifest(manifest_path)
+
+
+@pytest.mark.parametrize("raw_prepare_policy", ["skip-model", "force-model"])
+def test_manifest_v10_rejects_removed_raw_prepare_policy_values(tmp_path: Path, raw_prepare_policy: str) -> None:
+    vault, raw = make_vault(tmp_path)
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="legacy-policy")
+    manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
+    data = read_json(manifest_path)
+    data["vault_config_snapshot"]["raw_prepare_policy"] = raw_prepare_policy
     write_json(manifest_path, data)
 
     with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):

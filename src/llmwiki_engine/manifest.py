@@ -23,7 +23,7 @@ def read_manifest(path: Path) -> OperationManifest:
     if not isinstance(data, dict):
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
     schema_version = data.get("schema_version")
-    if schema_version != "operation_manifest.v9":
+    if schema_version != "operation_manifest.v10":
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
     if REQUIRED_MANIFEST_KEYS - set(data):
         raise ValueError(MVP_PIPELINE_INCOMPATIBLE)

@@ -26,8 +26,8 @@ class EvidencePolicy(str, Enum):
 
 class RawPreparePolicy(str, Enum):
     auto = "auto"
-    force_model = "force-model"
-    skip_model = "skip-model"
+    skip = "skip"
+    force = "force"
 
 
 class ArtifactVisibility(str, Enum):
@@ -744,7 +744,7 @@ class StepRecord(StrictModel):
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v9"] = "operation_manifest.v9"
+    schema_version: Literal["operation_manifest.v10"] = "operation_manifest.v10"
     operation_id: str
     operation_type: str
     engine_version: str

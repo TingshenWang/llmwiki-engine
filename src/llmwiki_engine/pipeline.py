@@ -700,7 +700,7 @@ def model_steps_for_raw_prepare_policy(
     *,
     raw_prepare_policy: RawPreparePolicy,
 ) -> list[str]:
-    if raw_prepare_policy == RawPreparePolicy.skip_model:
+    if raw_prepare_policy == RawPreparePolicy.skip:
         return [step for step in model_steps if step != "raw_prepare"]
     return model_steps
 
@@ -714,7 +714,7 @@ def model_backed_step_can_run_locally(
     return (
         not provider_runtime_present
         and step_name == "raw_prepare"
-        and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip_model
+        and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip
     )
 
 
@@ -1021,7 +1021,7 @@ def build_raw_prepare_skip_passthrough(
         raw_link_cleanup_ref=cleanup_ref,
         document_kind="unknown",
         prepared_markdown=raw_text.rstrip() + "\n",
-        operations_applied=["user_skip_model_markdown_passthrough"],
+        operations_applied=["user_skip_markdown_passthrough"],
         omission_policy="none",
         uncertain_items=[],
         risk_level="low",
@@ -1059,7 +1059,7 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
     input_raw_sha256 = sha256_file(ctx.raw_path)
     cleanup_ref = cleanup_path.relative_to(ctx.run_dir).as_posix()
     raw_prepare_policy = ctx.manifest.vault_config_snapshot.raw_prepare_policy
-    if raw_prepare_policy == RawPreparePolicy.skip_model:
+    if raw_prepare_policy == RawPreparePolicy.skip:
         preparation = build_raw_prepare_skip_passthrough(
             raw_path=ctx.raw_path,
             raw_rel=raw_rel,
@@ -7171,7 +7171,7 @@ def last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> int
 
 def step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
     if step_name == "raw_prepare":
-        if ctx.manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip_model:
+        if ctx.manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip:
             return "raw_prepare 使用 --prepare skip passthrough，跳过模型清洗"
         return None
     if step_name == "wiki_merge_planning":

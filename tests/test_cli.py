@@ -287,8 +287,8 @@ def test_run_rejects_fixture_dir_and_mock_fixture_dir_together(tmp_path: Path) -
     ("prepare", "expected"),
     [
         ("auto", RawPreparePolicy.auto),
-        ("skip", RawPreparePolicy.skip_model),
-        ("force", RawPreparePolicy.force_model),
+        ("skip", RawPreparePolicy.skip),
+        ("force", RawPreparePolicy.force),
     ],
 )
 def test_run_passes_prepare_policy(
@@ -328,7 +328,7 @@ def test_run_rejects_removed_legacy_prepare_flags(tmp_path: Path, flag: str) -> 
     assert f"No such option: {flag}" in result.output
 
 
-def test_status_labels_skip_prepare_as_local_provider(tmp_path: Path) -> None:
+def test_status_labels_skip_policy_as_local_provider(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
@@ -337,14 +337,14 @@ def test_status_labels_skip_prepare_as_local_provider(tmp_path: Path) -> None:
         raw_file=raw,
         fixture_dir=FIXTURE_ROOT / "mock",
         slug="skip-prepare-status",
-        raw_prepare_policy=RawPreparePolicy.skip_model,
+        raw_prepare_policy=RawPreparePolicy.skip,
     )
     runner = CliRunner()
 
     result = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])
 
     assert result.exit_code == 0
-    assert "local:skip_prepare" in result.output
+    assert "local:skip" in result.output
     assert "openai_compatible" not in next(line for line in result.output.splitlines() if "raw_prepare" in line)
 
 
@@ -362,7 +362,7 @@ def test_resume_passes_prepare_policy(monkeypatch: pytest.MonkeyPatch, tmp_path:
     result = runner.invoke(app, ["ingest", "resume", str(vault), "ING-demo", "--prepare", "force"])
 
     assert result.exit_code == 0
-    assert seen["raw_prepare_policy"] == RawPreparePolicy.force_model
+    assert seen["raw_prepare_policy"] == RawPreparePolicy.force
 
 
 def test_resume_invalid_from_step_reports_single_line_error(tmp_path: Path) -> None:
@@ -385,7 +385,28 @@ def test_resume_help_lists_step_names_from_metadata() -> None:
         assert step_name in result.output
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v10"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["ingest", "run", "--help"],
+        ["ingest", "run-next", "--help"],
+        ["ingest", "resume", "--help"],
+    ],
+)
+def test_prepare_help_uses_single_policy_values(command: list[str]) -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, command)
+
+    assert result.exit_code == 0
+    assert "[auto|skip|force]" in result.output
+    assert "skip-model" not in result.output
+    assert "force-model" not in result.output
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v9", "operation_manifest.v11"],
+)
 def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
     tmp_path: Path,
     schema_version: str,
@@ -796,7 +817,7 @@ def test_run_next_invokes_ingest_with_selected_raw(monkeypatch: pytest.MonkeyPat
     assert seen["raw_file"] == raw.resolve()
     assert seen["mock_fixture_dir"] == mock_fixture_dir
     assert seen["slug"] == "next-run"
-    assert seen["raw_prepare_policy"] == RawPreparePolicy.force_model
+    assert seen["raw_prepare_policy"] == RawPreparePolicy.force
 
 
 def test_run_next_outputs_json_after_ingest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

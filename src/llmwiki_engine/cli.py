@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from enum import Enum
 import io
 import json
 from pathlib import Path
@@ -57,29 +56,9 @@ console = Console()
 VALID_RESUME_STEPS_HELP = ", ".join(STEP_NAMES)
 
 
-class PrepareChoice(str, Enum):
-    auto = "auto"
-    skip = "skip"
-    force = "force"
-
-
-def _raw_prepare_policy_from_flags(
-    *,
-    prepare: PrepareChoice | None = None,
-) -> RawPreparePolicy | None:
-    if prepare is not None:
-        if prepare == PrepareChoice.auto:
-            return RawPreparePolicy.auto
-        if prepare == PrepareChoice.skip:
-            return RawPreparePolicy.skip_model
-        if prepare == PrepareChoice.force:
-            return RawPreparePolicy.force_model
-    return None
-
-
 def _raw_prepare_command_suffix(
     *,
-    prepare: PrepareChoice | None = None,
+    prepare: RawPreparePolicy | None = None,
 ) -> str:
     if prepare is not None:
         return f" --prepare {prepare.value}"
@@ -109,7 +88,7 @@ def ingest_run(
     ),
     profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
-    prepare: Optional[PrepareChoice] = typer.Option(
+    prepare: Optional[RawPreparePolicy] = typer.Option(
         None,
         "--prepare",
         help="Raw prepare policy: auto, skip, or force.",
@@ -120,9 +99,6 @@ def ingest_run(
     try:
         if fixture_dir is not None and mock_fixture_dir is not None:
             raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
-        raw_prepare_policy = _raw_prepare_policy_from_flags(
-            prepare=prepare,
-        )
         run_console = Console(file=io.StringIO()) if json_output else console
         manifest = run_simplified_ingest(
             vault=vault,
@@ -131,7 +107,7 @@ def ingest_run(
             mock_fixture_dir=mock_fixture_dir,
             profile_name=profile,
             slug=slug,
-            raw_prepare_policy=raw_prepare_policy,
+            raw_prepare_policy=prepare,
             console=run_console,
         )
     except (PipelineError, ProviderConfigError, WorkspaceError, ValueError) as exc:
@@ -231,7 +207,7 @@ def ingest_run_next(
     ),
     profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
-    prepare: Optional[PrepareChoice] = typer.Option(
+    prepare: Optional[RawPreparePolicy] = typer.Option(
         None,
         "--prepare",
         help="Raw prepare policy: auto, skip, or force.",
@@ -242,9 +218,6 @@ def ingest_run_next(
     try:
         if fixture_dir is not None and mock_fixture_dir is not None:
             raise typer.BadParameter("Use either --fixture-dir or --mock-fixture-dir, not both.")
-        raw_prepare_policy = _raw_prepare_policy_from_flags(
-            prepare=prepare,
-        )
         prepare_cli_suffix = _raw_prepare_command_suffix(
             prepare=prepare,
         )
@@ -283,7 +256,7 @@ def ingest_run_next(
             mock_fixture_dir=mock_fixture_dir,
             profile_name=profile,
             slug=slug,
-            raw_prepare_policy=raw_prepare_policy,
+            raw_prepare_policy=prepare,
             console=run_console,
         )
     except (PipelineError, ProviderConfigError, WorkspaceError, ValueError) as exc:
@@ -400,7 +373,7 @@ def ingest_resume(
         "--mock-fixture-dir",
         help="Force resumed model-backed steps to use mock:fixture with this fixture directory.",
     ),
-    prepare: Optional[PrepareChoice] = typer.Option(
+    prepare: Optional[RawPreparePolicy] = typer.Option(
         None,
         "--prepare",
         help="Raw prepare policy when resuming from raw_prepare or earlier: auto, skip, or force.",
@@ -408,15 +381,12 @@ def ingest_resume(
 ) -> None:
     """Resume using the current provider config for steps that will execute."""
     try:
-        raw_prepare_policy = _raw_prepare_policy_from_flags(
-            prepare=prepare,
-        )
         manifest = resume_ingest(
             vault=vault,
             operation_id=operation_id,
             from_step=from_step,
             mock_fixture_dir=mock_fixture_dir,
-            raw_prepare_policy=raw_prepare_policy,
+            raw_prepare_policy=prepare,
             console=console,
         )
     except (PipelineError, ProviderConfigError, VerifyError, WorkspaceError, ValueError) as exc:
@@ -955,8 +925,8 @@ def _metrics_bottleneck_summary(metrics: dict[str, object], *, limit: int = 3) -
 
 
 def _provider_label(vault: Path, manifest: OperationManifest, step_name: str, provider_spec: str | None) -> str:
-    if step_name == "raw_prepare" and provider_spec is None and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip_model:
-        return "local:skip_prepare"
+    if step_name == "raw_prepare" and provider_spec is None and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip:
+        return "local:skip"
     if provider_spec:
         return provider_spec
     if step_name.endswith("_review"):
