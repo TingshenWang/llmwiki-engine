@@ -38,11 +38,20 @@ def _load_profile_file(path: Path) -> ProfileSpec:
     page_types = {}
     for key, value in raw.get("page_types", {}).items():
         data = dict(value)
-        data.pop("name", None)
+        if "name" in data:
+            raise ProfileError(f"page_types.{key} must not contain a nested name field")
         page_types[key] = PageTypeSpec(name=key, **data)
     raw["page_types"] = page_types
-    raw["template_root"] = path.parent / "templates"
     return ProfileSpec.model_validate(raw)
+
+
+def profile_to_yaml_data(profile: ProfileSpec) -> dict[str, object]:
+    data = profile.model_dump(mode="json")
+    data["page_types"] = {
+        key: {field: value for field, value in spec.model_dump(mode="json").items() if field != "name"}
+        for key, spec in profile.page_types.items()
+    }
+    return data
 
 
 def page_output_path(root: Path, profile: ProfileSpec, page_type: str, title: str) -> Path:

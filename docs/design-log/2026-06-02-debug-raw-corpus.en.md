@@ -72,7 +72,7 @@ auditing.
 
 This corpus exposes the main reason the current generated pages are not yet
 usable: page shape has not been productized. Future profiles should not only
-describe page types, directories, and templates. They also need to describe:
+describe page types and directories. They also need to describe:
 
 - operation intent: whether an ingest absorbs an interview, organizes opinions, records a design, or updates existing pages;
 - page archetype: what information job each page type performs;

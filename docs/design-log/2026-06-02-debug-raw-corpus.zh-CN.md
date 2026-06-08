@@ -64,7 +64,7 @@ manifest、artifact、resume 和 apply 审计能力。
 ## 对页面规格的影响
 
 这组 corpus 暴露出当前页面不可用的核心原因：页面形态没有被产品化定义。后续
-profile 不应该只描述 page type、目录和模板，还需要描述：
+profile 不应该只描述 page type 和目录，还需要描述：
 
 - operation intent：本次 ingest 是吸收访谈、整理观点、沉淀设计，还是更新已有页面；
 - page archetype：不同页面类型应该承担什么信息功能；

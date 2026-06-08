@@ -134,15 +134,12 @@ draft_rendering -> validation -> apply_preview`。
 
 ## P1：未来配置化
 
-- 页面类型、section、frontmatter、空态提示、source page 结构都应逐步可配置。
+- 页面类型、section、frontmatter、空态提示、source page 结构可以逐步可配置。
 - MVP 可以继续使用全局固定结构。
 - 配置化不能破坏 run artifact 的可恢复、可验证和可审计边界。
-- 当前 `templates/` 标记为“暂未生效 / 未来配置化”。短期不恢复模板驱动；
-  页面结构还在讨论，M1 继续稳定硬编码渲染。
-- 模板系统未来必须彻底解决：当页面合同稳定后，再把 source/knowledge page
-  渲染抽成 template-driven，并补“自定义模板确实影响输出”的测试。
+- 当前不保留模板目录或模板字段；页面结构还在讨论，M1 继续稳定硬编码渲染。
 - source page 是否完全脱离 profile、变成不可配置系统页，后续再定；当前先保留
-  profile 中的 source 类型，但不得把模板误认为已生效。
+  profile 中的 source 类型。
 
 ## 暂不做
 

@@ -89,7 +89,7 @@ from .models import (
 )
 from .provider_config import ProviderExecutionContext, build_provider_execution_context
 from .providers import Provider
-from .profiles import load_profile, page_output_path, safe_filename
+from .profiles import load_profile, page_output_path, profile_to_yaml_data, safe_filename
 from .rendering import source_title_for_raw
 from .retrieval import (
     RetrievalError,
@@ -447,14 +447,8 @@ def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
     ensure_workspace_layout(vault)
     write_default_vault_config(vault)
     profile_root = vault / ".llmwiki" / "profiles" / profile.name
-    (profile_root / "templates").mkdir(parents=True, exist_ok=True)
-    write_yaml(profile_root / "profile.yaml", profile.model_dump(mode="json"))
-    for page_type, spec in profile.page_types.items():
-        source = profile.template_root / spec.template if profile.template_root else None
-        if source and source.exists():
-            target = profile_root / "templates" / spec.template
-            if not target.exists():
-                shutil.copyfile(source, target)
+    profile_root.mkdir(parents=True, exist_ok=True)
+    write_yaml(profile_root / "profile.yaml", profile_to_yaml_data(profile))
     write_yaml(
         vault / ".llmwiki" / "config.yaml",
         {

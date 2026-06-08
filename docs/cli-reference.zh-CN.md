@@ -432,7 +432,7 @@ uv run llmwiki ingest resume "$VAULT" "$OP"
 uv run llmwiki ingest apply "$VAULT" "$OP"
 ```
 
-普通 `apply` 目前只对 `dev` operation 可用。不碰 Git，不要求 vault 是 Git repo。
+普通 `apply` 不碰 Git，不要求 vault 是 Git repo。
 
 ## `profile` 命令
 
@@ -448,6 +448,8 @@ uv run llmwiki profile list
 uv run llmwiki profile validate project_basic
 uv run llmwiki profile validate /path/to/profile
 ```
+
+当前 profile 合同只接受 `version: "2"`。page type 由 `page_types` 的 key 命名，不要在每个 page type 内再写 `name`。旧 profile 里的 `template:` 字段已经删除；遇到校验失败时，删除旧字段或重新 `init` 一个新 vault。
 
 ## `eval` 命令
 

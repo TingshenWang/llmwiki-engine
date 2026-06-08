@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -93,19 +92,17 @@ class PageTypeSpec(StrictModel):
     name: str
     directory: str
     title_prefix: str
-    template: str
     required_sections: list[str] = Field(default_factory=list)
     evidence_policy: EvidencePolicy = EvidencePolicy.light
 
 
 class ProfileSpec(StrictModel):
     name: str
-    version: str = "1"
+    version: Literal["2"]
     description: str = ""
     default_page_type: str = "concept"
     source_page_type: str = "source"
     page_types: dict[str, PageTypeSpec]
-    template_root: Path | None = Field(default=None, exclude=True)
 
     @field_validator("page_types")
     @classmethod
@@ -749,7 +746,7 @@ class OperationManifest(StrictModel):
     operation_type: str
     engine_version: str
     profile: str
-    profile_version: str = "1"
+    profile_version: str
     vault_config_snapshot: VaultConfig = Field(default_factory=VaultConfig)
     workspace: str
     raw_bindings: list[RawBinding] = Field(default_factory=list)

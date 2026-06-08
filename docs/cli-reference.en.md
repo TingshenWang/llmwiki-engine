@@ -432,7 +432,7 @@ Write draft pages into `vault/wiki/`.
 uv run llmwiki ingest apply "$VAULT" "$OP"
 ```
 
-Plain `apply` is currently available only for `dev` operations. It does not touch Git and does not require the vault to be a Git repository.
+Plain `apply` does not touch Git and does not require the vault to be a Git repository.
 
 ## `profile` Commands
 
@@ -448,6 +448,8 @@ Validate a profile:
 uv run llmwiki profile validate project_basic
 uv run llmwiki profile validate /path/to/profile
 ```
+
+The current profile contract only accepts `version: "2"`. Page types are named by their `page_types` keys; do not add a nested `name` field inside each page type. The old `template:` field has been removed. If validation fails on an old profile, delete the old fields or initialize a new vault.
 
 ## `eval` Commands
 

@@ -176,7 +176,13 @@ def test_init_creates_workspace_layout_and_gitignore(tmp_path: Path) -> None:
     vault, _ = make_vault(tmp_path)
     assert (vault / ".llmwiki" / "config.yaml").exists()
     assert read_yaml(vault / ".llmwiki" / "config.yaml")["providers"] == {}
-    assert (vault / ".llmwiki" / "profiles" / "project_basic" / "profile.yaml").exists()
+    profile_yaml = vault / ".llmwiki" / "profiles" / "project_basic" / "profile.yaml"
+    assert profile_yaml.exists()
+    assert not (vault / ".llmwiki" / "profiles" / "project_basic" / "templates").exists()
+    written_profile = read_yaml(profile_yaml)
+    assert written_profile["version"] == "2"
+    assert all("template" not in spec for spec in written_profile["page_types"].values())
+    assert all("name" not in spec for spec in written_profile["page_types"].values())
     assert (vault / ".llmwiki" / "applied" / "operations.jsonl").exists()
     assert (vault / ".llmwiki" / "runs").exists()
     assert (vault / "wiki" / "index.md").exists()
@@ -1792,7 +1798,7 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     receipts = read_jsonl(vault / ".llmwiki" / "applied" / "operations.jsonl")
     assert receipts
     assert receipts[-1]["profile"] == "project_basic"
-    assert receipts[-1]["profile_version"] == "1"
+    assert receipts[-1]["profile_version"] == "2"
     assert "profile_snapshot_hash" not in receipts[-1]
     assert "prepared_raw" in receipts[-1]
     assert receipts[-1]["raw_cleanup_artifact_ref"] == "raw_link_cleanup/raw_link_cleanup.json"
