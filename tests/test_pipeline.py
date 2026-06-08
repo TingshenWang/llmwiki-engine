@@ -46,6 +46,7 @@ from llmwiki_engine.models import (
     SourceDigestCandidate,
     StepStatus,
     VerificationStatus,
+    WeakOrNoiseItem,
     WikiKnowledgePoolEntry,
     WikiMergePlanArtifact,
 )
@@ -639,6 +640,8 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "build_source_digest_payload")
     assert not hasattr(pipeline_module, "SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT")
     assert not hasattr(pipeline_module, "PAPER_CAPTION_RE")
+    assert not hasattr(pipeline_module, "render_source_digest_markdown")
+    assert not hasattr(pipeline_module, "render_candidate_table")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -1262,7 +1265,7 @@ def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_de
             concept("C10", "无关 deferred"),
         ],
         weak_or_noise_items=[
-            pipeline_module.WeakOrNoiseItem(
+            WeakOrNoiseItem(
                 candidate_id="noise-1",
                 name="噪声",
                 one_sentence_summary="不应进入 draft payload。",

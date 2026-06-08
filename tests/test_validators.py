@@ -11,7 +11,7 @@ from llmwiki_engine.models import (
     WikiMergePlanArtifact,
     WikiMergePlanItem,
 )
-from llmwiki_engine.pipeline import render_source_digest_markdown
+from llmwiki_engine.source_digest_rendering import render_source_digest_markdown
 from llmwiki_engine.validators import ValidationError, validate_candidate_resolution, validate_source_digest, validate_wiki_merge_plan
 
 

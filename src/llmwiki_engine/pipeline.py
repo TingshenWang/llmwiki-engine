@@ -26,6 +26,7 @@ from . import page_sections as _page_sections
 from . import section_merge as _section_merge
 from . import source_digest_budget as _source_digest_budget
 from . import source_digest_payload as _source_digest_payload
+from . import source_digest_rendering as _source_digest_rendering
 from . import source_excerpt as _source_excerpt
 from . import text_similarity as _text_similarity
 from . import update_preservation as _update_preservation
@@ -83,7 +84,6 @@ from .models import (
     UpdateMergeReport,
     UpdatePageMergeReport,
     SectionMergeChange,
-    WeakOrNoiseItem,
     CandidateContextsArtifact,
     ContextOverlapSignal,
     EmbeddingRetrievalConfig,
@@ -789,7 +789,7 @@ def _run_source_digest(ctx: StepRunContext) -> None:
     out = step_root / "source_digest.json"
     write_json(out, digest)
     digest_md = step_root / "source_digest.md"
-    digest_md.write_text(render_source_digest_markdown(digest), encoding="utf-8")
+    digest_md.write_text(_source_digest_rendering.render_source_digest_markdown(digest), encoding="utf-8")
     budget_report_path = step_root / "source_digest_budget_report.json"
     budget_report_md = step_root / "source_digest_budget_report.md"
     write_json(budget_report_path, budget_report)
@@ -3706,30 +3706,6 @@ def _redacted_model(ctx: StepRunContext, model: TModel, model_type: type[TModel]
     return model_type.model_validate(data)
 
 
-def render_source_digest_markdown(digest: SourceDigestArtifact) -> str:
-    sections = [
-        "# 来源消化",
-        "",
-        f"- 原始材料: `{digest.source_raw_path}`",
-        f"- 摘要: {digest.summary}",
-        "",
-        "## 关键收获",
-        "",
-        "\n".join(f"- {item}" for item in digest.key_takeaways) or "- 暂无关键收获记录。",
-    ]
-    for title, candidates in [
-        ("实体", digest.entities),
-        ("概念", digest.concepts),
-        ("设计", digest.designs),
-        ("对比", digest.comparisons),
-        ("未决问题", digest.open_questions),
-        ("预算延后候选", digest.budget_deferred_candidates),
-        ("弱相关或噪声项", digest.weak_or_noise_items),
-    ]:
-        sections.extend(["", f"## {title}", "", render_candidate_table(candidates)])
-    return "\n".join(sections).rstrip() + "\n"
-
-
 def build_wiki_merge_plan(
     resolution: CandidateResolutionArtifact,
     digest: SourceDigestArtifact,
@@ -4346,15 +4322,6 @@ def complete_review_step(
 
 
 # M3 helper implementations.
-
-
-def render_candidate_table(candidates: list[SourceDigestCandidate] | list[WeakOrNoiseItem]) -> str:
-    if not candidates:
-        return "_暂无。_"
-    return format_markdown_table(
-        ["ID", "类型", "名称", "摘要", "重复风险"],
-        [[f"`{item.candidate_id}`", item.type, item.name, item.one_sentence_summary, item.duplicate_risk] for item in candidates],
-    )
 
 
 def backfill_missing_candidate_resolution_items(
