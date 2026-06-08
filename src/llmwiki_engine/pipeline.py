@@ -17,6 +17,7 @@ from rich.console import Console
 from pydantic import BaseModel
 
 from . import __version__
+from . import source_excerpt as _source_excerpt
 from .events import EventLogger, format_duration
 from .hash_utils import artifact_ref, sha256_bytes, sha256_file
 from .io import read_json, read_model, read_yaml, write_json, write_yaml
@@ -426,7 +427,7 @@ SOURCE_DIGEST_SOURCE_MAP_TOTAL_LIMIT = 22_000
 SOURCE_DIGEST_SOURCE_MAP_GLOBAL_EXCERPT_LIMIT = 2_400
 SOURCE_DIGEST_SOURCE_MAP_MIN_SECTION_EXCERPT_LIMIT = 320
 SOURCE_DIGEST_SOURCE_MAP_MAX_SECTION_EXCERPT_LIMIT = 900
-SOURCE_DIGEST_SOURCE_MAP_MAX_SECTIONS = 56
+SOURCE_DIGEST_SOURCE_MAP_MAX_SECTIONS = _source_excerpt.DEFAULT_SOURCE_MAP_MAX_SECTIONS
 SOURCE_DIGEST_SOURCE_MAP_MAX_CAPTIONS = 24
 MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT = 16_000
 MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT = 1_600
@@ -1012,7 +1013,7 @@ def build_source_digest_source_map(
     max_captions: int = SOURCE_DIGEST_SOURCE_MAP_MAX_CAPTIONS,
 ) -> dict[str, Any]:
     include_full_source = len(approved_prepared_text) <= full_source_limit
-    sections = markdown_sections_for_source_map(approved_prepared_text, max_sections=max_sections)
+    sections = _source_excerpt.markdown_sections_for_source_map(approved_prepared_text, max_sections=max_sections)
     section_budget_total = max(0, total_limit - global_limit)
     section_limit = max_section_limit
     if sections:
@@ -1037,7 +1038,7 @@ def build_source_digest_source_map(
                 "truncated": len(section["text"].strip()) > len(excerpt),
             }
         )
-    global_excerpt = "" if include_full_source else source_global_excerpt(approved_prepared_text, global_limit)
+    global_excerpt = "" if include_full_source else _source_excerpt.source_global_excerpt(approved_prepared_text, global_limit)
     captions = [] if include_full_source else source_digest_caption_snippets(approved_prepared_text, max_captions=max_captions)
     included_chars = len(global_excerpt) + included_section_chars + sum(len(item["text"]) for item in captions)
     return {
@@ -1069,50 +1070,6 @@ def build_source_digest_source_map(
 
 def markdown_heading_count(text: str) -> int:
     return sum(1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line))
-
-
-def markdown_sections_for_source_map(text: str, *, max_sections: int) -> list[dict[str, Any]]:
-    lines = text.splitlines(keepends=True)
-    offsets: list[int] = []
-    cursor = 0
-    heading_indices: list[int] = []
-    for index, line in enumerate(lines):
-        offsets.append(cursor)
-        if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
-            heading_indices.append(index)
-        cursor += len(line)
-    if not lines:
-        return []
-    if not heading_indices or heading_indices[0] != 0:
-        heading_indices.insert(0, 0)
-    all_heading_indices = sorted(set(heading_indices))
-    heading_indices = all_heading_indices[:max_sections]
-    sections: list[dict[str, Any]] = []
-    for position, start_index in enumerate(heading_indices):
-        source_position = all_heading_indices.index(start_index)
-        end_index = all_heading_indices[source_position + 1] if source_position + 1 < len(all_heading_indices) else len(lines)
-        text_block = "".join(lines[start_index:end_index]).strip()
-        if not text_block:
-            continue
-        heading_line = lines[start_index].strip() if start_index < len(lines) else ""
-        match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$", heading_line)
-        level = len(match.group(1)) if match else 0
-        heading = match.group(2).strip() if match else "Preamble"
-        char_start = offsets[start_index] if start_index < len(offsets) else 0
-        char_end = offsets[end_index] if end_index < len(offsets) else len(text)
-        sections.append(
-            {
-                "section_id": f"S{len(sections) + 1:03d}",
-                "heading": heading,
-                "level": level,
-                "line_start": start_index + 1,
-                "line_end": end_index,
-                "char_start": char_start,
-                "char_end": char_end,
-                "text": text_block,
-            }
-        )
-    return sections
 
 
 def source_digest_caption_snippets(text: str, *, max_captions: int) -> list[dict[str, Any]]:
@@ -1484,7 +1441,7 @@ def build_candidate_resolution_source_pack(
     per_candidate_limit: int = CANDIDATE_RESOLUTION_PER_CANDIDATE_EXCERPT_LIMIT,
 ) -> dict[str, Any]:
     include_full_source = len(approved_prepared_text) <= full_source_limit
-    global_excerpt = "" if include_full_source else source_global_excerpt(approved_prepared_text, global_limit)
+    global_excerpt = "" if include_full_source else _source_excerpt.source_global_excerpt(approved_prepared_text, global_limit)
     items: list[dict[str, Any]] = []
     included_chars = len(global_excerpt)
     for group_name in SOURCE_DIGEST_BUDGET_GROUP_ORDER:
@@ -1500,7 +1457,7 @@ def build_candidate_resolution_source_pack(
                 candidate.source_locator,
                 candidate.open_question_or_tension,
             ]
-            snippets = [] if include_full_source else source_snippets_for_cues(
+            snippets = [] if include_full_source else _source_excerpt.source_snippets_for_cues(
                 approved_prepared_text,
                 cues,
                 max_chars=per_candidate_limit,
@@ -1813,7 +1770,7 @@ def build_merge_planning_source_pack(
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     included_chars = 0
-    global_excerpt = "" if include_full_source else source_global_excerpt(approved_prepared_text, MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT)
+    global_excerpt = "" if include_full_source else _source_excerpt.source_global_excerpt(approved_prepared_text, MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT)
     included_chars += len(global_excerpt)
     for item in resolution.items:
         candidate_cues: list[str] = []
@@ -1846,7 +1803,7 @@ def build_merge_planning_source_pack(
             *candidate_cues,
             *item.source_basis.prepared_discovered_candidates,
         ]
-        snippets = [] if include_full_source else source_snippets_for_cues(
+        snippets = [] if include_full_source else _source_excerpt.source_snippets_for_cues(
             approved_prepared_text,
             cues,
             max_chars=MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT,
@@ -2011,7 +1968,7 @@ def compact_snapshot_for_merge_planning(
 
 
 def compact_entry_content_for_merge_planning(text: str) -> str:
-    return source_global_excerpt(text, MERGE_PLANNING_ENTRY_EXCERPT_LIMIT)
+    return _source_excerpt.source_global_excerpt(text, MERGE_PLANNING_ENTRY_EXCERPT_LIMIT)
 
 
 def compact_payload_text(text: str, limit: int) -> str:
@@ -2424,7 +2381,7 @@ def build_draft_source_excerpt_pack(
         effective_total_limit = min(total_limit, max(minimum_page_budget, ratio_budget))
     items = []
     used_chars = 0
-    global_excerpt = source_global_excerpt(approved_prepared_text, global_limit)
+    global_excerpt = _source_excerpt.source_global_excerpt(approved_prepared_text, global_limit)
     used_chars += len(global_excerpt)
     for index, item in enumerate(draftable_items):
         direct_candidate_cues = []
@@ -2469,9 +2426,9 @@ def build_draft_source_excerpt_pack(
         else:
             page_limit = min(per_page_limit, max(DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS, remaining_budget // remaining_items))
         primary_cues = [*base_cues, *direct_candidate_cues, *item.source_basis.prepared_discovered_candidates]
-        snippets = source_snippets_for_cues(approved_prepared_text, primary_cues, max_chars=page_limit)
-        if source_snippets_are_start_fallback(snippets) and expanded_candidate_cues:
-            snippets = source_snippets_for_cues(
+        snippets = _source_excerpt.source_snippets_for_cues(approved_prepared_text, primary_cues, max_chars=page_limit)
+        if _source_excerpt.source_snippets_are_start_fallback(snippets) and expanded_candidate_cues:
+            snippets = _source_excerpt.source_snippets_for_cues(
                 approved_prepared_text,
                 [*primary_cues, *expanded_candidate_cues],
                 max_chars=page_limit,
@@ -2514,540 +2471,6 @@ def build_draft_source_excerpt_pack(
         "global_excerpt": global_excerpt,
         "items": items,
     }
-
-
-def source_snippets_are_start_fallback(snippets: list[dict[str, Any]]) -> bool:
-    return not snippets or all(snippet.get("cue") == "fallback_start" for snippet in snippets)
-
-
-def source_global_excerpt(text: str, limit: int) -> str:
-    headings = "\n".join(line.strip() for line in text.splitlines() if line.lstrip().startswith("#"))
-    prefix = text.strip()[: max(0, limit - len(headings) - 4)]
-    return merge_markdown_blocks(prefix, headings)[:limit].strip()
-
-
-def source_snippets_for_cues(text: str, cues: list[str], *, max_chars: int) -> list[dict[str, Any]]:
-    if max_chars <= 0:
-        return []
-    semantic_terms = source_semantic_match_terms(cues)
-    window_candidates: list[tuple[int, int, str, int]] = []
-    seen_positions: set[int] = set()
-    locator_windows = source_section_locator_windows(text, cues, max_chars=max_chars, semantic_terms=semantic_terms)
-    for start, end, cue, score in locator_windows:
-        if any(abs(start - existing) < source_excerpt_start_tolerance(cue) for existing in seen_positions):
-            continue
-        seen_positions.add(start)
-        window_candidates.append((start, end, cue, score))
-    for cue in source_excerpt_cues(cues):
-        position = find_source_cue(text, cue)
-        if position < 0:
-            continue
-        center = max(0, position)
-        heading_start = markdown_heading_start_at_position(text, center)
-        if heading_start is not None:
-            start = heading_start
-            line_end = text.find("\n", heading_start)
-            section_search_start = line_end + 1 if line_end >= 0 else len(text)
-            end = min(source_heading_section_end(text, section_search_start, heading_marker_at_position(text, heading_start)), start + max_chars)
-        else:
-            before_chars = min(450, max(80, max_chars // 3))
-            after_chars = min(650, max(180, max_chars - before_chars))
-            start = max(0, center - before_chars)
-            end = min(len(text), center + len(cue) + after_chars)
-            start = adjust_window_start(text, start)
-            end = adjust_window_end(text, end)
-        window_text = text[start:end]
-        score = source_excerpt_window_score(window_text, cue, semantic_terms)
-        if source_excerpt_low_signal_cue(cue) and score < 28:
-            continue
-        if any(abs(start - existing) < source_excerpt_start_tolerance(cue) for existing in seen_positions):
-            continue
-        seen_positions.add(start)
-        window_candidates.append((start, end, cue, score))
-    if locator_windows:
-        semantic_window = source_semantic_fallback_window(text, cues, max_chars=max_chars)
-        if semantic_window is not None:
-            start, end, cue = semantic_window
-            if not any(abs(start - existing) < source_excerpt_start_tolerance(cue) for existing in seen_positions):
-                seen_positions.add(start)
-                window_candidates.append((start, end, cue, 88))
-    windows: list[tuple[int, int, str]] = []
-    for start, end, cue, _score in sorted(window_candidates, key=lambda item: (-item[3], item[0])):
-        if any(
-            ranges_overlap(
-                start,
-                end,
-                existing_start,
-                existing_end,
-                tolerance=source_excerpt_overlap_tolerance(cue, existing_cue),
-            )
-            for existing_start, existing_end, existing_cue in windows
-        ):
-            continue
-        windows.append((start, end, cue))
-        if sum(existing_end - existing_start for existing_start, existing_end, _ in windows) >= max_chars:
-            break
-    if not windows:
-        semantic_window = source_semantic_fallback_window(text, cues, max_chars=max_chars)
-        if semantic_window is not None:
-            start, end, cue = semantic_window
-            return [{"cue": cue, "start": start, "end": end, "text": text[start:end].strip()}]
-        heading_window = source_heading_fallback_window(text, cues, max_chars=max_chars)
-        if heading_window is not None:
-            start, end, cue = heading_window
-            return [{"cue": cue, "start": start, "end": end, "text": text[start:end].strip()}]
-        fallback = text.strip()[:max_chars]
-        return [{"cue": "fallback_start", "start": 0, "end": len(fallback), "text": fallback}] if fallback else []
-    snippets: list[dict[str, Any]] = []
-    remaining = max_chars
-    for start, end, cue in windows:
-        if remaining <= 0:
-            break
-        snippet = text[start:end].strip()
-        if len(snippet) > remaining:
-            snippet = snippet[:remaining].rstrip()
-            end = start + len(snippet)
-        snippets.append({"cue": cue, "start": start, "end": end, "text": snippet})
-        remaining -= len(snippet)
-    return snippets
-
-
-def source_excerpt_start_tolerance(cue: str) -> int:
-    return 1 if cue.startswith(("source_locator:", "fallback_semantic:")) else 120
-
-
-def source_excerpt_overlap_tolerance(cue: str, existing_cue: str) -> int:
-    if cue.startswith("source_locator:") or existing_cue.startswith("source_locator:"):
-        return 0
-    return 120
-
-
-SOURCE_SECTION_LOCATOR_RE = re.compile(r"\bS(?P<start>\d{3})(?:\s*[-–—~至到]\s*S?(?P<end>\d{3}))?\b", re.IGNORECASE)
-
-
-def source_section_locator_windows(
-    text: str,
-    cues: list[str],
-    *,
-    max_chars: int,
-    semantic_terms: list[str] | None = None,
-) -> list[tuple[int, int, str, int]]:
-    section_ids = source_section_locator_ids(cues)
-    if not section_ids:
-        return []
-    sections = {
-        section["section_id"]: section
-        for section in markdown_sections_for_source_map(text, max_sections=SOURCE_DIGEST_SOURCE_MAP_MAX_SECTIONS)
-    }
-    if not sections:
-        return []
-    per_locator_limit = min(max_chars, max(160, max_chars // max(1, min(len(section_ids), 3))))
-    windows: list[tuple[int, int, str, int]] = []
-    for section_id in section_ids:
-        section = sections.get(section_id)
-        if section is None:
-            continue
-        start = int(section.get("char_start", 0))
-        section_end = int(section.get("char_end", start))
-        end = min(section_end, start + per_locator_limit)
-        if end <= start:
-            continue
-        heading = str(section.get("heading", "")).strip()
-        window_text = text[start:end]
-        score = source_section_locator_window_score(window_text, semantic_terms or [])
-        windows.append((start, end, f"source_locator:{section_id}:{heading}", score))
-    return windows
-
-
-def source_section_locator_window_score(window_text: str, semantic_terms: list[str]) -> int:
-    if not semantic_terms:
-        return 96
-    normalized_window = normalized_source_match_text(window_text)
-    hits = [term for term in semantic_terms if len(term) >= 4 and term in normalized_window]
-    if not hits:
-        return 64
-    return 96 + min(16, sum(min(8, len(term)) for term in hits[:4]))
-
-
-def source_section_locator_ids(cues: list[str]) -> list[str]:
-    section_ids: list[str] = []
-    for cue in cues:
-        for match in SOURCE_SECTION_LOCATOR_RE.finditer(cue or ""):
-            start = int(match.group("start"))
-            end_text = match.group("end")
-            end = int(end_text) if end_text else start
-            if end < start:
-                continue
-            for number in range(start, min(end, start + 7) + 1):
-                section_id = f"S{number:03d}"
-                if section_id not in section_ids:
-                    section_ids.append(section_id)
-    return section_ids
-
-
-SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES = {
-    "ai",
-    "agi",
-    "anthropic",
-    "claude",
-    "claudecode",
-    "cowork",
-    "pm",
-    "产品",
-    "模型",
-    "功能",
-    "团队",
-    "用户",
-    "角色",
-    "设计",
-    "问题",
-    "成功",
-    "未来",
-    "什么",
-    "如何",
-    "为什么",
-    "需要",
-    "应该",
-    "可以",
-    "通过",
-    "帮助",
-    "重要",
-    "不同",
-    "类型",
-    "应用",
-    "开发",
-}
-
-SOURCE_EXCERPT_SHORT_ASCII_SIGNAL_CUES = {
-    "api",
-    "arr",
-    "cli",
-    "eval",
-    "gtm",
-    "mvp",
-    "prd",
-}
-
-
-def source_excerpt_window_score(window_text: str, cue: str, semantic_terms: list[str]) -> int:
-    normalized_cue = normalized_source_match_text(cue)
-    score = min(36, len(normalized_cue))
-    if re.search(r"[\u4e00-\u9fff]", cue) and re.search(r"[A-Za-z]", cue):
-        score += 6
-    if source_excerpt_low_signal_cue(cue):
-        score -= 16
-    semantic_score, present_terms, _ = source_semantic_block_score(window_text, semantic_terms)
-    score += semantic_score
-    if len(present_terms) >= 3:
-        score += 8
-    if markdown_heading_start_at_position(window_text, 0) == 0:
-        score += 16
-    return score
-
-
-def source_excerpt_low_signal_cue(cue: str) -> bool:
-    normalized_cue = normalized_source_match_text(cue)
-    if normalized_cue in SOURCE_EXCERPT_SHORT_ASCII_SIGNAL_CUES:
-        return False
-    if normalized_cue in SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES:
-        return True
-    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+#.-]{2,14}", cue.strip()):
-        return True
-    if re.fullmatch(r"s\d{1,4}", normalized_cue):
-        return True
-    return len(normalized_cue) < 4
-
-
-def ranges_overlap(start: int, end: int, other_start: int, other_end: int, *, tolerance: int = 0) -> bool:
-    return start < other_end + tolerance and other_start < end + tolerance
-
-
-def markdown_heading_start_at_position(text: str, position: int) -> int | None:
-    line_start = text.rfind("\n", 0, position) + 1
-    line_end = text.find("\n", position)
-    if line_end < 0:
-        line_end = len(text)
-    line = text[line_start:line_end]
-    return line_start if re.match(r"^#{1,6}\s+", line) else None
-
-
-def heading_marker_at_position(text: str, position: int) -> str:
-    match = re.match(r"^(#{1,6})\s+", text[position:])
-    return match.group(1) if match else "#"
-
-
-def source_heading_fallback_window(text: str, cues: list[str], *, max_chars: int) -> tuple[int, int, str] | None:
-    cue_variants = source_excerpt_cues(cues)
-    if not cue_variants:
-        return None
-    best: tuple[int, int, str, int] | None = None
-    for line_match in re.finditer(r"(?m)^(#{1,6})\s+(.+?)\s*$", text):
-        heading_text = line_match.group(2)
-        normalized_heading = normalized_source_match_text(heading_text)
-        if len(normalized_heading) < 3:
-            continue
-        for cue in cue_variants:
-            normalized_cue = normalized_source_match_text(cue)
-            if len(normalized_cue) < 3:
-                continue
-            score = heading_match_score(normalized_heading, normalized_cue)
-            if score <= 0:
-                continue
-            if best is None or score > best[3]:
-                start = line_match.start()
-                end = source_heading_section_end(text, line_match.end(), line_match.group(1))
-                best = (start, min(end, start + max_chars), f"fallback_heading:{heading_text}", score)
-    if best is None:
-        return None
-    return best[0], best[1], best[2]
-
-
-def heading_match_score(normalized_heading: str, normalized_cue: str) -> int:
-    if normalized_heading in normalized_cue or normalized_cue in normalized_heading:
-        return min(len(normalized_heading), len(normalized_cue)) + 20
-    heading_terms = meaningful_match_terms(normalized_heading)
-    cue_terms = meaningful_match_terms(normalized_cue)
-    overlap = heading_terms & cue_terms
-    if len(overlap) < 2 and not any(len(term) >= 6 for term in overlap):
-        return 0
-    if overlap:
-        return sum(len(term) for term in overlap)
-    return 0
-
-
-def source_semantic_fallback_window(text: str, cues: list[str], *, max_chars: int) -> tuple[int, int, str] | None:
-    terms = source_semantic_match_terms(cues)
-    if len(terms) < 2:
-        return None
-    best: tuple[int, int, str, int, int] | None = None
-    for block_start, block_end, block_text in source_semantic_blocks(text):
-        score, present_terms, first_position = source_semantic_block_score(block_text, terms)
-        if score <= 0:
-            continue
-        absolute_position = block_start + first_position
-        before_chars = min(420, max(100, max_chars // 3))
-        start = max(block_start, absolute_position - before_chars)
-        end = min(block_end, start + max_chars)
-        start = adjust_window_start(text, start)
-        end = adjust_window_end(text, end)
-        cue = "fallback_semantic:" + ",".join(present_terms[:4])
-        candidate = (start, end, cue, score, len(present_terms))
-        if best is None or (score, len(present_terms), block_start * -1) > (best[3], best[4], best[0] * -1):
-            best = candidate
-    if best is None:
-        return None
-    return best[0], best[1], best[2]
-
-
-def source_semantic_blocks(text: str) -> list[tuple[int, int, str]]:
-    blocks: list[tuple[int, int, str]] = []
-    for match in re.finditer(r"(?ms)(?:^|\n{2,})(?P<body>.*?)(?=\n{2,}|\Z)", text):
-        body = match.group("body")
-        if not body.strip():
-            continue
-        leading = len(body) - len(body.lstrip())
-        trailing = len(body.rstrip())
-        start = match.start("body") + leading
-        end = match.start("body") + trailing
-        block_text = text[start:end]
-        if len(normalized_source_match_text(block_text)) < 24:
-            continue
-        blocks.append((start, end, block_text))
-    return blocks
-
-
-def source_semantic_block_score(block_text: str, terms: list[str]) -> tuple[int, list[str], int]:
-    normalized_block, position_map = normalized_source_match_text_with_positions(block_text)
-    present: list[str] = []
-    first_normalized_position: int | None = None
-    for term in terms:
-        position = normalized_block.find(term)
-        if position < 0:
-            continue
-        if any(term in existing or existing in term for existing in present):
-            continue
-        present.append(term)
-        first_normalized_position = position if first_normalized_position is None else min(first_normalized_position, position)
-    if not present:
-        return 0, [], 0
-    long_hits = [term for term in present if len(term) >= 4]
-    if len(present) < 2 and not long_hits:
-        return 0, [], 0
-    score = sum(min(12, len(term)) for term in present) + len(present) * 3
-    if len(present) >= 2:
-        score += 8
-    if not long_hits:
-        score -= 6
-    if score < 18:
-        return 0, [], 0
-    first_position = 0
-    if first_normalized_position is not None and first_normalized_position < len(position_map):
-        first_position = position_map[first_normalized_position]
-    return score, present, first_position
-
-
-def source_semantic_match_terms(cues: list[str]) -> list[str]:
-    ascii_terms: set[str] = set()
-    cjk_terms: set[str] = set()
-    english_stopwords = {
-        "and",
-        "are",
-        "approved",
-        "digest",
-        "for",
-        "from",
-        "how",
-        "page",
-        "section",
-        "source",
-        "into",
-        "that",
-        "the",
-        "this",
-        "with",
-        "wiki",
-        "why",
-    }
-    cjk_stop_terms = {
-        "来源",
-        "定位",
-        "来源定位",
-        "摘要",
-        "问题",
-        "价值",
-        "页面",
-        "概念",
-        "设计",
-        "部分",
-        "小节",
-        "访谈",
-        "讨论",
-    }
-    for cue in source_excerpt_cues(cues):
-        normalized = unicodedata.normalize("NFKC", cue).lower()
-        for token in re.findall(r"[a-z][a-z0-9+#./-]{2,}", normalized):
-            if token in english_stopwords or source_section_locator_token(token):
-                continue
-            normalized_token = normalized_source_match_text(token)
-            if len(normalized_token) >= 3:
-                ascii_terms.add(normalized_token)
-        for segment in re.findall(r"[\u4e00-\u9fff]{3,}", normalized):
-            if segment in cjk_stop_terms:
-                continue
-            max_size = min(8, len(segment))
-            for size in range(max_size, 2, -1):
-                for index in range(0, len(segment) - size + 1):
-                    term = segment[index : index + size]
-                    if term not in cjk_stop_terms:
-                        normalized_term = normalized_source_match_text(term)
-                        if len(normalized_term) >= 3:
-                            cjk_terms.add(normalized_term)
-    ascii_sorted = sorted(ascii_terms, key=lambda value: (-len(value), value))
-    cjk_sorted = sorted(cjk_terms, key=lambda value: (-len(value), value))
-    total_limit = 80
-    ascii_limit = 32
-    cjk_min_limit = 24
-    selected = ascii_sorted[:ascii_limit]
-    cjk_limit = max(cjk_min_limit, total_limit - len(selected))
-    selected.extend(cjk_sorted[:cjk_limit])
-    if len(selected) < total_limit:
-        selected.extend(ascii_sorted[ascii_limit : ascii_limit + total_limit - len(selected)])
-    return selected[:total_limit]
-
-
-def source_section_locator_token(token: str) -> bool:
-    return bool(re.fullmatch(r"s\d{3}(?:[-–—~至到/]s?\d{3})?", token.strip().lower()))
-
-
-def meaningful_match_terms(text: str) -> set[str]:
-    terms = set(re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", text))
-    terms -= SOURCE_EXCERPT_LOW_SIGNAL_NORMALIZED_CUES
-    if not terms and len(text) >= 4:
-        terms.update(text[index : index + 4] for index in range(0, len(text) - 3))
-    return terms
-
-
-def source_heading_section_end(text: str, start: int, marker: str) -> int:
-    pattern = re.compile(r"(?m)^(#{1,%d})\s+" % len(marker))
-    match = pattern.search(text, start)
-    return match.start() if match is not None else len(text)
-
-
-def source_excerpt_cues(cues: list[str]) -> list[str]:
-    normalized: list[str] = []
-    for cue in cues:
-        for piece in re.split(r"[\n。；;，,、|]+", cue or ""):
-            text = piece.strip().strip("`*_ ")
-            if len(text) > 160:
-                text = text[:160].rstrip()
-            for variant in source_excerpt_cue_variants(text):
-                if variant not in normalized:
-                    normalized.append(variant)
-    normalized.sort(key=lambda value: (len(normalized_source_match_text(value)) < 8, -len(normalized_source_match_text(value))))
-    return normalized[:40]
-
-
-def source_excerpt_cue_variants(text: str) -> list[str]:
-    variants: list[str] = []
-
-    def add(value: str) -> None:
-        value = value.strip().strip("`*_ -")
-        if len(normalized_source_match_text(value)) < 3:
-            return
-        if value not in variants:
-            variants.append(value)
-
-    add(text)
-    without_parenthetical = re.sub(r"[\(（][^\)）]{2,80}[\)）]", " ", text)
-    add(without_parenthetical)
-    for match in re.finditer(r"[\(（]([^\)）]{2,80})[\)）]", text):
-        add(match.group(1))
-    for segment in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9 +#./-]{2,}", text):
-        add(segment)
-    return variants
-
-
-def find_source_cue(text: str, cue: str) -> int:
-    position = text.find(cue)
-    if position >= 0:
-        return position
-    normalized_cue = normalized_source_match_text(cue)
-    if len(normalized_cue) < 4:
-        return -1
-    normalized_text, position_map = normalized_source_match_text_with_positions(text)
-    normalized_position = normalized_text.find(normalized_cue)
-    if normalized_position < 0:
-        return -1
-    return position_map[normalized_position] if normalized_position < len(position_map) else -1
-
-
-def normalized_source_match_text(text: str) -> str:
-    return normalized_source_match_text_with_positions(text)[0]
-
-
-def normalized_source_match_text_with_positions(text: str) -> tuple[str, list[int]]:
-    chars: list[str] = []
-    positions: list[int] = []
-    for index, char in enumerate(text):
-        normalized = unicodedata.normalize("NFKC", char).lower()
-        for normalized_char in normalized:
-            if normalized_char.isspace():
-                continue
-            if unicodedata.category(normalized_char).startswith("P"):
-                continue
-            chars.append(normalized_char)
-            positions.append(index)
-    return "".join(chars), positions
-
-
-def adjust_window_start(text: str, start: int) -> int:
-    newline = text.rfind("\n", 0, start)
-    return newline + 1 if newline >= 0 and start - newline < 160 else start
-
-
-def adjust_window_end(text: str, end: int) -> int:
-    newline = text.find("\n", end)
-    return newline if newline >= 0 and newline - end < 160 else end
 
 
 def render_draft_source_excerpt_pack_markdown(pack: dict[str, Any]) -> str:
@@ -3187,11 +2610,11 @@ def update_preservation_section_is_low_value(
     phrases: list[str],
     concepts: list[dict[str, Any]],
 ) -> bool:
-    normalized = normalized_source_match_text(old_text)
+    normalized = _source_excerpt.normalized_source_match_text(old_text)
     meaningful_phrases = [
         phrase
         for phrase in phrases
-        if not update_preservation_phrase_is_placeholder(normalized_source_match_text(phrase))
+        if not update_preservation_phrase_is_placeholder(_source_excerpt.normalized_source_match_text(phrase))
     ]
     if not concepts and not meaningful_phrases:
         return True
@@ -3205,15 +2628,15 @@ def update_preservation_section_is_low_value(
 def update_preservation_phrases(text: str, *, limit: int = UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION) -> list[str]:
     phrases: list[str] = []
     for piece in re.split(r"[\n。；;，,、|：:]+", text):
-        for variant in source_excerpt_cue_variants(piece):
-            normalized = normalized_source_match_text(variant)
+        for variant in _source_excerpt.source_excerpt_cue_variants(piece):
+            normalized = _source_excerpt.normalized_source_match_text(variant)
             if len(normalized) < 4 or len(normalized) > 80:
                 continue
             if update_preservation_phrase_is_noise(normalized):
                 continue
             if variant not in phrases:
                 phrases.append(variant)
-    phrases.sort(key=lambda value: (phrase_signal_score(value), len(normalized_source_match_text(value))), reverse=True)
+    phrases.sort(key=lambda value: (phrase_signal_score(value), len(_source_excerpt.normalized_source_match_text(value))), reverse=True)
     return phrases[:limit]
 
 
@@ -3234,17 +2657,17 @@ def update_preservation_has_non_placeholder_signal(text: str) -> bool:
     if update_preservation_concepts(reusable_text):
         return True
     phrases = update_preservation_phrases(reusable_text)
-    return any(not update_preservation_phrase_is_placeholder(normalized_source_match_text(phrase)) for phrase in phrases)
+    return any(not update_preservation_phrase_is_placeholder(_source_excerpt.normalized_source_match_text(phrase)) for phrase in phrases)
 
 
 def update_preservation_non_placeholder_text(text: str) -> str:
     raw_segments = [
         segment.strip()
         for segment in re.split(r"[\n。；;，,、|：:]+", text)
-        if normalized_source_match_text(segment)
+        if _source_excerpt.normalized_source_match_text(segment)
     ]
     placeholder_flags = [
-        update_preservation_phrase_is_placeholder(normalized_source_match_text(segment))
+        update_preservation_phrase_is_placeholder(_source_excerpt.normalized_source_match_text(segment))
         for segment in raw_segments
     ]
     if not any(placeholder_flags):
@@ -3319,8 +2742,8 @@ def update_preservation_term_matches(text: str, term: str) -> bool:
         return False
     if update_preservation_term_uses_ascii_tokens(term):
         return update_preservation_ascii_phrase_matches(text, term)
-    normalized_term = normalized_source_match_text(term)
-    return bool(normalized_term) and normalized_term in normalized_source_match_text(text)
+    normalized_term = _source_excerpt.normalized_source_match_text(term)
+    return bool(normalized_term) and normalized_term in _source_excerpt.normalized_source_match_text(text)
 
 
 def update_preservation_concepts(text: str) -> list[dict[str, Any]]:
@@ -3371,7 +2794,7 @@ def update_preservation_concept_absorption(old: str, new: str) -> tuple[bool, li
 
 
 def phrase_signal_score(phrase: str) -> int:
-    normalized = normalized_source_match_text(phrase)
+    normalized = _source_excerpt.normalized_source_match_text(phrase)
     score = min(len(normalized), 40)
     if re.search(r"[A-Za-z]", phrase):
         score += 12
@@ -3403,7 +2826,7 @@ def update_section_absorption(old: str, new: str) -> tuple[bool, list[str], list
         if concepts and concept_absorbed and len(matched_concepts) >= max(2, update_preservation_required_concept_matches(concepts)):
             return True, matched_concepts, phrases
         return False, matched_concepts, phrases
-    matched = [phrase for phrase in phrases if find_source_cue(new, phrase) >= 0]
+    matched = [phrase for phrase in phrases if _source_excerpt.find_source_cue(new, phrase) >= 0]
     required = update_preservation_required_matches(phrases)
     if concepts and not concept_absorbed:
         return False, [*matched, *matched_concepts], phrases
@@ -3418,7 +2841,7 @@ def update_preservation_section_absorption(section: dict[str, Any], new_text: st
     if old_text.strip() and (old_text.strip() == new_text.strip() or old_text.strip() in new_text):
         matched_phrases = phrases[: update_preservation_required_matches(phrases)]
     else:
-        matched_phrases = [phrase for phrase in phrases if find_source_cue(new_text, phrase) >= 0]
+        matched_phrases = [phrase for phrase in phrases if _source_excerpt.find_source_cue(new_text, phrase) >= 0]
     required_phrases = int(section.get("min_required_matches") or update_preservation_required_matches(phrases))
     concept_obligations = [
         concept
@@ -4821,7 +4244,7 @@ def compact_snapshot_for_draft_rendering(
         if entry.path not in relevant_paths:
             continue
         include_content = entry.path in content_paths
-        content_excerpt = source_global_excerpt(entry.content, DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT) if include_content else ""
+        content_excerpt = _source_excerpt.source_global_excerpt(entry.content, DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT) if include_content else ""
         if content_excerpt:
             content_entry_count += 1
         entries.append(
@@ -5620,7 +5043,7 @@ def augment_source_digest_anchor_entities(
         if source_digest_candidate_title_key(candidate)
     }
     for anchor, metadata in SOURCE_DIGEST_ANCHOR_ENTITIES.items():
-        anchor_key = normalized_source_match_text(anchor)
+        anchor_key = _source_excerpt.normalized_source_match_text(anchor)
         if not anchor_key or anchor_key in existing_keys:
             continue
         signal = source_anchor_signal(approved_prepared_text, anchor)
@@ -5937,10 +5360,10 @@ def source_digest_candidate_title_key(candidate: SourceDigestCandidate) -> str:
 
 def source_digest_title_key(title: str) -> str:
     core_title = source_digest_parenthetical_translation_core(title)
-    core_key = normalized_source_match_text(core_title)
+    core_key = _source_excerpt.normalized_source_match_text(core_title)
     if len(core_key) >= 4:
         return core_key
-    return normalized_source_match_text(title)
+    return _source_excerpt.normalized_source_match_text(title)
 
 
 def source_digest_parenthetical_translation_core(title: str) -> str:
@@ -10496,8 +9919,8 @@ def old_additional_note_is_high_signal_boundary(note: str) -> bool:
 def old_additional_note_absorbed(note: str, target: str) -> bool:
     if not note.strip() or not target.strip():
         return False
-    normalized_note = normalized_source_match_text(note)
-    normalized_target = normalized_source_match_text(target)
+    normalized_note = _source_excerpt.normalized_source_match_text(note)
+    normalized_target = _source_excerpt.normalized_source_match_text(target)
     if normalized_note and normalized_note in normalized_target:
         return True
     return old_additional_note_boundary_paraphrase_absorbed(note, target)
@@ -10776,12 +10199,12 @@ def external_backing_supported_by_retained_existing_fact(text: str, marker: str,
     if not text or not marker or not existing_wiki_text:
         return False
     marker_equivalents = _dedupe_strings(
-        [normalized_source_match_text(marker), *[normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
+        [_source_excerpt.normalized_source_match_text(marker), *[_source_excerpt.normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
     )
     specific_anchors, generic_anchors = external_backing_topic_anchors(text)
-    normalized_text = normalized_source_match_text(text)
+    normalized_text = _source_excerpt.normalized_source_match_text(text)
     bridge_anchors = [
-        normalized_source_match_text(anchor)
+        _source_excerpt.normalized_source_match_text(anchor)
         for anchor in [
             "旧页",
             "旧页视角",
@@ -10799,7 +10222,7 @@ def external_backing_supported_by_retained_existing_fact(text: str, marker: str,
     if len(all_anchors) < 2:
         return False
     for sentence in external_backing_source_sentences(existing_wiki_text):
-        normalized_sentence = normalized_source_match_text(sentence)
+        normalized_sentence = _source_excerpt.normalized_source_match_text(sentence)
         if not any(equivalent and equivalent in normalized_sentence for equivalent in marker_equivalents):
             continue
         specific_hits = external_backing_anchor_hit_count(useful_specific, normalized_sentence)
@@ -10813,7 +10236,7 @@ def external_backing_supported_by_text(text: str, marker: str, source_text: str)
     if not text or not marker or not source_text:
         return False
     marker_equivalents = _dedupe_strings(
-        [normalized_source_match_text(marker), *[normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
+        [_source_excerpt.normalized_source_match_text(marker), *[_source_excerpt.normalized_source_match_text(phrase) for phrase in EXTERNAL_BACKING_EQUIVALENTS]]
     )
     specific_anchors, generic_anchors = external_backing_topic_anchors(text)
     if not specific_anchors:
@@ -10823,11 +10246,11 @@ def external_backing_supported_by_text(text: str, marker: str, source_text: str)
         return False
     sentences = external_backing_source_sentences(source_text)
     for index, sentence in enumerate(sentences):
-        normalized_sentence = normalized_source_match_text(sentence)
+        normalized_sentence = _source_excerpt.normalized_source_match_text(sentence)
         if not any(equivalent and equivalent in normalized_sentence for equivalent in marker_equivalents):
             continue
         context = " ".join(sentences[max(0, index - 1) : index + 2])
-        normalized_context = normalized_source_match_text(context)
+        normalized_context = _source_excerpt.normalized_source_match_text(context)
         if external_backing_anchor_hit_count(specific_anchors, normalized_context) < 1:
             continue
         if external_backing_anchor_hit_count(all_anchors, normalized_context) >= 2:
@@ -10914,21 +10337,21 @@ def scope_speculation_supported_by_text(text: str, source_text: str) -> bool:
     sentences = external_backing_source_sentences(source_text)
     for index, sentence in enumerate(sentences):
         context = " ".join(sentences[max(0, index - 1) : index + 2])
-        normalized_context = normalized_source_match_text(context)
+        normalized_context = _source_excerpt.normalized_source_match_text(context)
         if sum(1 for anchor in anchors if anchor in normalized_context) >= min(3, len(anchors)):
             return True
     return False
 
 
 def scope_speculation_anchors(text: str) -> list[str]:
-    normalized_text = normalized_source_match_text(text)
+    normalized_text = _source_excerpt.normalized_source_match_text(text)
     anchors: list[str] = []
     for token in re.findall(r"[A-Za-z][A-Za-z0-9.+_-]{1,}", unicodedata.normalize("NFKC", text)):
         normalized = token.lower().strip("._-+")
         if len(normalized) >= 3 and normalized not in {"the", "and", "for", "with", "from", "into", "this", "that"}:
             anchors.append(normalized)
     for phrase in re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）()·]{2,}", text):
-        normalized = normalized_source_match_text(phrase)
+        normalized = _source_excerpt.normalized_source_match_text(phrase)
         if len(normalized) >= 2 and normalized not in {"可能", "也许", "或许", "推测", "疑似", "受到影响", "受影响", "波及", "涉及", "牵涉", "导致", "造成", "影响到", "关联"}:
             anchors.append(normalized)
     deduped: list[str] = []
@@ -11562,7 +10985,7 @@ def rewrite_internal_artifact_references(body: str) -> tuple[str, list[dict[str,
 
 
 def grounding_known_english_quote_translation(quote: str) -> str:
-    normalized = normalized_source_match_text(quote)
+    normalized = _source_excerpt.normalized_source_match_text(quote)
     translations = {
         "anexcellentharnessthatprovidesafocusedcodingexperience": "一种优秀的 harness，提供聚焦的编码体验",
     }
@@ -11710,13 +11133,13 @@ def numeric_reliability_source_sentence(quote: str, source_sentences: list[str])
     percentages = re.findall(r"\d+(?:\.\d+)?\s*%", quote)
     if not percentages:
         return None
-    normalized_quote = normalized_source_match_text(quote)
+    normalized_quote = _source_excerpt.normalized_source_match_text(quote)
     if not any(marker in normalized_quote for marker in ["失败", "没价值", "不够", "不是自动化", "可靠", "有效"]):
         return None
     normalized_percentages = {normalized_percentage_token(percentage) for percentage in percentages}
     best: str | None = None
     for sentence in source_sentences:
-        normalized_sentence = normalized_source_match_text(sentence)
+        normalized_sentence = _source_excerpt.normalized_source_match_text(sentence)
         sentence_percentages = {
             normalized_percentage_token(percentage)
             for percentage in re.findall(r"\d+(?:\.\d+)?\s*%", unicodedata.normalize("NFKC", sentence))
@@ -12165,16 +11588,16 @@ def quote_supported_by_text(quote: str, text: str) -> bool:
 
 
 def normalized_quote_support_variants(text: str) -> list[str]:
-    variants = [normalized_source_match_text(text)]
+    variants = [_source_excerpt.normalized_source_match_text(text)]
     range_normalized = normalize_numeric_range_connectors(text)
     if range_normalized != text:
-        variants.append(normalized_source_match_text(range_normalized))
+        variants.append(_source_excerpt.normalized_source_match_text(range_normalized))
     enumerated_range_normalized = normalize_paired_temporal_enumerated_ranges(text)
     if enumerated_range_normalized != text:
-        variants.append(normalized_source_match_text(enumerated_range_normalized))
+        variants.append(_source_excerpt.normalized_source_match_text(enumerated_range_normalized))
     stripped = strip_inline_term_translation_parentheticals(text)
     if stripped != text:
-        variants.append(normalized_source_match_text(stripped))
+        variants.append(_source_excerpt.normalized_source_match_text(stripped))
     if re.search(r"\d", unicodedata.normalize("NFKC", text)):
         variants.extend(normalized_direct_quote_elision_variant(variant) for variant in list(variants))
     return _dedupe_strings([variant for variant in variants if variant])
@@ -12267,19 +11690,19 @@ def compact_paraphrase_supported_by_text(quote: str, text: str) -> bool:
         return False
     if not any(separator in quote for separator in ["，", ",", "；", ";", "、"]):
         return False
-    normalized_quote = normalized_source_match_text(quote)
+    normalized_quote = _source_excerpt.normalized_source_match_text(quote)
     if len(normalized_quote) < 16 or len(normalized_quote) > 96:
         return False
     if re.search(r"\d", normalized_quote):
         return False
     segments = [
         segment
-        for segment in (normalized_source_match_text(part) for part in re.split(r"[，,；;、]", quote))
+        for segment in (_source_excerpt.normalized_source_match_text(part) for part in re.split(r"[，,；;、]", quote))
         if len(segment) >= 4
     ]
     if len(segments) < 2:
         return False
-    normalized_text = normalized_source_match_text(text)
+    normalized_text = _source_excerpt.normalized_source_match_text(text)
     segment_hits: list[tuple[list[int], int, bool]] = []
     for segment in segments:
         exact_position = normalized_text.find(segment)
@@ -12312,7 +11735,7 @@ def compact_paraphrase_supported_by_text(quote: str, text: str) -> bool:
 def method_goal_paraphrase_supported_by_text(quote: str, text: str) -> bool:
     if not quote or not text:
         return False
-    normalized_quote = normalized_source_match_text(quote)
+    normalized_quote = _source_excerpt.normalized_source_match_text(quote)
     if len(normalized_quote) < 12 or len(normalized_quote) > 64:
         return False
     if re.search(r"\d", normalized_quote) or contains_hard_fact_marker(normalized_quote):
@@ -12321,7 +11744,7 @@ def method_goal_paraphrase_supported_by_text(quote: str, text: str) -> bool:
         return False
     if re.search(r"发布(?:了|过)|推出(?:了|过)|上线(?:了|过)", normalized_quote):
         return False
-    normalized_text = normalized_source_match_text(text)
+    normalized_text = _source_excerpt.normalized_source_match_text(text)
     anchors = compact_paraphrase_anchor_matches(normalized_quote, normalized_text)
     anchor_occurrences = [
         (anchor, compact_paraphrase_anchor_occurrences(anchor, normalized_text))
