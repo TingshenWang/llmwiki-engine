@@ -271,11 +271,6 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
                 f"{reason} 在 open_questions 里请改成中性的 `待补来源` 问题，"
                 "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提。"
             )
-    if grounding_claim_targets_open_question(claim) and claim.section_key != "open_questions":
-        reason = (
-            f"{reason} 这是 open_questions 页面；无来源支撑的场景、后果或影响推测不要留在 detail/examples 当事实；"
-            "请移动到 open_questions，改写成问题并标注 待补来源，不要换成另一个具体后果。"
-        )
     if not text:
         return reason
     return f"{reason} 触发文本：{text[:240]}"
