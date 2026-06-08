@@ -92,7 +92,7 @@ def test_source_digest_accepts_weak_noise_without_suggested_page_title() -> None
     assert "create" not in weak_section
 
 
-def test_source_digest_accepts_model_style_weak_noise_fields() -> None:
+def test_source_digest_accepts_current_weak_noise_fields() -> None:
     digest = SourceDigestArtifact.model_validate(
         {
             "source_raw_path": "raw/sample.md",
@@ -114,7 +114,7 @@ def test_source_digest_accepts_model_style_weak_noise_fields() -> None:
                     "name": "Lightweight aside",
                     "type": "noise",
                     "one_sentence_summary": "An aside that should not become a wiki page.",
-                    "why_matches": "The source mentions it, but there is not enough durable knowledge to ingest.",
+                    "why_matters": "The source mentions it, but there is not enough durable knowledge to ingest.",
                     "suggested_action": "ignore",
                 }
             ],
@@ -126,6 +126,23 @@ def test_source_digest_accepts_model_style_weak_noise_fields() -> None:
     markdown = render_source_digest_markdown(digest)
     weak_section = markdown.split("## 弱相关或噪声项", 1)[1]
     assert "ignore" not in weak_section
+
+
+def test_source_digest_rejects_why_matches_alias() -> None:
+    data = _digest().model_dump(mode="json")
+    data["weak_or_noise_items"] = [
+        {
+            "candidate_id": "NOISE001",
+            "name": "Lightweight aside",
+            "type": "noise",
+            "one_sentence_summary": "An aside that should not become a wiki page.",
+            "why_matches": "旧字段不再兼容。",
+            "suggested_action": "ignore",
+        }
+    ]
+
+    with pytest.raises(Exception, match="why_matches"):
+        SourceDigestArtifact.model_validate(data)
 
 
 def test_source_digest_rejects_wrong_schema_version() -> None:

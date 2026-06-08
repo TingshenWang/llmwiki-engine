@@ -3503,12 +3503,20 @@ def test_draft_rendering_model_schema_excludes_section_bodies() -> None:
         pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
 
 
+def test_draft_rendering_model_schema_rejects_source_coverage_checks_alias() -> None:
+    page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
+    page.pop("source_coverage_notes", None)
+    page["source_coverage_checks"] = "旧字段不再兼容。"
+
+    with pytest.raises(Exception, match="source_coverage_checks"):
+        pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
+
+
 def test_draft_rendering_model_output_is_canonicalized_for_internal_pipeline() -> None:
     page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
     page["page_plan_id"] = "PP-QWEN"
     page["canonical_target_path"] = "entities/Entity_Qwen-Agent.md"
-    page.pop("source_coverage_notes", None)
-    page["source_coverage_checks"] = "严格按照源内容，无额外添加。"
+    page["source_coverage_notes"] = "严格按照源内容，无额外添加。"
     draft = pipeline_module.DraftRenderingArtifact.model_validate(
         {"schema_version": "draft_rendering.v3", "pages": [page]}
     )

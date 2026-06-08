@@ -1326,7 +1326,7 @@ def source_digest_language_contract(vault_config: VaultConfig) -> dict[str, Any]
             "wiki_value",
             "open_question_or_tension",
             "resolution_hint",
-            "weak_or_noise_items.why_matches",
+            "weak_or_noise_items.why_matters",
         ],
         "stable_terms_may_remain_english": [
             "Claude Code",
@@ -1555,7 +1555,7 @@ def _run_source_digest(ctx: StepRunContext) -> None:
                 "Put weak or noisy mentions in weak_or_noise_items instead of creating pages for them.",
                 "weak_or_noise_items are review-only and are not ingested as wiki pages.",
                 "weak_or_noise_items may leave suggested_page_title empty and may use suggested_action='ignore'.",
-                "weak_or_noise_items may use why_matters or why_matches to explain why the mention was filtered.",
+                "weak_or_noise_items must use why_matters to explain why the mention was filtered.",
                 "The vault language is zh-CN: write summary, key_takeaways, candidate summaries, why_matters, and wiki_value in Chinese.",
                 "Stable domain terms such as Claude Code, RAG, PM, Workflow, Agent may stay in English, but explain them in Chinese when needed.",
                 "Do not return whole English paragraphs for user-visible fields; zh-CN validation will fail instead of silently translating.",

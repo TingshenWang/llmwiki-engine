@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> str:
@@ -255,7 +255,7 @@ class WeakOrNoiseItem(StrictModel):
     name: str
     type: str = "noise"
     one_sentence_summary: str
-    why_matters: str = Field(default="", validation_alias=AliasChoices("why_matters", "why_matches"))
+    why_matters: str = ""
     wiki_value: str = ""
     source_locator: str = ""
     suggested_page_title: str = ""
@@ -543,9 +543,6 @@ class DraftPageItem(StrictModel):
         if not isinstance(data, dict):
             return data
         data = dict(data)
-        coverage_checks = data.pop("source_coverage_checks", None)
-        if coverage_checks is not None and not data.get("source_coverage_notes"):
-            data["source_coverage_notes"] = _coerce_section_body_scalar(coverage_checks)
         if "quality_risks" in data:
             data["quality_risks"] = _coerce_string_list(data["quality_risks"])
         for field_name in ["summary", "body_markdown", "open_questions"]:

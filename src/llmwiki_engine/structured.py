@@ -251,9 +251,7 @@ def _parse_json(raw: str) -> tuple[dict[str, Any], bool]:
 
 
 def parse_structured_json_object(raw: str) -> tuple[dict[str, Any], bool]:
-    data, repaired = _parse_json(raw)
-    data, alias_repair_applied = _repair_common_structured_aliases(data)
-    return data, repaired or alias_repair_applied
+    return _parse_json(raw)
 
 
 def _repair_json_like_output(text: str) -> str:
@@ -371,25 +369,6 @@ def _quote_looks_like_string_boundary(text: str, quote_index: int) -> bool:
 
 def _remove_trailing_commas(text: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", text)
-
-
-def _repair_common_structured_aliases(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    changed = False
-
-    def visit(value: Any) -> Any:
-        nonlocal changed
-        if isinstance(value, list):
-            return [visit(item) for item in value]
-        if not isinstance(value, dict):
-            return value
-        repaired = {key: visit(item) for key, item in value.items()}
-        if "why_matches" in repaired and "why_matters" not in repaired:
-            repaired["why_matters"] = repaired.pop("why_matches")
-            changed = True
-        return repaired
-
-    repaired_root = visit(data)
-    return repaired_root, changed
 
 
 def _payload_char_count(payload: dict[str, Any]) -> int:
