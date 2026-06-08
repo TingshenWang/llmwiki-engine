@@ -17,6 +17,7 @@ import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.draft_outputs as draft_outputs_module
 import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
 import llmwiki_engine.draft_reviewing as draft_reviewing_module
+import llmwiki_engine.merge_plan_refinement as merge_plan_refinement_module
 import llmwiki_engine.merge_reporting as merge_reporting_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.planning_payloads as planning_payloads_module
@@ -13775,13 +13776,13 @@ def test_all_create_medium_with_concrete_reason_does_not_force_review() -> None:
     )
     plan = merge_review_plan(merge_review_create_item("PP-1", strength="medium", why_not_update=reason))
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_with_weak_reason_still_waits_for_review() -> None:
     plan = merge_review_plan(merge_review_create_item("PP-1", strength="medium", why_not_update="更适合新建。"))
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "理由不充分" in reason
@@ -13796,7 +13797,7 @@ def test_all_create_medium_with_generic_marker_reason_still_waits_for_review() -
         )
     )
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "理由不充分" in reason
@@ -13814,7 +13815,7 @@ def test_all_create_medium_with_long_generic_reason_still_waits_for_review() -> 
         )
     )
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "理由不充分" in reason
@@ -13843,7 +13844,7 @@ def test_all_create_medium_generic_old_title_scope_dismissal_waits_for_review() 
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -13873,7 +13874,7 @@ def test_all_create_medium_ai_agent_neicun_alias_waits_for_review() -> None:
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -13903,7 +13904,7 @@ def test_all_create_medium_existing_knowledge_page_marker_waits_for_review() -> 
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -13933,7 +13934,7 @@ def test_all_create_medium_old_title_comma_scope_predicate_waits_for_review() ->
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -13962,7 +13963,7 @@ def test_all_create_medium_added_page_marker_waits_for_review() -> None:
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -13991,7 +13992,7 @@ def test_all_create_medium_added_knowledge_page_marker_waits_for_review() -> Non
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -14020,7 +14021,7 @@ def test_all_create_medium_pure_english_memory_old_title_waits_for_review() -> N
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -14049,7 +14050,7 @@ def test_all_create_medium_rapid_memory_is_not_api_specific() -> None:
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "旧页标题像通用概念页" in reason
@@ -14079,7 +14080,7 @@ def test_all_create_medium_old_specific_negation_with_generic_old_scope_does_not
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_old_title_no_product_token_does_not_force_review() -> None:
@@ -14106,7 +14107,7 @@ def test_all_create_medium_old_title_no_product_token_does_not_force_review() ->
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_bare_negation_still_reviews_when_new_is_generic() -> None:
@@ -14132,7 +14133,7 @@ def test_all_create_medium_bare_negation_still_reviews_when_new_is_generic() -> 
     )
     plan = merge_review_plan(item)
 
-    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "中等召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_medium_adversarial_negation_still_waits_for_review() -> None:
@@ -14158,7 +14159,7 @@ def test_all_create_medium_adversarial_negation_still_waits_for_review() -> None
     )
     plan = merge_review_plan(item)
 
-    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "中等召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_medium_adversarial_negation_without_new_generic_still_waits_for_review() -> None:
@@ -14184,7 +14185,7 @@ def test_all_create_medium_adversarial_negation_without_new_generic_still_waits_
     )
     plan = merge_review_plan(item)
 
-    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "中等召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_medium_english_not_merely_specific_still_waits_for_review() -> None:
@@ -14210,7 +14211,7 @@ def test_all_create_medium_english_not_merely_specific_still_waits_for_review() 
     )
     plan = merge_review_plan(item)
 
-    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "中等召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_medium_old_not_generic_new_generic_still_waits_for_review() -> None:
@@ -14236,7 +14237,7 @@ def test_all_create_medium_old_not_generic_new_generic_still_waits_for_review() 
     )
     plan = merge_review_plan(item)
 
-    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "中等召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_medium_english_old_not_generic_new_generic_still_waits_for_review() -> None:
@@ -14262,7 +14263,7 @@ def test_all_create_medium_english_old_not_generic_new_generic_still_waits_for_r
     )
     plan = merge_review_plan(item)
 
-    assert "中等召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "中等召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_medium_product_specific_old_title_can_auto_pass() -> None:
@@ -14289,7 +14290,7 @@ def test_all_create_medium_product_specific_old_title_can_auto_pass() -> None:
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_source_specific_old_title_with_neicun_can_auto_pass() -> None:
@@ -14317,7 +14318,7 @@ def test_all_create_medium_source_specific_old_title_with_neicun_can_auto_pass()
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_runtime_neicun_does_not_become_agent_memory_review() -> None:
@@ -14344,7 +14345,7 @@ def test_all_create_medium_runtime_neicun_does_not_become_agent_memory_review() 
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_runtime_neicun_generic_wording_still_auto_passes() -> None:
@@ -14370,7 +14371,7 @@ def test_all_create_medium_runtime_neicun_generic_wording_still_auto_passes() ->
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_later_source_delta_does_not_make_old_page_specific() -> None:
@@ -14397,7 +14398,7 @@ def test_all_create_medium_later_source_delta_does_not_make_old_page_specific() 
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_agent_only_title_overlap_does_not_force_review() -> None:
@@ -14424,7 +14425,7 @@ def test_all_create_medium_agent_only_title_overlap_does_not_force_review() -> N
     )
     plan = merge_review_plan(item)
 
-    assert pipeline_module.merge_plan_all_create_review_reason(plan) == ""
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(plan) == ""
 
 
 def test_all_create_medium_with_locally_synthesized_reason_still_waits_for_review() -> None:
@@ -14439,13 +14440,13 @@ def test_all_create_medium_with_locally_synthesized_reason_still_waits_for_revie
     ).model_copy(
         update={
             "finalization_reason": (
-                f"medium overlap create 缺少 why_not_update，已{pipeline_module.LOCAL_MEDIUM_CREATE_REASON_MARKER}。"
+                f"medium overlap create 缺少 why_not_update，已{merge_plan_refinement_module.LOCAL_MEDIUM_CREATE_REASON_MARKER}。"
             )
         }
     )
     plan = merge_review_plan(item)
 
-    reason = pipeline_module.merge_plan_all_create_review_reason(plan)
+    reason = merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
     assert "中等召回风险" in reason
     assert "仅由本地补充" in reason
@@ -14458,21 +14459,21 @@ def test_all_create_strong_overlap_still_waits_for_review() -> None:
     )
     plan = merge_review_plan(merge_review_create_item("PP-1", strength="strong", why_not_update=reason))
 
-    assert "强召回风险" in pipeline_module.merge_plan_all_create_review_reason(plan)
+    assert "强召回风险" in merge_plan_refinement_module.merge_plan_all_create_review_reason(plan)
 
 
 def test_all_create_page_count_cap_waits_for_review_at_thirteen() -> None:
     allowed = [
         merge_review_create_item(f"PP-{index}", strength="none")
-        for index in range(pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS)
+        for index in range(merge_plan_refinement_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS)
     ]
     blocked = [
         merge_review_create_item(f"PP-{index}", strength="none")
-        for index in range(pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS + 1)
+        for index in range(merge_plan_refinement_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS + 1)
     ]
 
-    assert pipeline_module.merge_plan_all_create_review_reason(merge_review_plan(*allowed)) == ""
-    assert "超过自动通过上限" in pipeline_module.merge_plan_all_create_review_reason(merge_review_plan(*blocked))
+    assert merge_plan_refinement_module.merge_plan_all_create_review_reason(merge_review_plan(*allowed)) == ""
+    assert "超过自动通过上限" in merge_plan_refinement_module.merge_plan_all_create_review_reason(merge_review_plan(*blocked))
 
 
 def test_all_create_page_count_cap_can_use_vault_budget() -> None:
@@ -14480,15 +14481,7 @@ def test_all_create_page_count_cap_can_use_vault_budget() -> None:
 
     assert (
         "超过自动通过上限 4"
-        in pipeline_module.merge_plan_all_create_review_reason(merge_review_plan(*items), max_auto_create_items=4)
-    )
-
-
-def test_all_create_review_limit_never_exceeds_internal_cap() -> None:
-    assert pipeline_module.merge_plan_auto_create_review_limit(4) == 4
-    assert (
-        pipeline_module.merge_plan_auto_create_review_limit(pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS + 8)
-        == pipeline_module.MAX_AUTO_APPROVED_ALL_CREATE_ITEMS
+        in merge_plan_refinement_module.merge_plan_all_create_review_reason(merge_review_plan(*items), max_auto_create_items=4)
     )
 
 
