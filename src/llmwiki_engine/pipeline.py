@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from . import __version__
 from . import draft_validation as _draft_validation
+from . import errors as _errors
 from . import markdown_utils as _markdown_utils
 from . import open_questions as _open_questions
 from . import page_sections as _page_sections
@@ -142,10 +143,6 @@ from .verify import require_verified
 from .vault_config import read_vault_config, write_default_vault_config
 from .wiki_context import wiki_context_drift_messages
 from .workspace import RunStore, apply_lock, ensure_workspace_layout, relative_to_vault, resolve_raw_path, run_lock
-
-
-class PipelineError(RuntimeError):
-    pass
 
 
 RAW_INGEST_TEXT_SUFFIXES = {".md", ".markdown", ".mdown", ".txt"}
@@ -404,16 +401,16 @@ def resume_ingest(
     with apply_lock(vault), run_lock(vault, operation_id):
         manifest = read_manifest(store.manifest_path(operation_id))
         if manifest.status in {OperationStatus.applied, OperationStatus.source_recorded}:
-            raise PipelineError("Applied operations are immutable. Start a new operation instead.")
+            raise _errors.PipelineError("Applied operations are immutable. Start a new operation instead.")
         if manifest.status == OperationStatus.apply_failed:
-            raise PipelineError("apply_failed operations cannot be resumed; inspect written targets and rerun ingest.")
+            raise _errors.PipelineError("apply_failed operations cannot be resumed; inspect written targets and rerun ingest.")
         require_verified(vault, manifest)
         start, reset_from_step = default_resume_start(vault, store.run_dir(operation_id), manifest, from_step)
         if start is None:
             return manifest
         if raw_prepare_policy is not None:
             if step_index(start) > step_index("raw_prepare"):
-                raise PipelineError("raw prepare override only applies when raw_prepare will rerun; resume from raw_prepare or earlier.")
+                raise _errors.PipelineError("raw prepare override only applies when raw_prepare will rerun; resume from raw_prepare or earlier.")
             manifest.vault_config_snapshot.raw_prepare_policy = raw_prepare_policy
         validate_raw_link_cleanup_resume(run_dir=store.run_dir(operation_id), manifest=manifest, start=start)
         validate_resume_start(manifest, start)
@@ -489,7 +486,7 @@ def ensure_wiki_context_current_before_resume(vault: Path, run_dir: Path, start_
     snapshot = read_model(snapshot_path, WikiContextSnapshot)
     messages = wiki_context_drift_messages(vault, snapshot)
     if messages:
-        raise PipelineError("; ".join(messages))
+        raise _errors.PipelineError("; ".join(messages))
 
 
 def execute_ingest(
@@ -529,7 +526,7 @@ def execute_ingest(
             write_manifest(store.manifest_path(operation_id), manifest)
             refresh_run_metrics(vault, run_dir, manifest, warning_console=console)
             logger.emit(step_name, "failed", status="failed", message=message, duration_ms=last_attempt_duration_ms(manifest, step_name))
-            raise PipelineError(message) from exc
+            raise _errors.PipelineError(message) from exc
         write_manifest(store.manifest_path(operation_id), manifest)
         refresh_run_metrics(vault, run_dir, manifest, warning_console=console)
         if get_step(manifest, step_name).status == StepStatus.awaiting_review:
@@ -548,7 +545,7 @@ def validate_resume_start(manifest: OperationManifest, start_step: str) -> None:
     start_index = step_index(start_step)
     for step in manifest.steps[:start_index]:
         if not step_satisfied(step.status):
-            raise PipelineError(
+            raise _errors.PipelineError(
                 f"Cannot resume from {start_step}: upstream step {step.name} is {step.status.value}; "
                 f"resume from {step.name} or earlier."
             )
@@ -558,7 +555,7 @@ def ensure_pipeline_completed(manifest: OperationManifest) -> None:
     incomplete = [step for step in manifest.steps if not step_satisfied(step.status)]
     if incomplete:
         details = ", ".join(f"{step.name}={step.status.value}" for step in incomplete)
-        raise PipelineError(f"Operation is not draft-ready; incomplete step(s): {details}")
+        raise _errors.PipelineError(f"Operation is not draft-ready; incomplete step(s): {details}")
 
 
 def model_steps_for_raw_prepare_policy(
@@ -597,7 +594,7 @@ def _run_step(
 ) -> None:
     runner = STEP_RUNNERS.get(step_name)
     if runner is None:
-        raise PipelineError(f"Unknown step: {step_name}")
+        raise _errors.PipelineError(f"Unknown step: {step_name}")
     provider_record = execution_context.record if runner.spec.model_backed else None
     provider_runtime = provider_record.providers.get(step_name) if provider_record else None
     provider_spec_for_attempt = provider_runtime.spec if provider_runtime else None
@@ -618,7 +615,7 @@ def _run_step(
         if local_model_backed_step:
             begin_step_attempt(manifest, step_name)
         elif provider_record is None or provider_runtime is None:
-            raise PipelineError(f"No provider execution context found for model-backed step: {step_name}")
+            raise _errors.PipelineError(f"No provider execution context found for model-backed step: {step_name}")
         else:
             begin_model_step_attempt(
                 manifest,
@@ -672,7 +669,7 @@ def _run_raw_link_cleanup(ctx: StepRunContext) -> None:
     changed = cleaned_text != original_text
     if changed:
         if sha256_file(ctx.raw_path) != pre_hash:
-            raise PipelineError("raw changed during raw_link_cleanup; rerun ingest")
+            raise _errors.PipelineError("raw changed during raw_link_cleanup; rerun ingest")
         tmp = ctx.raw_path.with_name(f".{ctx.raw_path.name}.tmp")
         tmp.write_text(cleaned_text, encoding="utf-8")
         tmp.replace(ctx.raw_path)
@@ -713,10 +710,10 @@ def build_raw_prepare_skip_passthrough(
     cleanup_ref: str,
 ) -> RawPreparationArtifact:
     if raw_path.suffix.lower() not in {".md", ".markdown", ".mdown"}:
-        raise PipelineError("--prepare skip requires Markdown raw; use --prepare auto or --prepare force for non-Markdown raw.")
+        raise _errors.PipelineError("--prepare skip requires Markdown raw; use --prepare auto or --prepare force for non-Markdown raw.")
     raw_text = raw_path.read_text(encoding="utf-8")
     if not raw_text.strip():
-        raise PipelineError("--prepare skip requires non-empty raw Markdown.")
+        raise _errors.PipelineError("--prepare skip requires non-empty raw Markdown.")
     return RawPreparationArtifact(
         source_raw_path=raw_rel,
         input_raw_sha256=input_raw_sha256,
@@ -822,7 +819,7 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
         }
     )
     if preparation.source_raw_path != raw_rel:
-        raise PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
+        raise _errors.PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
     _write_raw_prepare_outputs(ctx, preparation, include_model_outputs=True)
 
 
@@ -1228,7 +1225,7 @@ def _run_source_digest(ctx: StepRunContext) -> None:
     )
     digest = _redacted_model(ctx, digest, SourceDigestArtifact)
     if digest.source_raw_path != raw_rel:
-        raise PipelineError(f"source_digest source path mismatch: {digest.source_raw_path} != {raw_rel}")
+        raise _errors.PipelineError(f"source_digest source path mismatch: {digest.source_raw_path} != {raw_rel}")
     digest = augment_source_digest_anchor_entities(digest, approved_prepared_text)
     digest, budget_report = cap_source_digest_candidates(digest, ctx.manifest.vault_config_snapshot.max_ingest_candidates)
     validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
@@ -1400,9 +1397,9 @@ def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
     md = step_root / "source_duplicate_guard.md"
     md.write_text(render_source_duplicate_guard_markdown(artifact), encoding="utf-8")
     if artifact.status == "source_duplicate":
-        raise PipelineError(f"source_duplicate: {artifact.reason}")
+        raise _errors.PipelineError(f"source_duplicate: {artifact.reason}")
     if artifact.status == "source_revision_detected":
-        raise PipelineError(
+        raise _errors.PipelineError(
             "同一路径内容已变化，source revision workflow 尚未实现；如确认为新材料，请另存为新 raw 文件名后重新 ingest。"
         )
     complete_step(
@@ -4115,15 +4112,15 @@ def _run_validation(ctx: StepRunContext) -> None:
     validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
     ensure_wiki_context_current(ctx.vault, snapshot)
     if any(item.action == "needs_human_decision" for item in merge_plan.items):
-        raise PipelineError("needs_human_decision must be revised to create/update/noop before validation.")
+        raise _errors.PipelineError("needs_human_decision must be revised to create/update/noop before validation.")
     if not digest.ingest_candidates() and not any(
         nonempty_prepared_discovered_candidates(item.source_basis) for item in merge_plan.items
     ):
-        raise PipelineError("source_digest must include at least one wiki candidate")
+        raise _errors.PipelineError("source_digest must include at least one wiki candidate")
     if not merge_plan.items:
-        raise PipelineError("wiki_merge_plan must include at least one action")
+        raise _errors.PipelineError("wiki_merge_plan must include at least one action")
     if not draft_write_manifest.targets:
-        raise PipelineError("draft_write_manifest must include at least one target")
+        raise _errors.PipelineError("draft_write_manifest must include at least one target")
     complete_step(ctx.manifest, step_name)
 
 
@@ -5424,7 +5421,7 @@ def build_wiki_merge_plan(
         candidate = first_source_basis_candidate(item.source_basis, candidates)
         if candidate is None:
             refs = ", ".join(source_basis_candidate_refs(item.source_basis)) or "none"
-            raise PipelineError(
+            raise _errors.PipelineError(
                 f"Cannot build deterministic merge plan for `{item.display_title or item.page_plan_id}`: "
                 f"no source digest candidate found for refs: {refs}."
             )
@@ -5574,7 +5571,7 @@ def assert_system_page_can_be_overwritten(vault: Path, target_path: str) -> None
     try:
         assert_current_system_page(path)
     except RuntimeError as exc:
-        raise PipelineError(f"{exc}: {target_path}") from exc
+        raise _errors.PipelineError(f"{exc}: {target_path}") from exc
 
 
 def yaml_scalar(value: str) -> str:
@@ -5610,7 +5607,7 @@ def resolve_vault_profile_name(vault: Path, profile_name: str | None) -> str:
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
     configured = config.get("profile")
     if not isinstance(configured, str) or not configured:
-        raise PipelineError(".llmwiki/config.yaml profile must be a non-empty string.")
+        raise _errors.PipelineError(".llmwiki/config.yaml profile must be a non-empty string.")
     return configured
 
 
@@ -5691,7 +5688,7 @@ def validate_raw_link_cleanup_resume(*, run_dir: Path, manifest: OperationManife
         return
     cleanup = read_model(artifact_path, RawLinkCleanupArtifact)
     if cleanup.changed:
-        raise PipelineError("Cannot resume from raw_link_cleanup after it changed raw; rerun ingest or resume from raw_prepare.")
+        raise _errors.PipelineError("Cannot resume from raw_link_cleanup after it changed raw; rerun ingest or resume from raw_prepare.")
 
 
 def last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> int | None:
@@ -6133,7 +6130,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             step_root = require_step_output_dir(run_dir, "draft_review")
             pending = step_root / "pending_write_manifest.json"
             if not pending.exists():
-                raise PipelineError("draft_review has no pending write manifest to approve.")
+                raise _errors.PipelineError("draft_review has no pending write manifest to approve.")
             approved = step_root / "approved_write_manifest.json"
             approved.write_text(pending.read_text(encoding="utf-8"), encoding="utf-8")
             approval = build_draft_approval(
@@ -6164,7 +6161,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             step_root = require_step_output_dir(run_dir, "merge_plan_review")
             pending = step_root / "pending_merge_plan.json"
             if not pending.exists():
-                raise PipelineError("merge_plan_review has no pending merge plan to approve.")
+                raise _errors.PipelineError("merge_plan_review has no pending merge plan to approve.")
             digest = read_model(require_step_output_dir(run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
             resolution = read_model(
                 require_step_output_dir(run_dir, "candidate_resolution") / "candidate_resolution.json",
@@ -6176,7 +6173,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             plan = finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_path.relative_to(run_dir).as_posix())
             validate_wiki_merge_plan(digest, plan, resolution, snapshot, language=manifest.vault_config_snapshot.wiki_language)
             if any(item.action == "needs_human_decision" for item in plan.items):
-                raise PipelineError("needs_human_decision must be revised to create/update/noop before approval.")
+                raise _errors.PipelineError("needs_human_decision must be revised to create/update/noop before approval.")
             approved = step_root / "approved_merge_plan.json"
             write_json(approved, plan)
             decision = ReviewDecision(
@@ -6202,7 +6199,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
             write_manifest(store.manifest_path(operation_id), manifest)
             refresh_run_metrics(vault, run_dir, manifest)
             return manifest
-        raise PipelineError(f"Unsupported review step: {review_step}")
+        raise _errors.PipelineError(f"Unsupported review step: {review_step}")
 
 
 def revise_review(vault: Path, operation_id: str, review_step: str) -> OperationManifest:
@@ -6221,7 +6218,7 @@ def revise_review(vault: Path, operation_id: str, review_step: str) -> Operation
             delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
             mark_from_pending(manifest, "draft_rendering")
         else:
-            raise PipelineError(f"Unsupported review step: {review_step}")
+            raise _errors.PipelineError(f"Unsupported review step: {review_step}")
         manifest.status = OperationStatus.running
         write_manifest(store.manifest_path(operation_id), manifest)
         refresh_run_metrics(vault, run_dir, manifest)
@@ -6271,17 +6268,17 @@ def require_upstream_artifacts_current(vault: Path, run_dir: Path, manifest: Ope
     if issues:
         preview = "; ".join(issues[:8])
         suffix = "" if len(issues) <= 8 else f"; ... and {len(issues) - 8} more"
-        raise PipelineError(f"upstream required artifacts changed before review: {preview}{suffix}")
+        raise _errors.PipelineError(f"upstream required artifacts changed before review: {preview}{suffix}")
 
 
 def _require_review_step_awaiting(manifest: OperationManifest, review_step: str) -> None:
     if manifest.status in {OperationStatus.applied, OperationStatus.source_recorded}:
-        raise PipelineError("Applied operations are immutable. Start a new operation instead.")
+        raise _errors.PipelineError("Applied operations are immutable. Start a new operation instead.")
     if manifest.status == OperationStatus.apply_failed:
-        raise PipelineError("apply_failed operations cannot be reviewed; inspect written targets and rerun ingest.")
+        raise _errors.PipelineError("apply_failed operations cannot be reviewed; inspect written targets and rerun ingest.")
     step = get_step(manifest, review_step)
     if step.status != StepStatus.awaiting_review:
-        raise PipelineError(f"{review_step} is not awaiting_review; current status is {step.status.value}.")
+        raise _errors.PipelineError(f"{review_step} is not awaiting_review; current status is {step.status.value}.")
 
 
 def latest_operation(vault: Path) -> str | None:
@@ -6412,7 +6409,7 @@ def require_m42_draft_sidecars(run_dir: Path) -> None:
     if missing:
         preview = ", ".join(f"`{path}`" for path in missing[:6])
         suffix = "" if len(missing) <= 6 else f", ... and {len(missing) - 6} more"
-        raise PipelineError(
+        raise _errors.PipelineError(
             "M4.2 draft sidecar artifacts are missing; resume from draft_rendering or earlier before approve/apply: "
             f"{preview}{suffix}"
         )
@@ -7020,7 +7017,7 @@ def build_wiki_context_snapshot(
             force_exact_backend=force_exact_backend,
         )
     except RetrievalError as exc:
-        raise PipelineError(str(exc)) from exc
+        raise _errors.PipelineError(str(exc)) from exc
     paths = {
         "wiki/index.md",
         "wiki/log.md",
@@ -7061,7 +7058,7 @@ def build_wiki_context_snapshot(
 def ensure_snapshot_within_limit(snapshot: WikiContextSnapshot, max_context_chars: int) -> None:
     total = sum(len(entry.content) for entry in snapshot.entries)
     if total > max_context_chars:
-        raise PipelineError(f"wiki_context_snapshot exceeds max_context_chars ({total} > {max_context_chars}); retry with a smaller vault or higher limit.")
+        raise _errors.PipelineError(f"wiki_context_snapshot exceeds max_context_chars ({total} > {max_context_chars}); retry with a smaller vault or higher limit.")
 
 
 def resolve_model_related_pages(
@@ -7262,7 +7259,7 @@ def finalize_wiki_merge_plan(
             typed_matches = [candidate for candidate in title_matches if candidate.page_type == item.page_type]
             resolution_item = (typed_matches or title_matches or [None])[0] if len(typed_matches or title_matches) == 1 else None
         if resolution_item is None:
-            raise PipelineError(f"wiki_merge_plan references unknown page_plan_id: {item.page_plan_id}")
+            raise _errors.PipelineError(f"wiki_merge_plan references unknown page_plan_id: {item.page_plan_id}")
         context_item = context_by_id.get(resolution_item.page_plan_id)
         inspected_paths = [hit.path for hit in context_item.hits] if context_item is not None else []
         strongest_hit = context_item.hits[0] if context_item is not None and context_item.hits else None
@@ -7293,7 +7290,7 @@ def finalize_wiki_merge_plan(
             canonical = normalize_model_wiki_target_path(resolution_item.candidate_target_path)
             matched_page = None
         if f"wiki/{canonical}" not in snapshot_paths:
-            raise PipelineError(f"wiki_merge_plan target is outside wiki_context_snapshot: wiki/{canonical}")
+            raise _errors.PipelineError(f"wiki_merge_plan target is outside wiki_context_snapshot: wiki/{canonical}")
         entry = snapshot_entry(snapshot, f"wiki/{canonical}")
         if action == "needs_human_decision":
             pass
@@ -7788,7 +7785,7 @@ def normalize_model_wiki_target_path(value: str) -> str:
 def ensure_wiki_context_current(vault: Path, snapshot: WikiContextSnapshot) -> None:
     messages = wiki_context_drift_messages(vault, snapshot)
     if messages:
-        raise PipelineError("; ".join(messages))
+        raise _errors.PipelineError("; ".join(messages))
 
 
 def render_merge_plan_markdown(plan: WikiMergePlanArtifact) -> str:
@@ -8337,7 +8334,7 @@ def snapshot_entry(snapshot: WikiContextSnapshot, path: str) -> WikiContextEntry
     for entry in snapshot.entries:
         if entry.path == path:
             return entry
-    raise PipelineError(f"snapshot missing path: {path}")
+    raise _errors.PipelineError(f"snapshot missing path: {path}")
 
 
 def draft_grounding_sections(page: DraftPageItem) -> list[tuple[str, str]]:
@@ -12265,7 +12262,7 @@ def build_apply_preview(vault: Path, run_dir: Path) -> ApplyPreview:
     draft_manifest = read_model(manifest_path, DraftWriteManifest)
     target_paths = [item.target_path for item in draft_manifest.targets]
     if len(target_paths) != len(set(target_paths)):
-        raise PipelineError("draft_write_manifest contains duplicate target_path values")
+        raise _errors.PipelineError("draft_write_manifest contains duplicate target_path values")
     targets: list[ApplyTarget] = []
     source_targets: list[str] = []
     log_targets: list[str] = []

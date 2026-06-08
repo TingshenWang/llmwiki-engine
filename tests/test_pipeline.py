@@ -24,6 +24,7 @@ from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
 from llmwiki_engine.manifest import read_manifest
+from llmwiki_engine.errors import PipelineError
 from llmwiki_engine.models import (
     CandidateResolutionArtifact,
     CandidateResolutionItem,
@@ -42,7 +43,6 @@ from llmwiki_engine.models import (
     WikiMergePlanArtifact,
 )
 from llmwiki_engine.pipeline import (
-    PipelineError,
     STEP_RUNNERS,
     _STEP_RUN_FUNCTIONS,
     build_index_rows,

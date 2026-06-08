@@ -11,6 +11,7 @@ from rich.table import Table
 
 from .apply import ApplyError, apply_operation
 from .eval import load_eval_report, run_eval
+from .errors import PipelineError
 from .events import format_duration
 from .io import read_json, read_jsonl, read_model
 from .models import (
@@ -23,7 +24,6 @@ from .models import (
     VerificationStatus,
 )
 from .pipeline import (
-    PipelineError,
     approve_review,
     init_vault,
     latest_operation,
