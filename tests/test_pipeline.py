@@ -14,10 +14,12 @@ from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
+import llmwiki_engine.draft_outputs as draft_outputs_module
 import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
 import llmwiki_engine.merge_reporting as merge_reporting_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.planning_payloads as planning_payloads_module
+import llmwiki_engine.related_pages as related_pages_module
 import llmwiki_engine.run_metrics as run_metrics_module
 import llmwiki_engine.source_digest_budget as source_digest_budget
 import llmwiki_engine.source_digest_payload as source_digest_payload_module
@@ -57,7 +59,6 @@ from llmwiki_engine.models import (
 from llmwiki_engine.pipeline import (
     STEP_RUNNERS,
     _STEP_RUN_FUNCTIONS,
-    build_index_rows,
     backfill_missing_candidate_resolution_items,
     build_wiki_context_snapshot,
     build_wiki_merge_plan,
@@ -697,6 +698,8 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "render_candidate_contexts_markdown")
     assert not hasattr(pipeline_module, "render_merge_decision_report")
     assert not hasattr(pipeline_module, "merge_plan_create_overlap_risk_items")
+    moved_pipeline_exports = {"FINAL_RELATED_LIMIT", "render_related_pages", "assemble_knowledge_page", "render_source_page", "build_index_rows", "render_update_merge_report", "render_related_merge_report", "render_update_diff"}
+    assert not any(hasattr(pipeline_module, name) for name in moved_pipeline_exports)
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -3577,7 +3580,7 @@ def test_related_renderer_filters_and_caps_candidates() -> None:
         reason="test",
     )
     report: list[pipeline_module.RelatedCandidateReport] = []
-    rendered = pipeline_module.render_related_pages(
+    rendered = related_pages_module.render_related_pages(
         item,
         existing_entry=pipeline_module.WikiContextEntry(
             path="wiki/concepts/Concept_Current.md",
@@ -3637,7 +3640,7 @@ def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> 
         reason="test",
     )
 
-    rendered = pipeline_module.render_related_pages(
+    rendered = related_pages_module.render_related_pages(
         item,
         known_paths={"concepts/Concept_A.md", "concepts/Concept_B.md", "concepts/Concept_C.md"},
     )
@@ -4693,7 +4696,7 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
-    related = pipeline_module.render_related_pages(
+    related = related_pages_module.render_related_pages(
         item,
         known_paths={"entities/Entity_Claude Code.md"},
     )
@@ -7176,7 +7179,7 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
     )
     profile = type("ProfileStub", (), {"page_types": {"concept": object()}})()
 
-    rows = build_index_rows(profile, plan, draft, snapshot)
+    rows = draft_outputs_module.build_index_rows(profile, plan, draft, snapshot)
 
     assert rows[0]["title"] == "旧标题"
     assert rows[0]["summary"] == "模型新摘要。"
@@ -7592,12 +7595,11 @@ def test_source_page_empty_unwritten_section_does_not_repeat_touched_pages() -> 
         post_cleanup_sha256="post",
     )
 
-    markdown = pipeline_module.render_source_page(
+    markdown = draft_outputs_module.render_source_page(
         title="Source sample",
         digest=digest,
         operation_id="ING-TEST",
         linked_pages=["concepts/Concept_A.md"],
-        touched_pages=["concepts/Concept_A.md"],
         no_change_pages=[],
         log_date="2026-06-06",
         raw_hash="raw-hash",
@@ -7645,12 +7647,11 @@ def test_source_page_unwritten_section_keeps_budget_deferred_candidates() -> Non
         post_cleanup_sha256="post",
     )
 
-    markdown = pipeline_module.render_source_page(
+    markdown = draft_outputs_module.render_source_page(
         title="Source sample",
         digest=digest,
         operation_id="ING-TEST",
         linked_pages=["concepts/Concept_A.md"],
-        touched_pages=["concepts/Concept_A.md"],
         no_change_pages=[],
         log_date="2026-06-06",
         raw_hash="raw-hash",
@@ -14764,7 +14765,7 @@ def test_source_type_plan_items_are_defensively_excluded_from_index_and_related(
     plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
     concept_item = [item for item in plan.items if "CAND001" in item.source_basis.source_candidate_ids][0]
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
-    rows = build_index_rows(profile, plan, DraftRenderingArtifact(pages=[]), snapshot)
+    rows = draft_outputs_module.build_index_rows(profile, plan, DraftRenderingArtifact(pages=[]), snapshot)
 
     assert concept_item.related_pages == []
     assert "CAND_SOURCE" in concept_item.related_unresolved
