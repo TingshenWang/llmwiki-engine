@@ -630,80 +630,45 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(retrieval_module, "parse_frontmatter")
     assert not hasattr(source_records_module, "frontmatter_list")
     assert not hasattr(source_records_module, "parse_frontmatter")
-    assert not hasattr(pipeline_module, "parse_frontmatter")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_GROUNDING_RISK_RULES")
-    assert not hasattr(pipeline_module, "build_draft_grounding_review")
-    assert not hasattr(pipeline_module, "quote_supported_by_text")
-    assert not hasattr(pipeline_module, "render_draft_grounding_review")
-    assert not hasattr(pipeline_module, "augment_source_digest_anchor_entities")
-    assert not hasattr(pipeline_module, "cap_source_digest_candidates")
-    assert not hasattr(pipeline_module, "render_source_digest_budget_report")
-    assert not hasattr(pipeline_module, "build_source_digest_source_map")
-    assert not hasattr(pipeline_module, "project_source_digest_source_map_for_payload")
-    assert not hasattr(pipeline_module, "build_source_kind_hints")
-    assert not hasattr(pipeline_module, "source_digest_language_contract")
-    assert not hasattr(pipeline_module, "render_source_digest_source_map_markdown")
-    assert not hasattr(pipeline_module, "render_source_kind_hints_markdown")
-    assert not hasattr(pipeline_module, "build_source_digest_payload")
-    assert not hasattr(pipeline_module, "SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT")
-    assert not hasattr(pipeline_module, "PAPER_CAPTION_RE")
-    assert not hasattr(pipeline_module, "render_source_digest_markdown")
-    assert not hasattr(pipeline_module, "render_candidate_table")
-    assert not hasattr(pipeline_module, "build_candidate_resolution_source_pack")
-    assert not hasattr(pipeline_module, "render_candidate_resolution_source_pack_markdown")
-    assert not hasattr(pipeline_module, "build_merge_planning_context_pack")
-    assert not hasattr(pipeline_module, "build_merge_planning_source_pack")
-    assert not hasattr(pipeline_module, "compact_candidate_contexts_for_merge_planning")
-    assert not hasattr(pipeline_module, "merge_planning_hit_excerpt_limit")
-    assert not hasattr(pipeline_module, "merge_planning_relevant_wiki_paths")
-    assert not hasattr(pipeline_module, "compact_snapshot_for_merge_planning")
-    assert not hasattr(pipeline_module, "merge_planning_payload_pack_summary")
-    assert not hasattr(pipeline_module, "render_merge_planning_context_pack_markdown")
-    assert not hasattr(pipeline_module, "json_char_count")
-    assert not hasattr(pipeline_module, "CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT")
-    assert not hasattr(pipeline_module, "CANDIDATE_RESOLUTION_GLOBAL_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "CANDIDATE_RESOLUTION_PER_CANDIDATE_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_CONTEXT_QUERY_LIMIT")
-    assert not hasattr(pipeline_module, "MERGE_PLANNING_ENTRY_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "source_basis_candidate_refs")
-    assert not hasattr(pipeline_module, "source_digest_candidate_lookup")
-    assert not hasattr(pipeline_module, "source_digest_candidate_id_closure")
-    assert not hasattr(pipeline_module, "first_source_basis_candidate")
-    assert not hasattr(pipeline_module, "build_draft_source_excerpt_pack")
-    assert not hasattr(pipeline_module, "render_draft_source_excerpt_pack_markdown")
-    assert not hasattr(pipeline_module, "build_draft_rendering_payload")
-    assert not hasattr(pipeline_module, "project_merge_plan_for_draft_rendering")
-    assert not hasattr(pipeline_module, "project_merge_plan_item_for_draft_rendering")
-    assert not hasattr(pipeline_module, "draft_rendering_relevant_wiki_paths")
-    assert not hasattr(pipeline_module, "should_include_draft_inspected_context")
-    assert not hasattr(pipeline_module, "normalize_wiki_snapshot_path")
-    assert not hasattr(pipeline_module, "compact_snapshot_for_draft_rendering")
-    assert not hasattr(pipeline_module, "compact_optional_dict")
-    assert not hasattr(pipeline_module, "project_source_digest_for_merge_plan")
-    assert not hasattr(pipeline_module, "source_digest_candidate_ids_for_merge_plan")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_TOTAL_CHAR_LIMIT")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_PER_PAGE_LIMIT")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_GLOBAL_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS")
-    assert not hasattr(pipeline_module, "DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT")
-    assert not hasattr(pipeline_module, "render_merge_planning_shortcut_report")
-    assert not hasattr(pipeline_module, "render_merge_plan_markdown")
-    assert not hasattr(pipeline_module, "render_merge_plan_review_prompt")
-    assert not hasattr(pipeline_module, "render_candidate_contexts_markdown")
-    assert not hasattr(pipeline_module, "render_merge_decision_report")
-    assert not hasattr(pipeline_module, "merge_plan_create_overlap_risk_items")
-    moved_pipeline_exports = {"FINAL_RELATED_LIMIT", "render_related_pages", "assemble_knowledge_page", "render_source_page", "build_index_rows", "render_update_merge_report", "render_related_merge_report", "render_update_diff"}
-    assert not any(hasattr(pipeline_module, name) for name in moved_pipeline_exports)
-    moved_review_exports = {"build_draft_approval", "render_draft_review_prompt", "draft_review_reason", "draft_review_requires_manual", "update_manual_resolution_count", "update_reinforcement_count", "update_reinforcement_report_ref", "draft_diff_ref", "draft_change_summary", "build_apply_preview"}
-    assert not any(hasattr(pipeline_module, name) for name in moved_review_exports)
+    moved_pipeline_exports = {
+        "parse_frontmatter", "DRAFT_RENDERING_GROUNDING_RISK_RULES", "build_draft_grounding_review",
+        "quote_supported_by_text", "render_draft_grounding_review", "augment_source_digest_anchor_entities",
+        "cap_source_digest_candidates", "render_source_digest_budget_report", "build_source_digest_source_map",
+        "project_source_digest_source_map_for_payload", "build_source_kind_hints", "source_digest_language_contract",
+        "render_source_digest_source_map_markdown", "render_source_kind_hints_markdown", "build_source_digest_payload",
+        "SOURCE_DIGEST_FULL_SOURCE_CHAR_LIMIT", "PAPER_CAPTION_RE", "render_source_digest_markdown", "render_candidate_table",
+        "build_candidate_resolution_source_pack", "render_candidate_resolution_source_pack_markdown",
+        "build_merge_planning_context_pack", "build_merge_planning_source_pack", "compact_candidate_contexts_for_merge_planning",
+        "merge_planning_hit_excerpt_limit", "merge_planning_relevant_wiki_paths", "compact_snapshot_for_merge_planning",
+        "merge_planning_payload_pack_summary", "render_merge_planning_context_pack_markdown", "json_char_count",
+        "CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT", "CANDIDATE_RESOLUTION_GLOBAL_EXCERPT_LIMIT",
+        "CANDIDATE_RESOLUTION_PER_CANDIDATE_EXCERPT_LIMIT", "MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT",
+        "MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT", "MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT",
+        "MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT", "MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT",
+        "MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK", "MERGE_PLANNING_CONTEXT_QUERY_LIMIT",
+        "MERGE_PLANNING_ENTRY_EXCERPT_LIMIT", "source_basis_candidate_refs", "source_digest_candidate_lookup",
+        "source_digest_candidate_id_closure", "first_source_basis_candidate", "build_draft_source_excerpt_pack",
+        "render_draft_source_excerpt_pack_markdown", "build_draft_rendering_payload", "project_merge_plan_for_draft_rendering",
+        "project_merge_plan_item_for_draft_rendering", "draft_rendering_relevant_wiki_paths",
+        "should_include_draft_inspected_context", "normalize_wiki_snapshot_path", "compact_snapshot_for_draft_rendering",
+        "compact_optional_dict", "project_source_digest_for_merge_plan", "source_digest_candidate_ids_for_merge_plan",
+        "DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT", "DRAFT_RENDERING_EXCERPT_TOTAL_CHAR_LIMIT",
+        "DRAFT_RENDERING_EXCERPT_PER_PAGE_LIMIT", "DRAFT_RENDERING_GLOBAL_EXCERPT_LIMIT",
+        "DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO", "DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS",
+        "DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT", "render_merge_planning_shortcut_report",
+        "render_merge_plan_markdown", "render_merge_plan_review_prompt", "render_candidate_contexts_markdown",
+        "render_merge_decision_report", "merge_plan_create_overlap_risk_items", "FINAL_RELATED_LIMIT",
+        "render_related_pages", "assemble_knowledge_page", "render_source_page", "build_index_rows",
+        "render_update_merge_report", "render_related_merge_report", "render_update_diff", "build_draft_approval",
+        "render_draft_review_prompt", "draft_review_reason", "draft_review_requires_manual",
+        "update_manual_resolution_count", "update_reinforcement_count", "update_reinforcement_report_ref",
+        "draft_diff_ref", "draft_change_summary", "build_apply_preview", "merge_plan_all_create_review_reason",
+        "MAX_AUTO_APPROVED_ALL_CREATE_ITEMS", "LOCAL_MEDIUM_CREATE_REASON_MARKER", "merge_same_source_duplicate_creates",
+        "merge_update_noop_same_targets", "normalize_model_wiki_target_path", "synthesize_medium_create_why_not_update",
+        "medium_create_generic_old_title_review_reason",
+    }
+    leaked = sorted(name for name in moved_pipeline_exports if hasattr(pipeline_module, name))
+    assert leaked == []
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
