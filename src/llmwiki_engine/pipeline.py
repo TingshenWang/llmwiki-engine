@@ -415,7 +415,8 @@ def resume_ingest(
         validate_raw_link_cleanup_resume(run_dir=store.run_dir(operation_id), manifest=manifest, start=start)
         validate_resume_start(manifest, start)
         ensure_wiki_context_current_before_resume(vault, store.run_dir(operation_id), start)
-        model_steps = model_steps_from(start)
+        resumable_step_names = set(downstream_steps(start))
+        model_steps = [step for step in MODEL_BACKED_STEPS if step in resumable_step_names]
         if "raw_prepare" in model_steps:
             model_steps = model_steps_for_raw_prepare_policy(
                 model_steps,
@@ -5603,11 +5604,6 @@ def resolve_vault_profile_name(vault: Path, profile_name: str | None) -> str:
     return configured
 
 
-def model_steps_from(start_step: str) -> list[str]:
-    names = set(downstream_steps(start_step))
-    return [step for step in MODEL_BACKED_STEPS if step in names]
-
-
 def _structured_call(
     run_dir: Path,
     execution_context: ProviderExecutionContext,
@@ -5748,7 +5744,8 @@ def build_run_metrics(vault: Path, run_dir: Path, manifest: OperationManifest) -
     for step in manifest.steps:
         durations = [attempt.duration_ms for attempt in step.attempts if attempt.duration_ms is not None]
         total = sum(durations)
-        provider = step_provider_label(step.name, step.attempts[-1].provider_spec if step.attempts else None)
+        provider_spec = step.attempts[-1].provider_spec if step.attempts else None
+        provider = provider_spec or ("local:auto_review" if step.name.endswith("_review") else "local")
         retry_count += max(0, len(step.attempts) - 1)
         repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=False)
         total_repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=True)
@@ -6085,14 +6082,6 @@ def provider_results_json_repair_count(paths: list[Path]) -> int:
         if data.get("json_repair_applied"):
             total += 1
     return total
-
-
-def step_provider_label(step_name: str, provider_spec: str | None) -> str:
-    if provider_spec:
-        return provider_spec
-    if step_name.endswith("_review"):
-        return "local:auto_review"
-    return "local"
 
 
 def awaiting_review_duration_ms(step: Any) -> int | None:
@@ -7546,7 +7535,7 @@ def merge_same_source_duplicate_creates(items: list[WikiMergePlanItem]) -> list[
                     continue
                 if not same_source_duplicate_create(left, right):
                     continue
-                canonical, suppressed = choose_duplicate_canonical(left, right)
+                canonical, suppressed = sorted([left, right], key=duplicate_canonical_rank)
                 merged = absorb_duplicate_create(canonical, suppressed)
                 suppressed_path = _wiki_markup.normalize_related_candidate_path(suppressed.canonical_target_path)
                 canonical_path = _wiki_markup.normalize_related_candidate_path(merged.canonical_target_path)
@@ -7686,11 +7675,6 @@ def duplicate_shape_conflict(left: WikiMergePlanItem, right: WikiMergePlanItem) 
         right_tokens = duplicate_tokens(right.display_title)
         return jaccard(left_tokens, right_tokens) < 0.9
     return len(pair) > 1
-
-
-def choose_duplicate_canonical(left: WikiMergePlanItem, right: WikiMergePlanItem) -> tuple[WikiMergePlanItem, WikiMergePlanItem]:
-    ranked = sorted([left, right], key=duplicate_canonical_rank)
-    return ranked[0], ranked[1]
 
 
 def duplicate_canonical_rank(item: WikiMergePlanItem) -> tuple[int, int, str]:
@@ -7861,7 +7845,8 @@ def merge_plan_all_create_review_reason(
         if item.strongest_overlap.strength == "medium"
         and (
             create_reason_needs_repair(item.why_not_update)
-            or medium_create_reason_was_locally_synthesized(item)
+            or item.why_not_update.startswith("本地补充：")
+            or LOCAL_MEDIUM_CREATE_REASON_MARKER in item.finalization_reason
             or medium_create_generic_old_title_review_reason(item)
         )
     ]
@@ -7875,16 +7860,14 @@ def merge_plan_auto_create_review_limit(configured_candidate_budget: int) -> int
     return min(configured_candidate_budget, MAX_AUTO_APPROVED_ALL_CREATE_ITEMS)
 
 
-def medium_create_reason_was_locally_synthesized(item: WikiMergePlanItem) -> bool:
-    return item.why_not_update.startswith("本地补充：") or LOCAL_MEDIUM_CREATE_REASON_MARKER in item.finalization_reason
-
-
 def medium_create_generic_old_title_review_reason(item: WikiMergePlanItem, *, old_display_title: str = "") -> str:
     if item.action != "create" or item.strongest_overlap.strength != "medium" or not item.strongest_overlap.path:
         return ""
     if create_reason_needs_repair(item.why_not_update):
         return ""
-    old_label = merge_overlap_old_label(item, old_display_title=old_display_title)
+    old_path = item.strongest_overlap.path
+    old_path_stem = _wiki_markup.clean_display_title(Path(old_path).stem) if old_path else ""
+    old_label = " ".join(part for part in [old_display_title.strip(), old_path, old_path_stem] if part)
     new_label = f"{item.display_title} {item.canonical_target_path}"
     if not merge_titles_share_specific_concept_terms(new_label, old_label):
         return ""
@@ -7898,12 +7881,6 @@ def medium_create_generic_old_title_review_reason(item: WikiMergePlanItem, *, ol
         "但模型选择 create 的理由把旧页归为具体平台/产品/实现或把新页归为通用概念；"
         "需要人工确认是否应 update 到已有知识页，或是否真的需要拆成独立页面。"
     )
-
-
-def merge_overlap_old_label(item: WikiMergePlanItem, *, old_display_title: str = "") -> str:
-    path = item.strongest_overlap.path
-    path_stem = _wiki_markup.clean_display_title(Path(path).stem) if path else ""
-    return " ".join(part for part in [old_display_title.strip(), path, path_stem] if part)
 
 
 def merge_titles_share_specific_concept_terms(new_label: str, old_label: str) -> bool:
