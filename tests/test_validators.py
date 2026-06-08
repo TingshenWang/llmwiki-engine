@@ -8,7 +8,6 @@ from llmwiki_engine.models import (
     SourceDigestArtifact,
     SourceDigestCandidate,
     WeakOrNoiseItem,
-    WikiContextSnapshot,
     WikiMergePlanArtifact,
     WikiMergePlanItem,
 )

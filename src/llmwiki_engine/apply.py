@@ -19,7 +19,6 @@ from .models import (
     OperationStatus,
     RawLinkCleanupArtifact,
     SourceDigestArtifact,
-    StepStatus,
     WikiContextSnapshot,
     utc_now,
 )

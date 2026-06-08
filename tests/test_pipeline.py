@@ -51,7 +51,7 @@ from llmwiki_engine.pipeline import (
     revise_review,
     status,
 )
-from llmwiki_engine.providers import MockProvider, OpenAICompatibleProvider
+from llmwiki_engine.providers import OpenAICompatibleProvider
 from llmwiki_engine.steps import (
     EVAL_MODULES,
     MODEL_BACKED_STEPS,

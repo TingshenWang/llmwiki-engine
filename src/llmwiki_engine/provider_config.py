@@ -16,7 +16,7 @@ from .providers import (
     ProviderRegistry,
 )
 from .redaction import Redactor
-from .steps import MODEL_BACKED_STEPS, PROVIDER_CONFIG_KEYS
+from .steps import PROVIDER_CONFIG_KEYS
 
 
 class ProviderConfigError(RuntimeError):
