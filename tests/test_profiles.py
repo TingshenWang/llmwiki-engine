@@ -76,12 +76,12 @@ page_types:
         load_profile(profile_path)
 
 
-def test_custom_profile_rejects_old_version(tmp_path: Path) -> None:
+def test_custom_profile_requires_current_version(tmp_path: Path) -> None:
     profile_path = tmp_path / "profile.yaml"
     profile_path.write_text(
         """
 name: custom
-version: "1"
+version: unsupported
 default_page_type: note
 source_page_type: source
 page_types:

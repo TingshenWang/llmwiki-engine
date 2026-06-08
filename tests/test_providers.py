@@ -549,11 +549,12 @@ def test_structured_model_call_repairs_control_chars_and_missing_string_quote_lo
     assert report["repair_count"] == 0
 
 
-def test_structured_model_call_rejects_common_field_alias(tmp_path: Path) -> None:
+def test_structured_model_call_rejects_missing_required_and_extra_field(tmp_path: Path) -> None:
     fixture_dir = tmp_path / "mock"
     fixture_dir.mkdir()
     data = json.loads((FIXTURE / "source_digest.json").read_text(encoding="utf-8"))
-    data["designs"][0]["why_matches"] = data["designs"][0].pop("why_matters")
+    data["designs"][0].pop("why_matters")
+    data["designs"][0]["unexpected_reason_field"] = "This field is not part of the current contract."
     (fixture_dir / "source_digest.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     provider = ProviderRegistry().create("mock:fixture", fixture_dir=fixture_dir)
 
@@ -570,7 +571,7 @@ def test_structured_model_call_rejects_common_field_alias(tmp_path: Path) -> Non
     assert report["final_outcome"] == "failed"
     issue_paths = [issue["field_path"] for issue in report["attempts"][0]["issues"]]
     assert "designs.0.why_matters" in issue_paths
-    assert "designs.0.why_matches" in issue_paths
+    assert "designs.0.unexpected_reason_field" in issue_paths
     attempt = json.loads((tmp_path / "provider_results" / "attempt-1.json").read_text(encoding="utf-8"))
     assert attempt["schema_valid"] is False
     assert attempt["json_repair_applied"] is False

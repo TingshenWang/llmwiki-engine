@@ -127,7 +127,7 @@ def test_source_digest_accepts_current_weak_noise_fields() -> None:
     assert "ignore" not in weak_section
 
 
-def test_source_digest_rejects_why_matches_alias() -> None:
+def test_source_digest_rejects_unexpected_candidate_field() -> None:
     data = _digest().model_dump(mode="json")
     data["weak_or_noise_items"] = [
         {
@@ -135,12 +135,12 @@ def test_source_digest_rejects_why_matches_alias() -> None:
             "name": "Lightweight aside",
             "type": "noise",
             "one_sentence_summary": "An aside that should not become a wiki page.",
-            "why_matches": "旧字段不再兼容。",
+            "unexpected_reason_field": "This field is not part of the current contract.",
             "suggested_action": "ignore",
         }
     ]
 
-    with pytest.raises(Exception, match="why_matches"):
+    with pytest.raises(Exception, match="unexpected_reason_field"):
         SourceDigestArtifact.model_validate(data)
 
 
