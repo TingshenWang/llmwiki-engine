@@ -1725,11 +1725,11 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert metrics["steps"][0]["provider"] == "local"
     assert metrics["current_attempt_duration_ms"] >= metrics["steps"][0]["last_duration_ms"]
     assert metrics["current_model_duration_ms"] >= 0
-    assert metrics["archived_model_duration_ms"] == 0
-    assert metrics["total_model_duration_ms"] == metrics["current_model_duration_ms"]
     assert metrics["internal_model_payload_char_count"] > 0
-    assert metrics["archived_internal_model_payload_char_count"] == 0
-    assert metrics["total_internal_model_payload_char_count"] == metrics["internal_model_payload_char_count"]
+    assert "archived_model_duration_ms" not in metrics
+    assert "total_model_duration_ms" not in metrics
+    assert "archived_internal_model_payload_char_count" not in metrics
+    assert "total_internal_model_payload_char_count" not in metrics
     assert metrics["payload_by_step"]
     assert metrics["largest_payload_step"]
     assert metrics["largest_payload_char_count"] > 0
@@ -3176,28 +3176,26 @@ def test_resume_from_deletes_downstream_step_dirs(tmp_path: Path) -> None:
     assert digest_step.attempts[0].outputs
     assert digest_step.attempts[0].completed_at is not None
     assert digest_step.attempts[0].duration_ms is not None
-    assert list((run_dir / "attempt_archive" / "source_digest").glob("*"))
+    assert not (run_dir / "attempt_archive").exists()
     assert digest_step.attempts[-1].outputs
     metrics = read_json(run_dir / "run_metrics.json")
     assert metrics["internal_model_call_count"] == 5
-    assert metrics["archived_internal_model_call_count"] == 4
-    assert metrics["total_internal_model_call_count"] == 9
     assert metrics["current_attempt_duration_ms"] >= 0
     assert metrics["current_model_duration_ms"] >= 0
-    assert metrics["archived_model_duration_ms"] >= 0
-    assert metrics["total_model_duration_ms"] == metrics["current_model_duration_ms"] + metrics["archived_model_duration_ms"]
     assert metrics["internal_model_payload_char_count"] > 0
-    assert metrics["archived_internal_model_payload_char_count"] > 0
-    assert metrics["total_internal_model_payload_char_count"] == (
-        metrics["internal_model_payload_char_count"] + metrics["archived_internal_model_payload_char_count"]
-    )
+    assert "archived_internal_model_call_count" not in metrics
+    assert "total_internal_model_call_count" not in metrics
+    assert "archived_model_duration_ms" not in metrics
+    assert "total_model_duration_ms" not in metrics
+    assert "archived_internal_model_payload_char_count" not in metrics
+    assert "total_internal_model_payload_char_count" not in metrics
     digest_metrics = [step for step in metrics["steps"] if step["name"] == "source_digest"][0]
     assert digest_metrics["internal_model_call_count"] == 1
-    assert digest_metrics["archived_internal_model_call_count"] == 1
-    assert digest_metrics["total_internal_model_call_count"] == 2
     assert digest_metrics["payload_char_count"] > 0
-    assert digest_metrics["archived_payload_char_count"] > 0
-    assert digest_metrics["total_payload_char_count"] == digest_metrics["payload_char_count"] + digest_metrics["archived_payload_char_count"]
+    assert "archived_internal_model_call_count" not in digest_metrics
+    assert "total_internal_model_call_count" not in digest_metrics
+    assert "archived_payload_char_count" not in digest_metrics
+    assert "total_payload_char_count" not in digest_metrics
 
 
 def test_resume_can_force_mock_fixture_over_live_config(tmp_path: Path) -> None:
@@ -3228,7 +3226,7 @@ def test_resume_can_force_mock_fixture_over_live_config(tmp_path: Path) -> None:
     assert context.providers["draft_rendering"].fixture_dir == (FIXTURE_ROOT / "mock").resolve().as_posix()
 
 
-def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts(tmp_path: Path) -> None:
+def test_step_repair_metrics_uses_per_step_attempts_for_current_provider_counts(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
 
     def write_report(step_dir: Path, attempt_count: int) -> None:
@@ -3271,21 +3269,14 @@ def test_step_repair_metrics_uses_per_step_attempts_for_archived_provider_counts
 
     write_report(run_dir / "draft_rendering", 2)
     write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000001Z" / "draft_rendering", 4)
-    write_report(run_dir / "attempt_archive" / "draft_rendering" / "2026-06-06T000002Z" / "draft_rendering", 3)
 
-    current = run_metrics_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=False)
-    total = run_metrics_module.step_repair_metrics(run_dir, "draft_rendering", include_archived=True)
+    current = run_metrics_module.step_repair_metrics(run_dir, "draft_rendering")
 
     assert current["attempt_count"] == 2
     assert current["provider_result_count"] == 2
     assert current["http_attempt_count"] == 5
     assert current["payload_char_count"] == 300
     assert current["json_repair_count"] == 1
-    assert total["attempt_count"] == 9
-    assert total["provider_result_count"] == 9
-    assert total["http_attempt_count"] == 28
-    assert total["payload_char_count"] == 1900
-    assert total["json_repair_count"] == 4
 
 
 def test_resume_invalid_provider_config_does_not_delete_outputs(tmp_path: Path) -> None:
@@ -13211,9 +13202,9 @@ def test_review_approval_rejects_upstream_artifact_replaced_by_directory(tmp_pat
         approve_review(vault, manifest.operation_id, "merge_plan_review")
 
 
-def test_revise_review_archives_pending_artifacts_before_reset(tmp_path: Path) -> None:
+def test_revise_review_deletes_pending_artifacts_before_reset(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    fixture_dir = tmp_path / "needs-human-archive-fixture"
+    fixture_dir = tmp_path / "needs-human-revise-fixture"
     fixture_dir.mkdir()
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
         data = read_json(FIXTURE_ROOT / "mock" / name)
@@ -13223,17 +13214,13 @@ def test_revise_review_archives_pending_artifacts_before_reset(tmp_path: Path) -
             data["items"][0]["blocked_reason"] = "需要人工决定是否创建。"
         write_json(fixture_dir / name, data)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="review-archive")
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=fixture_dir, slug="review-revise")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
 
     revised = revise_review(vault, manifest.operation_id, "merge_plan_review")
-    archives = list((run_dir / "review_archive" / "merge_plan_review").glob("*"))
 
     assert revised.status == OperationStatus.running
-    assert archives
-    assert (archives[0] / "pending_merge_plan.json").exists()
-    superseded = read_json(archives[0] / "superseded.json")
-    assert superseded["schema_version"] == "review_superseded.v1"
+    assert not (run_dir / "review_archive").exists()
     assert not (run_dir / "merge_plan_review").exists()
     assert not (run_dir / "wiki_merge_planning").exists()
 

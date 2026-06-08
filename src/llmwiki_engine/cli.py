@@ -742,18 +742,6 @@ def _print_metrics_summary(vault: Path, manifest: OperationManifest) -> None:
         largest_chars = int(metrics.get("largest_payload_char_count", 0) or 0)
         if largest_step and largest_chars:
             summary += f"; largest_payload_step={largest_step} ({largest_chars:,})"
-    archived_calls = metrics.get("archived_internal_model_call_count", 0)
-    archived_duration = metrics.get("archived_model_duration_ms", 0)
-    archived_payload_chars = int(metrics.get("archived_internal_model_payload_char_count", 0) or 0)
-    if archived_calls or archived_duration:
-        summary += (
-            f"; archived_model_calls={archived_calls}; "
-            f"archived_model_duration={format_duration(archived_duration)}; "
-            f"total_model_calls={metrics.get('total_internal_model_call_count', archived_calls)}; "
-            f"total_model_duration={format_duration(metrics.get('total_model_duration_ms'))}"
-        )
-        if archived_payload_chars or payload_chars:
-            summary += f"; total_payload_chars={int(metrics.get('total_internal_model_payload_char_count', payload_chars + archived_payload_chars) or 0):,}"
     if "candidate_selected_count" in metrics:
         summary += (
             f"; candidates={metrics.get('candidate_selected_count', 0)}/"

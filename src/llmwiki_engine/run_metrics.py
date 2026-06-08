@@ -35,18 +35,14 @@ def build_run_metrics(run_dir: Path, manifest: OperationManifest) -> dict[str, A
     model_durations: dict[str, int] = {}
     retry_count = 0
     current_totals = _empty_repair_metrics()
-    archived_totals = _empty_repair_metrics()
     for step in manifest.steps:
         durations = [attempt.duration_ms for attempt in step.attempts if attempt.duration_ms is not None]
         total = sum(durations)
         provider_spec = step.attempts[-1].provider_spec if step.attempts else None
         provider = provider_spec or ("local:auto_review" if step.name.endswith("_review") else "local")
         retry_count += max(0, len(step.attempts) - 1)
-        repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=False)
-        total_repair_metrics = step_repair_metrics(run_dir, step.name, include_archived=True)
-        archived_repair_metrics = subtract_repair_metrics(total_repair_metrics, repair_metrics)
+        repair_metrics = step_repair_metrics(run_dir, step.name)
         _add_repair_metrics(current_totals, repair_metrics)
-        _add_repair_metrics(archived_totals, archived_repair_metrics)
         row = {
             "name": step.name,
             "status": step.status.value,
@@ -63,21 +59,6 @@ def build_run_metrics(run_dir: Path, manifest: OperationManifest) -> dict[str, A
             row["provider_result_count"] = repair_metrics["provider_result_count"]
             row["http_attempt_count"] = repair_metrics["http_attempt_count"]
             row["payload_char_count"] = repair_metrics["payload_char_count"]
-        if archived_repair_metrics["attempt_count"]:
-            row["archived_internal_model_call_count"] = archived_repair_metrics["attempt_count"]
-            row["archived_repair_count"] = archived_repair_metrics["repair_count"]
-            row["archived_local_json_repair_count"] = archived_repair_metrics["json_repair_count"]
-            row["archived_repair_duration_ms"] = archived_repair_metrics["duration_ms"]
-            row["archived_provider_result_count"] = archived_repair_metrics["provider_result_count"]
-            row["archived_http_attempt_count"] = archived_repair_metrics["http_attempt_count"]
-            row["archived_payload_char_count"] = archived_repair_metrics["payload_char_count"]
-            row["total_internal_model_call_count"] = total_repair_metrics["attempt_count"]
-            row["total_repair_count"] = total_repair_metrics["repair_count"]
-            row["total_local_json_repair_count"] = total_repair_metrics["json_repair_count"]
-            row["total_repair_duration_ms"] = total_repair_metrics["duration_ms"]
-            row["total_provider_result_count"] = total_repair_metrics["provider_result_count"]
-            row["total_http_attempt_count"] = total_repair_metrics["http_attempt_count"]
-            row["total_payload_char_count"] = total_repair_metrics["payload_char_count"]
         shortcut_report = run_dir / step.name / "merge_planning_shortcut_report.json"
         if shortcut_report.exists():
             try:
@@ -130,7 +111,6 @@ def build_run_metrics(run_dir: Path, manifest: OperationManifest) -> dict[str, A
         written_target_count = len([target for target in preview.targets if target.will_write])
     current_attempt_duration_ms = sum(int(row.get("total_duration_ms") or 0) for row in steps)
     current_model_duration_ms = current_totals["duration_ms"]
-    archived_model_duration_ms = archived_totals["duration_ms"]
     budget_metrics = source_digest_budget_metrics(run_dir)
     return {
         "schema_version": "run_metrics.v1",
@@ -140,8 +120,6 @@ def build_run_metrics(run_dir: Path, manifest: OperationManifest) -> dict[str, A
         "model_durations_ms": model_durations,
         "current_attempt_duration_ms": current_attempt_duration_ms,
         "current_model_duration_ms": current_model_duration_ms,
-        "archived_model_duration_ms": archived_model_duration_ms,
-        "total_model_duration_ms": current_model_duration_ms + archived_model_duration_ms,
         "retry_count": retry_count,
         "internal_model_call_count": current_totals["attempt_count"],
         "repair_count": current_totals["repair_count"],
@@ -153,20 +131,6 @@ def build_run_metrics(run_dir: Path, manifest: OperationManifest) -> dict[str, A
         "payload_by_step": payload_steps,
         "largest_payload_step": largest_payload["name"] if largest_payload else "",
         "largest_payload_char_count": largest_payload["payload_char_count"] if largest_payload else 0,
-        "archived_internal_model_call_count": archived_totals["attempt_count"],
-        "archived_repair_count": archived_totals["repair_count"],
-        "archived_local_json_repair_count": archived_totals["json_repair_count"],
-        "archived_repair_duration_ms": archived_totals["duration_ms"],
-        "archived_provider_result_count": archived_totals["provider_result_count"],
-        "archived_http_attempt_count": archived_totals["http_attempt_count"],
-        "archived_internal_model_payload_char_count": archived_totals["payload_char_count"],
-        "total_internal_model_call_count": current_totals["attempt_count"] + archived_totals["attempt_count"],
-        "total_repair_count": current_totals["repair_count"] + archived_totals["repair_count"],
-        "total_local_json_repair_count": current_totals["json_repair_count"] + archived_totals["json_repair_count"],
-        "total_repair_duration_ms": current_totals["duration_ms"] + archived_totals["duration_ms"],
-        "total_provider_result_count": current_totals["provider_result_count"] + archived_totals["provider_result_count"],
-        "total_http_attempt_count": current_totals["http_attempt_count"] + archived_totals["http_attempt_count"],
-        "total_internal_model_payload_char_count": current_totals["payload_char_count"] + archived_totals["payload_char_count"],
         "created_count": created,
         "updated_count": updated,
         "noop_count": noop,
@@ -246,17 +210,8 @@ def _add_repair_metrics(totals: dict[str, int], metrics: dict[str, int]) -> None
         totals[key] += metrics[key]
 
 
-def subtract_repair_metrics(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
-    return {key: max(0, left.get(key, 0) - right.get(key, 0)) for key in REPAIR_METRIC_KEYS}
-
-
-def step_repair_metrics(run_dir: Path, step_name: str, *, include_archived: bool = True) -> dict[str, int]:
+def step_repair_metrics(run_dir: Path, step_name: str) -> dict[str, int]:
     step_dirs = [run_dir / step_name]
-    archive_root = run_dir / "attempt_archive"
-    if include_archived and archive_root.exists():
-        for archived_step in sorted(archive_root.glob(f"*/**/{step_name}")):
-            if archived_step.is_dir():
-                step_dirs.append(archived_step)
     attempt_count = 0
     repair_count = 0
     json_repair_count = 0

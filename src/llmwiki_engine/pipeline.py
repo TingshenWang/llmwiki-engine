@@ -282,13 +282,7 @@ def resume_ingest(
             manifest.provider_contexts.append(provider_execution_context.record)
         if reset_from_step is not None:
             write_manifest(store.manifest_path(operation_id), manifest)
-            delete_downstream_step_dirs(
-                vault,
-                operation_id,
-                reset_from_step,
-                archive=True,
-                archive_reason=f"resume requested from {reset_from_step}; previous step artifacts archived before regeneration.",
-            )
+            delete_downstream_step_dirs(vault, operation_id, reset_from_step)
             mark_from_pending(manifest, reset_from_step)
             write_manifest(store.manifest_path(operation_id), manifest)
         else:
@@ -2908,50 +2902,13 @@ def _structured_call(
     )
 
 
-def delete_downstream_step_dirs(
-    vault: Path,
-    operation_id: str,
-    start_step: str,
-    *,
-    archive: bool = False,
-    archive_reason: str = "",
-) -> None:
+def delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str) -> None:
     store = RunStore(vault)
     run_dir = store.run_dir(operation_id)
-    if archive:
-        archive_attempt_step_dirs(run_dir, start_step, archive_reason or "step artifacts archived before regeneration.")
     for step in downstream_steps(start_step):
         output_dir = step_output_dir(run_dir, step)
         if output_dir is not None:
             shutil.rmtree(output_dir, ignore_errors=True)
-
-
-def archive_attempt_step_dirs(run_dir: Path, start_step: str, reason: str) -> Path | None:
-    existing_steps = [
-        step
-        for step in downstream_steps(start_step)
-        if (step_output_dir(run_dir, step) is not None and step_output_dir(run_dir, step).exists())
-    ]
-    if not existing_steps:
-        return None
-    archive_root = run_dir / "attempt_archive" / start_step / safe_timestamp()
-    archive_root.mkdir(parents=True, exist_ok=True)
-    for step in existing_steps:
-        output_dir = step_output_dir(run_dir, step)
-        if output_dir is None or not output_dir.exists():
-            continue
-        shutil.copytree(output_dir, archive_root / step)
-    write_json(
-        archive_root / "attempt_superseded.json",
-        {
-            "schema_version": "attempt_superseded.v1",
-            "start_step": start_step,
-            "superseded_at": utc_now(),
-            "reason": reason,
-            "archived_steps": existing_steps,
-        },
-    )
-    return archive_root
 
 
 def validate_raw_link_cleanup_resume(*, run_dir: Path, manifest: OperationManifest, start: str) -> None:
@@ -3097,11 +3054,9 @@ def revise_review(vault: Path, operation_id: str, review_step: str) -> Operation
         run_dir = store.run_dir(operation_id)
         require_upstream_artifacts_current(vault, run_dir, manifest, review_step)
         if review_step == "merge_plan_review":
-            archive_pending_review_artifacts(run_dir, review_step)
             delete_downstream_step_dirs(vault, operation_id, "wiki_merge_planning")
             mark_from_pending(manifest, "wiki_merge_planning")
         elif review_step == "draft_review":
-            archive_pending_review_artifacts(run_dir, review_step)
             delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
             mark_from_pending(manifest, "draft_rendering")
         else:
@@ -3110,25 +3065,6 @@ def revise_review(vault: Path, operation_id: str, review_step: str) -> Operation
         write_manifest(store.manifest_path(operation_id), manifest)
         _run_metrics.refresh_run_metrics(run_dir, manifest)
         return manifest
-
-
-def archive_pending_review_artifacts(run_dir: Path, review_step: str) -> Path | None:
-    step_root = run_dir / review_step
-    if not step_root.exists():
-        return None
-    timestamp = safe_timestamp()
-    archive_root = run_dir / "review_archive" / review_step / timestamp
-    shutil.copytree(step_root, archive_root)
-    write_json(
-        archive_root / "superseded.json",
-        {
-            "schema_version": "review_superseded.v1",
-            "review_step": review_step,
-            "superseded_at": utc_now(),
-            "reason": "revise requested; pending review artifacts were archived before downstream regeneration.",
-        },
-    )
-    return archive_root
 
 
 def require_upstream_artifacts_current(vault: Path, run_dir: Path, manifest: OperationManifest, review_step: str) -> None:
