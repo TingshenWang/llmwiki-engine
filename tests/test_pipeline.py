@@ -459,6 +459,14 @@ def test_candidate_context_sort_explains_score_bucket_tie_breaks() -> None:
         score_bucket=retrieval_module.retrieval_score_bucket(0.501),
         strength="weak",
         match_basis="lexical",
+        sort_explanation=retrieval_module.retrieval_sort_explanation_for_values(
+            score=0.501,
+            strength="weak",
+            match_basis="lexical",
+            path="concepts/Concept_Runtime_Tie.md",
+            item=item,
+            entry=entries["concepts/Concept_Runtime_Tie.md"],
+        ),
         page_sha256="a",
     )
     higher_score_different_type = retrieval_module.CandidateContextHit(
@@ -470,6 +478,14 @@ def test_candidate_context_sort_explains_score_bucket_tie_breaks() -> None:
         score_bucket=retrieval_module.retrieval_score_bucket(0.509),
         strength="weak",
         match_basis="lexical",
+        sort_explanation=retrieval_module.retrieval_sort_explanation_for_values(
+            score=0.509,
+            strength="weak",
+            match_basis="lexical",
+            path="entities/Entity_Runtime_Tie.md",
+            item=item,
+            entry=entries["entities/Entity_Runtime_Tie.md"],
+        ),
         page_sha256="b",
     )
 
@@ -477,14 +493,75 @@ def test_candidate_context_sort_explains_score_bucket_tie_breaks() -> None:
         [higher_score_different_type, lower_score_same_type],
         key=lambda hit: retrieval_module.retrieval_sort_key(hit, item, entries),
     )
-    for hit in sorted_hits:
-        hit.sort_explanation = retrieval_module.retrieval_sort_explanation(hit, item, entries)
-
     assert sorted_hits[0].score < sorted_hits[1].score
     assert sorted_hits[0].path == "concepts/Concept_Runtime_Tie.md"
     assert "type=same" in sorted_hits[0].sort_explanation
     assert "dir=same" in sorted_hits[0].sort_explanation
     assert "type=different" in sorted_hits[1].sort_explanation
+
+
+@pytest.mark.parametrize("sort_explanation", [None, ""])
+def test_candidate_context_hit_requires_sort_explanation(sort_explanation: str | None) -> None:
+    data = {
+        "page_plan_id": "PP-TIE",
+        "rank": 1,
+        "path": "concepts/Concept_Runtime_Tie.md",
+        "display_title": "Runtime Tie",
+        "score": 0.5,
+        "score_bucket": 50,
+        "strength": "weak",
+        "match_basis": "lexical",
+        "page_sha256": "a",
+    }
+    if sort_explanation is not None:
+        data["sort_explanation"] = sort_explanation
+
+    with pytest.raises(Exception, match="sort_explanation"):
+        retrieval_module.CandidateContextHit.model_validate(data)
+
+
+def test_candidate_context_score_bucket_uses_persisted_rounded_score(tmp_path: Path) -> None:
+    vault, _ = make_vault(tmp_path)
+    page = vault / "wiki" / "concepts" / "Concept_Boundary.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(
+        "---\n"
+        "llmwiki_type: concept\n"
+        "title: Boundary\n"
+        "aliases: []\n"
+        "summary: Boundary summary.\n"
+        "created: 2026-06-08\n"
+        "updated: 2026-06-08\n"
+        "---\n\n"
+        "# Boundary\n\n"
+        "Boundary content.\n",
+        encoding="utf-8",
+    )
+    item = CandidateResolutionItem(
+        page_plan_id="PP-BOUNDARY",
+        source_basis=SourceBasis(source_candidate_ids=["CAND-BOUNDARY"]),
+        page_type="concept",
+        display_title="No lexical overlap",
+        path_stem="No lexical overlap",
+        candidate_target_path="concepts/Concept_No_Lexical_Overlap.md",
+        topic_summary="No lexical overlap.",
+        why_this_page="Forces embedding score to determine bucket.",
+        reason="test",
+    )
+    entry = retrieval_module.build_knowledge_pool(vault)[0]
+
+    hits = retrieval_module.rank_candidates(
+        item=item,
+        query="unmatched query",
+        knowledge_pool=[entry],
+        vault=vault,
+        config=retrieval_module.EmbeddingRetrievalConfig(backend="sentence_transformers"),
+        embedding_scores={entry.path: 0.579999},
+    )
+
+    assert hits[0].score == 0.58
+    assert hits[0].score_bucket == retrieval_module.retrieval_score_bucket(hits[0].score)
+    assert f"bucket={hits[0].score_bucket}" in hits[0].sort_explanation
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -1629,10 +1706,10 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "candidate_resolution.v3" in [ref.schema_version for ref in loaded.steps[6].outputs if ref.kind == "json"]
     assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[6].outputs if ref.kind == "json"]
     assert [ref.schema_version for ref in loaded.steps[7].outputs if ref.relative_path.endswith("wiki_context_snapshot.json")] == [
-        "wiki_context_snapshot.v2"
+        "wiki_context_snapshot.v3"
     ]
     assert [ref.schema_version for ref in loaded.steps[7].outputs if ref.relative_path.endswith("candidate_contexts.json")] == [
-        "candidate_contexts.v1"
+        "candidate_contexts.v2"
     ]
     assert [ref.schema_version for ref in loaded.steps[8].outputs if ref.relative_path.endswith("wiki_merge_plan.json")] == [
         "wiki_merge_plan.v5"
@@ -1660,8 +1737,8 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "lexical_expansion" in contexts_markdown
     assert (run_dir / "wiki_merge_planning" / "merge_decision_report.md").exists()
     snapshot = read_json(run_dir / "wiki_context_snapshot" / "wiki_context_snapshot.json")
-    assert snapshot["schema_version"] == "wiki_context_snapshot.v2"
-    assert snapshot["candidate_contexts"]["schema_version"] == "candidate_contexts.v1"
+    assert snapshot["schema_version"] == "wiki_context_snapshot.v3"
+    assert snapshot["candidate_contexts"]["schema_version"] == "candidate_contexts.v2"
     snapshot_paths = {entry["path"] for entry in snapshot["entries"]}
     assert {
         "wiki/index.md",
@@ -14504,6 +14581,10 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
                             score_bucket=72,
                             strength="medium",
                             match_basis="embedding",
+                            sort_explanation=(
+                                "bucket=72; strength_rank=2; basis_rank=1; type=same; dir=same; "
+                                "title_distance=2; path=concepts/Concept_持久记忆（Agent Memory）.md"
+                            ),
                             page_sha256="old-memory",
                         )
                     ],

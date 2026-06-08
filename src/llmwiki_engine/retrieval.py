@@ -219,17 +219,27 @@ def rank_candidates(
         strength = strength_for_score(score, basis, config)
         text = (vault / "wiki" / entry.path).read_text(encoding="utf-8")
         excerpt, truncated = excerpt_text(text, config.max_excerpt_chars)
-        score_bucket = retrieval_score_bucket(score)
+        rounded_score = round(score, 4)
+        score_bucket = retrieval_score_bucket(rounded_score)
+        sort_explanation = retrieval_sort_explanation_for_values(
+            score=rounded_score,
+            strength=strength,
+            match_basis=basis,
+            path=entry.path,
+            item=item,
+            entry=entry,
+        )
         hits.append(
             CandidateContextHit(
                 page_plan_id=item.page_plan_id,
                 rank=0,
                 path=entry.path,
                 display_title=entry.display_title,
-                score=round(score, 4),
+                score=rounded_score,
                 score_bucket=score_bucket,
                 strength=strength,
                 match_basis=basis,
+                sort_explanation=sort_explanation,
                 forced=basis.startswith("exact") or basis.startswith("normalized"),
                 page_sha256=entry.preimage_sha256,
                 excerpt=excerpt,
@@ -237,8 +247,6 @@ def rank_candidates(
             )
         )
     entry_by_path = {entry.path: entry for entry in knowledge_pool}
-    for hit in hits:
-        hit.sort_explanation = retrieval_sort_explanation(hit, item, entry_by_path)
     hits.sort(key=lambda hit: retrieval_sort_key(hit, item, entry_by_path))
     return hits
 
@@ -256,25 +264,43 @@ def retrieval_sort_components(
     item: CandidateResolutionItem,
     entry_by_path: dict[str, WikiKnowledgePoolEntry],
 ) -> dict[str, Any]:
-    entry = entry_by_path.get(hit.path)
-    score_bucket = retrieval_score_bucket(hit.score)
+    return retrieval_sort_components_for_values(
+        score=hit.score,
+        strength=hit.strength,
+        match_basis=hit.match_basis,
+        path=hit.path,
+        item=item,
+        entry=entry_by_path.get(hit.path),
+    )
+
+
+def retrieval_sort_components_for_values(
+    *,
+    score: float,
+    strength: str,
+    match_basis: str,
+    path: str,
+    item: CandidateResolutionItem,
+    entry: WikiKnowledgePoolEntry | None,
+) -> dict[str, Any]:
+    score_bucket = retrieval_score_bucket(score)
     same_type = entry is not None and entry.llmwiki_type == item.page_type
-    same_directory = same_target_directory(item.candidate_target_path, hit.path)
+    same_directory = same_target_directory(item.candidate_target_path, path)
     distance = title_distance(item, entry)
     key = (
-        -strength_rank(hit.strength),
+        -strength_rank(strength),
         -score_bucket,
-        -basis_rank(hit.match_basis),
+        -basis_rank(match_basis),
         0 if same_type else 1,
         0 if same_directory else 1,
         distance,
-        hit.path,
+        path,
     )
     return {
         "key": key,
         "score_bucket": score_bucket,
-        "strength_rank": strength_rank(hit.strength),
-        "basis_rank": basis_rank(hit.match_basis),
+        "strength_rank": strength_rank(strength),
+        "basis_rank": basis_rank(match_basis),
         "same_type": same_type,
         "same_directory": same_directory,
         "title_distance": distance,
@@ -286,7 +312,33 @@ def retrieval_sort_explanation(
     item: CandidateResolutionItem,
     entry_by_path: dict[str, WikiKnowledgePoolEntry],
 ) -> str:
-    components = retrieval_sort_components(hit, item, entry_by_path)
+    return retrieval_sort_explanation_for_values(
+        score=hit.score,
+        strength=hit.strength,
+        match_basis=hit.match_basis,
+        path=hit.path,
+        item=item,
+        entry=entry_by_path.get(hit.path),
+    )
+
+
+def retrieval_sort_explanation_for_values(
+    *,
+    score: float,
+    strength: str,
+    match_basis: str,
+    path: str,
+    item: CandidateResolutionItem,
+    entry: WikiKnowledgePoolEntry | None,
+) -> str:
+    components = retrieval_sort_components_for_values(
+        score=score,
+        strength=strength,
+        match_basis=match_basis,
+        path=path,
+        item=item,
+        entry=entry,
+    )
     return (
         f"bucket={components['score_bucket']}; "
         f"strength_rank={components['strength_rank']}; "
@@ -294,12 +346,12 @@ def retrieval_sort_explanation(
         f"type={'same' if components['same_type'] else 'different'}; "
         f"dir={'same' if components['same_directory'] else 'different'}; "
         f"title_distance={components['title_distance']}; "
-        f"path={hit.path}"
+        f"path={path}"
     )
 
 
 def retrieval_score_bucket(score: float) -> int:
-    return math.floor(score / SCORE_BUCKET_EPSILON)
+    return math.floor((score + 1e-12) / SCORE_BUCKET_EPSILON)
 
 
 def basis_rank(value: str) -> int:

@@ -1875,8 +1875,8 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, snapshot_path, step_name, "json", "wiki_context_snapshot.v2"),
-            _ref(ctx.run_dir, contexts_path, step_name, "json", "candidate_contexts.v1"),
+            _ref(ctx.run_dir, snapshot_path, step_name, "json", "wiki_context_snapshot.v3"),
+            _ref(ctx.run_dir, contexts_path, step_name, "json", "candidate_contexts.v2"),
             _ref(ctx.run_dir, contexts_md, step_name, "markdown"),
         ],
     )
@@ -9669,7 +9669,7 @@ def render_candidate_contexts_markdown(
                 hit.match_basis,
                 f"{hit.score:.4f}",
                 str(hit.score_bucket or int(hit.score / SCORE_BUCKET_EPSILON)),
-                hit.sort_explanation or "legacy artifact: sort explanation unavailable",
+                hit.sort_explanation,
                 "`forced`" if hit.forced else "",
                 f"`{hit.path}`",
                 hit.display_title,

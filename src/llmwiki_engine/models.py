@@ -416,7 +416,7 @@ class WikiContextEntry(StrictModel):
 
 
 class WikiContextSnapshot(StrictModel):
-    schema_version: Literal["wiki_context_snapshot.v2"] = "wiki_context_snapshot.v2"
+    schema_version: Literal["wiki_context_snapshot.v3"] = "wiki_context_snapshot.v3"
     log_date: str
     source_target_path: str
     candidate_contexts_ref: str = ""
@@ -435,7 +435,7 @@ class CandidateContextHit(StrictModel):
     score_bucket: int = 0
     strength: Literal["weak", "medium", "strong"] = "weak"
     match_basis: str = ""
-    sort_explanation: str = ""
+    sort_explanation: str = Field(min_length=1)
     forced: bool = False
     page_sha256: str
     excerpt: str = ""
@@ -450,7 +450,7 @@ class CandidateContextItem(StrictModel):
 
 
 class CandidateContextsArtifact(StrictModel):
-    schema_version: Literal["candidate_contexts.v1"] = "candidate_contexts.v1"
+    schema_version: Literal["candidate_contexts.v2"] = "candidate_contexts.v2"
     retrieval_backend: str
     model: str = ""
     model_revision: str = ""
