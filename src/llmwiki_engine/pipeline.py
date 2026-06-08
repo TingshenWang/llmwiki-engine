@@ -1342,7 +1342,11 @@ def run_draft_rendering_model(
         for index in range(0, len(draftable_items), DRAFT_RENDERING_BATCH_PAGE_LIMIT)
     ]
     provider_spec = ctx.execution_context.runtime_for_task("draft_rendering").spec
-    max_parallel_batches = draft_rendering_batch_parallelism(provider_spec, len(batch_items_list))
+    max_parallel_batches = (
+        min(DRAFT_RENDERING_MAX_PARALLEL_BATCHES, len(batch_items_list))
+        if provider_spec and provider_spec.startswith("openai_compatible:")
+        else 1
+    )
     parallel = max_parallel_batches > 1
     batch_jobs: list[dict[str, Any]] = []
     batch_root = step_root / "model_batches"
@@ -1471,15 +1475,6 @@ def run_draft_rendering_model(
         wall_duration_ms=wall_duration_ms,
     )
     return draft_artifact
-
-
-def draft_rendering_batch_parallelism(provider_spec: str | None, batch_count: int) -> int:
-    if batch_count <= 1:
-        return 1
-    if provider_spec and provider_spec.startswith("openai_compatible:"):
-        return min(DRAFT_RENDERING_MAX_PARALLEL_BATCHES, batch_count)
-    return 1
-
 
 PAGE_SCOPED_DRAFT_REPAIR_ISSUE_CODES = {
     "unsupported_new_fact",

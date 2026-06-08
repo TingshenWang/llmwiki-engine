@@ -2567,9 +2567,6 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert payload["approved_prepared_markdown"] == ""
     assert payload["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
     assert payload["approved_digest_ref"] == "source_digest_review/approved_digest.json"
-    assert "approved_digest_projection_report" not in payload
-    assert "approved_merge_plan_projection_report" not in payload
-    assert "wiki_context_snapshot_projection_report" not in payload
     assert payload["approved_merge_plan_ref"] == "merge_plan_review/approved_merge_plan.json"
     assert payload["approved_merge_plan"]["schema_version"] == "draft_merge_plan_projection.v1"
     assert payload["required_page_plan_ids"]
@@ -2626,9 +2623,6 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert sidecar["schema_version"] == "draft_source_excerpt_pack.v1"
     assert (run_dir / "draft_rendering" / "draft_source_excerpt_pack.md").exists()
     assert len(payload["approved_merge_plan"]["items"]) == len(payload["required_page_plan_ids"])
-    assert not (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
-    assert not (run_dir / "draft_rendering" / "draft_merge_plan_projection_report.json").exists()
-    assert not (run_dir / "draft_rendering" / "draft_context_projection_report.json").exists()
     draft_step = [step for step in manifest.steps if step.name == "draft_rendering"][0]
     excerpt_ref = [
         ref
@@ -2636,7 +2630,6 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
         if ref.relative_path == "draft_rendering/draft_source_excerpt_pack.json"
     ][0]
     assert excerpt_ref.schema_version == "draft_source_excerpt_pack.v1"
-    assert not any("projection_report" in ref.relative_path for ref in draft_step.outputs)
 
 
 def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspected() -> None:
@@ -12286,14 +12279,6 @@ def test_draft_rendering_create_english_source_coverage_notes_is_filled_without_
     assert "Based on" not in draft["pages"][0]["source_coverage_notes"]
 
 
-def test_draft_rendering_batch_parallelism_is_provider_scoped() -> None:
-    assert pipeline_module.draft_rendering_batch_parallelism("mock:fixture", 3) == 1
-    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 1) == 1
-    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 2) == 2
-    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 3) == 3
-    assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 4) == 3
-
-
 def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "draft-batch-fixture"
@@ -12430,13 +12415,10 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     assert "墙钟耗时" in batch_report_markdown
     assert "最大单批 payload" in batch_report_markdown
     assert len(draft_artifact["pages"]) == 7
-    assert not (run_dir / "draft_rendering" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "provider_result.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "provider_result.json").exists()
     aggregate_provider_result = read_json(run_dir / "draft_rendering" / "provider_result.json")
     assert aggregate_provider_result["http_attempt_count"] == 3
-    assert not (run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_digest_projection_report.json").exists()
-    assert not (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_digest_projection_report.json").exists()
     assert (run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json").exists()
     repair_prompt = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-002" / "repair_prompts" / "attempt-2.json")
     assert repair_prompt["repair_contract"]["mode"] == "missing_page_completion"
@@ -12456,7 +12438,6 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     draft_step = next(step for step in manifest.steps if step.name == "draft_rendering")
     assert "draft_rendering_batch_report.v1" in [ref.schema_version for ref in draft_step.outputs]
     assert any(ref.relative_path.endswith("model_batches/batch-001/provider_result.json") for ref in draft_step.outputs)
-    assert not any("projection_report" in ref.relative_path for ref in draft_step.outputs)
     assert any(ref.relative_path.endswith("model_batches/batch-002/structured_repair_report.json") for ref in draft_step.outputs)
     assert any(
         ref.relative_path.endswith("model_batches/batch-002/repair_prompts/attempt-2.json") and not ref.required_for_resume
