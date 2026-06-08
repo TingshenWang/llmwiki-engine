@@ -7752,13 +7752,6 @@ def latest_operation(vault: Path) -> str | None:
     return candidates[-1].name if candidates else None
 
 
-def copy_fixture_raw(vault: Path, fixture_raw: Path) -> Path:
-    target = vault / "raw" / fixture_raw.name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(fixture_raw, target)
-    return target
-
-
 def safe_timestamp() -> str:
     return utc_now().replace("+00:00", "Z").replace(":", "")
 

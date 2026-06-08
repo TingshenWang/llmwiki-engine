@@ -5,12 +5,13 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
+from helpers import copy_fixture_raw
 import llmwiki_engine.cli as cli_module
 from llmwiki_engine.cli import app
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
 from llmwiki_engine.models import RawPreparePolicy
-from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, latest_operation, run_simplified_ingest
+from llmwiki_engine.pipeline import init_vault, latest_operation, run_simplified_ingest
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
 from llmwiki_engine.raw_import import ArxivRawImportItem, ArxivRawImportReport, RawUrlImportResult

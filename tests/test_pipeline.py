@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.steps as steps_module
@@ -42,7 +43,6 @@ from llmwiki_engine.pipeline import (
     backfill_missing_candidate_resolution_items,
     build_wiki_context_snapshot,
     build_wiki_merge_plan,
-    copy_fixture_raw,
     init_vault,
     latest_operation,
     approve_review,
