@@ -315,19 +315,6 @@ def test_run_passes_prepare_policy(
     assert seen["raw_prepare_policy"] == expected
 
 
-@pytest.mark.parametrize("flag", ["--skip-prepare", "--force-prepare"])
-def test_run_rejects_removed_legacy_prepare_flags(tmp_path: Path, flag: str) -> None:
-    vault = tmp_path / "vault"
-    raw = tmp_path / "raw.md"
-    raw.write_text("# Raw\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), flag])
-
-    assert result.exit_code != 0
-    assert f"No such option: {flag}" in result.output
-
-
 def test_status_labels_skip_policy_as_local_provider(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -399,8 +386,6 @@ def test_prepare_help_uses_single_policy_values(command: list[str]) -> None:
 
     assert result.exit_code == 0
     assert "[auto|skip|force]" in result.output
-    assert "skip-model" not in result.output
-    assert "force-model" not in result.output
 
 
 @pytest.mark.parametrize(

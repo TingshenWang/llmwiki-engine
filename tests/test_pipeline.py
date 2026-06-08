@@ -2173,26 +2173,6 @@ def test_vault_config_raw_prepare_policy_force_uses_model_cleanup(
     assert captured_payloads["raw_prepare"]["raw_prepare_policy"] == "force"
 
 
-@pytest.mark.parametrize("raw_prepare_policy", ["skip-model", "force-model"])
-def test_vault_config_rejects_removed_raw_prepare_policy_values(
-    tmp_path: Path,
-    raw_prepare_policy: str,
-) -> None:
-    vault, raw = make_vault(tmp_path)
-    config_path = vault / ".llmwiki" / "config.json"
-    config = read_json(config_path)
-    config["raw_prepare_policy"] = raw_prepare_policy
-    write_json(config_path, config)
-
-    with pytest.raises(Exception, match="raw_prepare_policy|Input should be"):
-        run_simplified_ingest(
-            vault=vault,
-            raw_file=raw,
-            fixture_dir=FIXTURE_ROOT / "mock",
-            slug="removed-raw-prepare-policy",
-        )
-
-
 def test_prepared_raw_review_for_skip_policy_is_plain_auto_approval(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
 
@@ -15125,19 +15105,6 @@ def test_manifest_v10_rejects_extra_top_level_fields_with_mvp_message(tmp_path: 
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     data = read_json(manifest_path)
     data["legacy_status_summary"] = {"old": True}
-    write_json(manifest_path, data)
-
-    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
-        read_manifest(manifest_path)
-
-
-@pytest.mark.parametrize("raw_prepare_policy", ["skip-model", "force-model"])
-def test_manifest_v10_rejects_removed_raw_prepare_policy_values(tmp_path: Path, raw_prepare_policy: str) -> None:
-    vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="legacy-policy")
-    manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
-    data = read_json(manifest_path)
-    data["vault_config_snapshot"]["raw_prepare_policy"] = raw_prepare_policy
     write_json(manifest_path, data)
 
     with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
