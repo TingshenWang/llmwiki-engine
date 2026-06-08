@@ -202,10 +202,9 @@ def run_simplified_ingest(
         **vault_config.model_dump(),
         raw_prepare_policy=effective_raw_prepare_policy,
     )
-    model_steps = model_steps_for_raw_prepare_policy(
-        list(MODEL_BACKED_STEPS),
-        raw_prepare_policy=effective_raw_prepare_policy,
-    )
+    model_steps = list(MODEL_BACKED_STEPS)
+    if effective_raw_prepare_policy == RawPreparePolicy.skip:
+        model_steps = [step for step in model_steps if step != "raw_prepare"]
     provider_execution_context = build_provider_execution_context(
         vault=vault,
         manifest_contexts=[],
@@ -269,11 +268,8 @@ def resume_ingest(
         ensure_wiki_context_current_before_resume(vault, store.run_dir(operation_id), start)
         resumable_step_names = set(downstream_steps(start))
         model_steps = [step for step in MODEL_BACKED_STEPS if step in resumable_step_names]
-        if "raw_prepare" in model_steps:
-            model_steps = model_steps_for_raw_prepare_policy(
-                model_steps,
-                raw_prepare_policy=manifest.vault_config_snapshot.raw_prepare_policy,
-            )
+        if "raw_prepare" in model_steps and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip:
+            model_steps = [step for step in model_steps if step != "raw_prepare"]
         provider_execution_context = build_provider_execution_context(
             vault=vault,
             manifest_contexts=manifest.provider_contexts,
@@ -405,16 +401,6 @@ def validate_resume_start(manifest: OperationManifest, start_step: str) -> None:
                 f"Cannot resume from {start_step}: upstream step {step.name} is {step.status.value}; "
                 f"resume from {step.name} or earlier."
             )
-
-
-def model_steps_for_raw_prepare_policy(
-    model_steps: list[str],
-    *,
-    raw_prepare_policy: RawPreparePolicy,
-) -> list[str]:
-    if raw_prepare_policy == RawPreparePolicy.skip:
-        return [step for step in model_steps if step != "raw_prepare"]
-    return model_steps
 
 
 def _run_step(
