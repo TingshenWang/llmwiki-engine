@@ -409,10 +409,6 @@ class WikiContextEntry(StrictModel):
     def missing(self) -> bool:
         return self.expected_state == "missing"
 
-    @property
-    def sha256(self) -> str | None:
-        return self.preimage_sha256
-
 
 class WikiContextSnapshot(StrictModel):
     schema_version: Literal["wiki_context_snapshot.v3"] = "wiki_context_snapshot.v3"
