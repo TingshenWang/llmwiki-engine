@@ -2641,40 +2641,23 @@ def _run_draft_review(ctx: StepRunContext) -> None:
     approval_path = step_root / "draft_approval.json"
     prompt_path = step_root / "review_prompt.md"
     prompt_path.write_text(_draft_reviewing.render_draft_review_prompt(ctx.run_dir, draft_manifest), encoding="utf-8")
+    auto_approval_notes = None
     if draft_manifest.source_only_noop:
-        write_json(approved_manifest_path, draft_manifest)
-        approval = _draft_reviewing.build_draft_approval(
-            ctx.run_dir,
-            approved_manifest_path,
-            decision="approved",
-            auto_approved=True,
-            notes="全 noop operation：来源会被记录，但没有知识页变化。",
-        )
-        write_json(approval_path, approval)
-        complete_review_step(
-            ctx.manifest,
-            step_name,
-            outputs=[
-                _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
-                _ref(ctx.run_dir, approved_manifest_path, step_name, "json", "draft_write_manifest.v1"),
-                _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
-            ],
-            review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
-        )
-        return
-    if not _draft_reviewing.draft_review_requires_manual(ctx.run_dir, draft_manifest):
-        write_json(approved_manifest_path, draft_manifest)
-        notes = (
+        auto_approval_notes = "全 noop operation：来源会被记录，但没有知识页变化。"
+    elif not _draft_reviewing.draft_review_requires_manual(ctx.run_dir, draft_manifest):
+        auto_approval_notes = (
             "纯 create operation，当前运行自动批准。"
             if not draft_manifest.has_updates
             else "update operation 未发现 grounding 或旧页保留观察风险；本地旧知识补强已写入审计报告，当前运行自动批准。"
         )
+    if auto_approval_notes is not None:
+        write_json(approved_manifest_path, draft_manifest)
         approval = _draft_reviewing.build_draft_approval(
             ctx.run_dir,
             approved_manifest_path,
             decision="approved",
             auto_approved=True,
-            notes=notes,
+            notes=auto_approval_notes,
         )
         write_json(approval_path, approval)
         complete_review_step(
