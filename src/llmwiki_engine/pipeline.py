@@ -17,7 +17,10 @@ from rich.console import Console
 from pydantic import BaseModel
 
 from . import __version__
+from . import markdown_utils as _markdown_utils
+from . import page_sections as _page_sections
 from . import source_excerpt as _source_excerpt
+from . import update_preservation as _update_preservation
 from .events import EventLogger, format_duration
 from .hash_utils import artifact_ref, sha256_bytes, sha256_file
 from .io import read_json, read_model, read_yaml, write_json, write_yaml
@@ -328,90 +331,6 @@ SOURCE_DIGEST_ANCHOR_ENTITIES: dict[str, dict[str, str]] = {
         "resolution_hint": "deterministic_source_anchor_entity: source explicitly names Cowork as a durable product/entity anchor.",
     },
 }
-UPDATE_PRESERVATION_SECTION_KEYS = (
-    "summary",
-    "core_content",
-    "detail",
-    "examples",
-    "value_points",
-    "additional_notes",
-)
-UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION = 8
-UPDATE_PRESERVATION_CONCEPT_GROUPS = (
-    {
-        "name": "managed_agents",
-        "label": "Managed Agents / 托管智能体",
-        "terms": ("Managed Agents", "托管智能体"),
-    },
-    {
-        "name": "harness",
-        "label": "harness / 适配框架",
-        "terms": ("harness", "Harness", "harnesses", "适配框架", "元harness", "元适配框架"),
-    },
-    {
-        "name": "brain_hands_decoupling",
-        "label": "大脑与双手解耦",
-        "terms": (
-            "大脑与双手",
-            "大脑双手",
-            "brain and hands",
-            "brain hands",
-            "brain & hands",
-            "separate the model brain from execution hands",
-            "model brain from execution hands",
-            "model brain and execution hands",
-            "model brain / execution hands",
-            "推理和规划",
-            "工具执行",
-            "解耦",
-            "路由模型意图",
-            "模型意图路由",
-        ),
-    },
-    {
-        "name": "session_context",
-        "label": "会话/持久上下文",
-        "terms": (
-            "session object",
-            "persistent session",
-            "persistent context",
-            "durable context",
-            "session state",
-            "session context",
-            "会话对象",
-            "持久上下文",
-            "上下文对象",
-            "会话是持久",
-            "执行状态",
-        ),
-    },
-    {
-        "name": "safety_boundary",
-        "label": "安全边界/权限限制",
-        "terms": ("安全边界", "权限", "限制文件", "文件、网络和资源", "文件网络和资源", "无限本机权限"),
-    },
-    {
-        "name": "isolated_execution",
-        "label": "隔离执行/容器",
-        "terms": (
-            "隔离容器",
-            "隔离执行环境",
-            "container",
-            "containers",
-            "containerized",
-            "sandbox",
-            "sandboxed",
-            "sandboxes",
-            "容器",
-            "沙箱",
-        ),
-    },
-    {
-        "name": "system_architecture_view",
-        "label": "系统架构视角",
-        "terms": ("系统架构视角", "产品功能列表", "只写成产品功能列表"),
-    },
-)
 DRAFT_RENDERING_FULL_SOURCE_CHAR_LIMIT = 24_000
 DRAFT_RENDERING_EXCERPT_TOTAL_CHAR_LIMIT = 24_000
 DRAFT_RENDERING_EXCERPT_PER_PAGE_LIMIT = 1_600
@@ -1021,7 +940,7 @@ def build_source_digest_source_map(
     source_map_sections: list[dict[str, Any]] = []
     included_section_chars = 0
     for section in sections:
-        excerpt = "" if include_full_source else compact_payload_text(section["text"], section_limit)
+        excerpt = "" if include_full_source else _markdown_utils.compact_payload_text(section["text"], section_limit)
         included_section_chars += len(excerpt)
         source_map_sections.append(
             {
@@ -1083,7 +1002,7 @@ def source_digest_caption_snippets(text: str, *, max_captions: int) -> list[dict
         captions.append(
             {
                 "line": line_number,
-                "text": compact_payload_text(stripped, 280),
+                "text": _markdown_utils.compact_payload_text(stripped, 280),
             }
         )
         if len(captions) >= max_captions:
@@ -1694,7 +1613,7 @@ def block_unrepaired_medium_create_reason(plan: WikiMergePlanArtifact) -> WikiMe
                         "apply_eligibility": "blocked",
                         "blocked_reason": item.blocked_reason
                         or f"召回到中等相关旧页 `{item.strongest_overlap.path}`，但模型选择 create 的理由不充分；需要人工确认。",
-                        "finalization_reason": merge_markdown_blocks(
+                        "finalization_reason": _markdown_utils.merge_markdown_blocks(
                             item.finalization_reason,
                             "模型 repair 后 why_not_update 仍不充分，已转为 needs_human_decision。",
                         ),
@@ -1842,7 +1761,7 @@ def compact_candidate_contexts_for_merge_planning(candidate_contexts: CandidateC
             excerpt_limit = (
                 merge_planning_hit_excerpt_limit(hit)
             )
-            excerpt = compact_payload_text(hit.excerpt, excerpt_limit)
+            excerpt = _markdown_utils.compact_payload_text(hit.excerpt, excerpt_limit)
             hits.append(
                 {
                     "page_plan_id": hit.page_plan_id,
@@ -1864,7 +1783,7 @@ def compact_candidate_contexts_for_merge_planning(candidate_contexts: CandidateC
         items.append(
             {
                 "page_plan_id": item.page_plan_id,
-                "query": compact_payload_text(item.query, MERGE_PLANNING_CONTEXT_QUERY_LIMIT),
+                "query": _markdown_utils.compact_payload_text(item.query, MERGE_PLANNING_CONTEXT_QUERY_LIMIT),
                 "hits": hits,
                 "unindexable_pages": item.unindexable_pages,
             }
@@ -1969,15 +1888,6 @@ def compact_snapshot_for_merge_planning(
 
 def compact_entry_content_for_merge_planning(text: str) -> str:
     return _source_excerpt.source_global_excerpt(text, MERGE_PLANNING_ENTRY_EXCERPT_LIMIT)
-
-
-def compact_payload_text(text: str, limit: int) -> str:
-    stripped = text.strip()
-    if limit <= 0:
-        return ""
-    if len(stripped) <= limit:
-        return stripped
-    return stripped[: max(0, limit - 3)].rstrip() + "..."
 
 
 def json_char_count(value: Any) -> int:
@@ -2528,544 +2438,6 @@ def blockquote_markdown(text: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in lines)
 
 
-def build_update_preservation_pack(merge_plan: WikiMergePlanArtifact, snapshot: WikiContextSnapshot) -> dict[str, Any]:
-    pages: list[dict[str, Any]] = []
-    for item in merge_plan.items:
-        if item.action != "update":
-            continue
-        try:
-            entry = snapshot_entry(snapshot, f"wiki/{item.canonical_target_path}")
-        except PipelineError:
-            continue
-        sections = parse_existing_sections(entry.content)
-        section_items: list[dict[str, Any]] = []
-        for section_key in UPDATE_PRESERVATION_SECTION_KEYS:
-            old_text = sections.get(section_key, "").strip()
-            if not old_text:
-                continue
-            reusable_old_text = update_preservation_non_placeholder_text(old_text)
-            phrases = update_preservation_phrases(reusable_old_text)
-            concepts = update_preservation_concepts(reusable_old_text)
-            if update_preservation_section_is_low_value(section_key, old_text, phrases, concepts):
-                continue
-            section_items.append(
-                {
-                    "section_key": section_key,
-                    "old_text": compact_payload_text(reusable_old_text, 1800),
-                    "old_char_count": len(old_text),
-                    "key_phrases": phrases,
-                    "min_required_matches": 0 if concepts else update_preservation_required_matches(phrases),
-                    "concept_obligations": concepts,
-                    "min_required_concept_matches": update_preservation_required_concept_matches(concepts),
-                }
-            )
-        section_items = collapse_update_preservation_sections(section_items)
-        if section_items:
-            pages.append(
-                {
-                    "page_plan_id": item.page_plan_id,
-                    "target_path": item.canonical_target_path,
-                    "display_title": item.display_title,
-                    "matched_page": item.matched_page,
-                    "sections": section_items,
-                }
-            )
-    return {
-        "schema_version": "update_preservation_pack.v1",
-        "goal": "For update pages, carry forward old reusable knowledge into the replacement draft or explicitly explain why it changed.",
-        "pages": pages,
-    }
-
-
-def collapse_update_preservation_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    detail = next((section for section in sections if section.get("section_key") == "detail"), None)
-    if detail is None:
-        return sections
-    detail_concepts = update_preservation_section_concept_names(detail)
-    if not detail_concepts:
-        return sections
-    collapsed: list[dict[str, Any]] = []
-    for section in sections:
-        section_key = str(section.get("section_key", ""))
-        section_concepts = update_preservation_section_concept_names(section)
-        if section_key in {"summary", "value_points"} and section_concepts and section_concepts <= detail_concepts:
-            continue
-        collapsed.append(section)
-    return collapsed
-
-
-def update_preservation_section_concept_names(section: dict[str, Any]) -> set[str]:
-    names: set[str] = set()
-    for concept in section.get("concept_obligations", []):
-        if isinstance(concept, dict):
-            name = str(concept.get("name") or "").strip()
-            if name:
-                names.add(name)
-    return names
-
-
-def update_preservation_section_is_low_value(
-    section_key: str,
-    old_text: str,
-    phrases: list[str],
-    concepts: list[dict[str, Any]],
-) -> bool:
-    normalized = _source_excerpt.normalized_source_match_text(old_text)
-    meaningful_phrases = [
-        phrase
-        for phrase in phrases
-        if not update_preservation_phrase_is_placeholder(_source_excerpt.normalized_source_match_text(phrase))
-    ]
-    if not concepts and not meaningful_phrases:
-        return True
-    if update_preservation_phrase_is_placeholder(normalized):
-        return not update_preservation_has_non_placeholder_signal(old_text)
-    if section_key == "value_points" and not concepts and len(meaningful_phrases) <= 1:
-        return True
-    return False
-
-
-def update_preservation_phrases(text: str, *, limit: int = UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION) -> list[str]:
-    phrases: list[str] = []
-    for piece in re.split(r"[\n。；;，,、|：:]+", text):
-        for variant in _source_excerpt.source_excerpt_cue_variants(piece):
-            normalized = _source_excerpt.normalized_source_match_text(variant)
-            if len(normalized) < 4 or len(normalized) > 80:
-                continue
-            if update_preservation_phrase_is_noise(normalized):
-                continue
-            if variant not in phrases:
-                phrases.append(variant)
-    phrases.sort(key=lambda value: (phrase_signal_score(value), len(_source_excerpt.normalized_source_match_text(value))), reverse=True)
-    return phrases[:limit]
-
-
-def update_preservation_phrase_is_noise(normalized: str) -> bool:
-    if update_preservation_phrase_is_placeholder(normalized):
-        return True
-    if normalized in {"暂无", "没有相关", "暂无相关", "无相关", "n/a", "na"}:
-        return True
-    if normalized.startswith("旧页保留观察"):
-        return True
-    return False
-
-
-def update_preservation_has_non_placeholder_signal(text: str) -> bool:
-    reusable_text = update_preservation_non_placeholder_text(text)
-    if not reusable_text:
-        return False
-    if update_preservation_concepts(reusable_text):
-        return True
-    phrases = update_preservation_phrases(reusable_text)
-    return any(not update_preservation_phrase_is_placeholder(_source_excerpt.normalized_source_match_text(phrase)) for phrase in phrases)
-
-
-def update_preservation_non_placeholder_text(text: str) -> str:
-    raw_segments = [
-        segment.strip()
-        for segment in re.split(r"[\n。；;，,、|：:]+", text)
-        if _source_excerpt.normalized_source_match_text(segment)
-    ]
-    placeholder_flags = [
-        update_preservation_phrase_is_placeholder(_source_excerpt.normalized_source_match_text(segment))
-        for segment in raw_segments
-    ]
-    if not any(placeholder_flags):
-        return text.strip()
-    return "\n".join(segment for segment, is_placeholder in zip(raw_segments, placeholder_flags) if not is_placeholder)
-
-
-def update_preservation_phrase_is_placeholder(normalized: str) -> bool:
-    value = normalized.lower()
-    if not value or value in {"n/a", "na"}:
-        return True
-    return any(
-        marker in value
-        for marker in [
-            "待补来源",
-            "来源未提供",
-            "暂无",
-            "没有相关",
-            "无相关",
-        ]
-    )
-
-
-def update_preservation_ascii_token_spans(text: str) -> tuple[str, list[tuple[str, int, int]]]:
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    spans = [(match.group(0), match.start(), match.end()) for match in re.finditer(r"[a-z0-9]+", normalized)]
-    return normalized, spans
-
-
-def update_preservation_term_uses_ascii_tokens(term: str) -> bool:
-    return bool(re.search(r"[A-Za-z]", term)) and term.isascii()
-
-
-def update_preservation_ascii_phrase_separator_allowed(separator: str, term_separator: str) -> bool:
-    if "&" in term_separator:
-        return separator.count("&") == 1 and all(char.isspace() or char == "&" for char in separator)
-    return all(char.isspace() or char in "-_/" for char in separator)
-
-
-def update_preservation_ascii_phrase_matches(text: str, term: str) -> bool:
-    normalized_term, term_spans = update_preservation_ascii_token_spans(term)
-    term_tokens = [token for token, _, _ in term_spans]
-    if not term_tokens:
-        return False
-    term_separators = [
-        normalized_term[term_spans[offset][2] : term_spans[offset + 1][1]]
-        for offset in range(len(term_spans) - 1)
-    ]
-    normalized_text, text_spans = update_preservation_ascii_token_spans(text)
-    text_tokens = [token for token, _, _ in text_spans]
-    if len(text_spans) < len(term_tokens):
-        return False
-    window_size = len(term_tokens)
-    for index in range(len(text_spans) - window_size + 1):
-        if text_tokens[index : index + window_size] != term_tokens:
-            continue
-        window_spans = text_spans[index : index + window_size]
-        separators = [
-            normalized_text[window_spans[offset][2] : window_spans[offset + 1][1]]
-            for offset in range(len(window_spans) - 1)
-        ]
-        if all(
-            update_preservation_ascii_phrase_separator_allowed(separator, term_separator)
-            for separator, term_separator in zip(separators, term_separators)
-        ):
-            return True
-    return False
-
-
-def update_preservation_term_matches(text: str, term: str) -> bool:
-    if not term.strip():
-        return False
-    if update_preservation_term_uses_ascii_tokens(term):
-        return update_preservation_ascii_phrase_matches(text, term)
-    normalized_term = _source_excerpt.normalized_source_match_text(term)
-    return bool(normalized_term) and normalized_term in _source_excerpt.normalized_source_match_text(text)
-
-
-def update_preservation_concepts(text: str) -> list[dict[str, Any]]:
-    concepts: list[dict[str, Any]] = []
-    for group in UPDATE_PRESERVATION_CONCEPT_GROUPS:
-        matched_terms = [
-            term
-            for term in group["terms"]
-            if update_preservation_term_matches(text, str(term))
-        ]
-        if matched_terms:
-            concepts.append(
-                {
-                    "name": group["name"],
-                    "label": group["label"],
-                    "matched_terms": matched_terms,
-                }
-            )
-    return concepts
-
-
-def update_preservation_required_concept_matches(concepts: list[dict[str, Any]]) -> int:
-    count = len(concepts)
-    if count <= 0:
-        return 0
-    if count <= 2:
-        return count
-    if count <= 4:
-        return 3
-    return max(3, (count * 2 + 2) // 3)
-
-
-def update_preservation_concept_absorption(old: str, new: str) -> tuple[bool, list[str], list[str], int]:
-    concepts = update_preservation_concepts(old)
-    if not concepts:
-        return True, [], [], 0
-    matched: list[str] = []
-    missing: list[str] = []
-    for concept in concepts:
-        group = next((item for item in UPDATE_PRESERVATION_CONCEPT_GROUPS if item["name"] == concept["name"]), None)
-        terms = tuple(group["terms"] if group is not None else concept.get("matched_terms", []))
-        if any(update_preservation_term_matches(new, str(term)) for term in terms):
-            matched.append(str(concept["label"]))
-        else:
-            missing.append(str(concept["label"]))
-    required = update_preservation_required_concept_matches(concepts)
-    return len(matched) >= required, matched, missing, required
-
-
-def phrase_signal_score(phrase: str) -> int:
-    normalized = _source_excerpt.normalized_source_match_text(phrase)
-    score = min(len(normalized), 40)
-    if re.search(r"[A-Za-z]", phrase):
-        score += 12
-    if any(keyword in phrase for keyword in ["harness", "Managed", "安全边界", "会话对象", "隔离", "权限", "架构", "上下文"]):
-        score += 10
-    if re.search(r"\d|%|倍|收入|用户|增长|下降|裁撤|预算|金额", phrase):
-        score += 6
-    return score
-
-
-def update_preservation_required_matches(phrases: list[str]) -> int:
-    if not phrases:
-        return 0
-    return 1 if len(phrases) <= 2 else 2
-
-
-def update_section_absorption(old: str, new: str) -> tuple[bool, list[str], list[str]]:
-    old = old.strip()
-    new = new.strip()
-    if not old or is_empty_placeholder(old):
-        return True, [], []
-    if old == new or old in new:
-        phrases = update_preservation_phrases(old)
-        return True, phrases[: update_preservation_required_matches(phrases)], phrases
-    phrases = update_preservation_phrases(old)
-    concept_absorbed, matched_concepts, _, _ = update_preservation_concept_absorption(old, new)
-    concepts = update_preservation_concepts(old)
-    if not phrases:
-        if concepts and concept_absorbed and len(matched_concepts) >= max(2, update_preservation_required_concept_matches(concepts)):
-            return True, matched_concepts, phrases
-        return False, matched_concepts, phrases
-    matched = [phrase for phrase in phrases if _source_excerpt.find_source_cue(new, phrase) >= 0]
-    required = update_preservation_required_matches(phrases)
-    if concepts and not concept_absorbed:
-        return False, [*matched, *matched_concepts], phrases
-    return len(matched) >= required or bool(matched_concepts), [*matched, *matched_concepts], phrases
-
-
-def update_preservation_section_absorption(section: dict[str, Any], new_text: str) -> dict[str, Any]:
-    old_text = str(section.get("old_text", ""))
-    phrases = [str(phrase) for phrase in section.get("key_phrases", []) if str(phrase).strip()]
-    if not phrases:
-        phrases = update_preservation_phrases(old_text)
-    if old_text.strip() and (old_text.strip() == new_text.strip() or old_text.strip() in new_text):
-        matched_phrases = phrases[: update_preservation_required_matches(phrases)]
-    else:
-        matched_phrases = [phrase for phrase in phrases if _source_excerpt.find_source_cue(new_text, phrase) >= 0]
-    required_phrases = int(section.get("min_required_matches") or update_preservation_required_matches(phrases))
-    concept_obligations = [
-        concept
-        for concept in section.get("concept_obligations", [])
-        if isinstance(concept, dict)
-    ]
-    if not concept_obligations:
-        concept_obligations = update_preservation_concepts(old_text)
-    matched_concepts: list[str] = []
-    missing_concepts: list[str] = []
-    for concept in concept_obligations:
-        name = str(concept.get("name", ""))
-        label = str(concept.get("label") or name)
-        group = next((item for item in UPDATE_PRESERVATION_CONCEPT_GROUPS if item["name"] == name), None)
-        terms = tuple(group["terms"] if group is not None else concept.get("matched_terms", []))
-        if any(update_preservation_term_matches(new_text, str(term)) for term in terms):
-            matched_concepts.append(label)
-        else:
-            missing_concepts.append(label)
-    required_concepts = int(
-        section.get("min_required_concept_matches")
-        or update_preservation_required_concept_matches(concept_obligations)
-    )
-    if required_concepts and matched_concepts:
-        phrase_absorbed = True
-    else:
-        phrase_absorbed = len(matched_phrases) >= required_phrases if required_phrases else True
-    concept_absorbed = len(matched_concepts) >= required_concepts if required_concepts else True
-    absorbed = phrase_absorbed and concept_absorbed
-    return {
-        "absorbed": absorbed,
-        "matched_phrases": matched_phrases,
-        "phrases": phrases,
-        "required_phrases": required_phrases,
-        "matched_concepts": matched_concepts,
-        "missing_concepts": missing_concepts,
-        "required_concepts": required_concepts,
-        "concept_labels": [str(concept.get("label") or concept.get("name", "")) for concept in concept_obligations],
-    }
-
-
-def update_preservation_issues(draft: DraftRenderingArtifact, pack: dict[str, Any]) -> list[StructuredIssue]:
-    pages_by_id = {page.page_plan_id: page for page in draft.pages}
-    issues: list[StructuredIssue] = []
-    for page_pack in pack.get("pages", []):
-        if not isinstance(page_pack, dict):
-            continue
-        page_plan_id = str(page_pack.get("page_plan_id", ""))
-        page = pages_by_id.get(page_plan_id)
-        if page is None:
-            continue
-        for section in page_pack.get("sections", []):
-            if not isinstance(section, dict):
-                continue
-            section_key = str(section.get("section_key", ""))
-            old_text = str(section.get("old_text", ""))
-            new_text = draft_page_text_for_preservation_section(page, section_key)
-            absorption = update_preservation_section_absorption(section, new_text)
-            if absorption["absorbed"]:
-                continue
-            field_key = draft_field_for_preservation_section(section_key)
-            concept_message = ""
-            if absorption["concept_labels"]:
-                concept_message = (
-                    f" Required old concept obligations: {', '.join(absorption['concept_labels'])}. "
-                    f"Need {absorption['required_concepts']}; matched concepts: {', '.join(absorption['matched_concepts']) or 'none'}; "
-                    f"missing concepts: {', '.join(absorption['missing_concepts']) or 'none'}."
-                )
-            issues.append(
-                StructuredIssue(
-                    issue_code="old_knowledge_not_absorbed",
-                    field_path=f"pages.{page_plan_id}.{field_key}",
-                    validator_id="update_preservation_pack",
-                    message=(
-                        f"Update draft for `{page_pack.get('target_path', '')}` does not carry forward old `{section_key}` knowledge. "
-                        f"Retain or rewrite at least {absorption['required_phrases']} key phrase(s), such as: {', '.join(absorption['phrases'][:4])}. "
-                        f"Matched so far: {', '.join([*absorption['matched_phrases'], *absorption['matched_concepts']]) or 'none'}."
-                        f"{concept_message}"
-                    ),
-                    repairability="repairable",
-                )
-            )
-    return issues
-
-
-def reinforce_update_preservation(
-    draft: DraftRenderingArtifact,
-    pack: dict[str, Any],
-) -> tuple[DraftRenderingArtifact, dict[str, Any]]:
-    pages_by_id = {page.page_plan_id: page for page in draft.pages}
-    updated_pages: dict[str, DraftPageItem] = {}
-    report_pages: list[dict[str, Any]] = []
-    for page_pack in pack.get("pages", []):
-        if not isinstance(page_pack, dict):
-            continue
-        page_plan_id = str(page_pack.get("page_plan_id", ""))
-        page = pages_by_id.get(page_plan_id)
-        if page is None:
-            continue
-        section_reports: list[dict[str, Any]] = []
-        summary = page.summary
-        body_markdown = page.body_markdown
-        open_questions = page.open_questions
-        for section in page_pack.get("sections", []):
-            if not isinstance(section, dict):
-                continue
-            section_key = str(section.get("section_key", ""))
-            old_text = str(section.get("old_text", "")).strip()
-            if not section_key or not old_text:
-                continue
-            target_field = draft_field_for_preservation_section(section_key)
-            working_page = page.model_copy(
-                update={
-                    "summary": summary,
-                    "body_markdown": body_markdown,
-                    "open_questions": open_questions,
-                }
-            )
-            current = draft_page_text_for_preservation_section(working_page, section_key)
-            absorption = update_preservation_section_absorption(section, current)
-            if absorption["absorbed"]:
-                continue
-            missing_concepts = list(absorption["missing_concepts"])
-            reinforcement = update_preservation_reinforcement_text(section_key, old_text, missing_concepts)
-            merged = merge_markdown_blocks(current, reinforcement)
-            if target_field == "summary":
-                summary = merged
-            elif target_field == "open_questions":
-                open_questions = merged
-            else:
-                body_markdown = merged
-            section_reports.append(
-                {
-                    "section_key": section_key,
-                    "target_field": target_field,
-                    "matched_before": [*absorption["matched_phrases"], *absorption["matched_concepts"]],
-                    "missing_concepts_before": missing_concepts,
-                    "required_concept_matches": absorption["required_concepts"],
-                    "key_phrases": absorption["phrases"][:4],
-                    "reinforcement_char_count": len(reinforcement),
-                    "reinforcement_preview": compact_payload_text(reinforcement, 240),
-                }
-            )
-        if section_reports:
-            updated = page.model_copy(
-                update={
-                    "summary": summary,
-                    "body_markdown": body_markdown,
-                    "open_questions": open_questions,
-                }
-            )
-            updated_pages[page_plan_id] = updated
-            report_pages.append(
-                {
-                    "page_plan_id": page_plan_id,
-                    "target_path": page_pack.get("target_path", ""),
-                    "display_title": page_pack.get("display_title", ""),
-                    "sections": section_reports,
-                }
-            )
-    if updated_pages:
-        pages = [updated_pages.get(page.page_plan_id, page) for page in draft.pages]
-        draft = draft.model_copy(update={"pages": pages})
-    report = {
-        "schema_version": "update_preservation_reinforcement_report.v1",
-        "changed": bool(report_pages),
-        "reinforced_page_count": len(report_pages),
-        "reinforced_section_count": sum(len(page["sections"]) for page in report_pages),
-        "pages": report_pages,
-    }
-    return draft, report
-
-
-def update_preservation_reinforcement_text(section_key: str, old_text: str, missing_concepts: list[str]) -> str:
-    old_excerpt = compact_payload_text(old_text, 700)
-    bridge = "与旧页架构视角相衔接，"
-    if missing_concepts:
-        concept_text = "、".join(missing_concepts)
-        old_excerpt = (
-            f"从旧页保留的架构视角看，本段仍需体现：{concept_text}。"
-            "这些是旧页已经建立的理解，应与本轮新材料并列保留。"
-        )
-        bridge = ""
-    if section_key == "value_points":
-        return f"- {bridge}{old_excerpt}"
-    if section_key == "examples":
-        return f"{bridge}{old_excerpt}"
-    if section_key == "open_questions":
-        return f"{bridge}{old_excerpt}"
-    return f"{bridge}{old_excerpt}"
-
-
-def render_update_preservation_reinforcement_report(report: dict[str, Any]) -> str:
-    rows: list[list[Any]] = []
-    for page in report.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for section in page.get("sections", []):
-            if not isinstance(section, dict):
-                continue
-            rows.append(
-                [
-                    page.get("page_plan_id", ""),
-                    page.get("display_title", ""),
-                    section.get("section_key", ""),
-                    ", ".join(str(value) for value in section.get("missing_concepts_before", [])),
-                    ", ".join(str(value) for value in section.get("key_phrases", [])),
-                    section.get("reinforcement_preview", ""),
-                ]
-            )
-    return (
-        "# Update Preservation Reinforcement Report\n\n"
-        f"- Changed: `{str(bool(report.get('changed'))).lower()}`\n"
-        f"- Reinforced pages: `{report.get('reinforced_page_count', 0)}`\n"
-        f"- Reinforced sections: `{report.get('reinforced_section_count', 0)}`\n\n"
-        + (
-            format_markdown_table(["页面计划", "标题", "段落", "补足概念", "关键短语", "补强预览"], rows)
-            if rows
-            else "_无需本地补强。_"
-        )
-        + "\n"
-    )
-
-
 def render_grounding_paraphrase_rewrite_report(report: dict[str, Any]) -> str:
     rows: list[list[Any]] = []
     for page in report.get("pages", []):
@@ -3240,32 +2612,6 @@ def write_draft_aux_report_if_active(
     return json_path, md_path
 
 
-def render_update_preservation_pack_markdown(pack: dict[str, Any]) -> str:
-    rows: list[list[Any]] = []
-    for page in pack.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for section in page.get("sections", []):
-            if not isinstance(section, dict):
-                continue
-            rows.append(
-                [
-                    page.get("page_plan_id", ""),
-                    page.get("display_title", ""),
-                    section.get("section_key", ""),
-                    section.get("min_required_matches", 0),
-                    ", ".join(str(phrase) for phrase in section.get("key_phrases", [])[:4]),
-                    section.get("min_required_concept_matches", 0),
-                    ", ".join(str(concept.get("label", "")) for concept in section.get("concept_obligations", [])[:5] if isinstance(concept, dict)),
-                ]
-            )
-    return (
-        "# Update Preservation Pack\n\n"
-        "这些 obligations 会传给 draft_rendering，并由本地 validator 检查；如果模型未吸收旧知识，会先触发 repair，最终仍由旧页保留观察兜底。\n\n"
-        f"{format_markdown_table(['页面计划', '标题', '段落', '最少短语', '关键短语', '最少概念', '概念义务'], rows) if rows else '_本轮没有 update preservation obligations。_'}\n"
-    )
-
-
 def run_draft_rendering_model(
     *,
     ctx: StepRunContext,
@@ -3313,11 +2659,11 @@ def run_draft_rendering_model(
         batch_source_pack_md = batch_dir / "draft_source_excerpt_pack.md"
         write_json(batch_source_pack_path, batch_source_excerpt_pack)
         batch_source_pack_md.write_text(render_draft_source_excerpt_pack_markdown(batch_source_excerpt_pack), encoding="utf-8")
-        batch_update_preservation_pack = build_update_preservation_pack(batch_plan, snapshot)
+        batch_update_preservation_pack = _update_preservation.build_update_preservation_pack(batch_plan, snapshot)
         batch_update_pack_path = batch_dir / "update_preservation_pack.json"
         batch_update_pack_md = batch_dir / "update_preservation_pack.md"
         write_json(batch_update_pack_path, batch_update_preservation_pack)
-        batch_update_pack_md.write_text(render_update_preservation_pack_markdown(batch_update_preservation_pack), encoding="utf-8")
+        batch_update_pack_md.write_text(_update_preservation.render_update_preservation_pack_markdown(batch_update_preservation_pack), encoding="utf-8")
         batch_jobs.append(
             {
                 "index": index,
@@ -3486,7 +2832,7 @@ def build_draft_rendering_missing_page_repair_payload(
         missing_plan,
         force_excerpt=True,
     )
-    missing_update_preservation_pack = build_update_preservation_pack(missing_plan, snapshot)
+    missing_update_preservation_pack = _update_preservation.build_update_preservation_pack(missing_plan, snapshot)
     missing_payload = build_draft_rendering_payload(
         ctx=ctx,
         digest=digest,
@@ -3575,7 +2921,7 @@ def build_draft_rendering_page_repair_payload(
         repair_plan,
         force_excerpt=True,
     )
-    repair_update_preservation_pack = build_update_preservation_pack(repair_plan, snapshot)
+    repair_update_preservation_pack = _update_preservation.build_update_preservation_pack(repair_plan, snapshot)
     repair_payload = build_draft_rendering_payload(
         ctx=ctx,
         digest=digest,
@@ -3784,7 +3130,7 @@ def extract_valid_partial_draft_rendering(
         return None
     if draft_self_talk_issues(candidate):
         return None
-    if update_preservation_issues(candidate, update_preservation_pack):
+    if _update_preservation.update_preservation_issues(candidate, update_preservation_pack):
         return None
     candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(candidate, approved_prepared_text)
     grounding_candidate = candidate
@@ -3867,7 +3213,7 @@ def run_single_draft_rendering_model_call(
         candidate = finalize_draft_rendering(validation_model, merge_plan, snapshot)
         validate_draft_rendering(candidate, merge_plan, language=ctx.manifest.vault_config_snapshot.wiki_language)
         repair_issues = draft_self_talk_issues(candidate)
-        repair_issues.extend(update_preservation_issues(candidate, update_preservation_pack))
+        repair_issues.extend(_update_preservation.update_preservation_issues(candidate, update_preservation_pack))
         if not active_repair_page_plan_ids:
             repair_issues.extend(accepted_partial_page_copy_issues(candidate, accepted_repair_pages_by_id))
         rewritten_candidate, _grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(
@@ -3979,13 +3325,13 @@ def run_single_draft_rendering_model_call(
         draft_artifact = last_merged_repair_artifact
     draft_artifact = _redacted_model(ctx, draft_artifact, DraftRenderingArtifact)
     draft_artifact = finalize_draft_rendering(draft_artifact, merge_plan, snapshot)
-    draft_artifact, reinforcement_report = reinforce_update_preservation(draft_artifact, update_preservation_pack)
+    draft_artifact, reinforcement_report = _update_preservation.reinforce_update_preservation(draft_artifact, update_preservation_pack)
     draft_artifact, grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(draft_artifact, approved_prepared_text)
     write_draft_aux_report_if_active(
         output_dir=output_dir,
         stem="update_preservation_reinforcement_report",
         report=reinforcement_report,
-        renderer=render_update_preservation_reinforcement_report,
+        renderer=_update_preservation.render_update_preservation_reinforcement_report,
         count_keys=["reinforced_page_count", "reinforced_section_count"],
     )
     write_draft_aux_report_if_active(
@@ -4543,7 +3889,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         merge_plan,
         force_excerpt=uses_draft_batches,
     )
-    update_preservation_pack = build_update_preservation_pack(merge_plan, snapshot)
+    update_preservation_pack = _update_preservation.build_update_preservation_pack(merge_plan, snapshot)
     root_model_input_sidecars: list[Path] = []
     if not uses_draft_batches:
         source_excerpt_pack_path = step_root / "draft_source_excerpt_pack.json"
@@ -4553,7 +3899,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         update_preservation_pack_path = step_root / "update_preservation_pack.json"
         update_preservation_pack_md = step_root / "update_preservation_pack.md"
         write_json(update_preservation_pack_path, update_preservation_pack)
-        update_preservation_pack_md.write_text(render_update_preservation_pack_markdown(update_preservation_pack), encoding="utf-8")
+        update_preservation_pack_md.write_text(_update_preservation.render_update_preservation_pack_markdown(update_preservation_pack), encoding="utf-8")
         root_model_input_sidecars.extend(
             [source_excerpt_pack_path, source_excerpt_pack_md, update_preservation_pack_path, update_preservation_pack_md]
         )
@@ -5481,8 +4827,8 @@ def merge_source_digest_duplicate_candidate(
             "related_candidates": _dedupe_strings(
                 [*canonical.related_candidates, duplicate.candidate_id, *duplicate.related_candidates]
             ),
-            "resolution_hint": merge_markdown_blocks(canonical.resolution_hint, note),
-            "open_question_or_tension": merge_markdown_blocks(
+            "resolution_hint": _markdown_utils.merge_markdown_blocks(canonical.resolution_hint, note),
+            "open_question_or_tension": _markdown_utils.merge_markdown_blocks(
                 canonical.open_question_or_tension,
                 duplicate.open_question_or_tension,
             ),
@@ -5748,7 +5094,7 @@ def deferred_digest_candidate(group_name: str, candidate: SourceDigestCandidate,
     note = f"page_budget_deferred: `{group_name}` 超出本次 max_ingest_candidates，保留在 source digest 审计中，后续可单独 ingest 或手动提升。"
     if represented_by:
         note += f" represented_by_aggregation: `{represented_by}` 已在本轮用聚合候选代表该候选的核心价值。"
-    data["resolution_hint"] = merge_markdown_blocks(
+    data["resolution_hint"] = _markdown_utils.merge_markdown_blocks(
         str(data.get("resolution_hint") or ""),
         note,
     )
@@ -7563,7 +6909,7 @@ def finalize_candidate_resolution(
             item = item.model_copy(
                 update={
                     "source_basis": item.source_basis.model_copy(update={"source_candidate_ids": cleaned_ids}),
-                    "coverage_notes": merge_markdown_blocks(
+                    "coverage_notes": _markdown_utils.merge_markdown_blocks(
                         item.coverage_notes,
                         f"系统清理 weak/noise candidate 引用：{', '.join(f'`{candidate_id}`' for candidate_id in leaked_ids)}。",
                     ),
@@ -7603,7 +6949,7 @@ def finalize_candidate_resolution(
                                 "prepared_discovered_candidates": prepared_discovered,
                             }
                         ),
-                        "coverage_notes": merge_markdown_blocks(
+                        "coverage_notes": _markdown_utils.merge_markdown_blocks(
                             item.coverage_notes,
                             unknown_note + f"{', '.join(f'`{candidate_id}`' for candidate_id in unknown_source_ids)}。",
                         ),
@@ -8149,15 +7495,15 @@ def synthesize_medium_create_why_not_update(
         else clean_display_title(strongest_hit.display_title if strongest_hit is not None else "已召回旧页")
     )
     old_summary = old_entry.metadata.summary if old_entry.metadata is not None else ""
-    old_scope = compact_payload_text(old_summary or old_title or old_path, 120)
-    new_scope = compact_payload_text(
+    old_scope = _markdown_utils.compact_payload_text(old_summary or old_title or old_path, 120)
+    new_scope = _markdown_utils.compact_payload_text(
         resolution_item.topic_summary
         or item.new_understanding
         or resolution_item.initial_section_intent
         or resolution_item.display_title,
         140,
     )
-    source_delta = compact_payload_text(
+    source_delta = _markdown_utils.compact_payload_text(
         resolution_item.why_this_page
         or resolution_item.coverage_notes
         or resolution_item.reason
@@ -8256,8 +7602,8 @@ def merge_update_noop_same_targets(items: list[WikiMergePlanItem]) -> list[WikiM
                     "related_pages": deduped_related,
                     "merged_page_plan_ids": merged_ids,
                     "noop_covered_by_update": True,
-                    "merge_reason": merge_markdown_blocks(item.merge_reason, reason),
-                    "finalization_reason": merge_markdown_blocks(item.finalization_reason, reason),
+                    "merge_reason": _markdown_utils.merge_markdown_blocks(item.merge_reason, reason),
+                    "finalization_reason": _markdown_utils.merge_markdown_blocks(item.finalization_reason, reason),
                 }
             )
         )
@@ -8451,7 +7797,7 @@ def absorb_duplicate_create(canonical: WikiMergePlanItem, suppressed: WikiMergeP
     section_plans = dict(canonical.section_plans)
     for key, value in suppressed.section_plans.items():
         if key in section_plans:
-            section_plans[key] = merge_markdown_blocks(section_plans[key], f"合并自 `{suppressed.page_plan_id}`：{value}")
+            section_plans[key] = _markdown_utils.merge_markdown_blocks(section_plans[key], f"合并自 `{suppressed.page_plan_id}`：{value}")
         else:
             section_plans[key] = f"合并自 `{suppressed.page_plan_id}`：{value}"
     related_pages = [*canonical.related_pages, *suppressed.related_pages]
@@ -8479,8 +7825,8 @@ def absorb_duplicate_create(canonical: WikiMergePlanItem, suppressed: WikiMergeP
             "merged_page_plan_ids": _dedupe_strings(
                 [*canonical.merged_page_plan_ids, canonical.page_plan_id, suppressed.page_plan_id, *suppressed.merged_page_plan_ids]
             ),
-            "merge_reason": merge_markdown_blocks(canonical.merge_reason, absorbed_note),
-            "finalization_reason": merge_markdown_blocks(canonical.finalization_reason, absorbed_note),
+            "merge_reason": _markdown_utils.merge_markdown_blocks(canonical.merge_reason, absorbed_note),
+            "finalization_reason": _markdown_utils.merge_markdown_blocks(canonical.finalization_reason, absorbed_note),
             "quality_risks": _dedupe_strings(
                 [
                     *canonical.quality_risks,
@@ -9205,24 +8551,6 @@ def draft_page_open_questions(page: DraftPageItem) -> str:
     return page.open_questions.strip()
 
 
-def draft_page_text_for_preservation_section(page: DraftPageItem, section_key: str) -> str:
-    if section_key == "summary":
-        return draft_page_summary(page)
-    if section_key == "open_questions":
-        return draft_page_open_questions(page)
-    if draft_field_for_preservation_section(section_key) == "body_markdown":
-        return draft_page_core_markdown(page)
-    return ""
-
-
-def draft_field_for_preservation_section(section_key: str) -> Literal["summary", "body_markdown", "open_questions"]:
-    if section_key == "summary":
-        return "summary"
-    if section_key == "open_questions":
-        return "open_questions"
-    return "body_markdown"
-
-
 def normalize_stable_brand_typos(text: str) -> str:
     replacements = [
         ("Clade Code", "Claude Code"),
@@ -9236,16 +8564,6 @@ def normalize_stable_brand_typos(text: str) -> str:
     for wrong, right in replacements:
         text = re.sub(rf"(?<![A-Za-z0-9]){re.escape(wrong)}(?![A-Za-z0-9])", right, text)
     return text
-
-
-def merge_markdown_blocks(existing: str, addition: str) -> str:
-    existing = existing.strip()
-    addition = addition.strip()
-    if not existing:
-        return addition
-    if not addition:
-        return existing
-    return f"{existing}\n\n{addition}"
 
 
 def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePlanArtifact, *, language: str | None = None) -> None:
@@ -9549,62 +8867,6 @@ def snapshot_entry(snapshot: WikiContextSnapshot, path: str) -> WikiContextEntry
     raise PipelineError(f"snapshot missing path: {path}")
 
 
-SECTION_TITLE_TO_KEY = {
-    "摘要": "summary",
-    "Summary": "summary",
-    "核心内容": "core_content",
-    "Core Content": "core_content",
-    "详情": "detail",
-    "Detail": "detail",
-    "Details": "detail",
-    "例子": "examples",
-    "Examples": "examples",
-    "价值点": "value_points",
-    "Value Points": "value_points",
-    "补充观察": "additional_notes",
-    "Additional Notes": "additional_notes",
-    "相关页面": "related",
-    "Related": "related",
-    "Related Pages": "related",
-    "矛盾与未决问题": "open_questions",
-    "Open Questions": "open_questions",
-    "Tensions / Open Questions": "open_questions",
-}
-ENGLISH_SECTION_TITLE_TO_KEY = {
-    title.casefold(): key for title, key in SECTION_TITLE_TO_KEY.items() if title.isascii()
-}
-
-
-def parse_existing_sections(markdown: str) -> dict[str, str]:
-    sections: dict[str, list[str]] = {}
-    current_key: str | None = None
-    for line in markdown.splitlines():
-        match = re.match(r"^##\s+(.+?)\s*$", line)
-        if match:
-            section_title = match.group(1).strip()
-            current_key = SECTION_TITLE_TO_KEY.get(section_title)
-            if current_key is None and section_title.isascii():
-                current_key = ENGLISH_SECTION_TITLE_TO_KEY.get(section_title.casefold())
-            if current_key is not None:
-                sections.setdefault(current_key, [])
-            continue
-        if current_key is not None:
-            sections[current_key].append(line)
-    return {key: "\n".join(value).strip() for key, value in sections.items()}
-
-
-def existing_core_content_from_sections(sections: dict[str, str]) -> str:
-    if sections.get("core_content", "").strip():
-        return sections["core_content"].strip()
-    blocks: list[str] = []
-    for key, title in [("detail", ""), ("examples", "例子"), ("value_points", "价值点"), ("additional_notes", "补充观察")]:
-        body = sections.get(key, "").strip()
-        if not body:
-            continue
-        blocks.append(f"### {title}\n\n{body}" if title else body)
-    return "\n\n".join(blocks).strip()
-
-
 def draft_grounding_sections(page: DraftPageItem) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = [("summary", draft_page_summary(page))]
     sections.extend(body_markdown_grounding_sections(draft_page_core_markdown(page)))
@@ -9645,15 +8907,15 @@ def body_markdown_grounding_sections(body: str) -> list[tuple[str, str]]:
     for section_key, lines in chunks:
         text = "\n".join(lines).strip()
         if text:
-            merged[section_key] = merge_markdown_blocks(merged.get(section_key, ""), text)
+            merged[section_key] = _markdown_utils.merge_markdown_blocks(merged.get(section_key, ""), text)
     return list(merged.items()) or [("detail", body)]
 
 
 def draft_body_heading_section_key(title: str) -> str:
     normalized = re.sub(r"\s+", " ", title.strip()).strip("#:： ")
-    mapped = SECTION_TITLE_TO_KEY.get(normalized)
+    mapped = _page_sections.SECTION_TITLE_TO_KEY.get(normalized)
     if mapped is None and normalized.isascii():
-        mapped = ENGLISH_SECTION_TITLE_TO_KEY.get(normalized.casefold())
+        mapped = _page_sections.ENGLISH_SECTION_TITLE_TO_KEY.get(normalized.casefold())
     if mapped in {"examples", "value_points", "additional_notes"}:
         return mapped
     compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", normalized)).casefold()
@@ -9720,11 +8982,6 @@ def draft_body_heading_title_should_scan(title: str, section_key: str) -> bool:
     )
 
 
-def is_empty_placeholder(text: str) -> bool:
-    normalized = re.sub(r"\s+", "", text)
-    return not normalized or any(marker in normalized for marker in ["暂无", "没有相关", "无相关", "N/A"])
-
-
 def merge_update_section(
     section_key: str,
     old: str,
@@ -9742,13 +8999,13 @@ def merge_update_section(
     preserved_old: list[str] = []
     removal_reason = ""
     needs_manual_resolution = False
-    absorbed, matched_phrases, _ = update_section_absorption(old, new) if old and new else (False, [], [])
+    absorbed, matched_phrases, _ = _update_preservation.update_section_absorption(old, new) if old and new else (False, [], [])
     context_absorbed = False
     context_matched_phrases: list[str] = []
     if old and new and not absorbed and absorption_context and update_merge_should_preserve_old_section(section_key, old):
         context_text = absorption_context.strip()
         if context_text and context_text != new:
-            context_absorbed, context_matched_phrases, _ = update_section_absorption(old, context_text)
+            context_absorbed, context_matched_phrases, _ = _update_preservation.update_section_absorption(old, context_text)
             absorbed = context_absorbed
     if section_key == "additional_notes":
         absorbed = False
@@ -9757,9 +9014,9 @@ def merge_update_section(
         context_matched_phrases = []
     if old and new and absorbed:
         retained.append(old)
-    if new and not is_empty_placeholder(new):
+    if new and not _markdown_utils.is_empty_placeholder(new):
         added.append(new)
-    if old and not retained and old != new and not is_empty_placeholder(old):
+    if old and not retained and old != new and not _markdown_utils.is_empty_placeholder(old):
         if section_key == "additional_notes":
             preserved_notes, removed_notes, absorbed_notes = split_high_signal_old_additional_notes(
                 old,
@@ -9767,7 +9024,7 @@ def merge_update_section(
                 absorption_context=absorption_context or "",
             )
             if preserved_notes:
-                new = merge_markdown_blocks(new, preserved_old_additional_notes_block(preserved_notes))
+                new = _markdown_utils.merge_markdown_blocks(new, preserved_old_additional_notes_block(preserved_notes))
                 retained.extend([*absorbed_notes, *preserved_notes])
                 preserved_old.extend(preserved_notes)
                 removed.extend(removed_notes)
@@ -9787,7 +9044,7 @@ def merge_update_section(
                 removal_reason = "旧段落不属于 update preservation 核心义务，且未被新草稿自然吸收；本轮不再机械保留。"
         elif update_merge_should_preserve_old_section(section_key, old):
             preserved = preserved_old_section_block(old)
-            new = merge_markdown_blocks(new, preserved)
+            new = _markdown_utils.merge_markdown_blocks(new, preserved)
             retained.append(old)
             preserved_old.append(old)
             needs_manual_resolution = True
@@ -9863,7 +9120,7 @@ def old_additional_note_units(text: str) -> list[str]:
     if paragraph:
         units.append(" ".join(paragraph).strip())
     normalized_units = [strip_old_additional_note_label(unit) for unit in units]
-    return [unit for unit in _dedupe_strings(normalized_units) if unit and not is_empty_placeholder(unit)]
+    return [unit for unit in _dedupe_strings(normalized_units) if unit and not _markdown_utils.is_empty_placeholder(unit)]
 
 
 def strip_old_additional_note_label(text: str) -> str:
@@ -10084,7 +9341,7 @@ def merge_update_open_questions_section(old: str, new: str) -> tuple[str, Sectio
     merged_questions = [*new_questions, *retained_old_questions]
     merged = "\n".join(f"- {question}" for question in merged_questions).strip()
     if not merged:
-        merged = new if not is_empty_placeholder(new) else "暂无矛盾与未决问题记录。"
+        merged = new if not _markdown_utils.is_empty_placeholder(new) else "暂无矛盾与未决问题记录。"
     reason = ""
     if old_questions:
         reason = "旧 open_questions 默认按问题粒度 union/dedupe 保留；占位/低信号问题不机械保留。"
@@ -10105,9 +9362,9 @@ def merge_update_open_questions_section(old: str, new: str) -> tuple[str, Sectio
 def update_merge_should_preserve_old_section(section_key: str, old_text: str) -> bool:
     if section_key not in {"summary", "detail", "core_content"}:
         return False
-    phrases = update_preservation_phrases(old_text)
-    concepts = update_preservation_concepts(old_text)
-    return not update_preservation_section_is_low_value(section_key, old_text, phrases, concepts)
+    phrases = _update_preservation.update_preservation_phrases(old_text)
+    concepts = _update_preservation.update_preservation_concepts(old_text)
+    return not _update_preservation.update_preservation_section_is_low_value(section_key, old_text, phrases, concepts)
 
 
 def preserved_old_section_block(old: str) -> str:
@@ -13227,7 +12484,7 @@ def assemble_knowledge_page(
     known_related_paths: set[str] | None = None,
     approved_raw_text: str = "",
 ) -> str:
-    existing_sections = parse_existing_sections(existing_entry.content)
+    existing_sections = _page_sections.parse_existing_sections(existing_entry.content)
     summary = draft_page_summary(page) or item.new_understanding
     core = draft_page_core_markdown(page) or item.knowledge_delta or item.new_understanding
     questions = draft_page_open_questions(page) or "暂无矛盾与未决问题记录。"
@@ -13251,7 +12508,7 @@ def assemble_knowledge_page(
             summary,
             absorption_context=update_absorption_context,
         )
-        old_core = existing_core_content_from_sections(existing_sections)
+        old_core = _page_sections.existing_core_content_from_sections(existing_sections)
         core, core_change = merge_update_section(
             "core_content",
             old_core,

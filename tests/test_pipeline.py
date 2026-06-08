@@ -14,7 +14,9 @@ from helpers import copy_fixture_raw
 import llmwiki_engine.apply as apply_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.steps as steps_module
+from llmwiki_engine import page_sections as page_sections_module
 from llmwiki_engine import retrieval as retrieval_module
+from llmwiki_engine import update_preservation as update_preservation_module
 from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
@@ -3921,7 +3923,7 @@ def test_merge_update_section_absorbs_live_brain_hands_summary_across_sections()
         "工具权限、沙盒执行、仓库上下文和持久会话状态来路由模型意图的适配层（harness）。"
     )
 
-    concepts = pipeline_module.update_preservation_concepts(old)
+    concepts = update_preservation_module.update_preservation_concepts(old)
     concept_names = {str(concept["name"]) for concept in concepts}
     merged, change = pipeline_module.merge_update_section(
         "summary",
@@ -4791,7 +4793,7 @@ def test_update_preservation_issues_detect_missing_old_key_phrases() -> None:
         ],
     }
 
-    issues = pipeline_module.update_preservation_issues(draft, pack)
+    issues = update_preservation_module.update_preservation_issues(draft, pack)
 
     assert [issue.issue_code for issue in issues] == ["old_knowledge_not_absorbed"]
     assert issues[0].repairability == "repairable"
@@ -5007,7 +5009,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
         "## 失败页\n\n失败页用于验证 repair payload 只重写失败页面。\n"
     )
     source_excerpt_pack = pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
-    update_preservation_pack = pipeline_module.build_update_preservation_pack(merge_plan, snapshot)
+    update_preservation_pack = update_preservation_module.build_update_preservation_pack(merge_plan, snapshot)
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
             pipeline_module.DraftPageItem(
@@ -5266,7 +5268,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         merge_plan=merge_plan,
         snapshot=snapshot,
         source_excerpt_pack=pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=20),
-        update_preservation_pack=pipeline_module.build_update_preservation_pack(merge_plan, snapshot),
+        update_preservation_pack=update_preservation_module.build_update_preservation_pack(merge_plan, snapshot),
         approved_prepared_text=raw_text,
     )
 
@@ -5350,7 +5352,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
     )
     raw_text = "# 测试材料\n\n## 通过页\n\n通过页。\n\n## 失败页\n\n失败页。\n"
     source_excerpt_pack = pipeline_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
-    update_preservation_pack = pipeline_module.build_update_preservation_pack(merge_plan, snapshot)
+    update_preservation_pack = update_preservation_module.build_update_preservation_pack(merge_plan, snapshot)
     accepted_ok = pipeline_module.DraftPageItem(
         page_plan_id="PP-OK",
         action="create",
@@ -5857,11 +5859,11 @@ def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None
         ],
     }
 
-    reinforced, report = pipeline_module.reinforce_update_preservation(draft, pack)
+    reinforced, report = update_preservation_module.reinforce_update_preservation(draft, pack)
 
     assert report["changed"] is True
     assert report["reinforced_section_count"] == 2
-    assert pipeline_module.update_preservation_issues(reinforced, pack) == []
+    assert update_preservation_module.update_preservation_issues(reinforced, pack) == []
     page = reinforced.pages[0]
     assert "从旧页保留的架构视角看" in page.summary
     assert "从旧页保留的架构视角看" in page.body_markdown
@@ -5910,11 +5912,11 @@ def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_en
         ],
     }
 
-    reinforced, report = pipeline_module.reinforce_update_preservation(draft, pack)
+    reinforced, report = update_preservation_module.reinforce_update_preservation(draft, pack)
 
     body = reinforced.pages[0].body_markdown
     assert report["changed"] is True
-    assert pipeline_module.update_preservation_issues(reinforced, pack) == []
+    assert update_preservation_module.update_preservation_issues(reinforced, pack) == []
     assert "从旧页保留的架构视角看" in body
     assert "会话/持久上下文" in body
     assert "隔离执行/容器" in body
@@ -5958,10 +5960,10 @@ def test_update_preservation_reinforcement_single_concept_does_not_invent_other_
         ],
     }
 
-    reinforced, _report = pipeline_module.reinforce_update_preservation(draft, pack)
+    reinforced, _report = update_preservation_module.reinforce_update_preservation(draft, pack)
 
     body = reinforced.pages[0].body_markdown
-    assert pipeline_module.update_preservation_issues(reinforced, pack) == []
+    assert update_preservation_module.update_preservation_issues(reinforced, pack) == []
     assert "Managed Agents / 托管智能体" in body
     assert "会话/持久上下文" not in body
     assert "隔离执行环境" not in body
@@ -5999,7 +6001,7 @@ def test_update_preservation_pack_records_concept_obligations() -> None:
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6048,7 +6050,7 @@ def test_update_preservation_pack_reads_current_core_content_section() -> None:
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6064,7 +6066,7 @@ def test_update_preservation_pack_reads_current_core_content_section() -> None:
 
 
 def test_update_preservation_concepts_do_not_match_bare_session_substrings() -> None:
-    concepts = pipeline_module.update_preservation_concepts(
+    concepts = update_preservation_module.update_preservation_concepts(
         "Possession of product context, user interview sessions, session stateless notes, "
         "session contextual comments, session 和 state, session和state, session 与 context, "
         "session & context, session. State, and session, state reveal product friction. "
@@ -6077,7 +6079,7 @@ def test_update_preservation_concepts_do_not_match_bare_session_substrings() -> 
 
 
 def test_update_preservation_concepts_match_brain_ampersand_hands_without_global_ampersand() -> None:
-    concepts = pipeline_module.update_preservation_concepts(
+    concepts = update_preservation_module.update_preservation_concepts(
         "Managed Agents decouple brain & hands in the execution architecture."
     )
 
@@ -6085,7 +6087,7 @@ def test_update_preservation_concepts_match_brain_ampersand_hands_without_global
     assert "Managed Agents / 托管智能体" in labels
     assert "大脑与双手解耦" in labels
 
-    dirty_concepts = pipeline_module.update_preservation_concepts(
+    dirty_concepts = update_preservation_module.update_preservation_concepts(
         "session & context are discussed separately. brain && hands is dirty shorthand."
     )
     dirty_labels = [concept["label"] for concept in dirty_concepts]
@@ -6124,7 +6126,7 @@ def test_update_preservation_pack_does_not_turn_interview_sessions_into_context_
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6136,7 +6138,7 @@ def test_update_preservation_pack_does_not_turn_interview_sessions_into_context_
 
 
 def test_update_preservation_concepts_match_specific_session_terms() -> None:
-    concepts = pipeline_module.update_preservation_concepts(
+    concepts = update_preservation_module.update_preservation_concepts(
         "The harness keeps a session object with persistent-session state, session/context, "
         "session_state, session-state, and a durable context."
     )
@@ -6150,7 +6152,7 @@ def test_update_preservation_concepts_match_specific_session_terms() -> None:
 
 
 def test_update_preservation_concepts_match_persistent_context_and_sandboxed_execution() -> None:
-    concepts = pipeline_module.update_preservation_concepts(
+    concepts = update_preservation_module.update_preservation_concepts(
         "Managed Agents use the session as a persistent context object inside sandboxed execution."
     )
 
@@ -6158,14 +6160,14 @@ def test_update_preservation_concepts_match_persistent_context_and_sandboxed_exe
     assert "会话/持久上下文" in labels
     assert "隔离执行/容器" in labels
 
-    morphology_concepts = pipeline_module.update_preservation_concepts(
+    morphology_concepts = update_preservation_module.update_preservation_concepts(
         "Harnesses run isolated containers, containerized execution, and sandboxes."
     )
     morphology_labels = [concept["label"] for concept in morphology_concepts]
     assert "harness / 适配框架" in morphology_labels
     assert "隔离执行/容器" in morphology_labels
 
-    sandboxing_concepts = pipeline_module.update_preservation_concepts("A sandboxing strategy is discussed.")
+    sandboxing_concepts = update_preservation_module.update_preservation_concepts("A sandboxing strategy is discussed.")
     sandboxing_labels = [concept["label"] for concept in sandboxing_concepts]
     assert "隔离执行/容器" not in sandboxing_labels
 
@@ -6176,13 +6178,13 @@ def test_update_preservation_session_absorption_uses_token_boundaries() -> None:
         "old_text": "Managed Agents keep session state as a persistent context.",
         "key_phrases": [],
         "min_required_matches": 0,
-        "concept_obligations": pipeline_module.update_preservation_concepts(
+        "concept_obligations": update_preservation_module.update_preservation_concepts(
             "Managed Agents keep session state as a persistent context."
         ),
         "min_required_concept_matches": 2,
     }
 
-    absorption = pipeline_module.update_preservation_section_absorption(
+    absorption = update_preservation_module.update_preservation_section_absorption(
         section,
         "Managed Agents are mentioned with session stateless notes, session contextual comments, "
         "and session 与 context 分开介绍。",
@@ -6200,13 +6202,13 @@ def test_update_preservation_morphology_absorption_uses_explicit_variants() -> N
         "old_text": "Harnesses run isolated containers and sandboxes.",
         "key_phrases": [],
         "min_required_matches": 0,
-        "concept_obligations": pipeline_module.update_preservation_concepts(
+        "concept_obligations": update_preservation_module.update_preservation_concepts(
             "Harnesses run isolated containers and sandboxes."
         ),
         "min_required_concept_matches": 2,
     }
 
-    absorption = pipeline_module.update_preservation_section_absorption(
+    absorption = update_preservation_module.update_preservation_section_absorption(
         section,
         "The architecture still uses harnesses and containerized execution.",
     )
@@ -6246,7 +6248,7 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
             )
         ],
     )
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6268,7 +6270,7 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
     labels = [concept["label"] for concept in section["concept_obligations"]]
     assert "Managed Agents / 托管智能体" in labels
     assert "会话/持久上下文" in labels
-    issues = pipeline_module.update_preservation_issues(draft, pack)
+    issues = update_preservation_module.update_preservation_issues(draft, pack)
 
     assert [issue.issue_code for issue in issues] == ["old_knowledge_not_absorbed"]
     assert "会话/持久上下文" in issues[0].message
@@ -6304,7 +6306,7 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
             )
         ],
     )
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6313,7 +6315,7 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
     assert "Managed Agents / 托管智能体" in labels
     assert "大脑与双手解耦" in labels
 
-    absorbed = pipeline_module.update_preservation_section_absorption(
+    absorbed = update_preservation_module.update_preservation_section_absorption(
         section,
         "Claude Code keeps Managed Agents architecture and explicitly decouples brain & hands.",
     )
@@ -6332,7 +6334,7 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
             )
         ]
     )
-    issues = pipeline_module.update_preservation_issues(draft, pack)
+    issues = update_preservation_module.update_preservation_issues(draft, pack)
 
     assert [issue.issue_code for issue in issues] == ["old_knowledge_not_absorbed"]
     assert "大脑与双手解耦" in issues[0].message
@@ -6378,7 +6380,7 @@ def test_update_preservation_pack_reads_english_section_headings() -> None:
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6395,7 +6397,7 @@ def test_update_preservation_pack_reads_english_section_headings() -> None:
 
 
 def test_parse_existing_sections_ignores_noncanonical_english_headings() -> None:
-    sections = pipeline_module.parse_existing_sections(
+    sections = page_sections_module.parse_existing_sections(
         "# Page\n\n"
         "Summary is mentioned in body text but is not a section.\n\n"
         "### Summary\n\n"
@@ -6410,7 +6412,7 @@ def test_parse_existing_sections_ignores_noncanonical_english_headings() -> None
 
 
 def test_parse_existing_sections_reads_casefold_english_headings() -> None:
-    sections = pipeline_module.parse_existing_sections(
+    sections = page_sections_module.parse_existing_sections(
         "# Page\n\n"
         "## summary\n\n"
         "Lowercase summary.\n\n"
@@ -6462,7 +6464,7 @@ def test_update_preservation_pack_keeps_mixed_placeholder_section_with_core_know
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6506,7 +6508,7 @@ def test_update_preservation_pack_keeps_mixed_empty_placeholder_section_with_cor
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6548,7 +6550,7 @@ def test_update_preservation_pack_keeps_core_after_placeholder_prefix_colon() ->
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6590,7 +6592,7 @@ def test_update_preservation_pack_skips_pure_placeholder_sections(placeholder: s
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6628,7 +6630,7 @@ def test_update_preservation_pack_skips_placeholder_even_when_it_mentions_known_
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6667,7 +6669,7 @@ def test_update_preservation_pack_keeps_english_phrase_with_na_substring() -> No
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6709,7 +6711,7 @@ def test_update_preservation_pack_does_not_use_placeholder_segment_concepts() ->
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6753,7 +6755,7 @@ def test_update_preservation_pack_filters_mixed_ascii_placeholder_segment() -> N
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6805,7 +6807,7 @@ def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
         ],
     )
 
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6846,7 +6848,7 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
             )
         ],
     )
-    pack = pipeline_module.build_update_preservation_pack(
+    pack = update_preservation_module.build_update_preservation_pack(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
@@ -6868,7 +6870,7 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
     assert tail not in section["old_text"]
     labels = [concept["label"] for concept in section["concept_obligations"]]
     assert "安全边界/权限限制" in labels
-    issues = pipeline_module.update_preservation_issues(draft, pack)
+    issues = update_preservation_module.update_preservation_issues(draft, pack)
 
     assert issues
     assert "安全边界/权限限制" in issues[0].message
