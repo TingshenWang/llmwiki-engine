@@ -1288,18 +1288,6 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     )
 
 
-def draft_aux_report_has_activity(report: dict[str, Any], count_keys: list[str]) -> bool:
-    if bool(report.get("changed")):
-        return True
-    for key in count_keys:
-        try:
-            if int(report.get(key, 0)) > 0:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return bool(report.get("pages"))
-
-
 def write_draft_aux_report_if_active(
     *,
     output_dir: Path,
@@ -1308,7 +1296,13 @@ def write_draft_aux_report_if_active(
     renderer: Any,
     count_keys: list[str],
 ) -> tuple[Path, Path] | None:
-    if not draft_aux_report_has_activity(report, count_keys):
+    has_activity = bool(report.get("changed")) or bool(report.get("pages"))
+    for key in count_keys:
+        try:
+            has_activity = has_activity or int(report.get(key, 0)) > 0
+        except (TypeError, ValueError):
+            continue
+    if not has_activity:
         return None
     json_path = output_dir / f"{stem}.json"
     md_path = output_dir / f"{stem}.md"
@@ -3236,40 +3230,37 @@ def backfill_missing_candidate_resolution_items(
         covered_ids.update(item.source_basis.source_candidate_ids)
     additions: list[CandidateResolutionItem] = []
     notes = list(artifact.missed_candidate_risks)
-    for group_name, candidate in digest_candidates_with_group(digest):
-        if candidate.candidate_id in covered_ids:
-            continue
-        page_type = page_type_for_digest_candidate(group_name, candidate, profile)
-        display_title = candidate.suggested_page_title.strip() or candidate.name.strip() or candidate.candidate_id
-        additions.append(
-            CandidateResolutionItem(
-                source_basis=SourceBasis(
-                    source_candidate_ids=[candidate.candidate_id],
-                    source_locator=candidate.source_locator,
-                ),
-                page_type=page_type,
-                display_title=display_title,
-                topic_summary=candidate.one_sentence_summary,
-                why_this_page=candidate.wiki_value or candidate.why_matters or "该候选来自 source_digest，模型在页面规划中遗漏，系统补齐为最小页面计划。",
-                initial_section_intent="系统补齐的最小页面计划；后续 merge planning / draft rendering 需要重新对照全文消化。",
-                coverage_notes=f"模型遗漏 approved_digest candidate `{candidate.candidate_id}`，系统已补齐。",
-                reason="candidate_resolution coverage backfill",
+    for group_name, candidates in [
+        ("entities", digest.entities),
+        ("concepts", digest.concepts),
+        ("designs", digest.designs),
+        ("comparisons", digest.comparisons),
+        ("open_questions", digest.open_questions),
+    ]:
+        for candidate in candidates:
+            if candidate.candidate_id in covered_ids:
+                continue
+            page_type = page_type_for_digest_candidate(group_name, candidate, profile)
+            display_title = candidate.suggested_page_title.strip() or candidate.name.strip() or candidate.candidate_id
+            additions.append(
+                CandidateResolutionItem(
+                    source_basis=SourceBasis(
+                        source_candidate_ids=[candidate.candidate_id],
+                        source_locator=candidate.source_locator,
+                    ),
+                    page_type=page_type,
+                    display_title=display_title,
+                    topic_summary=candidate.one_sentence_summary,
+                    why_this_page=candidate.wiki_value or candidate.why_matters or "该候选来自 source_digest，模型在页面规划中遗漏，系统补齐为最小页面计划。",
+                    initial_section_intent="系统补齐的最小页面计划；后续 merge planning / draft rendering 需要重新对照全文消化。",
+                    coverage_notes=f"模型遗漏 approved_digest candidate `{candidate.candidate_id}`，系统已补齐。",
+                    reason="candidate_resolution coverage backfill",
+                )
             )
-        )
-        notes.append(f"candidate_resolution model missed `{candidate.candidate_id}`; deterministic backfill added `{display_title}`.")
+            notes.append(f"candidate_resolution model missed `{candidate.candidate_id}`; deterministic backfill added `{display_title}`.")
     if not additions:
         return artifact
     return CandidateResolutionArtifact(items=[*artifact.items, *additions], missed_candidate_risks=notes)
-
-
-def digest_candidates_with_group(digest: SourceDigestArtifact) -> list[tuple[str, SourceDigestCandidate]]:
-    return [
-        *[("entities", item) for item in digest.entities],
-        *[("concepts", item) for item in digest.concepts],
-        *[("designs", item) for item in digest.designs],
-        *[("comparisons", item) for item in digest.comparisons],
-        *[("open_questions", item) for item in digest.open_questions],
-    ]
 
 
 def page_type_for_digest_candidate(group_name: str, candidate: SourceDigestCandidate, profile: Any) -> str:
