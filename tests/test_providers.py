@@ -31,7 +31,7 @@ def test_raw_prepare_fixture_contract() -> None:
     model, result = StructuredModelCall(provider).run("raw_prepare", {}, RawPreparationArtifact)
     assert result.schema_valid
     assert model.prepared_markdown.strip()
-    assert model.risk_level == "low"
+    assert model.operations_applied == ["kept_clean_markdown"]
 
 
 def test_mock_provider_numbered_json_takes_precedence_over_plain_fixture(tmp_path: Path) -> None:

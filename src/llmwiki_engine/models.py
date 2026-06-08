@@ -166,25 +166,14 @@ class StructuredRepairReport(StrictModel):
     non_repairable_issues: list[StructuredIssue] = Field(default_factory=list)
 
 
-class RawPreparationUncertainItem(StrictModel):
-    item: str
-    reason: str = ""
-    severity: Literal["low", "medium", "high"] = "medium"
-
-
 class RawPreparationArtifact(StrictModel):
     schema_version: Literal["raw_preparation.v1"] = "raw_preparation.v1"
     source_raw_path: str
     input_raw_sha256: str = ""
     raw_link_cleanup_ref: str = ""
-    document_kind: Literal["transcript", "article", "notes", "mixed", "unknown"] = "unknown"
     prepared_markdown: str
     operations_applied: list[str] = Field(default_factory=list)
     omission_policy: str = "non_content_noise_only"
-    uncertain_items: list[RawPreparationUncertainItem] = Field(default_factory=list)
-    risk_level: Literal["low", "medium", "high"] = "medium"
-    requires_human_review: bool = True
-    review_notes: str = ""
 
 
 class RawLinkCleanupLink(StrictModel):

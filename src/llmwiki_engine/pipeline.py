@@ -149,7 +149,6 @@ RAW_PREPARE_CONTRACT = {
         "Do not add facts that are not supported by the original raw.",
         "Remove or relocate non-content noise such as navigation fragments, boilerplate, self-promotion, and obvious formatting artifacts.",
         "Correct obvious wording or formatting errors only when the surrounding context makes the correction clear.",
-        "Record uncertainty instead of guessing.",
         "Return prepared_markdown as clean Markdown suitable for source_digest and downstream knowledge digestion.",
     ],
 }
@@ -541,14 +540,9 @@ def build_raw_prepare_skip_passthrough(
         source_raw_path=raw_rel,
         input_raw_sha256=input_raw_sha256,
         raw_link_cleanup_ref=cleanup_ref,
-        document_kind="unknown",
         prepared_markdown=raw_text.rstrip() + "\n",
         operations_applied=["user_skip_markdown_passthrough"],
         omission_policy="none",
-        uncertain_items=[],
-        risk_level="low",
-        requires_human_review=False,
-        review_notes="User selected --prepare skip; raw Markdown was passed through without model cleanup.",
     )
 
 
@@ -561,12 +555,9 @@ def _write_raw_prepare_outputs(ctx: StepRunContext, preparation: RawPreparationA
     prepared = step_root / "prepared.md"
     prepared.parent.mkdir(parents=True, exist_ok=True)
     prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
-    review = step_root / "preparation_review.md"
-    review.write_text(render_preparation_review(preparation), encoding="utf-8")
     outputs = [
         _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
         _ref(ctx.run_dir, prepared, step_name, "markdown"),
-        _ref(ctx.run_dir, review, step_name, "markdown"),
     ]
     if include_model_outputs:
         outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
@@ -650,22 +641,12 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
     step_name = "prepared_raw_review"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     prepared = require_step_output_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
-    preparation = read_model(require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json", RawPreparationArtifact)
     approved = step_root / "approved_prepared.md"
     approved.write_text(prepared.read_text(encoding="utf-8"), encoding="utf-8")
     prompt = step_root / "review_prompt.md"
-    risk_section = ""
-    if preparation.requires_human_review:
-        risk_section = (
-            "\n## Raw Prepare 风险提示\n\n"
-            f"- risk_level: `{preparation.risk_level}`\n"
-            f"- requires_human_review: `{str(preparation.requires_human_review).lower()}`\n"
-            "- 说明：当前运行会自动批准 prepared raw；下游步骤会继续基于 Approved Raw 校验。\n"
-        )
     prompt.write_text(
         "# Prepared Raw 审核\n\n"
-        "当前运行自动批准 prepared raw；后续可在这里接入交互式审核。\n"
-        f"{risk_section}",
+        "当前运行自动批准 prepared raw；下游步骤会继续基于 Approved Raw 校验。\n",
         encoding="utf-8",
     )
     feedback = step_root / "review_feedback.jsonl"
@@ -2778,29 +2759,6 @@ def assert_system_page_can_be_overwritten(vault: Path, target_path: str) -> None
         assert_current_system_page(path)
     except RuntimeError as exc:
         raise _errors.PipelineError(f"{exc}: {target_path}") from exc
-
-
-def render_preparation_review(preparation: RawPreparationArtifact) -> str:
-    operations = "\n".join(f"- {operation}" for operation in preparation.operations_applied) or "- 暂无记录。"
-    uncertain = "\n".join(
-        f"- [{item.severity}] {item.item}: {item.reason}" for item in preparation.uncertain_items
-    ) or "- 暂无记录。"
-    return (
-        "# Raw 清洗审核\n\n"
-        f"- 原始材料: `{preparation.source_raw_path}`\n"
-        f"- 文档类型: `{preparation.document_kind}`\n"
-        f"- 风险等级: `{preparation.risk_level}`\n"
-        f"- 是否需要人工审核: `{str(preparation.requires_human_review).lower()}`\n"
-        f"- 省略策略: `{preparation.omission_policy}`\n\n"
-        f"- Raw Wikilink 规范化: `{preparation.raw_link_cleanup_ref or 'raw_link_cleanup/raw_link_cleanup.json'}`\n"
-        f"- 输入 raw hash: `{preparation.input_raw_sha256 or 'unknown'}`\n\n"
-        "## 已执行操作\n\n"
-        f"{operations}\n\n"
-        "## 不确定项\n\n"
-        f"{uncertain}\n\n"
-        "## 审核备注\n\n"
-        f"{preparation.review_notes or '暂无审核备注。'}\n"
-    )
 
 
 def _structured_call(

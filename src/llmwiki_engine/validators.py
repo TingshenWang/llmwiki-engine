@@ -45,8 +45,6 @@ def validate_raw_preparation(preparation: RawPreparationArtifact) -> None:
         _raise_issue("invalid_raw_path", "raw_preparation source_raw_path must point inside raw/", validator_id="validate_raw_preparation")
     if not preparation.prepared_markdown.strip():
         _raise_issue("missing_field", "raw_preparation prepared_markdown is empty", field_path="prepared_markdown", validator_id="validate_raw_preparation", repairable=True)
-    if preparation.risk_level == "high" and not preparation.requires_human_review:
-        _raise_issue("invalid_review_gate", "high risk raw_preparation must require human review", validator_id="validate_raw_preparation")
 
 
 def validate_source_digest(digest: SourceDigestArtifact, *, language: str | None = None) -> None:

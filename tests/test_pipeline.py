@@ -1599,7 +1599,6 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert (run_dir / "raw_link_cleanup" / "cleanup.diff").exists()
     assert (run_dir / "raw_prepare" / "raw_preparation.json").exists()
     assert (run_dir / "raw_prepare" / "prepared.md").exists()
-    assert (run_dir / "raw_prepare" / "preparation_review.md").exists()
     assert (run_dir / "prepared_raw_review" / "approved_prepared.md").exists()
     prepared_decision = read_json(run_dir / "prepared_raw_review" / "review_decision.json")
     assert prepared_decision["schema_version"] == "review_decision.v2"
@@ -1954,7 +1953,6 @@ def test_model_artifacts_are_redacted(tmp_path: Path, monkeypatch: pytest.Monkey
         data = json.loads((FIXTURE_ROOT / "mock" / f"{task}.json").read_text(encoding="utf-8"))
         if task == "raw_prepare":
             data["prepared_markdown"] += f"\n{secret}"
-            data["review_notes"] = secret
         if task == "source_digest":
             data["summary"] += f" {secret}"
             data["concepts"][0]["why_matters"] += f" {secret}"
@@ -2046,7 +2044,6 @@ def test_raw_prepare_skip_policy_writes_local_passthrough_without_model_fixture(
     assert raw_prepare_metrics["provider"] == "local"
     assert "raw_prepare" not in manifest.provider_contexts[0].providers
     assert preparation["operations_applied"] == ["user_skip_markdown_passthrough"]
-    assert preparation["requires_human_review"] is False
     assert (run_dir / "raw_prepare" / "prepared.md").read_text(encoding="utf-8") == raw.read_text(encoding="utf-8").rstrip() + "\n"
     assert not (run_dir / "raw_prepare" / "provider_result.json").exists()
     assert not (run_dir / "raw_prepare" / "structured_repair_report.json").exists()
@@ -2189,11 +2186,8 @@ def test_prepared_raw_review_for_skip_policy_is_plain_auto_approval(tmp_path: Pa
         raw_prepare_policy=RawPreparePolicy.skip,
     )
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    prompt = (run_dir / "prepared_raw_review" / "review_prompt.md").read_text(encoding="utf-8")
     decision = read_json(run_dir / "prepared_raw_review" / "review_decision.json")
 
-    assert "Skip Prepare 风险提示" not in prompt
-    assert "policy_suppressed" not in prompt
     assert decision["notes"] == "当前运行自动批准；交互式审核尚未接入。"
 
 

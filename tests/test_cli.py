@@ -1083,7 +1083,6 @@ def test_api_key_does_not_spread_across_e2e_cli_boundaries(monkeypatch, tmp_path
         data = json.loads((FIXTURE_ROOT / "mock" / f"{task}.json").read_text(encoding="utf-8"))
         if task == "raw_prepare":
             data["prepared_markdown"] += f"\n{secret}\n"
-            data["review_notes"] = f"review note {secret}"
         if task == "source_digest":
             data["summary"] += f" {secret}"
             data["concepts"][0]["why_matters"] += f" {secret}"
