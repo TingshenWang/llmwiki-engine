@@ -13399,7 +13399,7 @@ def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> b
 
 
 def high_risk_actionable_can_context(compact: str, lowered: str) -> bool:
-    chinese_modality = r"(?:可以|可|适合|适宜|适用于|可用于|推荐用于)"
+    chinese_modality = r"(?:可以|可|可用于|推荐用于)"
     chinese_patterns = [
         rf"{chinese_modality}.{{0,8}}(?:服用|用药|吃|口服).{{0,10}}(?:药|阿司匹林|处方|剂量|胸痛|心梗|症状)",
         rf"{chinese_modality}.{{0,8}}(?:解除|起诉|索赔|要求赔偿|签署|签).{{0,10}}(?:合同|协议|竞业|雇主|公司|赔偿)",
@@ -13413,10 +13413,10 @@ def high_risk_actionable_can_context(compact: str, lowered: str) -> bool:
         r"\bcan\s+(?:sue|terminate|cancel|sign).{0,40}\b(?:employer|contract|non-compete|noncompete|liability|attorney)\b",
         r"\bcan\s+(?:invest|buy|purchase|configure).{0,40}\b(?:bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
         r"\bcan\s+(?:store|save|bypass|disable|delete|leak|expose).{0,40}\b(?:password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
-        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:taking|using|aspirin|medicine|medication|dosage|dose|chest pain|heart attack)\b",
-        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:suing|terminating|cancelling|signing|employer|contract|non-compete|noncompete|liability|attorney)\b",
-        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:investing|buying|purchasing|bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
-        r"\b(?:suitable|appropriate|recommended)\s+for.{0,40}\b(?:storing|saving|bypassing|disabling|deleting|leaking|exposing|password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
+        r"\brecommended\s+for.{0,40}\b(?:taking|using|aspirin|medicine|medication|dosage|dose|chest pain|heart attack)\b",
+        r"\brecommended\s+for.{0,40}\b(?:suing|terminating|cancelling|signing|employer|contract|non-compete|noncompete|liability|attorney)\b",
+        r"\brecommended\s+for.{0,40}\b(?:investing|buying|purchasing|bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
+        r"\brecommended\s+for.{0,40}\b(?:storing|saving|bypassing|disabling|deleting|leaking|exposing|password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
     ]
     return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in english_patterns)
 
