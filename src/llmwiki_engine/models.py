@@ -24,11 +24,6 @@ class EvidencePolicy(str, Enum):
     none = "none"
 
 
-class RunMode(str, Enum):
-    dev = "dev"
-    standard = "standard"
-
-
 class RawPreparePolicy(str, Enum):
     auto = "auto"
     force_model = "force-model"
@@ -749,10 +744,9 @@ class StepRecord(StrictModel):
 
 
 class OperationManifest(StrictModel):
-    schema_version: Literal["operation_manifest.v8"] = "operation_manifest.v8"
+    schema_version: Literal["operation_manifest.v9"] = "operation_manifest.v9"
     operation_id: str
     operation_type: str
-    run_mode: RunMode = RunMode.dev
     engine_version: str
     profile: str
     profile_version: str = "1"

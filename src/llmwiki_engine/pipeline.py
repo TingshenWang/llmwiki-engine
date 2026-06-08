@@ -61,7 +61,6 @@ from .models import (
     RawPreparePolicy,
     RawPreparationArtifact,
     ReviewDecision,
-    RunMode,
     RelatedPageRef,
     RelatedMergeReport,
     RelatedCandidateReport,
@@ -473,7 +472,6 @@ def run_simplified_ingest(
     mock_fixture_dir: Path | None = None,
     profile_name: str | None = None,
     slug: str | None = None,
-    run_mode: RunMode = RunMode.dev,
     raw_prepare_policy: RawPreparePolicy | None = None,
     console: Console | None = None,
 ) -> OperationManifest:
@@ -506,7 +504,6 @@ def run_simplified_ingest(
         manifest = OperationManifest(
             operation_id=operation_id,
             operation_type="ingest",
-            run_mode=run_mode,
             engine_version=__version__,
             profile=profile.name,
             profile_version=profile.version,
@@ -532,7 +529,6 @@ def resume_ingest(
     vault: Path,
     operation_id: str,
     from_step: str | None = None,
-    run_mode: RunMode | None = None,
     mock_fixture_dir: Path | None = None,
     raw_prepare_policy: RawPreparePolicy | None = None,
     console: Console | None = None,
@@ -540,8 +536,6 @@ def resume_ingest(
     store = RunStore(vault)
     with apply_lock(vault), run_lock(vault, operation_id):
         manifest = read_manifest(store.manifest_path(operation_id))
-        if run_mode is not None and run_mode != manifest.run_mode:
-            raise PipelineError("run_mode is immutable for an operation; rerun ingest to use a different mode.")
         if manifest.status in {OperationStatus.applied, OperationStatus.source_recorded}:
             raise PipelineError("Applied operations are immutable. Start a new operation instead.")
         if manifest.status == OperationStatus.apply_failed:

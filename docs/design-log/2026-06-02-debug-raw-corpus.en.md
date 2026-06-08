@@ -59,7 +59,7 @@ It tests:
 
 ## Debugging Mode
 
-Development should observe two run modes:
+Development should observe two debugging scenarios:
 
 - Single-source ingest: ingest one raw file at a time, then inspect the source page, page split, candidate resolution, and draft usability.
 - Sequential multi-source ingest: ingest the three raw files one by one into the same vault, then inspect how existing pages are updated, enriched, or kept from being duplicated.

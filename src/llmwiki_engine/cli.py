@@ -20,7 +20,6 @@ from .models import (
     RawIngestCandidateReport,
     RawPreparePolicy,
     ReviewDecision,
-    RunMode,
     VerificationStatus,
 )
 from .pipeline import (
@@ -110,7 +109,6 @@ def ingest_run(
     ),
     profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
-    mode: RunMode = RunMode.dev,
     prepare: Optional[PrepareChoice] = typer.Option(
         None,
         "--prepare",
@@ -133,7 +131,6 @@ def ingest_run(
             mock_fixture_dir=mock_fixture_dir,
             profile_name=profile,
             slug=slug,
-            run_mode=mode,
             raw_prepare_policy=raw_prepare_policy,
             console=run_console,
         )
@@ -234,7 +231,6 @@ def ingest_run_next(
     ),
     profile: Optional[str] = typer.Option(None, "--profile", help="Override the vault config profile for this run."),
     slug: Optional[str] = None,
-    mode: RunMode = RunMode.dev,
     prepare: Optional[PrepareChoice] = typer.Option(
         None,
         "--prepare",
@@ -287,7 +283,6 @@ def ingest_run_next(
             mock_fixture_dir=mock_fixture_dir,
             profile_name=profile,
             slug=slug,
-            run_mode=mode,
             raw_prepare_policy=raw_prepare_policy,
             console=run_console,
         )
@@ -410,7 +405,6 @@ def ingest_resume(
         "--prepare",
         help="Raw prepare policy when resuming from raw_prepare or earlier: auto, skip, or force.",
     ),
-    mode: Optional[RunMode] = None,
 ) -> None:
     """Resume using the current provider config for steps that will execute."""
     try:
@@ -421,7 +415,6 @@ def ingest_resume(
             vault=vault,
             operation_id=operation_id,
             from_step=from_step,
-            run_mode=mode,
             mock_fixture_dir=mock_fixture_dir,
             raw_prepare_policy=raw_prepare_policy,
             console=console,
@@ -474,7 +467,6 @@ def _print_manifest_table(vault: Path, manifest: OperationManifest) -> None:
     ]
     if review_reasons:
         console.print("[yellow]awaiting review:[/] " + "; ".join(review_reasons))
-    console.print(f"mode: [bold]{manifest.run_mode.value}[/]")
     console.print(f"status: [bold]{manifest.status.value}[/]")
     latest_error = next((step.error for step in reversed(manifest.steps) if step.error), None)
     if latest_error:
@@ -535,7 +527,6 @@ def _operation_inspect_payload(vault: Path, manifest: OperationManifest) -> dict
         "vault": vault.as_posix(),
         "operation_id": manifest.operation_id,
         "operation_status": manifest.status.value,
-        "run_mode": manifest.run_mode.value,
         "awaiting_review_step": awaiting_review_step,
         "awaiting_review_reasons": awaiting_review_reasons,
         "failed_steps": failed_steps,
@@ -578,7 +569,6 @@ def _print_inspect_report(payload: dict[str, object]) -> None:
     table.add_column("Field", no_wrap=True)
     table.add_column("Value", overflow="fold")
     table.add_row("status", str(payload["operation_status"]))
-    table.add_row("run_mode", str(payload["run_mode"]))
     table.add_row("awaiting_review_step", str(payload.get("awaiting_review_step") or ""))
     grounding_review = payload.get("grounding_review")
     if isinstance(grounding_review, dict) and grounding_review.get("exists"):
@@ -849,8 +839,6 @@ def _next_action(manifest: OperationManifest) -> str:
         if step.status.value in {"failed", "pending"}:
             return f"run `llmwiki ingest resume <vault> {manifest.operation_id}`"
     if manifest.status.value == "drafted":
-        if manifest.run_mode == RunMode.standard:
-            return "standard mode does not allow manual apply in this MVP"
         return f"run `llmwiki ingest apply <vault> {manifest.operation_id}`"
     return "inspect status"
 

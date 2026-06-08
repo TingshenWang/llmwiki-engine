@@ -9,7 +9,7 @@ import llmwiki_engine.cli as cli_module
 from llmwiki_engine.cli import app
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
-from llmwiki_engine.models import RawPreparePolicy, RunMode
+from llmwiki_engine.models import RawPreparePolicy
 from llmwiki_engine.pipeline import copy_fixture_raw, init_vault, latest_operation, run_simplified_ingest
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
@@ -79,7 +79,6 @@ def test_status_verify_exit_codes(tmp_path: Path) -> None:
     inspect_payload = json.loads(inspect_json.output)
     assert inspect_payload["operation_id"] == manifest.operation_id
     assert inspect_payload["operation_status"] == manifest.status.value
-    assert inspect_payload["run_mode"] == manifest.run_mode.value
     assert inspect_payload["metrics"]["internal_model_call_count"] >= 0
     assert inspect_payload["next_action"]
     inspect_hints = {item["label"]: item for item in inspect_payload["artifact_hints"]}
@@ -149,7 +148,6 @@ def test_ingest_run_json_with_mock_fixture_is_pure_json(tmp_path: Path) -> None:
     payload = json.loads(result.output)
     assert payload["operation_id"]
     assert payload["operation_status"] in {"awaiting_review", "drafted"}
-    assert payload["run_mode"] == RunMode.dev.value
     assert payload["raw_bindings"][0]["relative_path"] == "raw/raw_project_note.md"
     assert payload["metrics"]["internal_model_call_count"] >= 0
     hints = {item["label"]: item for item in payload["artifact_hints"]}
@@ -387,7 +385,7 @@ def test_resume_help_lists_step_names_from_metadata() -> None:
         assert step_name in result.output
 
 
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v9"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v10"])
 def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands(
     tmp_path: Path,
     schema_version: str,
@@ -489,7 +487,7 @@ def test_missing_operation_manifest_reports_single_line_error(tmp_path: Path, co
     assert "Traceback" not in result.output
 
 
-def test_standard_status_does_not_prompt_manual_apply(tmp_path: Path) -> None:
+def test_drafted_status_prompts_manual_apply(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
     raw = copy_fixture_raw(vault, FIXTURE_ROOT / "raw_project_note.md")
@@ -497,15 +495,13 @@ def test_standard_status_does_not_prompt_manual_apply(tmp_path: Path) -> None:
         vault=vault,
         raw_file=raw,
         fixture_dir=FIXTURE_ROOT / "mock",
-        slug="standard-next",
-        run_mode=RunMode.standard,
+        slug="single-mode-next",
     )
 
     runner = CliRunner()
     result = runner.invoke(app, ["ingest", "status", str(vault), manifest.operation_id])
     assert result.exit_code == 0
-    assert "standard mode does not allow manual apply in this MVP" in result.output
-    assert "llmwiki ingest apply" not in result.output
+    assert f"llmwiki ingest apply <vault> {manifest.operation_id}" in result.output
 
 
 def test_raw_candidates_reports_unprocessed_changed_and_duplicate_hash(tmp_path: Path) -> None:
@@ -800,7 +796,6 @@ def test_run_next_invokes_ingest_with_selected_raw(monkeypatch: pytest.MonkeyPat
     assert seen["raw_file"] == raw.resolve()
     assert seen["mock_fixture_dir"] == mock_fixture_dir
     assert seen["slug"] == "next-run"
-    assert seen["run_mode"] == RunMode.dev
     assert seen["raw_prepare_policy"] == RawPreparePolicy.force_model
 
 

@@ -66,7 +66,7 @@ draft_rendering -> validation -> apply_preview`。
 - apply 前展示最终 preview 表。
 - 表格至少包括：target path、create/update、preimage status、source page、knowledge page、system page。
 - `index.md`、`log.md`、`logs/YYYY-MM-DD.md` 必须出现在 preview 中，不能在 apply 后偷偷写。
-- 人类确认后才允许 apply；`standard` 在这阶段仍只自动到 draft/apply preview，不自动写入。
+- 人类确认后才允许 apply；ingest 只自动到 draft/apply preview，不自动写入。
 
 ## P0：增量合并与系统页
 
@@ -149,4 +149,4 @@ draft_rendering -> validation -> apply_preview`。
 - 不恢复强证据链作为主路径硬合同。
 - 不做 deferred/not_applied 候选池。
 - 不让 source page 链接中间 artifact。
-- 不做自动写入的 `standard` 模式；在审核系统稳定前，`standard` 只到 draft/apply preview。
+- 不做自动写入模式；在审核系统稳定前，ingest 只到 draft/apply preview。

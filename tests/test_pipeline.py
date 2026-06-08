@@ -26,7 +26,6 @@ from llmwiki_engine.models import (
     DraftRenderingArtifact,
     OperationStatus,
     RawPreparePolicy,
-    RunMode,
     SourceBasis,
     SourceDigestArtifact,
     SourceDigestCandidate,
@@ -1616,7 +1615,7 @@ def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
     assert "## 派生知识页" in source_text
     assert "`concepts/Concept_知识编译工程骨架.md`" in source_text
     assert "[[concepts/" not in source_text
-    assert loaded.schema_version == "operation_manifest.v8"
+    assert loaded.schema_version == "operation_manifest.v9"
     assert [ref.schema_version for ref in loaded.steps[0].outputs if ref.kind == "json"] == ["raw_link_cleanup.v1"]
     assert "raw_preparation.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
     assert "structured_repair_report.v1" in [ref.schema_version for ref in loaded.steps[1].outputs if ref.kind == "json"]
@@ -3222,41 +3221,11 @@ def test_resume_current_config_records_provider_on_failed_attempt(tmp_path: Path
     assert not (run_dir / "apply_preview").exists()
 
 
-def test_resume_mode_is_immutable_and_rejects_before_writing(tmp_path: Path) -> None:
+def test_resume_can_rerun_from_step_without_mode_parameter(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="mode")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    stale = run_dir / "draft_rendering" / "draft_pages" / "stale.md"
-    stale.write_text("stale", encoding="utf-8")
-    before = read_json(RunStore(vault).manifest_path(manifest.operation_id))
-
-    with pytest.raises(PipelineError, match="run_mode is immutable"):
-        resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="source_digest", run_mode=RunMode.standard)
-
-    after = read_json(RunStore(vault).manifest_path(manifest.operation_id))
-    assert after == before
-    assert stale.exists()
-
-    vault2, raw2 = make_vault(tmp_path / "standard")
-    standard = run_simplified_ingest(
-        vault=vault2,
-        raw_file=raw2,
-        fixture_dir=FIXTURE_ROOT / "mock",
-        slug="standard-mode",
-        run_mode=RunMode.standard,
-    )
-    before_standard = read_json(RunStore(vault2).manifest_path(standard.operation_id))
-    with pytest.raises(PipelineError, match="run_mode is immutable"):
-        resume_ingest(vault=vault2, operation_id=standard.operation_id, from_step="validation", run_mode=RunMode.dev)
-    assert read_json(RunStore(vault2).manifest_path(standard.operation_id)) == before_standard
-
-
-def test_resume_mode_can_confirm_existing_mode(tmp_path: Path) -> None:
-    vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="same-mode")
-    resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="validation", run_mode=RunMode.dev)
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="resume")
+    resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="validation")
     assert resumed.status == OperationStatus.drafted
-    assert resumed.run_mode == RunMode.dev
 
 
 def test_raw_and_artifact_drift_block_resume(tmp_path: Path) -> None:
@@ -14926,22 +14895,7 @@ def test_plain_apply_records_apply_failed_on_receipt_failure(tmp_path: Path, mon
     assert read_jsonl(vault / ".llmwiki" / "applied" / "operations.jsonl") == []
 
 
-def test_standard_apply_is_rejected_before_writing(tmp_path: Path) -> None:
-    vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(
-        vault=vault,
-        raw_file=raw,
-        fixture_dir=FIXTURE_ROOT / "mock",
-        slug="standard",
-        run_mode=RunMode.standard,
-    )
-    target = vault / "wiki" / "concepts" / "Concept_知识编译工程骨架.md"
-    with pytest.raises(ApplyError, match="standard mode does not allow manual apply"):
-        apply_operation(vault, manifest.operation_id)
-    assert not target.exists()
-
-
-@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v9"])
+@pytest.mark.parametrize("schema_version", ["operation_manifest.v4", "operation_manifest.v7", "operation_manifest.v8", "operation_manifest.v10"])
 def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path, schema_version: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v2")
@@ -14976,8 +14930,8 @@ def test_manifest_step_topology_must_match_current_mvp_pipeline(tmp_path: Path, 
         read_manifest(manifest_path)
 
 
-@pytest.mark.parametrize("missing_key", ["run_mode", "status", "provider_contexts", "updated_at"])
-def test_manifest_v4_requires_persisted_top_level_fields(tmp_path: Path, missing_key: str) -> None:
+@pytest.mark.parametrize("missing_key", ["status", "provider_contexts", "updated_at"])
+def test_manifest_v9_requires_persisted_top_level_fields(tmp_path: Path, missing_key: str) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="missing-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
@@ -14989,7 +14943,7 @@ def test_manifest_v4_requires_persisted_top_level_fields(tmp_path: Path, missing
         read_manifest(manifest_path)
 
 
-def test_manifest_v4_rejects_extra_top_level_fields_with_mvp_message(tmp_path: Path) -> None:
+def test_manifest_v9_rejects_extra_top_level_fields_with_mvp_message(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="extra-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)

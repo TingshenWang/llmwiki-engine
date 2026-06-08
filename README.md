@@ -46,8 +46,8 @@ and drafts can be tested before real models are introduced.
   digest; `wiki_context_snapshot` retrieves the most relevant existing wiki
   pages per planned topic; `wiki_merge_planning` uses that frozen evidence to
   decide create/update/noop/needs-human-decision.
-- Update writes are supported in dev mode as whole-page draft replacement, but
-  must pass explicit draft review before validation/apply.
+- Update writes are supported as whole-page draft replacement, but must pass
+  explicit draft review before validation/apply.
 - Knowledge pages use sparse deterministic `Related` wikilinks; source pages
   stay out of the Obsidian knowledge graph.
 - Human-editable profiles are YAML.
