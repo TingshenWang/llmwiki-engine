@@ -53,8 +53,6 @@ def require_operation_id(operation_id: str) -> str:
     return value
 
 def ensure_workspace_layout(vault: Path) -> None:
-    if (vault / "stage" / "ingest").exists() and not (vault / ".llmwiki").exists():
-        raise WorkspaceError("Legacy stage/ingest layout detected. Re-run init and create a new operation.")
     store = RunStore(vault)
     (store.runs_root).mkdir(parents=True, exist_ok=True)
     (store.llmwiki / "profiles").mkdir(parents=True, exist_ok=True)
@@ -68,7 +66,6 @@ def ensure_gitignore(vault: Path) -> None:
     path = vault / ".gitignore"
     line = ".llmwiki/"
     existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    existing = [item for item in existing if item != ".llmwiki/runs/"]
     if line not in existing:
         existing.append(line)
     path.write_text("\n".join(existing).strip() + "\n", encoding="utf-8")

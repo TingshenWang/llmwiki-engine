@@ -64,7 +64,7 @@ from llmwiki_engine.steps import (
 from llmwiki_engine.system_pages import local_date
 from llmwiki_engine.validators import validate_wiki_merge_plan
 from llmwiki_engine.verify import VerifyError, verify_run
-from llmwiki_engine.workspace import RunStore, WorkspaceError, ensure_workspace_layout
+from llmwiki_engine.workspace import RunStore
 
 
 ROOT = Path(__file__).parent
@@ -1638,13 +1638,6 @@ def test_changed_raw_link_cleanup_cannot_resume_from_cleanup_but_keeps_artifact_
     resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="raw_prepare")
     assert resumed.status == OperationStatus.drafted
     assert cleanup_report.exists()
-
-
-def test_legacy_stage_layout_blocks_without_workspace_layout(tmp_path: Path) -> None:
-    vault = tmp_path / "legacy"
-    (vault / "stage" / "ingest").mkdir(parents=True)
-    with pytest.raises(WorkspaceError):
-        ensure_workspace_layout(vault)
 
 
 def test_init_ingest_status_apply_closes_loop(tmp_path: Path) -> None:
