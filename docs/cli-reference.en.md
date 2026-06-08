@@ -170,7 +170,6 @@ llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest inspect <vault> [operation_id] [--json]
 llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
 llmwiki ingest raw-import-url <vault> <url> [--title TEXT] [--output PATH] [--overwrite] [--dedupe-url|--no-dedupe-url] [--arxiv-html|--no-arxiv-html] [--timeout SECONDS] [--max-bytes BYTES] [--json]
-llmwiki ingest raw-import-arxiv <vault> <query> [--limit N] [--dry-run] [--overwrite] [--dedupe-url|--no-dedupe-url] [--sort-by VALUE] [--sort-order VALUE] [--min-relevance-score N] [--timeout SECONDS] [--max-bytes BYTES] [--json]
 llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--prepare auto|skip|force]
 llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
@@ -449,7 +448,7 @@ uv run llmwiki profile validate project_basic
 uv run llmwiki profile validate /path/to/profile
 ```
 
-The current profile contract only accepts `version: "2"`. Page types are named by their `page_types` keys; do not add a nested `name` field inside each page type. The old `template:` field has been removed. If validation fails on an old profile, delete the old fields or initialize a new vault.
+The current profile contract accepts `version: "2"`. Page types are named by their `page_types` keys; do not add a nested `name` field inside each page type.
 
 ## `eval` Commands
 
@@ -514,9 +513,9 @@ An applied operation cannot be resumed. Start a new `ingest run`.
 
 `.llmwiki/` is local runtime/config state and should not be committed. Remove it from tracked/staged Git state first.
 
-`operation is incompatible with current MVP pipeline; rerun ingest`
+`operation manifest is not supported by this engine; rerun ingest`
 
-The current MVP pipeline changed. Old development runs are not migrated; start a new ingest operation.
+The operation manifest cannot be read by this engine. Start a new ingest operation.
 
 ## Git Boundary
 

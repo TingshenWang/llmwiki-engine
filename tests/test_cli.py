@@ -14,7 +14,7 @@ from llmwiki_engine.models import RawPreparePolicy
 from llmwiki_engine.pipeline import init_vault, latest_operation, run_simplified_ingest
 from llmwiki_engine.provider_checks import check_providers as check_providers_impl
 from llmwiki_engine.providers import OpenAICompatibleProvider
-from llmwiki_engine.raw_import import ArxivRawImportItem, ArxivRawImportReport, RawUrlImportResult
+from llmwiki_engine.raw_import import RawUrlImportResult
 from llmwiki_engine.steps import STEP_NAMES
 from llmwiki_engine.workspace import RunStore, WorkspaceError
 
@@ -405,7 +405,7 @@ def test_unsupported_manifest_schema_reports_single_line_error_for_user_commands
     for command in ["status", "resume", "apply"]:
         result = runner.invoke(app, ["ingest", command, str(vault), manifest.operation_id])
         assert result.exit_code != 0
-        assert "operation is incompatible with current MVP pipeline; rerun ingest" in _compact_output(result.output)
+        assert "operation manifest is not supported by this engine; rerun ingest" in _compact_output(result.output)
         assert "Traceback" not in result.output
 
 
@@ -434,7 +434,7 @@ def test_manifest_step_topology_reports_single_line_error_for_user_commands(tmp_
     for command in ["status", "resume", "apply"]:
         result = runner.invoke(app, ["ingest", command, str(vault), manifest.operation_id])
         assert result.exit_code != 0
-        assert "operation is incompatible with current MVP pipeline; rerun ingest" in _compact_output(result.output)
+        assert "operation manifest is not supported by this engine; rerun ingest" in _compact_output(result.output)
         assert "Traceback" not in result.output
 
 
@@ -617,18 +617,12 @@ def test_cli_reference_raw_import_overview_matches_current_flags() -> None:
     ]:
         lines = doc_path.read_text(encoding="utf-8").splitlines()
         raw_url_line = next(line for line in lines if line.startswith("llmwiki ingest raw-import-url "))
-        arxiv_line = next(line for line in lines if line.startswith("llmwiki ingest raw-import-arxiv "))
 
         assert "--output PATH" in raw_url_line
         assert "--dedupe-url|--no-dedupe-url" in raw_url_line
         assert "--arxiv-html|--no-arxiv-html" in raw_url_line
         assert "--slug" not in raw_url_line
         assert "--format" not in raw_url_line
-
-        assert "--limit N" in arxiv_line
-        assert "--sort-by VALUE" in arxiv_line
-        assert "--min-relevance-score N" in arxiv_line
-        assert "--max-results" not in arxiv_line
 
 
 def test_raw_candidates_all_includes_processed_and_table_gives_next_command(tmp_path: Path) -> None:
@@ -946,163 +940,6 @@ def test_raw_import_url_cli_outputs_json(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert payload["raw_path"] == "raw/Research Source.md"
     assert payload["title"] == "Research Source"
     assert payload["sha256"] == "abc123"
-
-
-def test_raw_import_arxiv_cli_outputs_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    fake_report = ArxivRawImportReport(
-        vault=vault.as_posix(),
-        query="LLM agents",
-        search_query="all:LLM AND all:agents",
-        sort_by="lastUpdatedDate",
-        sort_order="ascending",
-        candidate_window=2,
-        min_relevance_score=3,
-        skipped_count=0,
-        limit=2,
-        dry_run=True,
-        fetched_count=1,
-        imported_count=0,
-        existing_count=0,
-        failed_count=0,
-        items=(
-            ArxivRawImportItem(
-                arxiv_id="2507.21504",
-                title="Evaluation Survey",
-                abs_url="https://arxiv.org/abs/2507.21504",
-                html_url="https://arxiv.org/html/2507.21504",
-                status="found",
-                relevance_score=8,
-            ),
-        ),
-    )
-
-    def fake_import_arxiv_search(
-        received_vault: Path,
-        received_query: str,
-        *,
-        limit: int,
-        dry_run: bool,
-        overwrite: bool,
-        dedupe_url: bool,
-        sort_by: str,
-        sort_order: str,
-        min_relevance_score: int,
-        timeout: float,
-        max_bytes: int,
-    ) -> ArxivRawImportReport:
-        assert received_vault == vault
-        assert received_query == "LLM agents"
-        assert limit == 2
-        assert dry_run is True
-        assert not overwrite
-        assert dedupe_url is False
-        assert sort_by == "lastUpdatedDate"
-        assert sort_order == "ascending"
-        assert min_relevance_score == 3
-        assert timeout == 8.0
-        assert max_bytes == 4096
-        return fake_report
-
-    monkeypatch.setattr(cli_module, "import_arxiv_search", fake_import_arxiv_search)
-    runner = CliRunner()
-    result = runner.invoke(
-        app,
-        [
-            "ingest",
-            "raw-import-arxiv",
-            str(vault),
-            "LLM agents",
-            "--limit",
-            "2",
-            "--dry-run",
-            "--no-dedupe-url",
-            "--sort-by",
-            "lastUpdatedDate",
-            "--sort-order",
-            "ascending",
-            "--min-relevance-score",
-            "3",
-            "--timeout",
-            "8",
-            "--max-bytes",
-            "4096",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["dry_run"] is True
-    assert payload["candidate_window"] == 2
-    assert payload["min_relevance_score"] == 3
-    assert payload["items"][0]["status"] == "found"
-    assert payload["items"][0]["relevance_score"] == 8
-    assert payload["items"][0]["html_url"] == "https://arxiv.org/html/2507.21504"
-
-
-def test_raw_import_arxiv_cli_prints_direct_next_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    init_vault(vault, profile_name="project_basic")
-    raw_path = "raw/Evaluation Survey.md"
-    fake_report = ArxivRawImportReport(
-        vault=vault.as_posix(),
-        query="LLM agents",
-        search_query="all:LLM AND all:agents",
-        sort_by="relevance",
-        sort_order="descending",
-        candidate_window=20,
-        min_relevance_score=1,
-        skipped_count=0,
-        limit=1,
-        dry_run=False,
-        fetched_count=1,
-        imported_count=1,
-        existing_count=0,
-        failed_count=0,
-        items=(
-            ArxivRawImportItem(
-                arxiv_id="2507.21504",
-                title="Evaluation Survey",
-                abs_url="https://arxiv.org/abs/2507.21504",
-                html_url="https://arxiv.org/html/2507.21504",
-                status="imported",
-                raw_path=raw_path,
-                relevance_score=8,
-            ),
-        ),
-    )
-
-    def fake_import_arxiv_search(
-        received_vault: Path,
-        received_query: str,
-        *,
-        limit: int,
-        dry_run: bool,
-        overwrite: bool,
-        dedupe_url: bool,
-        sort_by: str,
-        sort_order: str,
-        min_relevance_score: int,
-        timeout: float,
-        max_bytes: int,
-    ) -> ArxivRawImportReport:
-        assert received_vault == vault
-        assert received_query == "LLM agents"
-        assert limit == 1
-        assert dry_run is False
-        return fake_report
-
-    monkeypatch.setattr(cli_module, "import_arxiv_search", fake_import_arxiv_search)
-    runner = CliRunner()
-    result = runner.invoke(app, ["ingest", "raw-import-arxiv", str(vault), "LLM agents"])
-
-    assert result.exit_code == 0
-    compact = _compact_output(result.output)
-    assert "next: `llmwiki ingest run" in compact
-    assert "Evaluation Survey.md`" in compact
-    assert "inspect: `llmwiki ingest raw-candidates" in compact
 
 
 def _compact_output(output: str) -> str:

@@ -36,7 +36,7 @@ from .provider_checks import check_providers
 from .provider_config import ProviderConfigError
 from .profiles import builtin_profile_names, load_profile
 from .providers import ProviderRegistry
-from .raw_import import ArxivRawImportReport, RawUrlImportError, RawUrlImportResult, import_arxiv_search, import_raw_url
+from .raw_import import RawUrlImportError, RawUrlImportResult, import_raw_url
 from .steps import STEP_NAMES
 from .verify import VerifyError, verify_run
 from .workspace import RunStore, WorkspaceError
@@ -314,49 +314,6 @@ def ingest_raw_import_url(
         typer.echo(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return
     _print_raw_url_import_result(result)
-
-
-@ingest_app.command("raw-import-arxiv")
-def ingest_raw_import_arxiv(
-    vault: Path,
-    query: str,
-    limit: int = typer.Option(1, "--limit", min=1, max=10, help="Maximum arXiv results to import."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Search and show matching arXiv papers without writing raw files."),
-    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing raw files when importing."),
-    dedupe_url: bool = typer.Option(True, "--dedupe-url/--no-dedupe-url", help="Reuse existing raw files with the same URL."),
-    sort_by: str = typer.Option("relevance", "--sort-by", help="arXiv sortBy: relevance, submittedDate, or lastUpdatedDate."),
-    sort_order: str = typer.Option("descending", "--sort-order", help="arXiv sortOrder: ascending or descending."),
-    min_relevance_score: int = typer.Option(
-        1,
-        "--min-relevance-score",
-        min=0,
-        help="Skip natural-language query results below this local relevance score.",
-    ),
-    timeout: float = typer.Option(30.0, "--timeout", min=1.0, help="HTTP request timeout in seconds."),
-    max_bytes: int = typer.Option(5_000_000, "--max-bytes", min=1024, help="Maximum fetched response size in bytes."),
-    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
-) -> None:
-    """Search arXiv and import matching papers into raw/ via arXiv HTML."""
-    try:
-        report = import_arxiv_search(
-            vault,
-            query,
-            limit=limit,
-            dry_run=dry_run,
-            overwrite=overwrite,
-            dedupe_url=dedupe_url,
-            sort_by=sort_by,
-            sort_order=sort_order,
-            min_relevance_score=min_relevance_score,
-            timeout=timeout,
-            max_bytes=max_bytes,
-        )
-    except (RawUrlImportError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if json_output:
-        typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
-        return
-    _print_arxiv_raw_import_report(report)
 
 
 @ingest_app.command("resume")
@@ -698,63 +655,6 @@ def _print_raw_url_import_result(result: RawUrlImportResult) -> None:
         table.add_row(key, value)
     console.print(table)
     console.print(f"next: `llmwiki ingest run {result.vault} {Path(result.absolute_path)}`")
-
-
-def _print_arxiv_raw_import_report(report: ArxivRawImportReport) -> None:
-    table = Table(title=f"arXiv raw import ({report.fetched_count} results)")
-    table.add_column("Status", no_wrap=True)
-    table.add_column("Score", justify="right")
-    table.add_column("arXiv ID", no_wrap=True)
-    table.add_column("Title", overflow="fold")
-    table.add_column("Raw", overflow="fold")
-    table.add_column("HTML URL", overflow="fold")
-    table.add_column("Error", overflow="fold")
-    for item in report.items:
-        table.add_row(
-            _arxiv_import_status_label(item.status),
-            str(item.relevance_score),
-            item.arxiv_id,
-            item.title,
-            item.raw_path,
-            item.html_url,
-            item.error,
-        )
-    console.print(table)
-    console.print(
-        "summary: "
-        f"imported={report.imported_count}; "
-        f"existing={report.existing_count}; "
-        f"skipped={report.skipped_count}; "
-        f"failed={report.failed_count}; "
-        f"dry_run={str(report.dry_run).lower()}"
-    )
-    console.print(f"search_query: `{report.search_query}`")
-    console.print(f"sort: `{report.sort_by}/{report.sort_order}`")
-    console.print(f"candidate_window: `{report.candidate_window}`")
-    console.print(f"min_relevance_score: `{report.min_relevance_score}`")
-    imported_paths = [
-        (Path(report.vault) / item.raw_path).as_posix()
-        for item in report.items
-        if item.raw_path and item.status in {"imported", "overwritten", "existing_url"}
-    ]
-    if not report.dry_run and imported_paths:
-        if len(imported_paths) == 1:
-            console.print(f"next: `llmwiki ingest run {report.vault} {imported_paths[0]}`")
-        else:
-            console.print(f"next: `llmwiki ingest run-next {report.vault}`")
-        console.print(f"inspect: `llmwiki ingest raw-candidates {report.vault}`")
-
-
-def _arxiv_import_status_label(status: str) -> str:
-    labels = {
-        "found": "[cyan]found[/]",
-        "imported": "[green]imported[/]",
-        "existing_url": "[cyan]existing_url[/]",
-        "overwritten": "[yellow]overwritten[/]",
-        "low_relevance": "[yellow]low_relevance[/]",
-        "failed": "[red]failed[/]",
-    }
-    return labels.get(status, status)
 
 
 def _raw_candidate_status_label(status: str) -> str:

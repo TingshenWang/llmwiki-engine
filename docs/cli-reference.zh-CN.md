@@ -169,7 +169,6 @@ llmwiki ingest status <vault> [operation_id] [--verify] [--json]
 llmwiki ingest inspect <vault> [operation_id] [--json]
 llmwiki ingest raw-candidates <vault> [--all] [--limit N] [--json]
 llmwiki ingest raw-import-url <vault> <url> [--title TEXT] [--output PATH] [--overwrite] [--dedupe-url|--no-dedupe-url] [--arxiv-html|--no-arxiv-html] [--timeout SECONDS] [--max-bytes BYTES] [--json]
-llmwiki ingest raw-import-arxiv <vault> <query> [--limit N] [--dry-run] [--overwrite] [--dedupe-url|--no-dedupe-url] [--sort-by VALUE] [--sort-order VALUE] [--min-relevance-score N] [--timeout SECONDS] [--max-bytes BYTES] [--json]
 llmwiki ingest resume <vault> <operation_id> [--from STEP] [--mock-fixture-dir PATH] [--prepare auto|skip|force]
 llmwiki ingest apply <vault> <operation_id>
 llmwiki profile list
@@ -449,7 +448,7 @@ uv run llmwiki profile validate project_basic
 uv run llmwiki profile validate /path/to/profile
 ```
 
-当前 profile 合同只接受 `version: "2"`。page type 由 `page_types` 的 key 命名，不要在每个 page type 内再写 `name`。旧 profile 里的 `template:` 字段已经删除；遇到校验失败时，删除旧字段或重新 `init` 一个新 vault。
+当前 profile 合同接受 `version: "2"`。page type 由 `page_types` 的 key 命名，不要在每个 page type 内再写 `name`。
 
 ## `eval` 命令
 
@@ -514,9 +513,9 @@ run artifact 被修改过或损坏，resume/apply 会阻止继续。
 
 `.llmwiki/` 是本地运行和配置目录，不应该进入 Git。需要先从 Git tracked/staged 状态移除。
 
-`operation is incompatible with current MVP pipeline; rerun ingest`
+`operation manifest is not supported by this engine; rerun ingest`
 
-当前 MVP pipeline 已变化。开发期旧 run 不做迁移，直接重新 ingest。
+当前 engine 无法读取这个 operation manifest。请重新执行一次 ingest。
 
 ## Git 边界
 

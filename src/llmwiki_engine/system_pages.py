@@ -5,8 +5,7 @@ from pathlib import Path
 
 SYSTEM_MARKER = "<!-- llmwiki:system-page:v3 -->"
 SYSTEM_CONTRACT_ERROR = (
-    "system page is incompatible with current MVP page contract; "
-    "rerun init/ingest during this development upgrade, not a file corruption issue"
+    "system page is not supported by this engine; rerun init or ingest to regenerate it"
 )
 
 

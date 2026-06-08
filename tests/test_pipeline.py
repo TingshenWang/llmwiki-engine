@@ -13366,24 +13366,24 @@ def test_cross_type_title_prefix_does_not_pollute_target_path(tmp_path: Path) ->
     assert item["display_title"] == "Foo"
 
 
-def test_m2_blocks_overwriting_incompatible_system_page(tmp_path: Path) -> None:
+def test_blocks_overwriting_unsupported_system_page(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     (vault / "wiki" / "index.md").write_text("# My human index\n", encoding="utf-8")
 
-    with pytest.raises(PipelineError, match="system page is incompatible with current MVP page contract"):
+    with pytest.raises(PipelineError, match="system page is not supported by this engine"):
         run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="human-index")
 
     assert (vault / "wiki" / "index.md").read_text(encoding="utf-8") == "# My human index\n"
 
 
-def test_m2_blocks_v1_system_marker(tmp_path: Path) -> None:
+def test_blocks_old_system_marker(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     (vault / "wiki" / "index.md").write_text(
         "# index\n\n<!-- llmwiki:system-page:v1 -->\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(PipelineError, match="system page is incompatible with current MVP page contract"):
+    with pytest.raises(PipelineError, match="system page is not supported by this engine"):
         run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="v1-index")
 
 
@@ -15064,7 +15064,7 @@ def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path
     data = read_json(manifest_path)
     data["schema_version"] = "operation_manifest.invalid"
     write_json(manifest_path, data)
-    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
+    with pytest.raises(ValueError, match="operation manifest is not supported by this engine"):
         read_manifest(manifest_path)
 
 
@@ -15077,7 +15077,7 @@ def test_unsupported_manifest_schema_is_rejected_with_clear_error(tmp_path: Path
         lambda names: [names[1], names[0], *names[2:]],
     ],
 )
-def test_manifest_step_topology_must_match_current_mvp_pipeline(tmp_path: Path, mutator) -> None:
+def test_manifest_step_topology_must_match_current_engine(tmp_path: Path, mutator) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="topology")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
@@ -15087,7 +15087,7 @@ def test_manifest_step_topology_must_match_current_mvp_pipeline(tmp_path: Path, 
     data["steps"] = [dict(steps_by_name.get(name, data["steps"][0]), name=name) for name in mutated_names]
     write_json(manifest_path, data)
 
-    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
+    with pytest.raises(ValueError, match="operation manifest is not supported by this engine"):
         read_manifest(manifest_path)
 
 
@@ -15100,11 +15100,11 @@ def test_manifest_v10_requires_persisted_top_level_fields(tmp_path: Path, missin
     data.pop(missing_key)
     write_json(manifest_path, data)
 
-    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
+    with pytest.raises(ValueError, match="operation manifest is not supported by this engine"):
         read_manifest(manifest_path)
 
 
-def test_manifest_v10_rejects_extra_top_level_fields_with_mvp_message(tmp_path: Path) -> None:
+def test_manifest_v10_rejects_extra_top_level_fields_with_engine_message(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="extra-field")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
@@ -15112,15 +15112,15 @@ def test_manifest_v10_rejects_extra_top_level_fields_with_mvp_message(tmp_path: 
     data["unexpected_status_summary"] = {"unexpected": True}
     write_json(manifest_path, data)
 
-    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
+    with pytest.raises(ValueError, match="operation manifest is not supported by this engine"):
         read_manifest(manifest_path)
 
 
-def test_manifest_reader_rejects_non_object_json_with_mvp_message(tmp_path: Path) -> None:
+def test_manifest_reader_rejects_non_object_json_with_engine_message(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="bad-root")
     manifest_path = RunStore(vault).manifest_path(manifest.operation_id)
     manifest_path.write_text("[]\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="operation is incompatible with current MVP pipeline"):
+    with pytest.raises(ValueError, match="operation manifest is not supported by this engine"):
         read_manifest(manifest_path)

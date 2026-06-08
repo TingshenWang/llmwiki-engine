@@ -11,8 +11,8 @@ from .io import read_json, write_json_atomic
 from .models import ArtifactRef, OperationManifest, OperationStatus, StepAttempt, StepRecord, StepStatus, utc_now
 from .steps import STEP_NAMES
 
-MVP_PIPELINE_INCOMPATIBLE = "operation is incompatible with current MVP pipeline; rerun ingest"
-REQUIRED_MANIFEST_KEYS = frozenset(OperationManifest.model_fields)
+UNSUPPORTED_OPERATION_MANIFEST = "operation manifest is not supported by this engine; rerun ingest"
+PERSISTED_MANIFEST_KEYS = frozenset(OperationManifest.model_fields)
 
 
 def read_manifest(path: Path) -> OperationManifest:
@@ -21,18 +21,15 @@ def read_manifest(path: Path) -> OperationManifest:
     except FileNotFoundError as exc:
         raise ValueError(f"Operation manifest not found: {path}") from exc
     if not isinstance(data, dict):
-        raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
-    schema_version = data.get("schema_version")
-    if schema_version != "operation_manifest.v10":
-        raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
-    if REQUIRED_MANIFEST_KEYS - set(data):
-        raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
+        raise ValueError(UNSUPPORTED_OPERATION_MANIFEST)
+    if PERSISTED_MANIFEST_KEYS - set(data):
+        raise ValueError(UNSUPPORTED_OPERATION_MANIFEST)
     try:
         manifest = OperationManifest.model_validate(data)
     except PydanticValidationError as exc:
-        raise ValueError(MVP_PIPELINE_INCOMPATIBLE) from exc
+        raise ValueError(UNSUPPORTED_OPERATION_MANIFEST) from exc
     if tuple(step.name for step in manifest.steps) != STEP_NAMES:
-        raise ValueError(MVP_PIPELINE_INCOMPATIBLE)
+        raise ValueError(UNSUPPORTED_OPERATION_MANIFEST)
     return manifest
 
 
