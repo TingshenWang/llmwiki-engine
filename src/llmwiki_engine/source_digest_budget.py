@@ -4,7 +4,6 @@ import re
 import unicodedata
 from typing import Any, Literal
 
-from . import frontmatter as _frontmatter
 from . import markdown_utils as _markdown_utils
 from . import open_questions as _open_questions
 from . import source_excerpt as _source_excerpt
@@ -25,7 +24,6 @@ DEFERRED_AGGREGATION_GROUP_LABELS = {
     "entities": "延后实体",
 }
 SOURCE_ANCHOR_AUTO_ENTITY_LIMIT = 2
-SOURCE_ANCHOR_RELATED_LIMIT = 3
 SOURCE_ANCHOR_NOISE_TITLES = {
     "api",
     "appendix",
@@ -85,26 +83,6 @@ SOURCE_ANCHOR_NEGATIVE_CONTEXT_MARKERS = (
     "only mentions",
     "just mentions",
 )
-SOURCE_ANCHOR_POSITIVE_CONTEXT_MARKERS = (
-    " is ",
-    " are ",
-    " can ",
-    " provides ",
-    " supports ",
-    " hosts ",
-    " enables ",
-    " powered by ",
-    " built on ",
-    " integrates ",
-    "是一个",
-    "是一种",
-    "是一款",
-    "作为",
-    "用于",
-    "发布",
-    "推出",
-    "创建",
-)
 SOURCE_ANCHOR_DOCUMENT_SUFFIX_TOKENS = {
     "chapter",
     "doc",
@@ -153,24 +131,17 @@ def augment_source_digest_anchor_entities(
         anchor_key = _source_excerpt.normalized_source_match_text(anchor)
         if not anchor_key or anchor_key in existing_keys:
             continue
-        signal = source_anchor_signal(approved_prepared_text, anchor)
-        if not signal["should_add"]:
-            continue
         candidate = SourceDigestCandidate(
             candidate_id=f"auto-ent-{anchor_key}",
             name=anchor,
             type="entity",
             one_sentence_summary=f"{anchor} 是源材料中高信号出现的实体，系统在页面预算前自动保留为实体候选。",
-            why_matters=f"{anchor} 出现在标题、元数据或明确实体语境中，可能是后续材料复用的稳定知识锚点。",
+            why_matters=f"{anchor} 在源材料正文中有明确实体关系语境，可能是后续材料复用的稳定知识锚点。",
             wiki_value=f"作为来源内实体锚点，可承接后续关于 {anchor} 的更新、互链和合并判断。",
-            source_locator=signal["source_locator"],
+            source_locator=source_anchor_first_locator(approved_prepared_text, anchor),
             suggested_page_title=anchor,
-            related_candidates=source_anchor_related_candidates(anchor, digest),
-            resolution_hint=(
-                f"generic_source_anchor_entity: high-confidence source anchor kept before page budget; "
-                f"occurrence_count={signal['occurrence_count']}; "
-                f"signal_reason={signal['reason']}"
-            ),
+            related_candidates=[],
+            resolution_hint="generic_source_anchor_entity: source text explicitly defines this entity before page budget.",
             duplicate_risk="medium",
         )
         additions.append(candidate)
@@ -183,80 +154,16 @@ def augment_source_digest_anchor_entities(
 
 
 def source_anchor_entity_candidates(text: str) -> list[str]:
-    frontmatter = _frontmatter.parse_frontmatter(text) or {}
-    metadata_text = "\n".join(str(frontmatter.get(key) or "") for key in ["title", "description", "source", "author"])
-    heading_text = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
-    candidates: dict[str, dict[str, Any]] = {}
-    for source_text, source_rank in [
-        (metadata_text, 0),
-        (heading_text, 1),
-        ("\n".join(source_anchor_positive_context_sentences(text)), 2),
-    ]:
-        for candidate in source_anchor_candidate_phrases(source_text):
-            signal = source_anchor_signal(text, candidate)
-            if not signal["should_add"]:
-                continue
-            key = source_digest_title_key(candidate)
-            current = candidates.get(key)
-            rank = source_anchor_signal_rank(signal["reason"], source_rank)
-            if current is None or rank < current["rank"]:
-                candidates[key] = {"anchor": candidate, "rank": rank, "occurrence_count": signal["occurrence_count"]}
-    ordered = sorted(candidates.values(), key=lambda item: (item["rank"], -int(item["occurrence_count"]), item["anchor"].lower()))
-    return [str(item["anchor"]) for item in ordered[:SOURCE_ANCHOR_AUTO_ENTITY_LIMIT]]
-
-
-def source_anchor_signal_rank(reason: str, source_rank: int) -> tuple[int, int]:
-    reason_parts = set(reason.split("+"))
-    if {"metadata_or_heading", "explicit_context"} <= reason_parts:
-        return (0, source_rank)
-    if "metadata_or_heading" in reason_parts:
-        return (1, source_rank)
-    if {"repeated", "explicit_context"} <= reason_parts:
-        return (2, source_rank)
-    if "explicit_context" in reason_parts:
-        return (3, source_rank)
-    return (4, source_rank)
-
-
-def source_anchor_signal(text: str, anchor: str) -> dict[str, Any]:
-    occurrence_count = source_anchor_occurrence_count(text, anchor)
-    if occurrence_count <= 0:
-        return {
-            "should_add": False,
-            "occurrence_count": 0,
-            "source_locator": "",
-            "reason": "absent",
-        }
-    frontmatter = _frontmatter.parse_frontmatter(text) or {}
-    metadata_text = "\n".join(
-        str(frontmatter.get(key) or "")
-        for key in ["title", "description", "source", "author"]
-    )
-    heading_text = "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
-    high_signal_text = "\n".join([metadata_text, heading_text])
-    high_signal = source_anchor_occurrence_count(high_signal_text, anchor) > 0
-    explicit_context = source_anchor_has_positive_context(text, anchor)
-    should_add = explicit_context or (high_signal and occurrence_count >= 3)
-    reason_parts: list[str] = []
-    if high_signal:
-        reason_parts.append("metadata_or_heading")
-    if occurrence_count >= 3:
-        reason_parts.append("repeated")
-    if explicit_context:
-        reason_parts.append("explicit_context")
-    return {
-        "should_add": should_add,
-        "occurrence_count": occurrence_count,
-        "source_locator": source_anchor_first_locator(text, anchor),
-        "reason": "+".join(reason_parts) or "weak_mention",
-    }
-
-
-def source_anchor_occurrence_count(text: str, anchor: str) -> int:
-    if not text or not anchor:
-        return 0
-    pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])", re.IGNORECASE)
-    return len(pattern.findall(source_anchor_readable_text(text)))
+    candidates: dict[str, str] = {}
+    for candidate in source_anchor_candidate_phrases(text):
+        if not source_anchor_has_positive_context(text, candidate):
+            continue
+        key = source_digest_title_key(candidate)
+        if key and key not in candidates:
+            candidates[key] = candidate
+        if len(candidates) >= SOURCE_ANCHOR_AUTO_ENTITY_LIMIT:
+            break
+    return list(candidates.values())
 
 
 def source_anchor_readable_text(text: str) -> str:
@@ -294,8 +201,11 @@ def source_anchor_relation_tail_has_positive_context(anchor: str, text: str) -> 
 
 
 def source_anchor_tail_has_entity_descriptor(text: str) -> bool:
-    padded = f" {text.lower()} "
-    return any(term in padded for term in SOURCE_ANCHOR_ENTITY_DESCRIPTOR_TERMS)
+    lowered = text.lower()
+    return any(
+        re.search(rf"(?<![A-Za-z0-9]){re.escape(term.strip())}(?![A-Za-z0-9])", lowered)
+        for term in SOURCE_ANCHOR_ENTITY_DESCRIPTOR_TERMS
+    )
 
 
 def source_anchor_name_has_distinctive_token(anchor: str) -> bool:
@@ -313,24 +223,14 @@ def source_anchor_has_document_suffix(candidate: str) -> bool:
     return False
 
 
-def source_anchor_positive_context_sentences(text: str) -> list[str]:
-    sentences = [sentence.strip() for sentence in re.split(r"(?<=[。！？!?\.])\s+|\n+", text) if sentence.strip()]
-    return [
-        sentence
-        for sentence in sentences
-        if not any(marker in sentence.lower() for marker in SOURCE_ANCHOR_NEGATIVE_CONTEXT_MARKERS)
-        and any(marker in sentence.lower() for marker in SOURCE_ANCHOR_POSITIVE_CONTEXT_MARKERS)
-    ]
-
-
 def source_anchor_candidate_phrases(text: str) -> list[str]:
     normalized = source_anchor_readable_text(text)
     normalized = re.sub(r"[`*_#>\\[\\]\"“”]", " ", normalized)
     phrases: list[str] = []
     pattern = re.compile(
         r"(?<![A-Za-z0-9])"
-        r"(?:[A-Z][A-Za-z0-9+.-]{2,}|[A-Z]{2,})"
-        r"(?:[ -]+(?:[A-Z][A-Za-z0-9+.-]{1,}|[A-Z]{2,})){0,3}"
+        r"(?:[A-Z][A-Za-z0-9+-]{2,}|[A-Z]{2,})"
+        r"(?:[ -]+(?:[A-Z][A-Za-z0-9+-]{1,}|[A-Z]{2,})){0,3}"
         r"(?![A-Za-z0-9])"
     )
     for match in pattern.finditer(normalized):
@@ -341,7 +241,7 @@ def source_anchor_candidate_phrases(text: str) -> list[str]:
 
 
 def source_anchor_phrase_variants(phrase: str) -> list[str]:
-    cleaned = re.sub(r"[^A-Za-z0-9+.-]+", " ", phrase).strip()
+    cleaned = re.sub(r"[^A-Za-z0-9+-]+", " ", phrase).strip()
     if not cleaned:
         return []
     tokens = cleaned.split()
@@ -392,19 +292,6 @@ def source_anchor_first_locator(text: str, anchor: str) -> str:
         if pattern.search(unicodedata.normalize("NFKC", line)):
             return f"L{line_no}"
     return ""
-
-
-def source_anchor_related_candidates(anchor: str, digest: SourceDigestArtifact) -> list[str]:
-    related: list[tuple[float, str]] = []
-    for candidate in digest.ingest_candidates():
-        title = candidate.suggested_page_title or candidate.name
-        if source_digest_title_key(title) == source_digest_title_key(anchor):
-            continue
-        score = source_digest_text_similarity(anchor, source_digest_candidate_intent_text(candidate))
-        if score >= 0.12:
-            related.append((score, title))
-    related.sort(key=lambda item: (-item[0], item[1]))
-    return _markdown_utils.dedupe_strings([title for _score, title in related])[:SOURCE_ANCHOR_RELATED_LIMIT]
 
 
 def cap_source_digest_candidates(digest: SourceDigestArtifact, max_candidates: int) -> tuple[SourceDigestArtifact, dict[str, Any]]:

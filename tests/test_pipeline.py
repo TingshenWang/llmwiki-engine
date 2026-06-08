@@ -812,6 +812,8 @@ def test_source_digest_anchor_entities_are_added_before_page_budget() -> None:
     assert augmented.entities[0].candidate_id == "auto-ent-managedagents"
     assert augmented.entities[1].source_locator.startswith("L")
     assert "generic_source_anchor_entity" in augmented.entities[1].resolution_hint
+    assert augmented.entities[0].related_candidates == []
+    assert augmented.entities[1].related_candidates == []
     assert not hasattr(source_digest_budget, "SOURCE_DIGEST_ANCHOR_ENTITIES")
 
     capped, report = source_digest_budget.cap_source_digest_candidates(augmented, 12)
@@ -860,6 +862,20 @@ def test_source_digest_anchor_entities_do_not_duplicate_parenthetical_translatio
     assert report["deduped_count"] == 0
 
 
+def test_source_digest_anchor_entities_do_not_merge_across_sentence_periods() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/scaling.md", summary="实体摘要。")
+    text = (
+        "Managed Agents is a meta-harness around Claude. "
+        "Claude Code is an excellent harness for coding work. "
+        "OpenAI. Anthropic is a company building AI systems."
+    )
+
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
+
+    assert [item.suggested_page_title for item in augmented.entities] == ["Managed Agents", "Claude Code"]
+    assert all("." not in item.suggested_page_title for item in augmented.entities)
+
+
 def test_source_digest_anchor_entities_ignore_weak_single_mentions() -> None:
     digest = SourceDigestArtifact(source_raw_path="raw/sample.md", summary="普通摘要。")
     text = "这篇材料只是随口提了一次 Claude Code，没有说明产品、harness 或团队上下文。"
@@ -895,6 +911,23 @@ def test_source_digest_anchor_entities_ignore_contextless_document_titles() -> N
         "[GitHub Project](https://github.com/datawhalechina/Hello-Agents)\n\n"
         "# Long Research Note\n\n"
         "This note studies agent memory evaluation and durable wiki candidates.\n"
+    )
+
+    augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
+
+    assert augmented.entities == []
+
+
+def test_source_digest_anchor_entities_ignore_metadata_and_repeated_mentions_without_definition() -> None:
+    digest = SourceDigestArtifact(source_raw_path="raw/repeated.md", summary="重复摘要。")
+    text = (
+        "---\n"
+        'title: "Qwen-Agent Qwen-Agent Qwen-Agent"\n'
+        'description: "Qwen-Agent appears several times in metadata."\n'
+        "---\n\n"
+        "# Qwen-Agent\n\n"
+        "Qwen-Agent appears in this note. Qwen-Agent appears again. Qwen-Agent appears a third time.\n"
+        "The note lists names but does not define what the project is or how it behaves.\n"
     )
 
     augmented = source_digest_budget.augment_source_digest_anchor_entities(digest, text)
