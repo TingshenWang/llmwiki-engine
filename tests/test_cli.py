@@ -23,19 +23,6 @@ ROOT = Path(__file__).parent
 FIXTURE_ROOT = ROOT / "fixtures" / "simple_project"
 
 
-def configure_openai_provider(vault: Path) -> None:
-    config_path = vault / ".llmwiki" / "config.yaml"
-    config = read_yaml(config_path)
-    config["providers"] = {
-        "default": {
-            "spec": "openai_compatible:test-model",
-            "endpoint": "https://example.test/v1/chat/completions",
-            "api_key": "sk-test",
-        }
-    }
-    write_yaml(config_path, config)
-
-
 def test_status_verify_exit_codes(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
