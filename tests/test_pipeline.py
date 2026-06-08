@@ -69,6 +69,18 @@ from llmwiki_engine.workspace import RunStore, WorkspaceError, ensure_workspace_
 
 ROOT = Path(__file__).parent
 FIXTURE_ROOT = ROOT / "fixtures" / "simple_project"
+CURRENT_DRAFT_PAGE_FIELDS = {
+    "page_plan_id",
+    "action",
+    "canonical_target_path",
+    "preimage_sha256",
+    "summary",
+    "body_markdown",
+    "open_questions",
+    "change_summary",
+    "source_coverage_notes",
+    "quality_risks",
+}
 
 
 def draft_text(value: object) -> str:
@@ -79,6 +91,12 @@ def draft_text(value: object) -> str:
     if isinstance(value, list):
         return "\n".join(f"- {draft_text(item).strip()}" for item in value if draft_text(item).strip())
     return str(value)
+
+
+def assert_draft_rendering_schema_page_fields(schema: dict) -> None:
+    page_schema = schema["$defs"]["DraftPageItem"]
+    assert set(page_schema["properties"]) == CURRENT_DRAFT_PAGE_FIELDS
+    assert page_schema["additionalProperties"] is False
 
 
 def draft_body(
@@ -2597,7 +2615,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "可能伴随" in grounding_risk_rules
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
     assert "Across body_markdown/open_questions" in contract_rules
-    assert "section_bodies" not in contract_rules
+    assert "source_coverage_notes" in contract_rules
     assert "张三" in contract_rules
     assert "user-123" in contract_rules
     assert "avoid presenting it as an observed user fact" in contract_rules
@@ -3611,22 +3629,22 @@ def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> 
     assert "候选页面" not in rendered
 
 
-def test_draft_rendering_model_schema_excludes_section_bodies() -> None:
+def test_draft_rendering_model_schema_uses_current_page_fields() -> None:
     schema = pipeline_module.DraftRenderingArtifact.model_json_schema()
-    assert "section_bodies" not in json.dumps(schema, ensure_ascii=False)
+    assert_draft_rendering_schema_page_fields(schema)
 
     page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
-    page["section_bodies"] = {"summary": "旧格式摘要", "detail": "旧格式正文"}
-    with pytest.raises(Exception, match="section_bodies"):
+    page["unexpected_page_field"] = "This field is not part of the current draft page contract."
+    with pytest.raises(Exception, match="unexpected_page_field"):
         pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
 
 
-def test_draft_rendering_model_schema_rejects_source_coverage_checks_alias() -> None:
+def test_draft_rendering_model_schema_rejects_unexpected_source_coverage_field() -> None:
     page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
     page.pop("source_coverage_notes", None)
-    page["source_coverage_checks"] = "旧字段不再兼容。"
+    page["unexpected_source_coverage_field"] = "This field is not part of the current draft page contract."
 
-    with pytest.raises(Exception, match="source_coverage_checks"):
+    with pytest.raises(Exception, match="unexpected_source_coverage_field"):
         pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
 
 
@@ -5215,7 +5233,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
 
     assert repair_prompt is not None
     assert repair_prompt["repair_contract"]["mode"] == "page_scoped_repair"
-    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["schema"], ensure_ascii=False)
+    assert_draft_rendering_schema_page_fields(repair_prompt["repair_contract"]["schema"])
     assert repair_prompt["repair_contract"]["accepted_page_plan_ids"] == ["PP-OK"]
     assert repair_prompt["repair_contract"]["repair_page_plan_ids"] == ["PP-BAD"]
     assert "accepted_partial_pages" not in repair_prompt
@@ -5228,7 +5246,6 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
             "page_type": "concept",
         }
     ]
-    assert "section_bodies" not in json.dumps(repair_prompt["accepted_page_refs"], ensure_ascii=False)
     assert repair_prompt["repair_page_payload"]["required_page_plan_ids"] == ["PP-BAD"]
     assert "PP-OK" not in repair_prompt["repair_page_payload"]["required_page_plan_ids"]
 
@@ -10106,7 +10123,6 @@ def test_grounding_open_question_repair_message_moves_speculation_to_open_questi
     message = pipeline_module.grounding_issue_message(claim)
 
     assert "open_questions" in message
-    assert "section_bodies" not in message
     assert "改写成问题" in message
     assert "待补来源" in message
     assert "detail/examples" in message
@@ -12193,8 +12209,8 @@ def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path:
     assert repair_report["attempts"][0]["issues"][0]["field_path"] == "summary"
     assert repair_report["attempts"][1]["repair_prompt_ref"] == "repair_prompts/attempt-2.json"
     repair_prompt = read_json(run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json")
-    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["issues"], ensure_ascii=False)
-    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["schema"], ensure_ascii=False)
+    assert repair_prompt["repair_contract"]["issues"][0]["field_path"] == "summary"
+    assert_draft_rendering_schema_page_fields(repair_prompt["repair_contract"]["schema"])
     assert any(ref.relative_path.endswith("repair_prompts/attempt-2.json") for ref in draft_step.outputs)
 
 
@@ -12423,8 +12439,8 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
         draft_pages[4]["page_plan_id"],
         draft_pages[5]["page_plan_id"],
     ]
-    assert "section_bodies" not in json.dumps(repair_prompt["accepted_partial_pages"], ensure_ascii=False)
-    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["schema"], ensure_ascii=False)
+    assert all(set(page) == CURRENT_DRAFT_PAGE_FIELDS for page in repair_prompt["accepted_partial_pages"])
+    assert_draft_rendering_schema_page_fields(repair_prompt["repair_contract"]["schema"])
     assert repair_prompt["missing_page_payload"]["required_page_plan_ids"] == [draft_pages[6]["page_plan_id"]]
     assert repair_report["provider"] == "batched:mock"
     assert repair_report["attempt_count"] == 3
