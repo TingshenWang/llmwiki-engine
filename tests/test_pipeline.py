@@ -15,9 +15,11 @@ import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.pipeline as pipeline_module
+import llmwiki_engine.planning_payloads as planning_payloads_module
 import llmwiki_engine.run_metrics as run_metrics_module
 import llmwiki_engine.source_digest_budget as source_digest_budget
 import llmwiki_engine.source_digest_payload as source_digest_payload_module
+import llmwiki_engine.source_refs as source_refs_module
 import llmwiki_engine.steps as steps_module
 from llmwiki_engine import open_questions as open_questions_module
 from llmwiki_engine import page_sections as page_sections_module
@@ -642,6 +644,32 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "PAPER_CAPTION_RE")
     assert not hasattr(pipeline_module, "render_source_digest_markdown")
     assert not hasattr(pipeline_module, "render_candidate_table")
+    assert not hasattr(pipeline_module, "build_candidate_resolution_source_pack")
+    assert not hasattr(pipeline_module, "render_candidate_resolution_source_pack_markdown")
+    assert not hasattr(pipeline_module, "build_merge_planning_context_pack")
+    assert not hasattr(pipeline_module, "build_merge_planning_source_pack")
+    assert not hasattr(pipeline_module, "compact_candidate_contexts_for_merge_planning")
+    assert not hasattr(pipeline_module, "merge_planning_hit_excerpt_limit")
+    assert not hasattr(pipeline_module, "merge_planning_relevant_wiki_paths")
+    assert not hasattr(pipeline_module, "compact_snapshot_for_merge_planning")
+    assert not hasattr(pipeline_module, "merge_planning_payload_pack_summary")
+    assert not hasattr(pipeline_module, "render_merge_planning_context_pack_markdown")
+    assert not hasattr(pipeline_module, "json_char_count")
+    assert not hasattr(pipeline_module, "CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT")
+    assert not hasattr(pipeline_module, "CANDIDATE_RESOLUTION_GLOBAL_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "CANDIDATE_RESOLUTION_PER_CANDIDATE_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_FULL_SOURCE_CHAR_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_SOURCE_GLOBAL_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_SOURCE_PER_PAGE_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_CONTEXT_QUERY_LIMIT")
+    assert not hasattr(pipeline_module, "MERGE_PLANNING_ENTRY_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "source_basis_candidate_refs")
+    assert not hasattr(pipeline_module, "source_digest_candidate_lookup")
+    assert not hasattr(pipeline_module, "source_digest_candidate_id_closure")
+    assert not hasattr(pipeline_module, "first_source_basis_candidate")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -753,7 +781,7 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
             ],
         ),
     )
-    projected_lookup = pipeline_module.source_digest_candidate_lookup(projected)
+    projected_lookup = source_refs_module.source_digest_candidate_lookup(projected)
     assert all(candidate_id in projected_lookup for candidate_id in aggregate.related_candidates)
     assert report["selected_count"] == 2
     assert report["deferred_count"] == 2
@@ -1213,7 +1241,7 @@ def test_source_excerpt_packs_expand_prepared_discovered_budget_deferred_cues() 
         "这里描述多脑多手架构如何把大脑与双手解耦，并通过 agent harness 组织 managed agents。\n"
     )
 
-    merge_pack = pipeline_module.build_merge_planning_context_pack(
+    merge_pack = planning_payloads_module.build_merge_planning_context_pack(
         approved_prepared_text=text + ("\n额外填充段落。\n" * 2000),
         digest=digest,
         resolution=resolution,
@@ -2481,7 +2509,7 @@ def test_candidate_resolution_payload_uses_excerpt_pack_for_long_prepared_source
     assert payload["approved_prepared_ref"] == "prepared_raw_review/approved_prepared.md"
     assert payload["source_excerpt_pack"]["schema_version"] == "candidate_resolution_source_excerpt_pack.v1"
     assert payload["source_excerpt_pack"]["full_source_in_payload"] is False
-    assert payload["source_excerpt_pack"]["original_char_count"] > pipeline_module.CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT
+    assert payload["source_excerpt_pack"]["original_char_count"] > planning_payloads_module.CANDIDATE_RESOLUTION_FULL_SOURCE_CHAR_LIMIT
     assert payload["source_excerpt_pack"]["included_char_count"] < payload["source_excerpt_pack"]["original_char_count"]
     assert "source_excerpt_pack" in " ".join(payload["contract"]["rules"])
 
@@ -2898,24 +2926,24 @@ def test_wiki_merge_planning_payload_uses_compact_context_projection(
     )
     contexts = payload["candidate_contexts"]
     assert contexts["schema_version"] == "candidate_contexts_projection.v1"
-    assert contexts["query_limit"] == pipeline_module.MERGE_PLANNING_CONTEXT_QUERY_LIMIT
-    assert contexts["hit_excerpt_limit"] == pipeline_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
-    assert contexts["weak_hit_excerpt_limit"] == pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
-    assert contexts["weak_hit_excerpt_max_rank"] == pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
+    assert contexts["query_limit"] == planning_payloads_module.MERGE_PLANNING_CONTEXT_QUERY_LIMIT
+    assert contexts["hit_excerpt_limit"] == planning_payloads_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+    assert contexts["weak_hit_excerpt_limit"] == planning_payloads_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+    assert contexts["weak_hit_excerpt_max_rank"] == planning_payloads_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
     assert contexts["hit_excerpt_role"] == "match_preview"
     assert contexts["content_evidence_ref"] == "wiki_context_projection.entries"
     assert any(hit["path"] == "concepts/Concept_Existing_Runtime.md" for item in contexts["items"] for hit in item["hits"])
     projected_hit = next(hit for item in contexts["items"] for hit in item["hits"])
     assert isinstance(projected_hit["score_bucket"], int)
     assert "bucket=" in projected_hit["sort_explanation"]
-    assert all(len(item["query"]) <= pipeline_module.MERGE_PLANNING_CONTEXT_QUERY_LIMIT for item in contexts["items"])
+    assert all(len(item["query"]) <= planning_payloads_module.MERGE_PLANNING_CONTEXT_QUERY_LIMIT for item in contexts["items"])
     assert all(
-        len(hit["excerpt"]) <= pipeline_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+        len(hit["excerpt"]) <= planning_payloads_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
         for item in contexts["items"]
         for hit in item["hits"]
     )
     assert all(
-        len(hit["excerpt"]) <= pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+        len(hit["excerpt"]) <= planning_payloads_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
         for item in contexts["items"]
         for hit in item["hits"]
         if hit["strength"] == "weak" and not hit["forced"]
@@ -2926,11 +2954,11 @@ def test_wiki_merge_planning_payload_uses_compact_context_projection(
             0
             if hit["strength"] == "weak"
             and not hit["forced"]
-            and hit["rank"] > pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
+            and hit["rank"] > planning_payloads_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
             else (
-                pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
+                planning_payloads_module.MERGE_PLANNING_WEAK_CONTEXT_HIT_EXCERPT_LIMIT
                 if hit["strength"] == "weak" and not hit["forced"]
-                else pipeline_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
+                else planning_payloads_module.MERGE_PLANNING_CONTEXT_HIT_EXCERPT_LIMIT
             )
         )
         for item in contexts["items"]
@@ -2940,16 +2968,16 @@ def test_wiki_merge_planning_payload_uses_compact_context_projection(
         hit["excerpt"] == ""
         for item in contexts["items"]
         for hit in item["hits"]
-        if hit["strength"] == "weak" and not hit["forced"] and hit["rank"] > pipeline_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
+        if hit["strength"] == "weak" and not hit["forced"] and hit["rank"] > planning_payloads_module.MERGE_PLANNING_WEAK_CONTEXT_EXCERPT_MAX_RANK
     )
 
     sidecar = read_json(run_dir / "wiki_merge_planning" / "merge_planning_context_pack.json")
     assert sidecar["schema_version"] == "merge_planning_context_pack.v1"
     assert sidecar["original_counts"]["candidate_contexts_json_chars"] > sidecar["projected_counts"]["candidate_contexts_projection_json_chars"]
-    assert sidecar["original_counts"]["approved_digest_json_chars"] == pipeline_module.json_char_count(
+    assert sidecar["original_counts"]["approved_digest_json_chars"] == planning_payloads_module.json_char_count(
         read_json(run_dir / "source_digest_review" / "approved_digest.json")
     )
-    assert sidecar["original_counts"]["candidate_resolution_json_chars"] == pipeline_module.json_char_count(
+    assert sidecar["original_counts"]["candidate_resolution_json_chars"] == planning_payloads_module.json_char_count(
         read_json(run_dir / "candidate_resolution" / "candidate_resolution.json")
     )
     assert (run_dir / "wiki_merge_planning" / "merge_planning_context_pack.md").exists()
