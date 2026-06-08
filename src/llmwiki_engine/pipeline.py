@@ -909,6 +909,11 @@ def build_source_digest_source_map(
     global_excerpt = "" if include_full_source else _source_excerpt.source_global_excerpt(approved_prepared_text, global_limit)
     captions = [] if include_full_source else source_digest_caption_snippets(approved_prepared_text, max_captions=max_captions)
     included_chars = len(global_excerpt) + included_section_chars + sum(len(item["text"]) for item in captions)
+    heading_count = sum(
+        1
+        for line in approved_prepared_text.splitlines()
+        if re.match(r"^\s{0,3}#{1,6}\s+\S", line)
+    )
     return {
         "schema_version": "source_digest_source_map.v1",
         "approved_prepared_ref": approved_prepared_ref,
@@ -920,7 +925,7 @@ def build_source_digest_source_map(
         "global_excerpt_limit": global_limit,
         "section_excerpt_limit": section_limit,
         "max_sections": max_sections,
-        "omitted_section_count": max(0, markdown_heading_count(approved_prepared_text) - len(source_map_sections)),
+        "omitted_section_count": max(0, heading_count - len(source_map_sections)),
         "global_excerpt": global_excerpt,
         "outline": [
             {
@@ -934,10 +939,6 @@ def build_source_digest_source_map(
         "captions": captions,
         "sections": source_map_sections,
     }
-
-
-def markdown_heading_count(text: str) -> int:
-    return sum(1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line))
 
 
 def source_digest_caption_snippets(text: str, *, max_captions: int) -> list[dict[str, Any]]:
@@ -1497,7 +1498,7 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
     source_title = source_title_for_raw(digest.source_raw_path)
     log_date = local_date()
-    retrieval_config = effective_retrieval_config(ctx)
+    retrieval_config = ctx.manifest.vault_config_snapshot.embedding_retrieval
     snapshot = build_wiki_context_snapshot(
         ctx.vault,
         resolution,
@@ -1533,10 +1534,6 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
             _ref(ctx.run_dir, contexts_md, step_name, "markdown"),
         ],
     )
-
-
-def effective_retrieval_config(ctx: StepRunContext) -> EmbeddingRetrievalConfig:
-    return ctx.manifest.vault_config_snapshot.embedding_retrieval
 
 
 def uses_mock_provider_context(execution_context: ProviderExecutionContext) -> bool:
@@ -1786,7 +1783,10 @@ def compact_snapshot_for_merge_planning(
     for entry in snapshot.entries:
         if entry.path not in relevant_paths:
             continue
-        content_excerpt = compact_entry_content_for_merge_planning(entry.content)
+        content_excerpt = _source_excerpt.source_global_excerpt(
+            entry.content,
+            MERGE_PLANNING_ENTRY_EXCERPT_LIMIT,
+        )
         entries.append(
             {
                 "path": entry.path,
@@ -1833,10 +1833,6 @@ def compact_snapshot_for_merge_planning(
         "knowledge_metadata_pool": metadata_pool,
         "entries": entries,
     }
-
-
-def compact_entry_content_for_merge_planning(text: str) -> str:
-    return _source_excerpt.source_global_excerpt(text, MERGE_PLANNING_ENTRY_EXCERPT_LIMIT)
 
 
 def json_char_count(value: Any) -> int:
@@ -2009,11 +2005,6 @@ def render_merge_planning_shortcut_report(report: dict[str, Any]) -> str:
     )
 
 
-def merge_planning_shortcut_provider_allowed(ctx: StepRunContext, step_name: str) -> bool:
-    runtime = ctx.execution_context.runtime_for_task(step_name)
-    return not runtime.spec.startswith("mock:")
-
-
 def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     step_name = "wiki_merge_planning"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -2039,7 +2030,8 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     context_pack_md = step_root / "merge_planning_context_pack.md"
     write_json(context_pack_path, context_pack)
     context_pack_md.write_text(render_merge_planning_context_pack_markdown(context_pack), encoding="utf-8")
-    if merge_planning_shortcut_provider_allowed(ctx, step_name):
+    runtime = ctx.execution_context.runtime_for_task(step_name)
+    if not runtime.spec.startswith("mock:"):
         shortcut_report = empty_vault_create_merge_planning_shortcut_report(digest, resolution, snapshot, candidate_contexts)
     else:
         shortcut_report = {"used": False}
@@ -6614,8 +6606,10 @@ def scan_raw_ingest_candidates(
                 size_bytes=stat.st_size,
                 mtime=datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
                 matched_by=matched_by,
-                source_pages=_record_source_pages(matched_records),
-                operation_ids=_record_operation_ids(matched_records),
+                source_pages=sorted({record.source_page for record in matched_records}),
+                operation_ids=sorted(
+                    {operation_id for record in matched_records for operation_id in record.operation_ids}
+                ),
                 reason=reason,
             )
         )
@@ -6726,14 +6720,6 @@ def _frontmatter_raw_paths(frontmatter: dict[str, Any]) -> list[str]:
         if normalized:
             raw_paths.append(normalized)
     return raw_paths
-
-
-def _record_source_pages(records: list[_SourceRawCoverageRecord]) -> list[str]:
-    return sorted({record.source_page for record in records})
-
-
-def _record_operation_ids(records: list[_SourceRawCoverageRecord]) -> list[str]:
-    return sorted({operation_id for record in records for operation_id in record.operation_ids})
 
 
 def _frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:
