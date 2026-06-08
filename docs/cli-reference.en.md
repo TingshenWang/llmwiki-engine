@@ -44,7 +44,6 @@ source_digest.json
 The execution source for model-backed steps. Public provider specs are:
 
 - `mock:fixture`: read deterministic fixture files for tests.
-- `human`: manual handoff placeholder.
 - `openai_compatible:<model>`: call a Chat Completions-compatible API.
 
 `apply`
@@ -217,7 +216,6 @@ uv run llmwiki providers list
 Expected provider names:
 
 ```text
-human
 mock
 openai_compatible
 ```
@@ -256,7 +254,7 @@ With `--live`, openai-compatible providers receive a minimal connectivity probe:
 uv run llmwiki providers check "$VAULT" --live
 ```
 
-`--live` does not write the vault, does not create a run, and is not a full ingest. Mock providers only check fixtures. Human providers do not make network requests. Real providers receive a small Chat Completions probe:
+`--live` does not write the vault, does not create a run, and is not a full ingest. Mock providers only check fixtures. Real providers receive a small Chat Completions probe:
 
 - `temperature=0`
 - `max_tokens=512`

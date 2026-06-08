@@ -1034,7 +1034,7 @@ def test_providers_check_config_error_does_not_print_empty_table(tmp_path: Path)
     init_vault(vault, profile_name="project_basic")
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
-    config["providers"] = {"unknown": "human"}
+    config["providers"] = {"unknown": "mock:fixture"}
     write_yaml(config_path, config)
 
     runner = CliRunner()

@@ -43,8 +43,8 @@ def test_source_digest_bad_format_is_blocked(tmp_path: Path) -> None:
         StructuredModelCall(provider).run("source_digest", {}, SourceDigestArtifact)
 
 
-def test_registry_lists_planned_provider_types() -> None:
-    assert ProviderRegistry().names() == ["human", "mock", "openai_compatible"]
+def test_registry_lists_current_provider_types() -> None:
+    assert ProviderRegistry().names() == ["mock", "openai_compatible"]
 
 
 def test_openai_compatible_provider_uses_authorization_header() -> None:

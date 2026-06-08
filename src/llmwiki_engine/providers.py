@@ -236,19 +236,11 @@ class OpenAICompatibleProvider:
             time.sleep(delay)
 
 
-class HumanProvider:
-    name = "human"
-
-    def generate_raw(self, task: str, payload: dict[str, Any], output_model: type[BaseModel]) -> str:
-        raise ProviderError("HumanProvider is a placeholder; provide artifact files manually and resume.")
-
-
 class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, type | object] = {
             "mock": MockProvider,
             "openai_compatible": OpenAICompatibleProvider,
-            "human": HumanProvider,
         }
 
     def names(self) -> list[str]:
@@ -285,8 +277,6 @@ class ProviderRegistry:
             if retry_backoff_seconds is not None:
                 kwargs["retry_backoff_seconds"] = retry_backoff_seconds
             return OpenAICompatibleProvider(model, endpoint, api_key, **kwargs)
-        if provider_name == "human":
-            return HumanProvider()
         raise ProviderError(f"Unknown provider spec: {spec}")
 
 

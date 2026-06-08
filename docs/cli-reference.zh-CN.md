@@ -44,7 +44,6 @@ source_digest.json
 模型步骤的执行来源。目前公开支持：
 
 - `mock:fixture`：从 fixture 文件读取固定输出，适合测试。
-- `human`：人工交接占位，会提示需要手动提供 artifact。
 - `openai_compatible:<model>`：调用 Chat Completions-compatible API。
 
 `apply`
@@ -216,7 +215,6 @@ uv run llmwiki providers list
 当前输出应包含：
 
 ```text
-human
 mock
 openai_compatible
 ```
@@ -255,8 +253,8 @@ mock provider ... has no fixture_dir; ingest will require --fixture-dir.
 uv run llmwiki providers check "$VAULT" --live
 ```
 
-`--live` 不会写 vault，不会创建 run，也不等同于完整 ingest。mock 只检查 fixture，
-human 不发请求。真实 provider 会收到一次小型 Chat Completions 探针：
+`--live` 不会写 vault，不会创建 run，也不等同于完整 ingest。mock 只检查 fixture。
+真实 provider 会收到一次小型 Chat Completions 探针：
 
 - `temperature=0`
 - `max_tokens=512`

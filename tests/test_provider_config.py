@@ -145,7 +145,7 @@ def test_vault_unknown_provider_key_error_includes_source(tmp_path: Path) -> Non
     init_vault(vault)
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
-    config["providers"] = {"unknown": "human"}
+    config["providers"] = {"unknown": "mock:fixture"}
     write_yaml(config_path, config)
 
     with pytest.raises(ProviderConfigError) as exc:
@@ -334,25 +334,42 @@ def test_openai_compatible_rejects_invalid_retry_config(
         )
 
 
-@pytest.mark.parametrize("spec", ["mock:fixture", "human"])
-def test_non_openai_providers_reject_retry_config(tmp_path: Path, spec: str) -> None:
+def test_mock_provider_rejects_retry_config(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     init_vault(vault)
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
+    fixture_dir = tmp_path / "mock"
+    fixture_dir.mkdir()
     config["providers"] = {
         "default": {
-            "spec": spec,
+            "spec": "mock:fixture",
+            "fixture_dir": fixture_dir.as_posix(),
             "max_retries": 1,
         }
     }
-    if spec == "mock:fixture":
-        fixture_dir = tmp_path / "mock"
-        fixture_dir.mkdir()
-        config["providers"]["default"]["fixture_dir"] = fixture_dir.as_posix()
     write_yaml(config_path, config)
 
     with pytest.raises(ProviderConfigError, match="does not support .*max_retries"):
+        build_provider_execution_context(
+            vault=vault,
+            manifest_contexts=[],
+            fixture_dir=None,
+            source="initial_run",
+            from_step=None,
+            tasks=["raw_prepare"],
+        )
+
+
+def test_human_provider_name_is_rejected(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    config_path = vault / ".llmwiki" / "config.yaml"
+    config = read_yaml(config_path)
+    config["providers"] = {"default": {"spec": "human"}}
+    write_yaml(config_path, config)
+
+    with pytest.raises(ProviderConfigError, match="Unknown provider"):
         build_provider_execution_context(
             vault=vault,
             manifest_contexts=[],

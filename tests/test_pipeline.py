@@ -1877,19 +1877,29 @@ def test_resume_after_failed_step(tmp_path: Path) -> None:
 
 def test_pipeline_uses_task_provider_config(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
+    empty_fixture = tmp_path / "empty-fixture"
+    empty_fixture.mkdir()
     config_path = vault / ".llmwiki" / "config.yaml"
     config = read_yaml(config_path)
-    config["providers"]["source_digest"] = "human"
+    config["providers"]["default"] = {
+        "spec": "mock:fixture",
+        "fixture_dir": str(FIXTURE_ROOT / "mock"),
+    }
+    config["providers"]["source_digest"] = {
+        "spec": "mock:fixture",
+        "fixture_dir": empty_fixture.as_posix(),
+    }
     write_yaml(config_path, config)
 
-    with pytest.raises(Exception, match="HumanProvider"):
-        run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="provider")
+    with pytest.raises(Exception, match="Mock fixture missing"):
+        run_simplified_ingest(vault=vault, raw_file=raw, slug="provider")
     operation_id = next(RunStore(vault).runs_root.iterdir()).name
     manifest = status(vault, operation_id)
     assert manifest.status == OperationStatus.failed
     failed_step = [step for step in manifest.steps if step.status == StepStatus.failed][0]
     assert failed_step.name == "source_digest"
-    assert failed_step.attempts[-1].provider_spec == "human"
+    assert failed_step.attempts[-1].provider_spec == "mock:fixture"
+    assert manifest.provider_contexts[0].providers["source_digest"].fixture_dir == empty_fixture.as_posix()
 
 
 def test_mock_ingest_requires_fixture_dir_when_config_has_none(tmp_path: Path) -> None:
@@ -3313,7 +3323,10 @@ def test_invalid_task_provider_config_does_not_fallback_to_default(tmp_path: Pat
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     digest = run_dir / "source_digest" / "source_digest.json"
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
-    config["providers"]["default"] = "human"
+    config["providers"]["default"] = {
+        "spec": "mock:fixture",
+        "fixture_dir": str(FIXTURE_ROOT / "mock"),
+    }
     config["providers"]["source_digest"] = ""
     write_yaml(vault / ".llmwiki" / "config.yaml", config)
     with pytest.raises(Exception, match="Invalid provider config for task: source_digest"):
@@ -3357,25 +3370,31 @@ def test_provider_config_rejects_unknown_field_before_deleting_outputs(tmp_path:
 
 def test_resume_current_config_records_provider_on_failed_attempt(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="human")
+    empty_fixture = tmp_path / "empty-fixture"
+    empty_fixture.mkdir()
+    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=FIXTURE_ROOT / "mock", slug="provider-fail")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     config = read_yaml(vault / ".llmwiki" / "config.yaml")
     config["providers"]["default"] = {
         "spec": "mock:fixture",
         "fixture_dir": str(FIXTURE_ROOT / "mock"),
     }
-    config["providers"]["source_digest"] = "human"
+    config["providers"]["source_digest"] = {
+        "spec": "mock:fixture",
+        "fixture_dir": empty_fixture.as_posix(),
+    }
     write_yaml(vault / ".llmwiki" / "config.yaml", config)
 
-    with pytest.raises(Exception, match="HumanProvider"):
+    with pytest.raises(Exception, match="Mock fixture missing"):
         resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="source_digest")
 
     resumed = status(vault, manifest.operation_id)
     digest_step = [step for step in resumed.steps if step.name == "source_digest"][0]
     assert digest_step.status == StepStatus.failed
     assert digest_step.attempts[-1].provider_context_source == "resume_current_config"
-    assert digest_step.attempts[-1].provider_spec == "human"
+    assert digest_step.attempts[-1].provider_spec == "mock:fixture"
     assert digest_step.attempts[-1].provider_record_id == "provider-context-002"
+    assert resumed.provider_contexts[-1].providers["source_digest"].fixture_dir == empty_fixture.as_posix()
     assert (run_dir / "prepared_raw_review" / "approved_prepared.md").exists()
     assert not (run_dir / "draft_rendering").exists()
     assert not (run_dir / "apply_preview").exists()
@@ -12274,7 +12293,6 @@ def test_draft_rendering_create_english_source_coverage_notes_is_filled_without_
 
 def test_draft_rendering_batch_parallelism_is_provider_scoped() -> None:
     assert pipeline_module.draft_rendering_batch_parallelism("mock:fixture", 3) == 1
-    assert pipeline_module.draft_rendering_batch_parallelism("human", 3) == 1
     assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 1) == 1
     assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 2) == 2
     assert pipeline_module.draft_rendering_batch_parallelism("openai_compatible:gpt-4.1", 3) == 3

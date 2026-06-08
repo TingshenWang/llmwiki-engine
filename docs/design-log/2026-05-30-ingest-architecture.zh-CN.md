@@ -161,8 +161,7 @@ Provider 应该按模块选择，而不是全局只选一个模型。这可以�
 MVP provider 集合包括：
 
 - `MockProvider`：用于确定性 fixtures 和测试；
-- `OpenAICompatibleProvider`：用于 hosted 或 API 中转站的 Chat Completions-compatible 接口；
-- `HumanProvider`：用于显式人工交接点。
+- `OpenAICompatibleProvider`：用于 hosted 或 API 中转站的 Chat Completions-compatible 接口。
 
 每个模型驱动步骤都应该使用 structured calls，并记录 schema validation、有限
 repair、cost、latency 和失败输出诊断。

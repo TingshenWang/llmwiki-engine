@@ -182,8 +182,7 @@ for harder extraction or planning tasks.
 The MVP provider set is:
 
 - `MockProvider` for deterministic fixtures and tests;
-- `OpenAICompatibleProvider` for hosted or routed Chat Completions-compatible APIs;
-- `HumanProvider` for explicit manual handoff points.
+- `OpenAICompatibleProvider` for hosted or routed Chat Completions-compatible APIs.
 
 Every model-backed step should use structured calls with schema validation,
 bounded repair, cost and latency capture, and failed-output diagnostics.

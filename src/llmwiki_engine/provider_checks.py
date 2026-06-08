@@ -104,9 +104,6 @@ def check_providers(
                 result.warn(f"mock provider for {task} has no fixture_dir; ingest will require --fixture-dir.")
             elif not Path(runtime.fixture_dir).is_dir():
                 result.warn(f"mock fixture_dir for {task} does not exist: {runtime.fixture_dir}")
-        elif provider_name == "human":
-            continue
-
     if live and result.ok:
         _run_live_checks(result, execution_context, credential_labels, http_client_factory)
     return result

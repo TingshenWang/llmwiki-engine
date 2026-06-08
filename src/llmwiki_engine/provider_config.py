@@ -238,7 +238,7 @@ def provider_runtime_spec_for_task(
         raise _provider_error(entry, task, f"Invalid provider config for task: {task}")
     provider_name = spec.partition(":")[0]
     _, separator, model = spec.partition(":")
-    if provider_name not in {"mock", "human", "openai_compatible"}:
+    if provider_name not in {"mock", "openai_compatible"}:
         raise _provider_error(entry, task, f"Unknown provider spec for {task}: {provider_name}")
 
     _validate_optional_string(entry, task, endpoint, f"Invalid provider endpoint for task: {task}")
@@ -279,23 +279,6 @@ def provider_runtime_spec_for_task(
             ),
             api_key,
         )
-
-    if provider_name == "human":
-        if separator:
-            raise _provider_error(entry, task, f"human provider for {task} must use spec: human.")
-        if (
-            endpoint is not None
-            or api_key is not None
-            or config_fixture_dir is not None
-            or max_retries is not None
-            or retry_backoff_seconds is not None
-        ):
-            raise _provider_error(
-                entry,
-                task,
-                f"human provider for {task} does not support endpoint, api_key, fixture_dir, max_retries, or retry_backoff_seconds.",
-            )
-        return ProviderRuntimeSpec(spec=spec), None
 
     if endpoint is not None or api_key is not None:
         raise _provider_error(entry, task, f"mock provider for {task} does not support endpoint or api_key.")
