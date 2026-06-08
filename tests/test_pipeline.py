@@ -4411,7 +4411,7 @@ def test_finalize_draft_rendering_merges_body_markdown_with_legacy_core_sections
     assert "这个旧槽里的价值判断也不能丢。" in body
 
 
-def test_validate_draft_rendering_rejects_system_heading_inside_body_markdown() -> None:
+def test_validate_draft_rendering_strips_system_heading_inside_body_markdown() -> None:
     plan = qwen_related_block_plan()
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -4432,10 +4432,11 @@ def test_validate_draft_rendering_rejects_system_heading_inside_body_markdown() 
         ]
     )
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
-        pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
+    canonical = pipeline_module.canonicalize_draft_artifact(draft, plan)
 
-    assert exc_info.value.issues[0].issue_code == "forbidden_system_section_in_core"
+    pipeline_module.validate_draft_rendering(canonical, plan, language="zh-CN")
+    assert "相关页面" not in canonical.pages[0].body_markdown
+    assert "Entity_Qwen-Agent" not in canonical.pages[0].body_markdown
 
 
 def test_blocked_apply_eligibility_stops_at_merge_plan_review(tmp_path: Path) -> None:
@@ -5492,6 +5493,41 @@ def test_validate_draft_rendering_allows_related_word_without_link_block() -> No
     )
 
     pipeline_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
+
+
+def test_canonicalize_draft_rendering_strips_system_sections_from_free_body() -> None:
+    plan = qwen_related_block_plan()
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-QWEN",
+                action="create",
+                canonical_target_path="entities/Entity_Qwen-Agent.md",
+                summary="Qwen-Agent 是 Agent 开发框架。",
+                body_markdown=(
+                    "Qwen-Agent 把模型、工具和智能体运行时组织在一起，适合说明 Agent 框架的工程边界。\n\n"
+                    "## 相关页面\n\n"
+                    "- [[concepts/Concept_Agent 开发框架（Qwen-Agent）.md]]：模型误写的系统段落。\n\n"
+                    "## 后续说明\n\n"
+                    "这部分仍属于自由正文，应该保留。\n\n"
+                    "## 矛盾与未决问题\n\n"
+                    "- 这个系统段落也应交给系统统一渲染。"
+                ),
+                change_summary="创建 Qwen-Agent 页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    canonical = pipeline_module.canonicalize_draft_artifact(draft, plan)
+    body = canonical.pages[0].body_markdown
+
+    pipeline_module.validate_draft_rendering(canonical, plan, language="zh-CN")
+    assert "相关页面" not in body
+    assert "矛盾与未决问题" not in body
+    assert "Concept_Agent 开发框架" not in body
+    assert "后续说明" in body
+    assert "这部分仍属于自由正文，应该保留。" in body
 
 
 def test_validate_draft_rendering_allows_tilde_fenced_related_markdown_example() -> None:

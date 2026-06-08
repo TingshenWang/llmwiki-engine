@@ -11203,6 +11203,7 @@ def normalize_core_body_markdown(body: str, *, item: WikiMergePlanItem | None = 
         if len(parts) >= 3:
             body = parts[2].strip()
     body = demote_core_body_headings(body)
+    body = strip_core_body_system_sections(body)
     return body.strip()
 
 
@@ -11219,6 +11220,40 @@ def demote_core_body_headings(body: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines)
+
+
+def strip_core_body_system_sections(body: str) -> str:
+    lines: list[str] = []
+    skip_heading_level: int | None = None
+    fence_char = ""
+    fence_length = 0
+    for line in body.splitlines():
+        if fence_char:
+            if skip_heading_level is None:
+                lines.append(line)
+            if closing_fence_line(line, fence_char, fence_length):
+                fence_char = ""
+                fence_length = 0
+            continue
+        if match := opening_fence_line(line):
+            marker = match.group("marker")
+            fence_char = marker[0]
+            fence_length = len(marker)
+            if skip_heading_level is None:
+                lines.append(line)
+            continue
+        heading_match = re.match(r"^\s{0,3}(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$", line)
+        if heading_match:
+            title = re.sub(r"\s+", " ", heading_match.group("title").strip()).strip("#:： ")
+            level = len(heading_match.group("marks"))
+            if title.casefold() in SYSTEM_CORE_SECTION_TITLES:
+                skip_heading_level = level
+                continue
+            if skip_heading_level is not None and level <= skip_heading_level:
+                skip_heading_level = None
+        if skip_heading_level is None:
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def core_body_system_heading(body: str) -> str | None:
