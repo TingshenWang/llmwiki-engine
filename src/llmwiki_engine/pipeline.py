@@ -176,6 +176,8 @@ DRAFT_RENDERING_GROUNDING_RISK_RULES = (
     "use quotes only for text that exact-matches source_excerpt_pack, approved_prepared_markdown, or inspected wiki context.",
     "For interview, ASR/OCR, or translated transcript source text, treat speaker-like Chinese wording as paraphrase "
     "unless the exact span is present; prefer indirect attribution such as 访谈中提到、她描述、团队讨论.",
+    "The user has already approved this source for ingest. Do not reject or avoid a domain just because it is medical, legal, financial, security, account, password, payment, or privacy related.",
+    "The only hard grounding boundary is contradiction with the approved source: absence of support is a warning, not a blocker.",
     "When turning source-local capabilities or examples into popularity/adoption/authority claims, prefer source-local "
     "wording such as 本材料提到、访谈中讨论、团队成员提到、本材料将该说法用于解释 unless the source/wiki context clearly supports broader phrasing.",
     "In open_questions, unsupported adoption/authority premises such as 公认、最佳实践、行业最佳、广泛采用、业界普遍 are allowed as hypotheses, "
@@ -5836,11 +5838,11 @@ def build_draft_rendering_payload(
                 "For zh-CN vaults, translate or paraphrase English raw examples into Chinese; do not paste whole English sentences into body_markdown, open_questions, change_summary, or source_coverage_notes.",
                 "Stable English product/protocol terms such as Claude Code, Managed Agents, harness, sandbox, session, MCP, Eval, TTFT, CLI, API, and Cowork may remain in English, but surrounding prose must be Chinese.",
                 "Ground examples, value points, and reuse scenarios in source content.",
-                "Across body_markdown/open_questions/section_bodies, do not fabricate example values such as `张三`, `Alice`, `user-123`, `user123`, concrete user preferences, dates, plans, metrics, credentials, or IDs unless exact source/wiki support exists; use placeholders such as `<user_id>`, `<memory_text>`, `<memory_query>`, `某个用户`, or `用户偏好 X`.",
-                "When body_markdown includes examples, do not invent concrete user facts, user ids, preferences, dates, plans, metrics, credentials, or command arguments unless exact source text supports them; for generic explanation, use abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
-                "Do not invent sensitive or dynamic user-support query examples such as account balance, password reset, payment/refund, order/ticket status, login/session, credentials, API keys, tokens, cookies, phone, email, address, or profile lookups unless exact source/wiki support exists; use neutral placeholders such as `<dynamic_user_query>` or `<support_query>`, or use source-backed technical queries.",
-                "Do not write legal, medical, financial, safety/security, account/password/payment/privacy advice as fact unless the source/wiki context explicitly supports the same claim; put unsupported high-risk advice in open_questions as 待补来源 instead.",
-                "Do not evade sensitive/dynamic query checks by turning a rejected quoted query into an unquoted hypothetical user-support scenario about orders, payments, login, account data, credentials, or contact/profile data.",
+                "Across body_markdown/open_questions/section_bodies, prefer source-backed or clearly illustrative examples; when a concrete value such as `张三`, `Alice`, `user-123`, a preference, date, plan, metric, credential, or ID is not from the source/wiki, avoid presenting it as an observed user fact and use placeholders such as `<user_id>`, `<memory_text>`, `<memory_query>`, `某个用户`, or `用户偏好 X` when that preserves the meaning.",
+                "When body_markdown includes examples, keep concrete user facts, user ids, preferences, dates, plans, metrics, credentials, and command arguments source-aware; for generic explanation, prefer abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
+                "The user has already approved this material for ingest; do not suppress content merely because it belongs to medical, legal, financial, security, account, password, payment, or privacy domains.",
+                "Grounding should protect source fidelity, not make domain-risk judgments for the user. Keep domain-specific claims when they reflect the approved source or inspected wiki context.",
+                "New named-entity relationships, releases, acquisitions, identity claims, causal facts, or concrete private facts should stay source-aware. Absence of support may be reported as a warning, but only contradiction with the approved source should create review.",
                 "For CLI/API/code examples, Chinese surrounding explanation is fine, but command/API literal arguments are an explicit exception to the zh-CN translation rule: they must either copy exact source literals or use placeholders such as `<memory_text>`, `<user_id>`, or `<memory_query>`; do not translate a source literal into a new concrete preference, user id, query, path, or command argument.",
                 "When the source only states a recommendation or best practice, do not invent causal outcomes with terms such as `导致`, `造成`, `影响到`, or `用户会...`; either state the source-backed boundary without a new consequence, or move the consequence to open_questions as 待补来源.",
                 *DRAFT_RENDERING_GROUNDING_RISK_RULES,
@@ -12159,13 +12161,6 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
             "如果是 CLI/API/code 示例，命令参数要么照抄来源 literal，要么改成 `<memory_text>`、`<user_id>`、`<memory_query>` 这类占位符；"
             "不要把被拒绝的具体偏好、用户 ID、查询或命令参数换成另一个具体值。"
         )
-    if grounding_dynamic_sensitive_query_issue(claim):
-        reason = (
-            f"{reason} 不要把账户余额、密码重置、支付/退款、订单/工单状态、登录/会话、凭证/API key/token/cookie、"
-            "电话/邮箱/地址/个人资料这类敏感或动态用户查询当作编造例子；"
-            "请删除该例子，或改成 `<dynamic_user_query>`、`<support_query>`、`如何 <action>` 这类中性占位符，"
-            "除非 raw/wiki 明确给出这个例子。"
-        )
     if grounding_external_backing_issue(claim):
         reason = (
             f"{reason} 这是非阻塞提醒："
@@ -12199,14 +12194,6 @@ def grounding_external_backing_issue(claim: GroundingClaim) -> bool:
         claim.support == "unsupported"
         and claim.action in {"needs_review", "warn"}
         and "新增外部背书/强事实标记" in claim.reason
-    )
-
-
-def grounding_dynamic_sensitive_query_issue(claim: GroundingClaim) -> bool:
-    return (
-        claim.support == "unsupported"
-        and claim.action == "needs_review"
-        and quote_has_dynamic_sensitive_query_marker(re.sub(r"\s+", "", claim.text.strip()), claim.text)
     )
 
 
@@ -12415,14 +12402,10 @@ def grounding_text_supported_by_context(text: str, approved_raw_text: str, exist
     return quote_supported_by_text(text, approved_raw_text) or quote_supported_by_text(text, existing_wiki_text)
 
 
-def unsupported_quote_grounding_action(body: str, quote: str, *, quote_start: int, section_key: str) -> Literal["warn", "needs_review"]:
-    return "warn" if low_risk_unsupported_quote_warning(body, quote, quote_start=quote_start, section_key=section_key) else "needs_review"
-
-
 def unsupported_quote_grounding_reason(body: str, quote: str, *, quote_start: int, section_key: str) -> str:
-    blocking_marker = unsupported_quote_blocking_marker(body, quote, quote_start=quote_start, section_key=section_key)
-    if blocking_marker:
-        return f"直接引用必须在 raw 或已有 wiki 中 exact match；{blocking_marker}"
+    risk_marker = unsupported_quote_risk_marker(body, quote, quote_start=quote_start, section_key=section_key)
+    if risk_marker:
+        return f"直接引用未在 raw 或已有 wiki 中 exact match；{risk_marker} 作为非阻塞提醒保留，必要时可人工回看来源。"
     if explicit_direct_quote_context(body, quote, quote_start=quote_start) or attributed_quote_context(body, quote_start=quote_start):
         return "写成直接引用/作者归因的引号内容未在 raw 或已有 wiki 中 exact match；作为非阻塞提醒保留，必要时可改成转述或人工回看来源。"
     normalized_quote = re.sub(r"\s+", "", unicodedata.normalize("NFKC", quote.strip()))
@@ -12434,29 +12417,15 @@ def unsupported_quote_grounding_reason(body: str, quote: str, *, quote_start: in
     return "低风险未支撑引号内容仅记录为 warning，不阻塞自动 ingest；如需严谨可人工回看来源。"
 
 
-def low_risk_unsupported_quote_warning(body: str, quote: str, *, quote_start: int, section_key: str) -> bool:
-    return unsupported_quote_blocking_marker(body, quote, quote_start=quote_start, section_key=section_key) == ""
-
-
-def unsupported_quote_blocking_marker(body: str, quote: str, *, quote_start: int, section_key: str) -> str:
+def unsupported_quote_risk_marker(body: str, quote: str, *, quote_start: int, section_key: str) -> str:
     sentence = sentence_around_index(body, quote_start)
     normalized_quote = re.sub(r"\s+", "", unicodedata.normalize("NFKC", quote.strip()))
-    normalized_sentence = re.sub(r"\s+", "", unicodedata.normalize("NFKC", sentence.strip()))
-    if quote_has_dynamic_sensitive_query_marker(normalized_quote, quote) or quote_has_dynamic_sensitive_query_marker(
-        normalized_sentence,
-        sentence,
-    ):
-        return "该表述涉及账户、密码、支付、订单、登录、凭证或隐私等动态/敏感用户场景。"
-    high_risk_marker = high_risk_domain_statement_marker(sentence) or high_risk_domain_statement_marker(quote)
-    if high_risk_marker:
-        _marker, domain_label = high_risk_marker
-        return f"该表述涉及高风险{domain_label}建议或断言。"
     if severe_factual_claim_marker(quote) or severe_factual_claim_marker(sentence):
         return "该表述包含专名关系、发布、收购、隶属、身份或因果等严重事实关系。"
     if section_key == "examples" and (unsupported_backing_marker(quote) or unsupported_backing_marker(sentence)):
         return ""
     if section_key == "examples" and examples_quote_has_unsafe_marker_for_bypass(normalized_quote, quote):
-        return "例子区内容包含具体用户事实、动态查询或敏感数据。"
+        return ""
     return ""
 
 
@@ -12550,6 +12519,197 @@ def severe_relation_marker_meta_usage(compact: str, marker: str) -> bool:
 
 def severe_factual_claim_has_named_entity(text: str) -> bool:
     return bool(severe_factual_named_entities(text))
+
+
+def grounding_claim_contradicts_approved_raw(claim_text: str, approved_raw_text: str) -> bool:
+    if not claim_text.strip() or not approved_raw_text.strip():
+        return False
+    if quote_supported_by_text(claim_text, approved_raw_text):
+        return False
+    claim_marker = severe_factual_claim_marker(claim_text)
+    if not claim_marker:
+        return False
+    claim_group = severe_factual_relation_group(claim_marker)
+    if not claim_group:
+        return False
+    claim_entities = severe_factual_entities_in_text_order(claim_text)
+    if len(claim_entities) < 2:
+        return False
+    for sentence in external_backing_source_sentences(approved_raw_text):
+        source_marker = severe_factual_claim_marker(sentence)
+        if not source_marker or severe_factual_relation_group(source_marker) != claim_group:
+            continue
+        source_entities = severe_factual_entities_in_text_order(sentence)
+        if len(source_entities) < 2:
+            continue
+        if severe_factual_relations_contradict(
+            claim_text=claim_text,
+            source_text=sentence,
+            claim_entities=claim_entities,
+            source_entities=source_entities,
+            relation_group=claim_group,
+        ):
+            return True
+    return False
+
+
+def severe_factual_relation_group(marker: str) -> str:
+    normalized = marker.lower().strip()
+    groups = {
+        "acquire": {"收购", "acquired", "acquires", "acquire"},
+        "release": {"发布", "推出", "released", "releases", "launched", "launches"},
+        "create": {"创立", "创建", "created", "founded", "built by", "developed by"},
+        "ownership": {"隶属", "属于", "由", "owned by"},
+        "role": {"担任", "任职", "ceo", "cto", "founder"},
+        "announce": {"宣布", "announced"},
+        "propose": {"提出", "proposed by"},
+    }
+    for group, markers in groups.items():
+        if normalized in markers:
+            return group
+    return ""
+
+
+def severe_factual_entities_in_text_order(text: str) -> list[str]:
+    entities = []
+    for entity in severe_factual_named_entities(text):
+        index = text.find(entity)
+        if index >= 0:
+            entities.append((index, entity))
+    entities.sort(key=lambda item: (item[0], -len(item[1]), item[1]))
+    return _dedupe_strings([entity for _index, entity in entities])
+
+
+def severe_factual_relations_contradict(
+    *,
+    claim_text: str,
+    source_text: str,
+    claim_entities: list[str],
+    source_entities: list[str],
+    relation_group: str,
+) -> bool:
+    claim_set = set(claim_entities)
+    source_set = set(source_entities)
+    common = claim_set & source_set
+    if not common:
+        return False
+    claim_relation = severe_factual_relation_tuple(claim_text, claim_entities, relation_group)
+    source_relation = severe_factual_relation_tuple(source_text, source_entities, relation_group)
+    if claim_relation and source_relation:
+        claim_actor, claim_object = claim_relation
+        source_actor, source_object = source_relation
+        if severe_factual_relation_polarity(claim_text) != severe_factual_relation_polarity(source_text) and (
+            claim_actor == source_actor and claim_object == source_object
+        ):
+            return True
+        if claim_actor == source_object and claim_object == source_actor:
+            return True
+        if claim_object == source_object and claim_actor != source_actor:
+            return True
+        if relation_group in {"ownership", "role"} and claim_actor == source_actor and claim_object != source_object:
+            return True
+        return False
+    if severe_factual_relation_polarity(claim_text) != severe_factual_relation_polarity(source_text) and (
+        claim_set == source_set or len(common) >= 2
+    ):
+        return True
+    if len(common) >= 2 and [entity for entity in claim_entities if entity in common] != [
+        entity for entity in source_entities if entity in common
+    ]:
+        return True
+    if (
+        relation_group in {"acquire", "release", "create", "ownership", "role", "announce", "propose"}
+        and claim_entities[-1] == source_entities[-1]
+        and claim_entities[0] != source_entities[0]
+    ):
+        return True
+    if (
+        relation_group in {"acquire", "release", "create", "announce", "propose"}
+        and severe_factual_relation_by_actor_form(claim_text, relation_group)
+        and severe_factual_relation_by_actor_form(source_text, relation_group)
+        and claim_entities[0] == source_entities[0]
+        and set(claim_entities[1:]) - source_set
+        and set(source_entities[1:]) - claim_set
+    ):
+        return True
+    if relation_group in {"ownership", "role"} and (
+        claim_entities[0] == source_entities[0] and set(claim_entities[1:]) - source_set and set(source_entities[1:]) - claim_set
+    ):
+        return True
+    return False
+
+
+def severe_factual_relation_tuple(text: str, entities: list[str], relation_group: str) -> tuple[str, str] | None:
+    if len(entities) < 2:
+        return None
+    if relation_group in {"acquire", "release", "create", "announce", "propose"}:
+        if severe_factual_relation_by_actor_form(text, relation_group) or severe_factual_relation_passive_form(text, relation_group):
+            return entities[1], entities[0]
+        return entities[0], entities[1]
+    if relation_group == "ownership":
+        compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+        lowered = unicodedata.normalize("NFKC", text).lower()
+        if "属于" in compact or "隶属" in compact or re.search(r"\bowned\s+by\b", lowered):
+            return entities[1], entities[0]
+        return entities[0], entities[1]
+    if relation_group == "role":
+        return entities[0], entities[1]
+    return None
+
+
+def severe_factual_relation_polarity(text: str) -> int:
+    normalized = unicodedata.normalize("NFKC", text)
+    compact = re.sub(r"\s+", "", normalized)
+    lowered = normalized.lower()
+    if re.search(r"(?:没有|并未|未曾|从未|不再|不是|并非|未).{0,12}(?:收购|发布|推出|创立|创建|隶属|属于|担任|任职|宣布|提出|支持|证明|导致|造成|取代|替代)", compact):
+        return -1
+    if re.search(r"(?:收购|发布|推出|创立|创建|隶属|属于|担任|任职|宣布|提出|支持|证明|导致|造成|取代|替代).{0,8}(?:不成立|并不成立|没有发生|未发生)", compact):
+        return -1
+    if re.search(
+        r"\b(?:not|never|no longer|did not|does not|do not|has not|have not|had not|was not|were not|is not|are not|isn't|aren't|wasn't|weren't)\b.{0,80}"
+        r"\b(?:acquir|releas|launch|found|creat|own|develop|built|propos|support|cause|replace|ceo|cto|founder)\b",
+        lowered,
+        re.IGNORECASE,
+    ):
+        return -1
+    return 1
+
+
+def severe_factual_relation_by_actor_form(text: str, relation_group: str) -> bool:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    lowered = unicodedata.normalize("NFKC", text).lower()
+    group_markers = {
+        "acquire": ("收购",),
+        "release": ("发布", "推出"),
+        "create": ("创立", "创建"),
+        "announce": ("宣布",),
+        "propose": ("提出",),
+    }
+    markers = group_markers.get(relation_group, ())
+    if "由" in compact and any(re.search(rf"由.{{1,40}}{re.escape(marker)}", compact) for marker in markers):
+        return True
+    english_patterns = {
+        "acquire": r"\bacquired\s+by\b",
+        "release": r"\b(?:released|launched)\s+by\b",
+        "create": r"\b(?:created|founded|built|developed)\s+by\b",
+        "announce": r"\bannounced\s+by\b",
+        "propose": r"\bproposed\s+by\b",
+    }
+    pattern = english_patterns.get(relation_group)
+    return bool(pattern and re.search(pattern, lowered, re.IGNORECASE))
+
+
+def severe_factual_relation_passive_form(text: str, relation_group: str) -> bool:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    group_markers = {
+        "acquire": ("收购",),
+        "release": ("发布", "推出"),
+        "create": ("创立", "创建"),
+        "announce": ("宣布",),
+        "propose": ("提出",),
+    }
+    markers = group_markers.get(relation_group, ())
+    return any(re.search(rf"被.{{1,40}}{re.escape(marker)}", compact) for marker in markers)
 
 
 def severe_weak_factual_relation_requires_review(text: str, compact: str) -> bool:
@@ -13275,187 +13435,6 @@ def unquoted_dynamic_sensitive_extra_marker(compact: str, original: str = "") ->
     return None
 
 
-def high_risk_domain_statement_marker(text: str) -> tuple[str, str] | None:
-    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
-    lowered = unicodedata.normalize("NFKC", text).lower()
-    if not compact and not lowered:
-        return None
-    if not high_risk_assertive_or_prescriptive_context(compact, lowered):
-        return None
-    checks: list[tuple[str, str, list[str], list[str]]] = [
-        (
-            "医疗",
-            "医疗",
-            [
-                "医疗",
-                "医学",
-                "患者",
-                "病人",
-                "服用",
-                "用药",
-                "药物",
-                "阿司匹林",
-                "心梗",
-                "疾病",
-                "症状",
-                "诊断",
-                "治疗",
-                "处方",
-                "剂量",
-                "手术",
-            ],
-            [
-                r"\b(?:patient|patients|aspirin|medicine|medication|diagnose|diagnosis|treat|treatment|prescribe|dosage|heart attack)\b",
-            ],
-        ),
-        (
-            "法律",
-            "法律",
-            [
-                "法律",
-                "法务",
-                "竞业",
-                "竞业协议",
-                "合同",
-                "协议",
-                "诉讼",
-                "赔偿",
-                "违法",
-                "合法",
-                "劳动仲裁",
-                "起诉",
-                "签署",
-            ],
-            [
-                r"\b(?:legal|law|lawsuit|sue|contract|non-compete|noncompete|liability|illegal|lawful|attorney)\b",
-            ],
-        ),
-        (
-            "金融",
-            "金融",
-            [
-                "金融",
-                "财务",
-                "投资",
-                "存款",
-                "债券",
-                "股票",
-                "基金",
-                "贷款",
-                "理财",
-                "高收益",
-                "买入",
-                "卖出",
-                "资产",
-            ],
-            [
-                r"\b(?:invest|investment|deposit|bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
-            ],
-        ),
-        (
-            "安全",
-            "安全",
-            [
-                "网络安全",
-                "绕过认证",
-                "绕过权限",
-                "禁用安全",
-                "关闭防火墙",
-                "关闭权限",
-                "泄露密钥",
-                "公开密钥",
-                "删除日志",
-                "删日志",
-                "密码",
-                "凭证",
-                "明文",
-                "隐私",
-            ],
-            [
-                r"\b(?:bypass authentication|bypass auth|disable security|turn off firewall|disable firewall|"
-                r"leak api key|expose secret|delete logs|password|passwords|credential|credentials|plaintext|privacy)\b",
-            ],
-        ),
-    ]
-    for marker, label, chinese_markers, english_patterns in checks:
-        matched = next((item for item in chinese_markers if item in compact), "")
-        if matched:
-            return matched, label
-        for pattern in english_patterns:
-            match = re.search(pattern, lowered, re.IGNORECASE)
-            if match:
-                return match.group(0), label
-    return None
-
-
-def high_risk_assertive_or_prescriptive_context(compact: str, lowered: str) -> bool:
-    if high_risk_actionable_can_context(compact, lowered):
-        return True
-    chinese_markers = [
-        "应该",
-        "应当",
-        "不能",
-        "不得",
-        "必须",
-        "一定",
-        "无需",
-        "建议",
-        "推荐",
-        "保证",
-        "预防",
-        "治疗",
-        "诊断",
-        "服用",
-        "用药",
-        "处方",
-        "剂量",
-        "投资",
-        "买入",
-        "卖出",
-        "签署",
-        "加入",
-        "绕过",
-        "禁用",
-        "关闭防火墙",
-        "泄露密钥",
-        "公开密钥",
-    ]
-    if any(marker in compact for marker in chinese_markers):
-        return True
-    return bool(
-        re.search(
-            r"\b(?:should|must|cannot|can't|do not|don't|never|always|recommend|recommended|"
-            r"guarantees?|prevents?|diagnos(?:e|es|ed|ing)|treats?|prescrib(?:e|es|ed|ing)|"
-            r"dosage|dose|medication|take|invest|buy|sell|sign|join|disable|bypass|leak|expose)\b",
-            lowered,
-            re.IGNORECASE,
-        )
-    )
-
-
-def high_risk_actionable_can_context(compact: str, lowered: str) -> bool:
-    chinese_modality = r"(?:可以|可|可用于|推荐用于)"
-    chinese_patterns = [
-        rf"{chinese_modality}.{{0,8}}(?:服用|用药|吃|口服).{{0,10}}(?:药|阿司匹林|处方|剂量|胸痛|心梗|症状)",
-        rf"{chinese_modality}.{{0,8}}(?:解除|起诉|索赔|要求赔偿|签署|签).{{0,10}}(?:合同|协议|竞业|雇主|公司|赔偿)",
-        rf"{chinese_modality}.{{0,8}}(?:投资|买入|买|配置|购买).{{0,10}}(?:理财|债券|股票|基金|贷款|高收益|存款)",
-        rf"{chinese_modality}.{{0,8}}(?:绕过|禁用|关闭|删除|删|泄露|公开|存储|保存).{{0,12}}(?:认证|权限|防火墙|日志|密钥|密码|凭证|明文|隐私)",
-    ]
-    if any(re.search(pattern, compact, re.IGNORECASE) for pattern in chinese_patterns):
-        return True
-    english_patterns = [
-        r"\bcan\s+(?:take|use|prescribe).{0,40}\b(?:aspirin|medicine|medication|dosage|dose|chest pain|heart attack)\b",
-        r"\bcan\s+(?:sue|terminate|cancel|sign).{0,40}\b(?:employer|contract|non-compete|noncompete|liability|attorney)\b",
-        r"\bcan\s+(?:invest|buy|purchase|configure).{0,40}\b(?:bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
-        r"\bcan\s+(?:store|save|bypass|disable|delete|leak|expose).{0,40}\b(?:password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
-        r"\brecommended\s+for.{0,40}\b(?:taking|using|aspirin|medicine|medication|dosage|dose|chest pain|heart attack)\b",
-        r"\brecommended\s+for.{0,40}\b(?:suing|terminating|cancelling|signing|employer|contract|non-compete|noncompete|liability|attorney)\b",
-        r"\brecommended\s+for.{0,40}\b(?:investing|buying|purchasing|bond|bonds|stock|stocks|fund|funds|loan|yield|portfolio|savings)\b",
-        r"\brecommended\s+for.{0,40}\b(?:storing|saving|bypassing|disabling|deleting|leaking|exposing|password|passwords|secret|secrets|credential|credentials|auth|authentication|firewall|logs?|plaintext|privacy)\b",
-    ]
-    return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in english_patterns)
-
-
 def collect_grounding_claims(
     *,
     item: WikiMergePlanItem,
@@ -13496,7 +13475,7 @@ def collect_grounding_claims(
                 examples_quote_has_concrete_marker(normalized_quote, quote) or examples_unsafe_bypass_quote
             ):
                 is_concept_label_quote = False
-            if examples_unsafe_bypass_quote or (quote_has_dynamic_sensitive_query and not supported):
+            if examples_unsafe_bypass_quote:
                 is_illustrative_example = False
                 is_memory_example = False
             if (
@@ -13623,6 +13602,7 @@ def collect_grounding_claims(
                     )
                 )
                 continue
+            contradicts_raw = grounding_claim_contradicts_approved_raw(quote, approved_raw_text) if not supported else False
             claims.append(
                 GroundingClaim(
                     page_plan_id=page.page_plan_id,
@@ -13634,12 +13614,20 @@ def collect_grounding_claims(
                     action=(
                         "kept"
                         if supported
-                        else unsupported_quote_grounding_action(body, quote, quote_start=quote_start, section_key=section_key)
+                        else (
+                            "needs_review"
+                            if contradicts_raw
+                            else "warn"
+                        )
                     ),
                     reason=(
                         "直接引用已在 raw 或已有 wiki 中规范化 exact match。"
                         if supported
-                        else unsupported_quote_grounding_reason(body, quote, quote_start=quote_start, section_key=section_key)
+                        else (
+                            "该表述与 Approved Raw 中的同类事实关系明显不符；需要人工处理。"
+                            if contradicts_raw
+                            else unsupported_quote_grounding_reason(body, quote, quote_start=quote_start, section_key=section_key)
+                        )
                     ),
                 )
             )
@@ -13649,69 +13637,18 @@ def collect_grounding_claims(
             text = line.strip(" -*")
             if not text or len(text) < 8:
                 continue
-            unquoted_dynamic_marker = unquoted_dynamic_sensitive_scenario_marker(
-                text,
-                section_key=section_key,
-                page_type=item.page_type,
-            )
-            if unquoted_dynamic_marker:
-                unsupported_text = sentence_with_marker(text, unquoted_dynamic_marker)
-                raw_supported = quote_supported_by_text(unsupported_text, approved_raw_text)
-                existing_supported = quote_supported_by_text(unsupported_text, existing_entry.content)
-                supported = raw_supported or existing_supported
-                claims.append(
-                    GroundingClaim(
-                        page_plan_id=page.page_plan_id,
-                        target_path=item.canonical_target_path,
-                        section_key=section_key,
-                        claim_type="new_fact",
-                        text=unsupported_text,
-                        support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
-                        action="kept" if supported else "needs_review",
-                        reason=(
-                            "无引号动态用户场景已在 raw 或已有 wiki 中规范化 exact match。"
-                            if supported
-                            else (
-                                f"无来源动态用户场景 `{unquoted_dynamic_marker}` 未被 raw 或 inspected wiki 同句级支撑；"
-                                "请删除该场景，或改成 `<dynamic_user_query>`、`<support_query>` 这类中性占位符。"
-                            )
-                        ),
-                    )
-                )
             scope_marker = None if section_key == "open_questions" else unsupported_scope_speculation_marker(text)
-            high_risk_marker = None if section_key == "open_questions" else high_risk_domain_statement_marker(text)
             unquoted_scan_text = remove_grounding_quote_spans_for_scan(text)
             severe_marker = None if section_key == "open_questions" else severe_factual_claim_marker(unquoted_scan_text)
-            if high_risk_marker:
-                marker, domain_label = high_risk_marker
-                unsupported_text = sentence_with_marker(text, marker)
-                raw_supported = quote_supported_by_text(unsupported_text, approved_raw_text)
-                existing_supported = quote_supported_by_text(unsupported_text, existing_entry.content)
-                supported = raw_supported or existing_supported
-                claims.append(
-                    GroundingClaim(
-                        page_plan_id=page.page_plan_id,
-                        target_path=item.canonical_target_path,
-                        section_key=section_key,
-                        claim_type="new_fact",
-                        text=unsupported_text,
-                        support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
-                        action="kept" if supported else "needs_review",
-                        reason=(
-                            f"高风险{domain_label}领域断言已在 raw 或已有 wiki 中规范化 exact match。"
-                            if supported
-                            else (
-                                f"高风险{domain_label}领域断言 `{marker}` 缺少 raw 或 inspected wiki 同句级支撑；"
-                                "法律、医疗、金融、安全、账户/密码/支付/隐私相关建议必须删除、改成待补来源问题，或提供明确来源支撑。"
-                            )
-                        ),
-                    )
-                )
             if severe_marker:
                 unsupported_text = sentence_with_marker(text, severe_marker)
                 raw_supported = quote_supported_by_text(unsupported_text, approved_raw_text)
                 existing_supported = quote_supported_by_text(unsupported_text, existing_entry.content)
                 supported = raw_supported or existing_supported
+                contradicts_raw = (not supported) and grounding_claim_contradicts_approved_raw(
+                    unsupported_text,
+                    approved_raw_text,
+                )
                 claims.append(
                     GroundingClaim(
                         page_plan_id=page.page_plan_id,
@@ -13720,13 +13657,15 @@ def collect_grounding_claims(
                         claim_type="new_fact",
                         text=unsupported_text,
                         support="raw" if raw_supported else ("existing_wiki" if existing_supported else "unsupported"),
-                        action="kept" if supported else "needs_review",
+                        action="kept" if supported else ("needs_review" if contradicts_raw else "warn"),
                         reason=(
                             "严重事实关系已在 raw 或已有 wiki 中规范化 exact match。"
                             if supported
+                            else "该表述与 Approved Raw 中的同类事实关系明显不符；需要人工处理。"
+                            if contradicts_raw
                             else (
                                 f"新增严重事实关系 `{severe_marker}` 缺少 raw 或 inspected wiki 同句级支撑；"
-                                "专名关系、发布、收购、隶属或身份关系需要来源支撑。"
+                                "作为非阻塞提醒保留，必要时可人工回看来源。"
                             )
                         ),
                     )
@@ -14427,8 +14366,6 @@ def examples_quote_has_unsafe_marker_for_bypass(normalized: str, original: str =
     if examples_quote_has_sensitive_user_data_marker(normalized, original):
         return True
     if severe_factual_claim_marker(original) or severe_factual_claim_marker(normalized):
-        return True
-    if high_risk_domain_statement_marker(original) or high_risk_domain_statement_marker(normalized):
         return True
     if re.search(r"https?://|www\.|@|[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{8,}", original):
         return True

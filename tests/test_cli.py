@@ -194,6 +194,8 @@ def test_ingest_run_reports_awaiting_review_instead_of_ready(tmp_path: Path) -> 
     fixture_dir.mkdir()
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
         data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "raw_prepare.json":
+            data["prepared_markdown"] += "\n\nAnthropic 收购了 OpenAI。"
         if name == "draft_rendering.json":
             data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)

@@ -3233,10 +3233,11 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "Across body_markdown/open_questions/section_bodies" in contract_rules
     assert "张三" in contract_rules
     assert "user-123" in contract_rules
-    assert "do not invent concrete user facts" in contract_rules
+    assert "avoid presenting it as an observed user fact" in contract_rules
     assert "用户偏好 X" in contract_rules
-    assert "sensitive or dynamic user-support query examples" in contract_rules
-    assert "<dynamic_user_query>" in contract_rules
+    assert "user has already approved this material for ingest" in contract_rules
+    assert "Grounding should protect source fidelity" in contract_rules
+    assert "only contradiction with the approved source should create review" in contract_rules
     assert "CLI/API/code examples" in contract_rules
     assert "<memory_text>" in contract_rules
     assert "<user_id>" in contract_rules
@@ -8227,12 +8228,14 @@ def test_embedding_model_revision_falls_back_to_unknown() -> None:
     assert retrieval_module.model_revision(FakeModel()) == "unknown"
 
 
-def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: Path) -> None:
+def test_create_draft_with_raw_contradiction_stops_at_draft_review(tmp_path: Path) -> None:
     vault, raw = make_vault(tmp_path)
     fixture_dir = tmp_path / "grounding-fixture"
     fixture_dir.mkdir()
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
         data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "raw_prepare.json":
+            data["prepared_markdown"] += "\n\nAnthropic 收购了 OpenAI。"
         if name == "draft_rendering.json":
             data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
@@ -8247,8 +8250,7 @@ def test_create_draft_with_unsupported_new_fact_stops_at_draft_review(tmp_path: 
     assert grounding["unsupported_new_facts"]
     unsupported = grounding["unsupported_new_facts"][0]
     assert unsupported["text"] == "OpenAI 收购了 Anthropic。"
-    assert "收购" in unsupported["reason"]
-    assert "严重事实关系" in unsupported["reason"]
+    assert "明显不符" in unsupported["reason"]
     assert "# 草稿来源支撑审查" in grounding_markdown
     assert "unsupported new_fact" not in grounding_markdown
     assert "Draft Grounding Review" not in grounding_markdown
@@ -8493,9 +8495,9 @@ def test_cleanup_unsupported_example_literals_replaces_user_id_leaf_placeholder(
         review=review_before,
     )
 
-    assert report["changed"] is True
-    assert report["replacements"][0]["replacement"] == "`<user_id>`"
-    assert "`<user_id>`" in cleaned.pages[0].section_bodies["examples"]
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["replacement_count"] == 0
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
@@ -8511,9 +8513,9 @@ def test_cleanup_unsupported_example_literals_preserves_memory_query_syntax() ->
         review=review_before,
     )
 
-    assert report["changed"] is True
-    assert report["replacements"][0]["replacement"] == '"<memory_query>"'
-    assert '`recall("<memory_query>")`' in cleaned.pages[0].section_bodies["examples"]
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["replacement_count"] == 0
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
@@ -8529,10 +8531,9 @@ def test_cleanup_unsupported_example_literals_preserves_inline_command_syntax() 
         review=review_before,
     )
 
-    assert report["changed"] is True
-    assert report["replacement_count"] == 1
-    assert '`mem0 add --user-id "<user_id>" --text "用户喜欢蓝色"`' in cleaned.pages[0].section_bodies["examples"]
-    assert " `<user_id>` " not in cleaned.pages[0].section_bodies["examples"]
+    assert cleaned == draft
+    assert report["changed"] is False
+    assert report["replacement_count"] == 0
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
@@ -8643,12 +8644,8 @@ def test_cleanup_unsupported_example_literals_skips_mixed_fact_literals(literal:
     assert cleaned == draft
     assert report["changed"] is False
     review_after = pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "")
-    if any(marker in literal for marker in ["订单", "凭证", "密码"]):
-        assert {item["reason"] for item in report["skipped"]} == {"skipped_mixed_fact_literal"}
-        assert review_after.requires_review
-    else:
-        assert report["skipped"] == []
-        assert not review_after.requires_review
+    assert report["skipped"] == []
+    assert not review_after.requires_review
 
 
 def test_grounding_examples_allow_abstract_memory_query_literals() -> None:
@@ -8696,22 +8693,23 @@ def test_grounding_examples_allow_short_query_template_quotes() -> None:
         "例如“reset password”",
     ],
 )
-def test_grounding_examples_sensitive_dynamic_queries_do_not_bypass(examples: str) -> None:
+def test_grounding_examples_sensitive_dynamic_queries_do_not_block_ingest(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+    assert all(claim.action != "needs_review" for claim in review.claims)
 
 
-def test_grounding_detail_sensitive_dynamic_query_does_not_bypass_as_illustrative() -> None:
+def test_grounding_detail_sensitive_dynamic_query_does_not_block_ingest() -> None:
     draft, plan, snapshot = build_examples_grounding_case(
         "暂无相关例子记录。",
         detail="语义缓存可以处理常见问题，例如“忘记密码怎么办”。",
     )
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["忘记密码怎么办"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -8762,15 +8760,16 @@ def test_grounding_detail_sensitive_dynamic_query_does_not_bypass_as_illustrativ
         "语义缓存可以处理常见问题，例如“query user profiles”。",
     ],
 )
-def test_grounding_detail_memory_examples_sensitive_dynamic_queries_do_not_bypass(detail: str) -> None:
+def test_grounding_detail_memory_examples_sensitive_dynamic_queries_do_not_block_ingest(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+    assert all(claim.action != "needs_review" for claim in review.claims)
 
 
-def test_grounding_body_markdown_sensitive_dynamic_query_requires_review() -> None:
+def test_grounding_body_markdown_sensitive_dynamic_query_does_not_block_ingest() -> None:
     _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -8787,8 +8786,8 @@ def test_grounding_body_markdown_sensitive_dynamic_query_requires_review() -> No
     )
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -8799,7 +8798,7 @@ def test_grounding_body_markdown_sensitive_dynamic_query_requires_review() -> No
         ("### 金融建议\n\n普通用户应该把大部分存款投入高收益债券。", "存款"),
     ],
 )
-def test_grounding_body_markdown_high_risk_domain_advice_requires_review(
+def test_grounding_body_markdown_high_risk_domain_advice_does_not_block_ingest(
     body_markdown: str,
     expected_marker: str,
 ) -> None:
@@ -8820,9 +8819,9 @@ def test_grounding_body_markdown_high_risk_domain_advice_requires_review(
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert review.unsupported_new_facts[0].action == "needs_review"
-    assert expected_marker in review.unsupported_new_facts[0].reason or expected_marker in review.unsupported_new_facts[0].text
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+    assert expected_marker
 
 
 def test_grounding_body_markdown_high_risk_domain_advice_allows_source_supported_claim() -> None:
@@ -8845,8 +8844,7 @@ def test_grounding_body_markdown_high_risk_domain_advice_allows_source_supported
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, sentence)
 
     assert review.requires_review is False
-    assert review.claims[-1].support == "raw"
-    assert review.claims[-1].action == "kept"
+    assert review.unsupported_new_facts == []
 
 
 def test_grounding_open_questions_high_risk_domain_gap_is_not_blocked_as_fact() -> None:
@@ -8925,7 +8923,7 @@ def test_grounding_low_risk_body_quote_warns_without_review() -> None:
         ("### 产品关系\n\n“Claude 由 Google 发布”是一个需要来源支撑的产品关系。", "Claude 由 Google 发布"),
     ],
 )
-def test_grounding_severe_factual_relationship_quote_requires_review(body_markdown: str, expected: str) -> None:
+def test_grounding_severe_factual_relationship_quote_warns_without_raw_contradiction(body_markdown: str, expected: str) -> None:
     _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -8943,8 +8941,8 @@ def test_grounding_severe_factual_relationship_quote_requires_review(body_markdo
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [expected]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [expected]
 
 
 @pytest.mark.parametrize(
@@ -8955,7 +8953,7 @@ def test_grounding_severe_factual_relationship_quote_requires_review(body_markdo
         ("### 产品关系\n\nClaude 由 Google 发布。", "Claude 由 Google 发布。"),
     ],
 )
-def test_grounding_severe_factual_relationship_unquoted_requires_review(body_markdown: str, expected: str) -> None:
+def test_grounding_severe_factual_relationship_unquoted_warns_without_raw_contradiction(body_markdown: str, expected: str) -> None:
     _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -8973,11 +8971,11 @@ def test_grounding_severe_factual_relationship_unquoted_requires_review(body_mar
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == [expected]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == [expected]
 
 
-def test_grounding_severe_factual_relationship_quote_is_not_duplicated_by_unquoted_scan() -> None:
+def test_grounding_severe_factual_relationship_quote_warning_is_not_duplicated_by_unquoted_scan() -> None:
     _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -8995,7 +8993,186 @@ def test_grounding_severe_factual_relationship_quote_is_not_duplicated_by_unquot
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic"]
+    assert review.requires_review is False
+    assert [claim.text for claim in review.warnings] == ["OpenAI 收购了 Anthropic"]
+
+
+def test_grounding_severe_factual_relationship_blocks_when_raw_contradicts() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="严重事实关系与 raw 不符才阻断。",
+                body_markdown="### 公司关系\n\nOpenAI 收购了 Anthropic。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 收购了 OpenAI。")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic。"]
+    assert "明显不符" in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_role_relationship_blocks_when_raw_names_different_org() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="身份关系与 raw 不符才阻断。",
+                body_markdown="### 身份关系\n\nSam Altman 担任 Anthropic CEO。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Sam Altman 担任 OpenAI CEO。")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["Sam Altman 担任 Anthropic CEO。"]
+
+
+def test_grounding_severe_factual_relationship_blocks_explicit_raw_negation() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="显式否定与肯定冲突才阻断。",
+                body_markdown="### 公司关系\n\nOpenAI 收购了 Anthropic。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "OpenAI 没有收购 Anthropic。")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic。"]
+
+
+def test_grounding_creator_relationship_blocks_same_object_different_creator() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="同一对象不同创建方与 raw 不符才阻断。",
+                body_markdown="### 创建关系\n\nOpenAI 创建了 Claude。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 创建了 Claude。")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 创建了 Claude。"]
+
+
+def test_grounding_release_relationship_same_subject_different_object_only_warns() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="同一主体发布另一个对象只是缺支撑，不算 raw 矛盾。",
+                body_markdown="### 发布关系\n\nOpenAI 发布了 Sora。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "OpenAI 发布了 ChatGPT。")
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+    assert [claim.text for claim in review.warnings] == ["OpenAI 发布了 Sora。"]
+
+
+@pytest.mark.parametrize(
+    ("body_markdown", "approved_raw", "expected"),
+    [
+        ("### 创建关系\n\nClaude 由 OpenAI 创建。", "Claude 由 Anthropic 创建。", "Claude 由 OpenAI 创建。"),
+        ("### 发布关系\n\nSora 由 OpenAI 发布。", "Sora 由 Anthropic 发布。", "Sora 由 OpenAI 发布。"),
+        ("### Creation\n\nClaude was developed by OpenAI.", "Claude was developed by Anthropic.", "Claude was developed by OpenAI."),
+    ],
+)
+def test_grounding_by_actor_relationship_blocks_same_object_different_actor(
+    body_markdown: str,
+    approved_raw: str,
+    expected: str,
+) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="由某方创建/发布的同一对象不同主体与 raw 不符才阻断。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("body_markdown", "approved_raw"),
+    [
+        ("### 收购关系\n\nAnthropic 被 OpenAI 收购。", "OpenAI 收购了 Anthropic。"),
+        ("### 创建关系\n\nClaude 由 Anthropic 创建。", "Anthropic 创建了 Claude。"),
+    ],
+)
+def test_grounding_active_passive_paraphrase_does_not_count_as_raw_contradiction(
+    body_markdown: str,
+    approved_raw: str,
+) -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="主动/被动同义转述不应被当成 raw 矛盾。",
+                body_markdown=body_markdown,
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, approved_raw)
+
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 def test_grounding_severe_factual_relationship_unquoted_allows_source_supported_claim() -> None:
@@ -9174,8 +9351,8 @@ def test_grounding_blocks_real_api_key_literal_in_configuration_example() -> Non
     )
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert review.unsupported_new_facts[0].action == "needs_review"
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -9189,8 +9366,8 @@ def test_grounding_placeholder_secret_does_not_hide_real_secret(detail: str) -> 
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert review.unsupported_new_facts[0].action == "needs_review"
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -9202,7 +9379,7 @@ def test_grounding_placeholder_secret_does_not_hide_real_secret(detail: str) -> 
         ("### 产品关系\n\nOpenAI 创建了 Assistant 产品。", "创建"),
     ],
 )
-def test_grounding_real_create_and_propose_relationships_still_require_review(
+def test_grounding_real_create_and_propose_relationships_warn_without_raw_contradiction(
     body_markdown: str,
     expected_marker: str,
 ) -> None:
@@ -9213,7 +9390,7 @@ def test_grounding_real_create_and_propose_relationships_still_require_review(
                 page_plan_id="PP-EXAMPLES",
                 action="create",
                 canonical_target_path="concepts/Concept_Examples.md",
-                summary="真实创建/提出关系仍需要来源支撑。",
+                summary="真实创建/提出关系缺支撑时只提醒。",
                 body_markdown=body_markdown,
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
@@ -9223,9 +9400,10 @@ def test_grounding_real_create_and_propose_relationships_still_require_review(
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert review.unsupported_new_facts[0].action == "needs_review"
-    assert expected_marker in review.unsupported_new_facts[0].reason
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
+    assert review.warnings[0].action == "warn"
+    assert expected_marker in review.warnings[0].reason
 
 
 def test_grounding_security_sandbox_advice_does_not_require_review() -> None:
@@ -9253,7 +9431,7 @@ def test_grounding_security_sandbox_advice_does_not_require_review() -> None:
     assert review.unsupported_new_facts == []
 
 
-def test_grounding_quote_uses_sentence_context_for_high_risk_domain() -> None:
+def test_grounding_quote_uses_sentence_context_without_blocking_high_risk_domain() -> None:
     _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -9271,8 +9449,8 @@ def test_grounding_quote_uses_sentence_context_for_high_risk_domain() -> None:
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["医疗上通常推荐“方案A”。"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -9330,7 +9508,7 @@ def test_grounding_high_risk_domain_meta_statements_do_not_require_review(body_m
         "### Security Advice\n\nThis setup is recommended for storing passwords in plaintext.",
     ],
 )
-def test_grounding_high_risk_domain_actionable_can_statements_still_require_review(body_markdown: str) -> None:
+def test_grounding_high_risk_domain_actionable_can_statements_do_not_block_ingest(body_markdown: str) -> None:
     _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     draft = pipeline_module.DraftRenderingArtifact(
         pages=[
@@ -9348,8 +9526,8 @@ def test_grounding_high_risk_domain_actionable_can_statements_still_require_revi
 
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 def test_render_draft_grounding_review_shows_warning_section() -> None:
@@ -9395,21 +9573,19 @@ def test_render_draft_grounding_review_shows_warning_section() -> None:
         "在连续对话场景中，假设用户先询问某个过去的订单信息，随后用户说修改那个订单的地址。",
     ],
 )
-def test_grounding_detail_unquoted_dynamic_user_scenarios_require_review(detail: str) -> None:
+def test_grounding_detail_unquoted_dynamic_user_scenarios_do_not_block_ingest(detail: str) -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。", detail=detail)
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
-    assert "无来源动态用户场景" in review.unsupported_new_facts[0].reason
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
-def test_grounding_examples_unquoted_dynamic_user_scenario_requires_review() -> None:
+def test_grounding_examples_unquoted_dynamic_user_scenario_does_not_block_ingest() -> None:
     review = build_examples_grounding_review("例如用户反复询问与某个订单状态相关的相似问题。")
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
-    assert "无来源动态用户场景" in review.unsupported_new_facts[0].reason
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 def test_grounding_sensitive_dynamic_query_passes_when_source_supported() -> None:
@@ -9449,7 +9625,7 @@ def test_grounding_unquoted_dynamic_user_scenario_passes_when_source_supported()
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, detail)
 
     assert review.requires_review is False
-    assert any(claim.text == detail and claim.support == "raw" for claim in review.claims)
+    assert review.unsupported_new_facts == []
 
 
 def test_grounding_examples_still_allow_safe_technical_query_template_after_sensitive_guard() -> None:
@@ -9500,8 +9676,8 @@ def test_grounding_detail_allows_safe_technical_troubleshooting_queries(detail: 
 def test_grounding_unquoted_dynamic_scenario_scanner_ignores_quoted_claims() -> None:
     review = build_examples_grounding_review("例如“查看某个用户的账户余额”这类问题。")
 
-    assert review.requires_review is True
-    assert [claim.text for claim in review.unsupported_new_facts] == ["查看某个用户的账户余额"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 def test_grounding_unquoted_dynamic_scenario_scanner_ignores_open_questions_section() -> None:
@@ -9625,65 +9801,11 @@ def test_grounding_examples_allow_isolated_query_template_contexts(examples: str
         "例如“query users API keys”",
     ],
 )
-def test_grounding_examples_query_template_keeps_sensitive_quotes_strict(examples: str) -> None:
+def test_grounding_examples_query_template_does_not_block_without_raw_contradiction(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    blocking_markers = [
-        "用户 1234",
-        "删除了凭证",
-        "查询王小明",
-        "手机号",
-        "邮箱",
-        "登录记录",
-        "email address",
-        "查询Alice",
-        "查询Charlie",
-        "查询alice",
-        "查找Alice",
-        "查找王小明",
-        "user's address",
-        "customer address",
-        "user IP",
-        "customer IP",
-        "users profiles",
-        "users addresses",
-        "customer cookies",
-        "user IDs",
-        "customer card",
-        "credit card",
-        "users tokens",
-        "user sessions",
-        "user passwords",
-        "people's addresses",
-        "people profiles",
-        "persons addresses",
-        "people locations",
-        "users' emails",
-        "user's birthday",
-        "user's name",
-        "person profile",
-        "customer profiles",
-        "user addresses",
-        "users IPs",
-        "users emails",
-        "persons' addresses",
-        "SSN",
-        "social security number",
-        "passport number",
-        "license number",
-        "api key",
-        "API key",
-        "secrets",
-        "passwds",
-        "已经发布",
-        "推出企业版",
-    ]
-    if not any(marker in examples for marker in blocking_markers):
-        assert review.requires_review is False
-        return
-
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -9695,11 +9817,11 @@ def test_grounding_examples_query_template_keeps_sensitive_quotes_strict(example
         "类似“payment setup guide”的请求",
     ],
 )
-def test_grounding_examples_sensitive_quotes_do_not_use_bypass_paths(examples: str) -> None:
+def test_grounding_examples_sensitive_quotes_do_not_block_ingest(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -9710,11 +9832,11 @@ def test_grounding_examples_sensitive_quotes_do_not_use_bypass_paths(examples: s
         "记忆评估问题“王小明的手机号是多少？”",
     ],
 )
-def test_grounding_examples_sensitive_memory_eval_quotes_stay_strict(examples: str) -> None:
+def test_grounding_examples_sensitive_memory_eval_quotes_do_not_block_ingest(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    assert review.requires_review is True
-    assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
+    assert review.requires_review is False
+    assert review.unsupported_new_facts == []
 
 
 @pytest.mark.parametrize(
@@ -9748,12 +9870,8 @@ def test_grounding_examples_sensitive_memory_eval_quotes_stay_strict(examples: s
 def test_grounding_examples_placeholder_bypass_warns_for_concrete_or_attributed_quotes(examples: str) -> None:
     review = build_examples_grounding_review(examples)
 
-    strict_markers = ["张三", "手机号", "订单状态"]
-    if any(marker in examples for marker in strict_markers):
-        assert review.requires_review is True
-        assert [claim.action for claim in review.unsupported_new_facts] == ["needs_review"]
-        return
     assert review.requires_review is False
+    assert review.unsupported_new_facts == []
     assert review.warnings or review.claims
 
 
@@ -10174,27 +10292,6 @@ def test_grounding_external_backing_issue_message_neutralizes_open_question_prem
     assert "不要保留 公认、广泛、业界普遍、最佳实践、行业最佳 作为问题前提" in message
     assert "非阻塞提醒" in message
     assert "触发文本：目前是否存在公认的最佳融合策略？" in message
-
-
-def test_grounding_dynamic_sensitive_query_issue_message_names_neutral_placeholders() -> None:
-    claim = pipeline_module.GroundingClaim(
-        page_plan_id="PP-SEMANTIC-CACHE",
-        target_path="concepts/Concept_语义缓存（Semantic Caching）.md",
-        section_key="examples",
-        claim_type="new_fact",
-        text="某个用户的账户余额是多少？",
-        support="unsupported",
-        action="needs_review",
-        reason="直接引用必须在 raw 或已有 wiki 中 exact match。",
-    )
-
-    message = pipeline_module.grounding_issue_message(claim)
-
-    assert "账户余额、密码重置、支付/退款" in message
-    assert "<dynamic_user_query>" in message
-    assert "<support_query>" in message
-    assert "不要把被拒绝的具体偏好" in message
-    assert "触发文本：某个用户的账户余额是多少？" in message
 
 
 def test_grounding_external_backing_detects_adoption_and_best_practice_real_path() -> None:
@@ -13733,6 +13830,8 @@ def test_resume_cannot_skip_awaiting_draft_review(tmp_path: Path, from_step: str
     fixture_dir.mkdir()
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
         data = read_json(FIXTURE_ROOT / "mock" / name)
+        if name == "raw_prepare.json":
+            data["prepared_markdown"] += "\n\nAnthropic 收购了 OpenAI。"
         if name == "draft_rendering.json":
             data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
