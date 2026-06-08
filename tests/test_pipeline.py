@@ -4694,6 +4694,73 @@ def test_merge_update_section_cross_section_absorption_avoids_old_observation() 
     assert "其他章节吸收旧段落" in change.removal_reason
 
 
+def test_draft_review_prompt_points_to_batch_reinforcement_report(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    draft_root = run_dir / "draft_rendering"
+    draft_root.mkdir(parents=True)
+    write_json(
+        draft_root / "draft_rendering_batch_report.json",
+        {
+            "schema_version": "draft_rendering_batch_report.v1",
+            "batches": [
+                {
+                    "batch_id": "batch-001",
+                    "reinforced_section_count": 2,
+                }
+            ],
+        },
+    )
+    (draft_root / "draft_rendering_batch_report.md").write_text("# Draft Rendering 分批报告\n", encoding="utf-8")
+
+    prompt = pipeline_module.render_draft_review_prompt(
+        run_dir,
+        pipeline_module.DraftWriteManifest(targets=[]),
+    )
+
+    assert "本地旧知识补强已执行：是（2 段旧页知识已由系统本地补强并记录）" in prompt
+    assert "`draft_rendering/draft_rendering_batch_report.md`" in prompt
+    assert "`draft_rendering/update_preservation_reinforcement_report.md`" not in prompt
+
+
+def test_draft_aux_report_writes_only_when_active(tmp_path: Path) -> None:
+    output_dir = tmp_path / "draft_rendering"
+    output_dir.mkdir()
+
+    skipped = pipeline_module.write_draft_aux_report_if_active(
+        output_dir=output_dir,
+        stem="grounding_paraphrase_rewrite_report",
+        report={
+            "schema_version": "grounding_paraphrase_rewrite_report.v1",
+            "changed": False,
+            "rewrite_count": 0,
+            "pages": [],
+        },
+        renderer=pipeline_module.render_grounding_paraphrase_rewrite_report,
+        count_keys=["rewrite_count"],
+    )
+
+    assert skipped is None
+    assert not (output_dir / "grounding_paraphrase_rewrite_report.json").exists()
+    assert not (output_dir / "grounding_paraphrase_rewrite_report.md").exists()
+
+    written = pipeline_module.write_draft_aux_report_if_active(
+        output_dir=output_dir,
+        stem="grounding_paraphrase_rewrite_report",
+        report={
+            "schema_version": "grounding_paraphrase_rewrite_report.v1",
+            "changed": False,
+            "rewrite_count": 1,
+            "pages": [],
+        },
+        renderer=pipeline_module.render_grounding_paraphrase_rewrite_report,
+        count_keys=["rewrite_count"],
+    )
+
+    assert written is not None
+    assert (output_dir / "grounding_paraphrase_rewrite_report.json").exists()
+    assert (output_dir / "grounding_paraphrase_rewrite_report.md").exists()
+
+
 def test_merge_update_section_absorbs_live_brain_hands_summary_across_sections() -> None:
     old = (
         "Claude Code is useful because it shows how a Managed Agents system can separate the model "
@@ -13143,11 +13210,12 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
     assert batch_report["max_batch_payload_char_count"] > 0
     assert batch_report["avg_batch_payload_char_count"] > 0
     assert all(batch["payload_char_count"] > 0 for batch in batch_report["batches"])
-    top_source_pack = read_json(run_dir / "draft_rendering" / "draft_source_excerpt_pack.json")
+    assert not (run_dir / "draft_rendering" / "draft_source_excerpt_pack.json").exists()
+    assert not (run_dir / "draft_rendering" / "draft_source_excerpt_pack.md").exists()
+    assert not (run_dir / "draft_rendering" / "update_preservation_pack.json").exists()
+    assert not (run_dir / "draft_rendering" / "update_preservation_pack.md").exists()
     first_batch_source_pack = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-001" / "draft_source_excerpt_pack.json")
     second_batch_source_pack = read_json(run_dir / "draft_rendering" / "model_batches" / "batch-002" / "draft_source_excerpt_pack.json")
-    assert top_source_pack["force_excerpt"] is True
-    assert top_source_pack["full_source_in_payload"] is False
     assert first_batch_source_pack["force_excerpt"] is True
     assert first_batch_source_pack["full_source_in_payload"] is False
     assert second_batch_source_pack["force_excerpt"] is True

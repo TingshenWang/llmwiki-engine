@@ -4974,6 +4974,35 @@ def render_example_concrete_cleanup_report(report: dict[str, Any]) -> str:
     return "\n".join(sections)
 
 
+def draft_aux_report_has_activity(report: dict[str, Any], count_keys: list[str]) -> bool:
+    if bool(report.get("changed")):
+        return True
+    for key in count_keys:
+        try:
+            if int(report.get(key, 0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return bool(report.get("pages"))
+
+
+def write_draft_aux_report_if_active(
+    *,
+    output_dir: Path,
+    stem: str,
+    report: dict[str, Any],
+    renderer: Any,
+    count_keys: list[str],
+) -> tuple[Path, Path] | None:
+    if not draft_aux_report_has_activity(report, count_keys):
+        return None
+    json_path = output_dir / f"{stem}.json"
+    md_path = output_dir / f"{stem}.md"
+    write_json(json_path, report)
+    md_path.write_text(renderer(report), encoding="utf-8")
+    return json_path, md_path
+
+
 def render_update_preservation_pack_markdown(pack: dict[str, Any]) -> str:
     rows: list[list[Any]] = []
     for page in pack.get("pages", []):
@@ -5722,27 +5751,33 @@ def run_single_draft_rendering_model_call(
     draft_artifact = finalize_draft_rendering(draft_artifact, merge_plan, snapshot)
     draft_artifact, reinforcement_report = reinforce_update_preservation(draft_artifact, update_preservation_pack)
     draft_artifact, grounding_rewrite_report = rewrite_grounding_sensitive_paraphrases(draft_artifact, approved_prepared_text)
-    reinforcement_path = output_dir / "update_preservation_reinforcement_report.json"
-    reinforcement_md = output_dir / "update_preservation_reinforcement_report.md"
-    write_json(reinforcement_path, reinforcement_report)
-    reinforcement_md.write_text(render_update_preservation_reinforcement_report(reinforcement_report), encoding="utf-8")
-    grounding_rewrite_path = output_dir / "grounding_paraphrase_rewrite_report.json"
-    grounding_rewrite_md = output_dir / "grounding_paraphrase_rewrite_report.md"
-    write_json(grounding_rewrite_path, grounding_rewrite_report)
-    grounding_rewrite_md.write_text(render_grounding_paraphrase_rewrite_report(grounding_rewrite_report), encoding="utf-8")
+    write_draft_aux_report_if_active(
+        output_dir=output_dir,
+        stem="update_preservation_reinforcement_report",
+        report=reinforcement_report,
+        renderer=render_update_preservation_reinforcement_report,
+        count_keys=["reinforced_page_count", "reinforced_section_count"],
+    )
+    write_draft_aux_report_if_active(
+        output_dir=output_dir,
+        stem="grounding_paraphrase_rewrite_report",
+        report=grounding_rewrite_report,
+        renderer=render_grounding_paraphrase_rewrite_report,
+        count_keys=["rewrite_count"],
+    )
     draft_artifact, open_question_cleanup_report = cleanup_open_question_unsupported_scope_claims(
         draft_artifact,
         merge_plan,
         snapshot,
         approved_prepared_text,
     )
-    open_question_cleanup_path = output_dir / "open_question_grounding_cleanup_report.json"
-    open_question_cleanup_md = output_dir / "open_question_grounding_cleanup_report.md"
     redacted_open_question_cleanup_report = ctx.execution_context.redactor.redact(open_question_cleanup_report)
-    write_json(open_question_cleanup_path, redacted_open_question_cleanup_report)
-    open_question_cleanup_md.write_text(
-        render_open_question_grounding_cleanup_report(redacted_open_question_cleanup_report),
-        encoding="utf-8",
+    write_draft_aux_report_if_active(
+        output_dir=output_dir,
+        stem="open_question_grounding_cleanup_report",
+        report=redacted_open_question_cleanup_report,
+        renderer=render_open_question_grounding_cleanup_report,
+        count_keys=["relocation_count", "skipped_count"],
     )
     grounding_review = build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
     draft_artifact, example_cleanup_report = cleanup_unsupported_example_literals(
@@ -5752,13 +5787,13 @@ def run_single_draft_rendering_model_call(
         approved_prepared_text,
         review=grounding_review,
     )
-    example_cleanup_path = output_dir / "example_concrete_cleanup_report.json"
-    example_cleanup_md = output_dir / "example_concrete_cleanup_report.md"
     redacted_example_cleanup_report = ctx.execution_context.redactor.redact(example_cleanup_report)
-    write_json(example_cleanup_path, redacted_example_cleanup_report)
-    example_cleanup_md.write_text(
-        render_example_concrete_cleanup_report(redacted_example_cleanup_report),
-        encoding="utf-8",
+    write_draft_aux_report_if_active(
+        output_dir=output_dir,
+        stem="example_concrete_cleanup_report",
+        report=redacted_example_cleanup_report,
+        renderer=render_example_concrete_cleanup_report,
+        count_keys=["replacement_count", "skipped_count"],
     )
     return draft_artifact
 
@@ -6447,21 +6482,27 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     ensure_wiki_context_current(ctx.vault, snapshot)
     approved_prepared_text = (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8")
     draftable_count = len([item for item in merge_plan.items if item.action in {"create", "update"}])
+    uses_draft_batches = draftable_count > DRAFT_RENDERING_BATCH_PAGE_LIMIT
     source_excerpt_pack = build_draft_source_excerpt_pack(
         approved_prepared_text,
         digest,
         merge_plan,
-        force_excerpt=draftable_count > DRAFT_RENDERING_BATCH_PAGE_LIMIT,
+        force_excerpt=uses_draft_batches,
     )
-    source_excerpt_pack_path = step_root / "draft_source_excerpt_pack.json"
-    source_excerpt_pack_md = step_root / "draft_source_excerpt_pack.md"
-    write_json(source_excerpt_pack_path, source_excerpt_pack)
-    source_excerpt_pack_md.write_text(render_draft_source_excerpt_pack_markdown(source_excerpt_pack), encoding="utf-8")
     update_preservation_pack = build_update_preservation_pack(merge_plan, snapshot)
-    update_preservation_pack_path = step_root / "update_preservation_pack.json"
-    update_preservation_pack_md = step_root / "update_preservation_pack.md"
-    write_json(update_preservation_pack_path, update_preservation_pack)
-    update_preservation_pack_md.write_text(render_update_preservation_pack_markdown(update_preservation_pack), encoding="utf-8")
+    root_model_input_sidecars: list[Path] = []
+    if not uses_draft_batches:
+        source_excerpt_pack_path = step_root / "draft_source_excerpt_pack.json"
+        source_excerpt_pack_md = step_root / "draft_source_excerpt_pack.md"
+        write_json(source_excerpt_pack_path, source_excerpt_pack)
+        source_excerpt_pack_md.write_text(render_draft_source_excerpt_pack_markdown(source_excerpt_pack), encoding="utf-8")
+        update_preservation_pack_path = step_root / "update_preservation_pack.json"
+        update_preservation_pack_md = step_root / "update_preservation_pack.md"
+        write_json(update_preservation_pack_path, update_preservation_pack)
+        update_preservation_pack_md.write_text(render_update_preservation_pack_markdown(update_preservation_pack), encoding="utf-8")
+        root_model_input_sidecars.extend(
+            [source_excerpt_pack_path, source_excerpt_pack_md, update_preservation_pack_path, update_preservation_pack_md]
+        )
     _, digest_projection_report = project_source_digest_for_merge_plan(digest, merge_plan)
     write_draft_digest_projection_report(step_root, digest_projection_report)
     draft_artifact = run_draft_rendering_model(
@@ -6478,7 +6519,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     draft_artifact_path = step_root / "draft_rendering.json"
     write_json(draft_artifact_path, draft_artifact)
     draft_root = step_root / "draft_pages"
-    outputs: list[Path] = [source_excerpt_pack_path, source_excerpt_pack_md, update_preservation_pack_path, update_preservation_pack_md]
+    outputs: list[Path] = list(root_model_input_sidecars)
     for digest_projection_sidecar in [
         step_root / "draft_digest_projection_report.json",
         step_root / "draft_digest_projection_report.md",
@@ -16301,10 +16342,11 @@ def render_draft_review_prompt(run_dir: Path, draft_manifest: DraftWriteManifest
         if manual_resolution_count
         else ""
     )
+    reinforcement_report_ref = update_reinforcement_report_ref(run_dir)
     reinforcement_warning = (
         "## 本地旧知识补强提示\n\n"
-        f"Draft rendering 本地补强了 {reinforcement_count} 段旧页知识，并记录在 "
-        "`draft_rendering/update_preservation_reinforcement_report.md`。如本轮还因其他问题进入人工审核，"
+        f"Draft rendering 本地补强了 {reinforcement_count} 段旧页知识，并记录在 {reinforcement_report_ref}。"
+        "如本轮还因其他问题进入人工审核，"
         "可顺手检查这些桥接语是否自然。\n\n"
         if reinforcement_count
         else ""
@@ -16393,6 +16435,17 @@ def update_reinforcement_count(run_dir: Path) -> int:
         return sum(int(batch.get("reinforced_section_count", 0)) for batch in report.get("batches", []))
     except Exception:
         return 0
+
+
+def update_reinforcement_report_ref(run_dir: Path) -> str:
+    draft_root = run_dir / "draft_rendering"
+    root_report = draft_root / "update_preservation_reinforcement_report.md"
+    if root_report.exists():
+        return "`draft_rendering/update_preservation_reinforcement_report.md`"
+    batch_report = draft_root / "draft_rendering_batch_report.md"
+    if batch_report.exists():
+        return "`draft_rendering/draft_rendering_batch_report.md`"
+    return "`draft_rendering/`"
 
 
 def draft_diff_ref(run_dir: Path, target: DraftWriteTarget) -> str:
