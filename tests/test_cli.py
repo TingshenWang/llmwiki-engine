@@ -197,7 +197,7 @@ def test_ingest_run_reports_awaiting_review_instead_of_ready(tmp_path: Path) -> 
         if name == "raw_prepare.json":
             data["prepared_markdown"] += "\n\nAnthropic 收购了 OpenAI。"
         if name == "draft_rendering.json":
-            data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
+            data["pages"][0]["body_markdown"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
     runner = CliRunner()

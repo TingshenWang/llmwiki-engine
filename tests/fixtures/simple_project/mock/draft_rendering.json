@@ -6,13 +6,9 @@
       "action": "create",
       "canonical_target_path": "concepts/Concept_知识编译工程骨架.md",
       "preimage_sha256": null,
-      "section_bodies": {
-        "summary": "知识编译工程骨架强调，llmwiki-engine 的第一阶段要先证明 CLI、状态机、artifact 和 validator 这些基础设施可运行。",
-        "detail": "这个判断把 MVP 的重点放在可测试、可恢复、可验证的流程骨架上。只有 CLI 能触发流程、状态机能记录进度、artifact 能被审查、validator 能挡住坏输出，后续真实模型能力才有稳定承载。",
-        "examples": "- 简化 Ingest 先生成 source 和知识页草稿，而不是直接写正式 wiki。\n- 先验证 pipeline 输出，再逐步接入真实模型。",
-        "value_points": "- 避免一开始只追求生成内容，而忽略流程是否可恢复。\n- 为后续 update apply、review gate 和 drift 校验提供基础。",
-        "open_questions": "暂无矛盾与未决问题记录。"
-      },
+      "summary": "知识编译工程骨架强调，llmwiki-engine 的第一阶段要先证明 CLI、状态机、artifact 和 validator 这些基础设施可运行。",
+      "body_markdown": "这个判断把 MVP 的重点放在可测试、可恢复、可验证的流程骨架上。只有 CLI 能触发流程、状态机能记录进度、artifact 能被审查、validator 能挡住坏输出，后续真实模型能力才有稳定承载。\n\n### 例子\n\n- 简化 Ingest 先生成 source 和知识页草稿，而不是直接写正式 wiki。\n- 先验证 pipeline 输出，再逐步接入真实模型。\n\n### 价值点\n\n- 避免一开始只追求生成内容，而忽略流程是否可恢复。\n- 为后续 update apply、review gate 和 drift 校验提供基础。",
+      "open_questions": "暂无矛盾与未决问题记录。",
       "change_summary": "创建或更新知识编译工程骨架页面，补充并澄清源材料中的 MVP 编译重点。",
       "source_coverage_notes": "覆盖项目笔记中关于 CLI、状态机、artifact、validator 的内容。",
       "quality_risks": []
@@ -22,13 +18,9 @@
       "action": "create",
       "canonical_target_path": "designs/Design_简化 Ingest 草稿流程.md",
       "preimage_sha256": null,
-      "section_bodies": {
-        "summary": "简化 Ingest 草稿流程先生成 source 和知识页草稿，用草稿验证工程骨架，再进入正式写入。",
-        "detail": "这个流程把自动生成和正式 wiki 写入分开。模型先输出可审查的草稿，系统再通过 validation、apply preview 和后续 apply gate 控制写入面。",
-        "examples": "- source 页记录原始材料摘要和派生页面路径。\n- 知识页草稿先落在 operation 目录中，用户可以检查后再 apply。",
-        "value_points": "- 降低模型直接污染 wiki 的风险。\n- 为人工审核、diff review 和安全写入留下明确位置。",
-        "open_questions": "草稿阶段应该由人类审核到什么粒度？"
-      },
+      "summary": "简化 Ingest 草稿流程先生成 source 和知识页草稿，用草稿验证工程骨架，再进入正式写入。",
+      "body_markdown": "这个流程把自动生成和正式 wiki 写入分开。模型先输出可审查的草稿，系统再通过 validation、apply preview 和后续 apply gate 控制写入面。\n\n### 例子\n\n- source 页记录原始材料摘要和派生页面路径。\n- 知识页草稿先落在 operation 目录中，用户可以检查后再 apply。\n\n### 价值点\n\n- 降低模型直接污染 wiki 的风险。\n- 为人工审核、diff review 和安全写入留下明确位置。",
+      "open_questions": "草稿阶段应该由人类审核到什么粒度？",
       "change_summary": "创建简化 Ingest 草稿流程设计页。",
       "source_coverage_notes": "覆盖项目笔记中关于先生成草稿、再验证工程骨架的内容。",
       "quality_risks": []

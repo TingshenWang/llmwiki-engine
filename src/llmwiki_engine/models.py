@@ -533,14 +533,13 @@ class DraftPageItem(StrictModel):
     summary: str = ""
     body_markdown: str = ""
     open_questions: str = ""
-    section_bodies: dict[str, str] = Field(default_factory=dict)
     change_summary: str
     source_coverage_notes: str = ""
     quality_risks: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
-    def coerce_section_body_values(cls, data: Any) -> Any:
+    def coerce_page_values(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
         data = dict(data)
@@ -552,11 +551,7 @@ class DraftPageItem(StrictModel):
         for field_name in ["summary", "body_markdown", "open_questions"]:
             if field_name in data:
                 data[field_name] = _coerce_section_body(data[field_name])
-        section_bodies = data.get("section_bodies")
-        if not isinstance(section_bodies, dict):
-            return data
-        normalized = {str(key): _coerce_section_body(value) for key, value in section_bodies.items()}
-        return {**data, "section_bodies": normalized}
+        return data
 
 
 def _coerce_section_body(value: Any) -> str:

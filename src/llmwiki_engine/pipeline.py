@@ -328,7 +328,14 @@ SOURCE_DIGEST_ANCHOR_ENTITIES: dict[str, dict[str, str]] = {
         "resolution_hint": "deterministic_source_anchor_entity: source explicitly names Cowork as a durable product/entity anchor.",
     },
 }
-UPDATE_PRESERVATION_SECTION_KEYS = ("summary", "detail", "value_points")
+UPDATE_PRESERVATION_SECTION_KEYS = (
+    "summary",
+    "core_content",
+    "detail",
+    "examples",
+    "value_points",
+    "additional_notes",
+)
 UPDATE_PRESERVATION_MAX_PHRASES_PER_SECTION = 8
 UPDATE_PRESERVATION_CONCEPT_GROUPS = (
     {
@@ -3652,7 +3659,7 @@ def update_preservation_issues(draft: DraftRenderingArtifact, pack: dict[str, An
             absorption = update_preservation_section_absorption(section, new_text)
             if absorption["absorbed"]:
                 continue
-            field_key = "body_markdown" if section_key in CORE_DRAFT_SECTION_KEYS else section_key
+            field_key = draft_field_for_preservation_section(section_key)
             concept_message = ""
             if absorption["concept_labels"]:
                 concept_message = (
@@ -3692,7 +3699,9 @@ def reinforce_update_preservation(
         if page is None:
             continue
         section_reports: list[dict[str, Any]] = []
-        section_bodies = dict(page.section_bodies)
+        summary = page.summary
+        body_markdown = page.body_markdown
+        open_questions = page.open_questions
         for section in page_pack.get("sections", []):
             if not isinstance(section, dict):
                 continue
@@ -3700,21 +3709,31 @@ def reinforce_update_preservation(
             old_text = str(section.get("old_text", "")).strip()
             if not section_key or not old_text:
                 continue
-            target_section_key = "detail" if section_key in CORE_DRAFT_SECTION_KEYS else section_key
-            current = draft_page_text_for_preservation_section(
-                draft_page_with_section_bodies(page, section_bodies),
-                section_key,
+            target_field = draft_field_for_preservation_section(section_key)
+            working_page = page.model_copy(
+                update={
+                    "summary": summary,
+                    "body_markdown": body_markdown,
+                    "open_questions": open_questions,
+                }
             )
+            current = draft_page_text_for_preservation_section(working_page, section_key)
             absorption = update_preservation_section_absorption(section, current)
             if absorption["absorbed"]:
                 continue
             missing_concepts = list(absorption["missing_concepts"])
             reinforcement = update_preservation_reinforcement_text(section_key, old_text, missing_concepts)
-            section_bodies[target_section_key] = merge_markdown_blocks(current, reinforcement)
+            merged = merge_markdown_blocks(current, reinforcement)
+            if target_field == "summary":
+                summary = merged
+            elif target_field == "open_questions":
+                open_questions = merged
+            else:
+                body_markdown = merged
             section_reports.append(
                 {
                     "section_key": section_key,
-                    "target_section_key": target_section_key,
+                    "target_field": target_field,
                     "matched_before": [*absorption["matched_phrases"], *absorption["matched_concepts"]],
                     "missing_concepts_before": missing_concepts,
                     "required_concept_matches": absorption["required_concepts"],
@@ -3724,7 +3743,13 @@ def reinforce_update_preservation(
                 }
             )
         if section_reports:
-            updated = draft_page_with_section_bodies(page, section_bodies)
+            updated = page.model_copy(
+                update={
+                    "summary": summary,
+                    "body_markdown": body_markdown,
+                    "open_questions": open_questions,
+                }
+            )
             updated_pages[page_plan_id] = updated
             report_pages.append(
                 {
@@ -4588,7 +4613,7 @@ def run_single_draft_rendering_model_call(
                     ],
                 )
             validation_model = merge_repaired_draft_with_accepted_pages(
-                model,
+                validation_model,
                 accepted_pages_by_id=accepted_repair_pages_by_id,
                 repair_page_plan_ids=active_repair_page_plan_ids,
                 merge_plan=merge_plan,
@@ -4809,20 +4834,19 @@ def build_draft_rendering_payload(
                 "body_markdown": "Required core wiki content. The model owns headings, order, examples, boundaries, and explanatory structure.",
                 "open_questions": "Optional contradictions, uncertainties, or 待补来源 questions.",
             },
-            "legacy_section_body_keys": ["summary", "detail", "examples", "value_points", "additional_notes", "open_questions"],
             "rules": [
-                "Prefer returning summary, body_markdown, and open_questions for each page. section_bodies is accepted only for backward compatibility.",
+                "Return summary, body_markdown, and open_questions for each page.",
                 "Return content only; do not include frontmatter, level-1 headings, source wikilinks, or full markdown pages.",
                 "The output pages array must contain exactly required_page_plan_ids, one page per id, with no omissions, duplicates, or extra ids.",
                 "body_markdown is the core output area. Write detailed, concrete Chinese wiki prose there with self-chosen Markdown subheadings; do not merely write a few vague sentences.",
                 "Do not force content into fixed sections such as examples/value_points/additional_notes. If examples, boundaries, tradeoffs, mechanisms, or observations are useful, place them naturally inside body_markdown under headings you choose.",
                 "Use open_questions only for real contradictions, uncertainties, or 待补来源 questions. If none are useful, return an empty string.",
-                "Do not put `相关页面`/`Related Pages` blocks or self wikilinks inside body_markdown or section_bodies; the system renders official related pages separately.",
+                "Do not put `相关页面`/`Related Pages` blocks or self wikilinks inside body_markdown; the system renders official related pages separately.",
                 "approved_digest, approved_merge_plan, and wiki_context_snapshot are compact projections for this draft batch; full reviewed artifacts are fixed by their *_ref fields for local audit and validators.",
                 "For updates, read existing page excerpts from wiki_context_snapshot and update_preservation_pack, then produce a complete replacement core body that absorbs still-useful old knowledge naturally.",
                 "Use source_excerpt_pack as the primary source support. If approved_prepared_markdown is empty, the full approved source is intentionally omitted from this model payload and remains available only to downstream validators through approved_prepared_ref.",
                 "For updates, satisfy update_preservation_pack in the first draft: carry forward concept obligations "
-                "and reusable key phrases into body_markdown or the matching legacy section body, rewritten naturally with the new source "
+                "and reusable key phrases into body_markdown, rewritten naturally with the new source "
                 "rather than appended as a dump. change_summary may summarize retention but does not satisfy the obligation.",
                 "Do not produce pages that are only source summaries; every body_markdown must include concrete digested understanding such as viewpoint, mechanism, example, use scenario, boundary condition, tradeoff, or value point.",
                 "For updates, change_summary must explain what the new source adds, changes, clarifies, retains, or removes from the old understanding.",
@@ -4831,7 +4855,7 @@ def build_draft_rendering_payload(
                 "For zh-CN vaults, translate or paraphrase English raw examples into Chinese; do not paste whole English sentences into body_markdown, open_questions, change_summary, or source_coverage_notes.",
                 "Stable English product/protocol terms such as Claude Code, Managed Agents, harness, sandbox, session, MCP, Eval, TTFT, CLI, API, and Cowork may remain in English, but surrounding prose must be Chinese.",
                 "Ground examples, value points, and reuse scenarios in source content.",
-                "Across body_markdown/open_questions/section_bodies, prefer source-backed or clearly illustrative examples; when a concrete value such as `张三`, `Alice`, `user-123`, a preference, date, plan, metric, credential, or ID is not from the source/wiki, avoid presenting it as an observed user fact and use placeholders such as `<user_id>`, `<memory_text>`, `<memory_query>`, `某个用户`, or `用户偏好 X` when that preserves the meaning.",
+                "Across body_markdown/open_questions, prefer source-backed or clearly illustrative examples; when a concrete value such as `张三`, `Alice`, `user-123`, a preference, date, plan, metric, credential, or ID is not from the source/wiki, avoid presenting it as an observed user fact and use placeholders such as `<user_id>`, `<memory_text>`, `<memory_query>`, `某个用户`, or `用户偏好 X` when that preserves the meaning.",
                 "When body_markdown includes examples, keep concrete user facts, user ids, preferences, dates, plans, metrics, credentials, and command arguments source-aware; for generic explanation, prefer abstract placeholders such as `某个用户`, `用户偏好 X`, `user_id`, `memory` or describe the pattern without quoted literals.",
                 "The user has already approved this material for ingest; do not suppress content merely because it belongs to medical, legal, financial, security, account, password, payment, or privacy domains.",
                 "Grounding should protect source fidelity, not make domain-risk judgments for the user. Keep domain-specific claims when they reflect the approved source or inspected wiki context.",
@@ -9834,7 +9858,6 @@ def finalize_draft_rendering(
     return DraftRenderingArtifact(pages=pages)
 
 
-CANONICAL_DRAFT_SECTION_KEYS = ("summary", "detail", "examples", "value_points", "additional_notes", "open_questions")
 CORE_DRAFT_SECTION_KEYS = {"detail", "examples", "value_points", "additional_notes", "core_content"}
 SYSTEM_CORE_SECTION_TITLES = {
     "相关页面",
@@ -9845,14 +9868,6 @@ SYSTEM_CORE_SECTION_TITLES = {
     "open questions",
     "tensions / open questions",
 }
-LEGACY_CORE_SECTION_TITLES = {
-    "detail": "",
-    "examples": "例子",
-    "value_points": "价值点",
-    "additional_notes": "补充观察",
-}
-
-
 def default_create_change_summary(item: WikiMergePlanItem) -> str:
     if item.action != "create":
         return ""
@@ -9883,41 +9898,15 @@ def finalize_draft_source_coverage_notes(notes: str, item: WikiMergePlanItem) ->
 
 
 def canonical_draft_page_content(page: DraftPageItem, *, item: WikiMergePlanItem) -> dict[str, Any]:
-    normalized_sections = normalize_draft_section_bodies(page.section_bodies)
-    summary = normalize_stable_brand_typos((page.summary or normalized_sections.get("summary", "")).strip())
-    legacy_core = legacy_section_bodies_to_core_markdown(normalized_sections)
-    body = combine_draft_core_markdown(page.body_markdown.strip(), legacy_core)
+    summary = normalize_stable_brand_typos(page.summary.strip())
+    body = page.body_markdown.strip()
     body = normalize_core_body_markdown(body, item=item)
-    open_questions = normalize_stable_brand_typos(
-        (page.open_questions or normalized_sections.get("open_questions", "")).strip()
-    )
-    section_bodies = {
-        "summary": summary,
-        "detail": body,
-        "open_questions": open_questions,
-    }
+    open_questions = normalize_stable_brand_typos(page.open_questions.strip())
     return {
         "summary": summary,
         "body_markdown": body,
         "open_questions": open_questions,
-        "section_bodies": section_bodies,
     }
-
-
-def combine_draft_core_markdown(body_markdown: str, legacy_core: str) -> str:
-    body = body_markdown.strip()
-    legacy = legacy_core.strip()
-    if not body:
-        return legacy
-    if not legacy:
-        return body
-    normalized_body = normalized_digest_text(body)
-    normalized_legacy = normalized_digest_text(legacy)
-    if normalized_body == normalized_legacy or normalized_legacy in normalized_body:
-        return body
-    if normalized_body and normalized_body in normalized_legacy:
-        return legacy
-    return merge_markdown_blocks(body, legacy)
 
 
 def canonicalize_draft_page(page: DraftPageItem, *, item: WikiMergePlanItem) -> DraftPageItem:
@@ -9939,41 +9928,6 @@ def canonicalize_draft_artifact(artifact: DraftRenderingArtifact, plan: WikiMerg
     if not changed:
         return artifact
     return artifact.model_copy(update={"pages": pages})
-
-
-def draft_page_with_section_bodies(page: DraftPageItem, section_bodies: dict[str, str]) -> DraftPageItem:
-    section_bodies = normalize_draft_section_bodies(section_bodies)
-    summary = section_bodies.get("summary", page.summary)
-    body = legacy_section_bodies_to_core_markdown(section_bodies)
-    if not body:
-        body = page.body_markdown
-    open_questions = section_bodies.get("open_questions", page.open_questions)
-    stored_section_bodies = dict(section_bodies)
-    stored_section_bodies["summary"] = summary
-    stored_section_bodies["detail"] = body
-    stored_section_bodies["open_questions"] = open_questions
-    return page.model_copy(
-        update={
-            "summary": summary,
-            "body_markdown": body,
-            "open_questions": open_questions,
-            "section_bodies": stored_section_bodies,
-        }
-    )
-
-
-def legacy_section_bodies_to_core_markdown(section_bodies: dict[str, str]) -> str:
-    blocks: list[str] = []
-    for key in ["detail", "examples", "value_points", "additional_notes"]:
-        body = section_bodies.get(key, "").strip()
-        if not body:
-            continue
-        title = LEGACY_CORE_SECTION_TITLES[key]
-        if title:
-            blocks.append(f"### {title}\n\n{body}")
-        else:
-            blocks.append(body)
-    return "\n\n".join(blocks).strip()
 
 
 def normalize_core_body_markdown(body: str, *, item: WikiMergePlanItem | None = None) -> str:
@@ -10048,18 +10002,15 @@ def core_body_system_heading(body: str) -> str | None:
 
 
 def draft_page_summary(page: DraftPageItem) -> str:
-    return (page.summary or page.section_bodies.get("summary", "")).strip()
+    return page.summary.strip()
 
 
 def draft_page_core_markdown(page: DraftPageItem) -> str:
-    if page.body_markdown.strip():
-        return page.body_markdown.strip()
-    legacy_core = legacy_section_bodies_to_core_markdown(normalize_draft_section_bodies(page.section_bodies))
-    return legacy_core.strip()
+    return page.body_markdown.strip()
 
 
 def draft_page_open_questions(page: DraftPageItem) -> str:
-    return (page.open_questions or page.section_bodies.get("open_questions", "")).strip()
+    return page.open_questions.strip()
 
 
 def draft_page_text_for_preservation_section(page: DraftPageItem, section_key: str) -> str:
@@ -10067,26 +10018,17 @@ def draft_page_text_for_preservation_section(page: DraftPageItem, section_key: s
         return draft_page_summary(page)
     if section_key == "open_questions":
         return draft_page_open_questions(page)
-    if section_key in CORE_DRAFT_SECTION_KEYS:
+    if draft_field_for_preservation_section(section_key) == "body_markdown":
         return draft_page_core_markdown(page)
-    return page.section_bodies.get(section_key, "")
+    return ""
 
 
-def normalize_draft_section_bodies(section_bodies: dict[str, str]) -> dict[str, str]:
-    normalized: dict[str, str] = {}
-    for raw_key, raw_body in section_bodies.items():
-        if not isinstance(raw_body, str):
-            continue
-        body = normalize_stable_brand_typos(raw_body.strip())
-        if not body:
-            continue
-        canonical_key = draft_section_key_alias(raw_key)
-        if canonical_key is None:
-            header = re.sub(r"\s+", " ", raw_key.strip()) or "Additional Notes"
-            body = f"### {header}\n\n{body}"
-            canonical_key = "detail"
-        normalized[canonical_key] = merge_markdown_blocks(normalized.get(canonical_key, ""), body)
-    return normalized
+def draft_field_for_preservation_section(section_key: str) -> Literal["summary", "body_markdown", "open_questions"]:
+    if section_key == "summary":
+        return "summary"
+    if section_key == "open_questions":
+        return "open_questions"
+    return "body_markdown"
 
 
 def normalize_stable_brand_typos(text: str) -> str:
@@ -10104,58 +10046,6 @@ def normalize_stable_brand_typos(text: str) -> str:
     return text
 
 
-def draft_section_key_alias(raw_key: str) -> str | None:
-    key = unicodedata.normalize("NFKC", raw_key)
-    key = re.sub(r"^[#*\s`]+|[:：#*\s`]+$", "", key)
-    key = re.sub(r"[-_]+", " ", key)
-    key = re.sub(r"\s+", " ", key).strip().lower()
-    aliases = {
-        "summary": "summary",
-        "摘要": "summary",
-        "detail": "detail",
-        "details": "detail",
-        "understanding": "detail",
-        "详情": "detail",
-        "理解": "detail",
-        "examples": "examples",
-        "example": "examples",
-        "cases": "examples",
-        "case": "examples",
-        "例子": "examples",
-        "案例": "examples",
-        "value points": "value_points",
-        "value point": "value_points",
-        "values": "value_points",
-        "value": "value_points",
-        "why this matters": "value_points",
-        "advice": "value_points",
-        "advice for pms": "value_points",
-        "价值点": "value_points",
-        "建议": "value_points",
-        "additional notes": "additional_notes",
-        "additional note": "additional_notes",
-        "notes": "additional_notes",
-        "observations": "additional_notes",
-        "observation": "additional_notes",
-        "freeform": "additional_notes",
-        "free form": "additional_notes",
-        "补充观察": "additional_notes",
-        "补充": "additional_notes",
-        "观察": "additional_notes",
-        "open questions": "open_questions",
-        "open question": "open_questions",
-        "questions": "open_questions",
-        "tensions": "open_questions",
-        "conflicts": "open_questions",
-        "uncertainties": "open_questions",
-        "矛盾与未决问题": "open_questions",
-        "未决问题": "open_questions",
-    }
-    if key in CANONICAL_DRAFT_SECTION_KEYS:
-        return key
-    return aliases.get(key)
-
-
 def merge_markdown_blocks(existing: str, addition: str) -> str:
     existing = existing.strip()
     addition = addition.strip()
@@ -10167,8 +10057,6 @@ def merge_markdown_blocks(existing: str, addition: str) -> str:
 
 
 def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePlanArtifact, *, language: str | None = None) -> None:
-    allowed_sections = set(CANONICAL_DRAFT_SECTION_KEYS)
-    required_sections = {"summary", "detail"}
     plan_by_id = {item.page_plan_id: item for item in plan.items}
     required_ids = {item.page_plan_id for item in plan.items if item.action in {"create", "update"}}
     actual_ids = {page.page_plan_id for page in artifact.pages}
@@ -10184,23 +10072,10 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
         display_title = plan_item.display_title if plan_item is not None else ""
         if not page.canonical_target_path.strip():
             raise_draft_issue("missing_field", f"{page.page_plan_id} canonical_target_path must not be empty", field_path="canonical_target_path")
-        if not page.section_bodies:
-            raise_draft_issue("missing_field", f"{page.page_plan_id} section_bodies must not be empty", field_path="section_bodies")
-        section_keys = set(page.section_bodies)
-        unknown_sections = section_keys - allowed_sections
-        if unknown_sections:
-            raise_draft_issue(
-                "unsupported_section_key",
-                f"{page.page_plan_id} section_bodies contains unsupported section key(s): {sorted(unknown_sections)}",
-                field_path="section_bodies",
-            )
-        missing_sections = required_sections - section_keys
-        if missing_sections:
-            raise_draft_issue(
-                "missing_field",
-                f"{page.page_plan_id} section_bodies misses required section key(s): {sorted(missing_sections)}",
-                field_path="section_bodies",
-            )
+        if not draft_page_summary(page):
+            raise_draft_issue("missing_field", f"{page.page_plan_id} summary must not be empty", field_path="summary")
+        if not draft_page_core_markdown(page):
+            raise_draft_issue("missing_field", f"{page.page_plan_id} body_markdown must not be empty", field_path="body_markdown")
         if not page.change_summary.strip():
             raise_draft_issue("missing_field", f"{page.page_plan_id} change_summary must not be empty", field_path="change_summary")
         if not page.source_coverage_notes.strip():
@@ -10215,38 +10090,31 @@ def validate_draft_rendering(artifact: DraftRenderingArtifact, plan: WikiMergePl
                 ),
                 field_path="body_markdown",
             )
-        for section_key, body in page.section_bodies.items():
-            if section_key in required_sections and not body.strip():
-                raise_draft_issue(
-                    "missing_field",
-                    f"{page.page_plan_id} section {section_key} must not be empty",
-                    field_path=f"section_bodies.{section_key}",
-                )
+        for field_name, body in [
+            ("summary", draft_page_summary(page)),
+            ("body_markdown", draft_page_core_markdown(page)),
+            ("open_questions", draft_page_open_questions(page)),
+        ]:
             if "---\n" in body or body.lstrip().startswith("# ") or contains_source_graph_link(body):
                 raise_draft_issue(
                     "forbidden_page_markdown",
-                    f"{page.page_plan_id} section body contains forbidden page-level markdown",
-                    field_path=f"section_bodies.{section_key}",
+                    f"{page.page_plan_id} {field_name} contains forbidden page-level markdown",
+                    field_path=field_name,
                 )
             if section_contains_stray_related_links(body, page.canonical_target_path, display_title=display_title):
-                field_path = (
-                    f"pages.{page.page_plan_id}.body_markdown"
-                    if section_key == "detail"
-                    else f"pages.{page.page_plan_id}.section_bodies.{section_key}"
-                )
                 raise_draft_issue(
                     "stray_related_links_in_content",
                     (
-                        f"{page.page_plan_id} section {section_key} contains a related-page block or self wikilink; "
+                        f"{page.page_plan_id} {field_name} contains a related-page block or self wikilink; "
                         "remove body-level related links because the system renders official related pages separately."
                     ),
-                    field_path=field_path,
+                    field_path=f"pages.{page.page_plan_id}.{field_name}",
                 )
             if language == "zh-CN" and looks_like_untranslated_english(body):
                 raise_draft_issue(
                     "zh_cn_untranslated_user_text",
-                    f"{page.page_plan_id} section {section_key} must be Chinese for zh-CN vault",
-                    field_path=f"section_bodies.{section_key}",
+                    f"{page.page_plan_id} {field_name} must be Chinese for zh-CN vault",
+                    field_path=field_name,
                 )
         if language == "zh-CN" and looks_like_untranslated_english(page.change_summary):
             raise_draft_issue(
@@ -10287,17 +10155,21 @@ def validate_digestive_quality(page: DraftPageItem, item: WikiMergePlanItem) -> 
 def draft_self_talk_issues(artifact: DraftRenderingArtifact) -> list[StructuredIssue]:
     issues: list[StructuredIssue] = []
     for page in artifact.pages:
-        for section_key, body in page.section_bodies.items():
+        for field_name, body in [
+            ("summary", draft_page_summary(page)),
+            ("body_markdown", draft_page_core_markdown(page)),
+            ("open_questions", draft_page_open_questions(page)),
+        ]:
             marker = draft_self_talk_marker(body)
             if not marker:
                 continue
             issues.append(
                 StructuredIssue(
                     issue_code="model_self_talk_leak",
-                    field_path=f"pages.{page.page_plan_id}.{section_key}",
+                    field_path=f"pages.{page.page_plan_id}.{field_name}",
                     validator_id="draft_content_quality",
                     message=(
-                        f"{page.page_plan_id} section {section_key} contains model self-talk marker `{marker}`; "
+                        f"{page.page_plan_id} {field_name} contains model self-talk marker `{marker}`; "
                         "remove reasoning notes about checking, uncertainty, or future edits, and keep only the final sourced page content."
                     ),
                     repairability="repairable",
@@ -10532,7 +10404,128 @@ def parse_existing_sections(markdown: str) -> dict[str, str]:
 def existing_core_content_from_sections(sections: dict[str, str]) -> str:
     if sections.get("core_content", "").strip():
         return sections["core_content"].strip()
-    return legacy_section_bodies_to_core_markdown(sections)
+    blocks: list[str] = []
+    for key, title in [("detail", ""), ("examples", "例子"), ("value_points", "价值点"), ("additional_notes", "补充观察")]:
+        body = sections.get(key, "").strip()
+        if not body:
+            continue
+        blocks.append(f"### {title}\n\n{body}" if title else body)
+    return "\n\n".join(blocks).strip()
+
+
+def draft_grounding_sections(page: DraftPageItem) -> list[tuple[str, str]]:
+    sections: list[tuple[str, str]] = [("summary", draft_page_summary(page))]
+    sections.extend(body_markdown_grounding_sections(draft_page_core_markdown(page)))
+    sections.append(("open_questions", draft_page_open_questions(page)))
+    return [(section_key, body) for section_key, body in sections if body.strip()]
+
+
+def body_markdown_grounding_sections(body: str) -> list[tuple[str, str]]:
+    body = body.strip()
+    if not body:
+        return []
+    chunks: list[tuple[str, list[str]]] = [("detail", [])]
+    current_lines = chunks[0][1]
+    fence_char = ""
+    fence_length = 0
+    for line in body.splitlines():
+        if fence_char:
+            current_lines.append(line)
+            if closing_fence_line(line, fence_char, fence_length):
+                fence_char = ""
+                fence_length = 0
+            continue
+        if match := opening_fence_line(line):
+            marker = match.group("marker")
+            fence_char = marker[0]
+            fence_length = len(marker)
+            current_lines.append(line)
+            continue
+        heading_match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if heading_match:
+            title = re.sub(r"\s+", " ", heading_match.group(1).strip()).strip("#:： ")
+            section_key = draft_body_heading_section_key(title)
+            current_lines = [title] if draft_body_heading_title_should_scan(title, section_key) else []
+            chunks.append((section_key, current_lines))
+            continue
+        current_lines.append(line)
+    merged: dict[str, str] = {}
+    for section_key, lines in chunks:
+        text = "\n".join(lines).strip()
+        if text:
+            merged[section_key] = merge_markdown_blocks(merged.get(section_key, ""), text)
+    return list(merged.items()) or [("detail", body)]
+
+
+def draft_body_heading_section_key(title: str) -> str:
+    normalized = re.sub(r"\s+", " ", title.strip()).strip("#:： ")
+    mapped = SECTION_TITLE_TO_KEY.get(normalized)
+    if mapped is None and normalized.isascii():
+        mapped = ENGLISH_SECTION_TITLE_TO_KEY.get(normalized.casefold())
+    if mapped in {"examples", "value_points", "additional_notes"}:
+        return mapped
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", normalized)).casefold()
+    lowered = unicodedata.normalize("NFKC", normalized).casefold()
+    if any(marker in compact for marker in ["例子", "示例", "案例", "使用场景"]):
+        return "examples"
+    if re.search(r"\b(?:examples?|use cases?|case studies|scenarios?)\b", lowered):
+        return "examples"
+    if any(marker in compact for marker in ["价值点", "价值", "意义", "为什么重要"]):
+        return "value_points"
+    if re.search(r"\b(?:value points?|why it matters|importance)\b", lowered):
+        return "value_points"
+    if any(marker in compact for marker in ["补充观察", "补充", "观察", "备注"]):
+        return "additional_notes"
+    if re.search(r"\b(?:additional notes?|notes?|observations?)\b", lowered):
+        return "additional_notes"
+    return "detail"
+
+
+def draft_body_heading_title_should_scan(title: str, section_key: str) -> bool:
+    normalized = re.sub(r"\s+", " ", title.strip()).strip("#:： ")
+    if not normalized:
+        return False
+    if section_key == "detail":
+        return True
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", normalized)).casefold()
+    structural_titles = {
+        "例子",
+        "示例",
+        "案例",
+        "使用场景",
+        "examples",
+        "example",
+        "usecases",
+        "usecase",
+        "scenarios",
+        "scenario",
+        "价值点",
+        "价值",
+        "为什么重要",
+        "valuepoints",
+        "valuepoint",
+        "whyitmatters",
+        "importance",
+        "补充观察",
+        "补充",
+        "观察",
+        "备注",
+        "additionalnotes",
+        "additionalnote",
+        "notes",
+        "note",
+        "observations",
+        "observation",
+    }
+    if compact in structural_titles:
+        return False
+    return bool(
+        severe_factual_claim_marker(normalized)
+        or unsupported_backing_marker(normalized)
+        or contains_hard_fact_marker(compact)
+        or contains_short_fact_marker(compact)
+        or re.search(r"\d", normalized)
+    )
 
 
 def is_empty_placeholder(text: str) -> bool:
@@ -10953,7 +10946,7 @@ def grounding_issue_message(claim: GroundingClaim) -> str:
     if grounding_claim_targets_open_question(claim) and claim.section_key != "open_questions":
         reason = (
             f"{reason} 这是 open_questions 页面；无来源支撑的场景、后果或影响推测不要留在 detail/examples 当事实；"
-            "请移动到 section_bodies.open_questions，改写成问题并标注 待补来源，不要换成另一个具体后果。"
+            "请移动到 open_questions，改写成问题并标注 待补来源，不要换成另一个具体后果。"
         )
     if not text:
         return reason
@@ -11679,23 +11672,27 @@ def rewrite_grounding_sensitive_paraphrases(
     rewrite_count = 0
     source_sentences = grounding_rewrite_source_sentences(approved_raw_text)
     for page in artifact.pages:
-        section_bodies: dict[str, str] = {}
+        updates: dict[str, str] = {}
         page_sections: list[dict[str, Any]] = []
-        for section_key, body in page.section_bodies.items():
+        for field_name, body in [
+            ("summary", page.summary),
+            ("body_markdown", page.body_markdown),
+            ("open_questions", page.open_questions),
+        ]:
             rewritten_body, section_rewrites = rewrite_grounding_sensitive_body(body, source_sentences)
-            section_bodies[section_key] = rewritten_body
+            updates[field_name] = rewritten_body
             if section_rewrites:
                 rewrite_count += len(section_rewrites)
-                page_sections.append({"section_key": section_key, "rewrites": section_rewrites})
+                page_sections.append({"field": field_name, "rewrites": section_rewrites})
         if page_sections:
             report_pages.append(
                 {
                     "page_plan_id": page.page_plan_id,
                     "target_path": page.canonical_target_path,
-                    "sections": page_sections,
+                    "fields": page_sections,
                 }
             )
-            rewritten_pages.append(draft_page_with_section_bodies(page, section_bodies))
+            rewritten_pages.append(page.model_copy(update=updates))
         else:
             rewritten_pages.append(page)
     report = {
@@ -12221,7 +12218,7 @@ def collect_grounding_claims(
     approved_raw_text: str,
     claims: list[GroundingClaim],
 ) -> None:
-    for section_key, body in page.section_bodies.items():
+    for section_key, body in draft_grounding_sections(page):
         for quote, quote_start in iter_grounding_quote_spans(body):
             normalized_quote = re.sub(r"\s+", "", quote.strip())
             is_explicit_quote = explicit_direct_quote_context(body, quote, quote_start=quote_start)
@@ -13608,20 +13605,13 @@ def build_draft_grounding_review(
 
 
 def draft_page_for_grounding(page: DraftPageItem) -> DraftPageItem:
-    section_bodies = normalize_draft_section_bodies(page.section_bodies)
-    if page.summary.strip() and not section_bodies.get("summary"):
-        section_bodies["summary"] = page.summary.strip()
-    if page.body_markdown.strip() and not section_bodies.get("detail"):
-        section_bodies["detail"] = normalize_core_body_markdown(page.body_markdown)
-    if page.open_questions.strip() and not section_bodies.get("open_questions"):
-        section_bodies["open_questions"] = page.open_questions.strip()
-    if not section_bodies:
-        section_bodies = {
+    return page.model_copy(
+        update={
             "summary": page.summary.strip(),
-            "detail": normalize_core_body_markdown(page.body_markdown),
+            "body_markdown": normalize_core_body_markdown(page.body_markdown),
             "open_questions": page.open_questions.strip(),
         }
-    return page.model_copy(update={"section_bodies": section_bodies})
+    )
 
 
 OPEN_QUESTION_SCOPE_CLEANUP_SECTIONS = {"detail", "examples", "value_points", "additional_notes"}
@@ -13653,10 +13643,11 @@ def cleanup_open_question_unsupported_scope_claims(
         if not page_claims:
             rewritten_pages.append(page)
             continue
-        section_bodies = dict(page.section_bodies)
+        body_markdown = page.body_markdown
+        open_questions = page.open_questions
         existing_question_keys = {
             open_question_key(question)
-            for question in meaningful_open_question_lines(section_bodies.get("open_questions", ""))
+            for question in meaningful_open_question_lines(open_questions)
         }
         page_report = {
             "page_plan_id": page.page_plan_id,
@@ -13666,7 +13657,7 @@ def cleanup_open_question_unsupported_scope_claims(
         }
         added_count = 0
         for claim in page_claims:
-            body = section_bodies.get(claim.section_key, "")
+            body = body_markdown if claim.section_key != "open_questions" else open_questions
             updated_body, removal_status = remove_grounding_claim_exact_once(body, claim.text)
             if removal_status != "removed":
                 page_report["skipped"].append(
@@ -13692,17 +13683,13 @@ def cleanup_open_question_unsupported_scope_claims(
                 )
                 skipped_count += 1
                 continue
-            section_bodies[claim.section_key] = (
-                updated_body
-                if updated_body.strip()
-                else open_question_scope_cleanup_section_placeholder(claim.section_key)
-            )
+            if claim.section_key == "open_questions":
+                open_questions = updated_body
+            else:
+                body_markdown = updated_body if updated_body.strip() else open_question_scope_cleanup_section_placeholder(claim.section_key)
             append_decision = "skipped_duplicate_question"
             if not duplicate_question:
-                section_bodies["open_questions"] = append_open_question_line(
-                    section_bodies.get("open_questions", ""),
-                    relocated_question,
-                )
+                open_questions = append_open_question_line(open_questions, relocated_question)
                 existing_question_keys.add(question_key)
                 added_count += 1
                 append_decision = "appended"
@@ -13717,7 +13704,7 @@ def cleanup_open_question_unsupported_scope_claims(
                 }
             )
         if page_report["relocations"]:
-            rewritten_pages.append(draft_page_with_section_bodies(page, section_bodies))
+            rewritten_pages.append(page.model_copy(update={"body_markdown": body_markdown, "open_questions": open_questions}))
         else:
             rewritten_pages.append(page)
         if page_report["relocations"] or page_report["skipped"]:
@@ -13757,18 +13744,13 @@ def cleanup_unsupported_example_literals(
         if not page_claims:
             rewritten_pages.append(page)
             continue
-        section_bodies = dict(page.section_bodies)
-        updated_bodies = dict(section_bodies)
+        updated_body = page.body_markdown
         changed = False
         for claim in page_claims:
-            target_section_key = claim.section_key if claim.section_key in section_bodies else "examples"
-            if target_section_key not in section_bodies and "detail" in section_bodies:
-                target_section_key = "detail"
-            updated_body = updated_bodies.get(target_section_key, "")
-            if target_section_key == "detail" and not detail_contains_legacy_example_heading(updated_body):
+            target_section_key = "detail"
+            if not detail_contains_example_heading(updated_body):
                 continue
             updated_body, result = replace_unsupported_example_literal_once(updated_body, claim.text)
-            updated_bodies[target_section_key] = updated_body
             result.update(
                 {
                     "page_plan_id": page.page_plan_id,
@@ -13783,7 +13765,7 @@ def cleanup_unsupported_example_literals(
             else:
                 skipped.append(result)
         if changed:
-            rewritten_pages.append(draft_page_with_section_bodies(page, updated_bodies))
+            rewritten_pages.append(page.model_copy(update={"body_markdown": updated_body}))
         else:
             rewritten_pages.append(page)
     report = {
@@ -13808,8 +13790,12 @@ def unsupported_example_literal_cleanup_claim(claim: GroundingClaim) -> bool:
     )
 
 
-def detail_contains_legacy_example_heading(body: str) -> bool:
-    return bool(re.search(r"^\s{0,3}#{3,6}\s+(?:例子|Examples?)\s*$", body, re.IGNORECASE | re.MULTILINE))
+def detail_contains_example_heading(body: str) -> bool:
+    for line in body.splitlines():
+        match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if match and draft_body_heading_section_key(match.group(1)) == "examples":
+            return True
+    return False
 
 
 def replace_unsupported_example_literal_once(body: str, text: str) -> tuple[str, dict[str, Any]]:

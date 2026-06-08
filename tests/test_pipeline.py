@@ -72,6 +72,38 @@ ROOT = Path(__file__).parent
 FIXTURE_ROOT = ROOT / "fixtures" / "simple_project"
 
 
+def draft_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(f"- {draft_text(item).strip()}" for item in value if draft_text(item).strip())
+    return str(value)
+
+
+def draft_body(
+    *,
+    detail: object = "",
+    examples: object = "",
+    value_points: object = "",
+    additional_notes: object = "",
+) -> str:
+    blocks = []
+    detail_text = draft_text(detail).strip()
+    if detail_text:
+        blocks.append(detail_text)
+    for title, value in [
+        ("例子", examples),
+        ("价值点", value_points),
+        ("补充观察", additional_notes),
+    ]:
+        text = draft_text(value).strip()
+        if text:
+            blocks.append(f"### {title}\n\n{text}")
+    return "\n\n".join(blocks)
+
+
 def make_vault(tmp_path: Path) -> tuple[Path, Path]:
     vault = tmp_path / "vault"
     init_vault(vault, profile_name="project_basic")
@@ -2400,7 +2432,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     grounding_risk_rules = " ".join(payload["contract"]["grounding_risk_rules"])
     assert "source_excerpt_pack" in contract_rules
     assert "satisfy update_preservation_pack in the first draft" in contract_rules
-    assert "body_markdown or the matching legacy section body" in contract_rules
+    assert "and reusable key phrases into body_markdown" in contract_rules
     assert "change_summary may summarize retention but does not satisfy the obligation" in contract_rules
     assert "Do not wrap paraphrases" in contract_rules
     assert "Do not wrap paraphrases" in grounding_risk_rules
@@ -2416,7 +2448,8 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
     assert "keep the wording proportional to the source" in grounding_risk_rules
     assert "可能伴随" in grounding_risk_rules
     assert "translate or paraphrase English raw examples into Chinese" in contract_rules
-    assert "Across body_markdown/open_questions/section_bodies" in contract_rules
+    assert "Across body_markdown/open_questions" in contract_rules
+    assert "section_bodies" not in contract_rules
     assert "张三" in contract_rules
     assert "user-123" in contract_rules
     assert "avoid presenting it as an observed user fact" in contract_rules
@@ -3460,51 +3493,33 @@ def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> 
     assert "候选页面" not in rendered
 
 
-def test_draft_rendering_normalizes_model_section_keys(tmp_path: Path) -> None:
-    vault, raw = make_vault(tmp_path)
-    fixture_dir = tmp_path / "draft-section-fixture"
-    fixture_dir.mkdir()
-    for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json", "draft_rendering.json"]:
-        data = read_json(FIXTURE_ROOT / "mock" / name)
-        if name == "draft_rendering.json":
-            data["pages"][0]["section_bodies"] = {
-                "Summary": "这是模型用英文 key 写出的摘要。",
-                "Background": "模型补充了背景，但没有使用 canonical key。",
-                "Product Philosophy": "模型拆出了产品哲学观察。",
-                "Collaboration with Boris Cherny": "模型拆出了协作背景。",
-                "Advice for PMs": ["PM 应该把建议写到价值点中。", "数组也要转成 Markdown 字符串。"],
-                "Additional Notes": "这是模型明确放进自由发挥区的观察。",
-                "Open Questions": "这个主题还有一个未决问题。",
-            }
-            data["pages"][0].pop("source_coverage_notes", None)
-            data["pages"][0]["source_coverage_checks"] = "严格按照源内容，无额外添加。"
-        write_json(fixture_dir / name, data)
+def test_draft_rendering_model_schema_excludes_section_bodies() -> None:
+    schema = pipeline_module.DraftRenderingArtifact.model_json_schema()
+    assert "section_bodies" not in json.dumps(schema, ensure_ascii=False)
 
-    manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="draft-sections")
-    run_dir = RunStore(vault).run_dir(manifest.operation_id)
-    draft = read_json(run_dir / "draft_rendering" / "draft_rendering.json")
-    first_page = draft["pages"][0]
-    assert set(first_page["section_bodies"]) == {
-        "summary",
-        "detail",
-        "open_questions",
-    }
-    assert first_page["section_bodies"]["summary"] == "这是模型用英文 key 写出的摘要。"
-    assert first_page["body_markdown"] == first_page["section_bodies"]["detail"]
-    assert "### Background" in first_page["section_bodies"]["detail"]
-    assert "### Product Philosophy" in first_page["section_bodies"]["detail"]
-    assert "### 价值点" in first_page["section_bodies"]["detail"]
-    assert "- PM 应该把建议写到价值点中。" in first_page["section_bodies"]["detail"]
-    assert "### 补充观察" in first_page["section_bodies"]["detail"]
-    assert "这是模型明确放进自由发挥区的观察。" in first_page["section_bodies"]["detail"]
-    assert first_page["source_coverage_notes"] == "严格按照源内容，无额外添加。"
+    page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
+    page["section_bodies"] = {"summary": "旧格式摘要", "detail": "旧格式正文"}
+    with pytest.raises(Exception, match="section_bodies"):
+        pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
 
-    concept_text = (run_dir / "draft_rendering" / "draft_pages" / "concepts" / "Concept_知识编译工程骨架.md").read_text(
-        encoding="utf-8"
+
+def test_draft_rendering_model_output_is_canonicalized_for_internal_pipeline() -> None:
+    page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
+    page["page_plan_id"] = "PP-QWEN"
+    page["canonical_target_path"] = "entities/Entity_Qwen-Agent.md"
+    page.pop("source_coverage_notes", None)
+    page["source_coverage_checks"] = "严格按照源内容，无额外添加。"
+    draft = pipeline_module.DraftRenderingArtifact.model_validate(
+        {"schema_version": "draft_rendering.v3", "pages": [page]}
     )
-    assert "## 核心内容" in concept_text
-    assert "\n## 补充观察\n" not in concept_text
-    assert "这是模型明确放进自由发挥区的观察。" in concept_text
+
+    finalized = pipeline_module.canonicalize_draft_artifact(draft, qwen_related_block_plan())
+    first_page = finalized.pages[0]
+
+    assert first_page.summary == page["summary"]
+    assert first_page.body_markdown == page["body_markdown"]
+    assert "### 例子" in first_page.body_markdown
+    assert first_page.source_coverage_notes == "严格按照源内容，无额外添加。"
 
 
 def test_validate_draft_rendering_accepts_freeform_body_markdown() -> None:
@@ -3533,7 +3548,7 @@ def test_validate_draft_rendering_accepts_freeform_body_markdown() -> None:
     pipeline_module.validate_draft_rendering(draft, plan, language="zh-CN")
 
 
-def test_finalize_draft_rendering_merges_body_markdown_with_legacy_core_sections() -> None:
+def test_finalize_draft_rendering_preserves_freeform_body_markdown() -> None:
     plan = qwen_related_block_plan()
     snapshot = pipeline_module.WikiContextSnapshot(
         log_date="2026-06-06",
@@ -3554,11 +3569,14 @@ def test_finalize_draft_rendering_merges_body_markdown_with_legacy_core_sections
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
                 summary="Qwen-Agent 是 Agent 开发框架。",
-                body_markdown="### 自定义核心\n\n模型自己写的核心判断。",
-                section_bodies={
-                    "examples": "这个旧槽里的例子也不能丢。",
-                    "value_points": "这个旧槽里的价值判断也不能丢。",
-                },
+                body_markdown=(
+                    "### 自定义核心\n\n"
+                    "模型自己写的核心判断。\n\n"
+                    "### 例子\n\n"
+                    "这个例子由自由正文承载。\n\n"
+                    "### 价值点\n\n"
+                    "这个价值判断也由自由正文承载。"
+                ),
                 change_summary="创建 Qwen-Agent 页面。",
                 source_coverage_notes="测试。",
             )
@@ -3569,8 +3587,8 @@ def test_finalize_draft_rendering_merges_body_markdown_with_legacy_core_sections
     body = finalized.pages[0].body_markdown
 
     assert "### 自定义核心" in body
-    assert "这个旧槽里的例子也不能丢。" in body
-    assert "这个旧槽里的价值判断也不能丢。" in body
+    assert "这个例子由自由正文承载。" in body
+    assert "这个价值判断也由自由正文承载。" in body
 
 
 def test_validate_draft_rendering_strips_system_heading_inside_body_markdown() -> None:
@@ -4458,7 +4476,8 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
                 page_plan_id="PP-TYPO",
                 action="create",
                 canonical_target_path="entities/Entity_Cat Wu.md",
-                section_bodies={"summary": "Cat Wu 负责 Clade Code，任职于 Anropinic，并与 Borris Cherny 协作。"},
+                summary="Cat Wu 负责 Clade Code，任职于 Anropinic，并与 Borris Cherny 协作。",
+                body_markdown="Cat Wu 负责 Clade Code，任职于 Anropinic，并与 Borris Cherny 协作。",
                 change_summary="创建 Borris 相关页面。",
                 source_coverage_notes="Borris 与 Cat Wu 的访谈。",
             )
@@ -4487,11 +4506,11 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
         known_paths={"entities/Entity_Claude Code.md"},
     )
 
-    assert "Claude Code" in finalized.pages[0].section_bodies["summary"]
-    assert "Anthropic" in finalized.pages[0].section_bodies["summary"]
-    assert "Boris Cherny" in finalized.pages[0].section_bodies["summary"]
-    assert "Clade Code" not in finalized.pages[0].section_bodies["summary"]
-    assert "Borris" not in finalized.pages[0].section_bodies["summary"]
+    assert "Claude Code" in finalized.pages[0].summary
+    assert "Anthropic" in finalized.pages[0].summary
+    assert "Boris Cherny" in finalized.pages[0].summary
+    assert "Clade Code" not in finalized.pages[0].summary
+    assert "Borris" not in finalized.pages[0].summary
     assert finalized.pages[0].change_summary == "创建 Boris 相关页面。"
     assert finalized.pages[0].source_coverage_notes == "Boris 与 Cat Wu 的访谈。"
     assert "Cat Wu 是 Claude Code 产品负责人" in related
@@ -4521,11 +4540,8 @@ def test_validate_draft_rendering_rejects_model_self_talk() -> None:
                 page_plan_id="PP-SELF-TALK",
                 action="create",
                 canonical_target_path="concepts/Concept_静态基准评估.md",
-                section_bodies={
-                    "summary": "静态基准可能高估智能体表现。",
-                    "detail": "静态基准会受污染影响。检查原文后我会修正数字方向，这里需要谨慎。",
-                    "examples": "例如，静态结果可能高于实时结果。",
-                },
+                summary="静态基准可能高估智能体表现。",
+                body_markdown=draft_body(detail="静态基准会受污染影响。检查原文后我会修正数字方向，这里需要谨慎。", examples="例如，静态结果可能高于实时结果。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -4536,7 +4552,7 @@ def test_validate_draft_rendering_rejects_model_self_talk() -> None:
     issues = pipeline_module.draft_self_talk_issues(draft)
 
     assert [issue.issue_code for issue in issues] == ["model_self_talk_leak"]
-    assert issues[0].field_path == "pages.PP-SELF-TALK.detail"
+    assert issues[0].field_path == "pages.PP-SELF-TALK.body_markdown"
     assert "检查原文" in issues[0].message
 
 
@@ -4547,11 +4563,8 @@ def test_validate_draft_rendering_rejects_wiki_state_leak() -> None:
                 page_plan_id="PP-STATE-LEAK",
                 action="create",
                 canonical_target_path="entities/Entity_Cowork.md",
-                section_bodies={
-                    "summary": "Cowork 是知识工作协作者产品。",
-                    "detail": "Cowork 用于综合信息和创建文档。",
-                    "additional_notes": "目前 wiki 中无此页面，创建后可与 Claude Code、Cat Wu 等页面互链。",
-                },
+                summary="Cowork 是知识工作协作者产品。",
+                body_markdown=draft_body(detail="Cowork 用于综合信息和创建文档。", additional_notes="目前 wiki 中无此页面，创建后可与 Claude Code、Cat Wu 等页面互链。"),
                 change_summary="创建 Cowork 页面。",
                 source_coverage_notes="测试。",
             )
@@ -4561,7 +4574,7 @@ def test_validate_draft_rendering_rejects_wiki_state_leak() -> None:
     issues = pipeline_module.draft_self_talk_issues(draft)
 
     assert [issue.issue_code for issue in issues] == ["model_self_talk_leak"]
-    assert issues[0].field_path == "pages.PP-STATE-LEAK.additional_notes"
+    assert issues[0].field_path == "pages.PP-STATE-LEAK.body_markdown"
     assert "目前wiki中无此页面" in issues[0].message
 
 
@@ -4588,11 +4601,8 @@ def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
                 page_plan_id="PP-CAUTION",
                 action="create",
                 canonical_target_path="concepts/Concept_高风险部署.md",
-                section_bodies={
-                    "summary": "高风险部署需要额外审查。",
-                    "detail": "高风险部署需要谨慎处理，尤其是在权限、用户数据和自动化执行边界不清楚时。",
-                    "examples": "例如，生产环境自动化执行前应先做人工审批。",
-                },
+                summary="高风险部署需要额外审查。",
+                body_markdown=draft_body(detail="高风险部署需要谨慎处理，尤其是在权限、用户数据和自动化执行边界不清楚时。", examples="例如，生产环境自动化执行前应先做人工审批。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -4628,12 +4638,8 @@ def qwen_related_block_draft(additional_notes: str) -> pipeline_module.DraftRend
                 page_plan_id="PP-QWEN",
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
-                section_bodies={
-                    "summary": "Qwen-Agent 是 Agent 开发框架。",
-                    "detail": "Qwen-Agent 支持工具使用、规划和记忆能力。",
-                    "examples": "例如，开发者可以用它把 LLM、工具和智能体抽象组合成一个可运行助手。",
-                    "additional_notes": additional_notes,
-                },
+                summary="Qwen-Agent 是 Agent 开发框架。",
+                body_markdown=draft_body(detail="Qwen-Agent 支持工具使用、规划和记忆能力。", examples="例如，开发者可以用它把 LLM、工具和智能体抽象组合成一个可运行助手。", additional_notes=additional_notes),
                 change_summary="创建 Qwen-Agent 页面。",
                 source_coverage_notes="测试。",
             )
@@ -4776,7 +4782,7 @@ def test_stray_related_links_issue_is_page_scoped_repairable() -> None:
     issues = [
         pipeline_module.StructuredIssue(
             issue_code="stray_related_links_in_content",
-            field_path="pages.PP-QWEN.section_bodies.additional_notes",
+            field_path="pages.PP-QWEN.body_markdown",
             validator_id="validate_draft_rendering",
             message="stray related links",
             repairability="repairable",
@@ -4793,10 +4799,8 @@ def test_update_preservation_issues_detect_missing_old_key_phrases() -> None:
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "Claude Code 是一个编码助手，本轮只补充产品功能。",
-                    "detail": "新材料讨论 PowerUp、TODO List 和发布速度。",
-                },
+                summary="Claude Code 是一个编码助手，本轮只补充产品功能。",
+                body_markdown=draft_body(detail="新材料讨论 PowerUp、TODO List 和发布速度。"),
                 change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
@@ -4859,10 +4863,8 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "Claude Code 是一个编码助手，本轮只补充产品功能。",
-                    "detail": "新材料讨论 PowerUp、TODO List 和发布速度。",
-                },
+                summary="Claude Code 是一个编码助手，本轮只补充产品功能。",
+                body_markdown=draft_body(detail="新材料讨论 PowerUp、TODO List 和发布速度。"),
                 change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
@@ -4931,11 +4933,8 @@ def test_partial_draft_extraction_keeps_example_cleanup_for_final_report() -> No
                 page_plan_id="PP-OK",
                 action="create",
                 canonical_target_path="concepts/Concept_OK.md",
-                section_bodies={
-                    "summary": "通过页摘要。",
-                    "detail": "这个页面用于说明 deterministic cleanup 的使用场景和边界：只处理 examples 里的示例参数，不把结果事实当占位符。",
-                    "examples": "- 示例构建编号是 “ABC123”。",
-                },
+                summary="通过页摘要。",
+                body_markdown=draft_body(detail="这个页面用于说明 deterministic cleanup 的使用场景和边界：只处理 examples 里的示例参数，不把结果事实当占位符。", examples="- 示例构建编号是 “ABC123”。"),
                 change_summary="创建通过页。",
                 source_coverage_notes="测试。",
             )
@@ -5048,10 +5047,8 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
                 page_plan_id="PP-OK",
                 action="create",
                 canonical_target_path="concepts/Concept_OK.md",
-                section_bodies={
-                    "summary": "通过页摘要。",
-                    "detail": "通过页用于验证 accepted partial pages 会被保留。",
-                },
+                summary="通过页摘要。",
+                body_markdown=draft_body(detail="通过页用于验证 accepted partial pages 会被保留。"),
                 change_summary="创建通过页。",
                 source_coverage_notes="依据测试材料生成。",
             ),
@@ -5059,11 +5056,8 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
                 page_plan_id="PP-BAD",
                 action="create",
                 canonical_target_path="concepts/Concept_BAD.md",
-                section_bodies={
-                    "summary": "失败页摘要。",
-                    "detail": "失败页用于验证 repair payload。",
-                    "examples": "例如，“用户喜欢蓝色”。",
-                },
+                summary="失败页摘要。",
+                body_markdown=draft_body(detail="失败页用于验证 repair payload。", examples="例如，“用户喜欢蓝色”。"),
                 change_summary="创建失败页。",
                 source_coverage_notes="依据测试材料生成。",
             ),
@@ -5095,6 +5089,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
 
     assert repair_prompt is not None
     assert repair_prompt["repair_contract"]["mode"] == "page_scoped_repair"
+    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["schema"], ensure_ascii=False)
     assert repair_prompt["repair_contract"]["accepted_page_plan_ids"] == ["PP-OK"]
     assert repair_prompt["repair_contract"]["repair_page_plan_ids"] == ["PP-BAD"]
     assert "accepted_partial_pages" not in repair_prompt
@@ -5140,19 +5135,21 @@ def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
-        section_bodies={"summary": "本地保留的通过页。", "detail": "不要被模型覆盖。"},
-        change_summary="创建通过页。",
+        summary="本地保留的通过页。",
+        body_markdown=draft_body(detail="不要被模型覆盖。"),
+        change_summary="创建页面。",
         source_coverage_notes="本地 accepted。",
     )
     returned_ok = accepted_ok.model_copy(
-        update={"section_bodies": {"summary": "模型错误改写的通过页。", "detail": "不应采纳。"}}
+        update={"summary": "模型错误改写的通过页。", "body_markdown": "不应采纳。"}
     )
     repaired_bad = pipeline_module.DraftPageItem(
         page_plan_id="PP-BAD",
         action="create",
         canonical_target_path="concepts/Concept_BAD.md",
-        section_bodies={"summary": "修复后的失败页。", "detail": "只采纳修复页。"},
-        change_summary="修复失败页。",
+        summary="修复后的失败页。",
+        body_markdown=draft_body(detail="只采纳修复页。"),
+        change_summary="修复页面。",
         source_coverage_notes="repair。",
     )
 
@@ -5164,8 +5161,8 @@ def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy
     )
 
     assert [page.page_plan_id for page in merged.pages] == ["PP-OK", "PP-BAD"]
-    assert merged.pages[0].section_bodies["summary"] == "本地保留的通过页。"
-    assert merged.pages[1].section_bodies["summary"] == "修复后的失败页。"
+    assert merged.pages[0].summary == "本地保留的通过页。"
+    assert merged.pages[1].summary == "修复后的失败页。"
 
 
 def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) -> None:
@@ -5236,10 +5233,8 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
-        section_bodies={
-            "summary": "通过页摘要。",
-            "detail": "通过页可以用来验证本地 accepted 页面在 repair 后仍被保留。",
-        },
+        summary="通过页摘要。",
+        body_markdown=draft_body(detail="通过页可以用来验证本地 accepted 页面在 repair 后仍被保留。"),
         change_summary="通过页摘要。",
         source_coverage_notes="通过页可以用来验证本地 accepted 页面在 repair 后仍被保留。",
     )
@@ -5247,10 +5242,8 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         page_plan_id="PP-BAD",
         action="create",
         canonical_target_path="concepts/Concept_BAD.md",
-        section_bodies={
-            "summary": "失败页摘要。",
-            "detail": "失败页可以用来验证局部修复只重写坏页。检查原文后我会修正。",
-        },
+        summary="失败页摘要。",
+        body_markdown=draft_body(detail="失败页可以用来验证局部修复只重写坏页。检查原文后我会修正。"),
         change_summary="失败页摘要。",
         source_coverage_notes="失败页可以用来验证局部修复只重写坏页。",
     )
@@ -5258,10 +5251,8 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         page_plan_id="PP-BAD",
         action="create",
         canonical_target_path="concepts/Concept_BAD.md",
-        section_bodies={
-            "summary": "失败页摘要。",
-            "detail": "失败页可以用来验证局部修复只重写坏页。",
-        },
+        summary="失败页摘要。",
+        body_markdown=draft_body(detail="失败页可以用来验证局部修复只重写坏页。"),
         change_summary="失败页摘要。",
         source_coverage_notes="失败页可以用来验证局部修复只重写坏页。",
     )
@@ -5279,6 +5270,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         def generate_raw(self, task: str, payload: dict[str, object], output_model: type[object]) -> str:
             self.payloads.append(payload)
             output = self.outputs[len(self.payloads) - 1]
+            output = pipeline_module.canonicalize_draft_artifact(output, merge_plan)
             return json.dumps(output.model_dump(mode="json"), ensure_ascii=False)
 
     class NoopRedactor:
@@ -5313,8 +5305,8 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
     )
 
     assert [page.page_plan_id for page in result.pages] == ["PP-OK", "PP-BAD"]
-    assert result.pages[0].section_bodies["detail"] == "通过页可以用来验证本地 accepted 页面在 repair 后仍被保留。"
-    assert result.pages[1].section_bodies["detail"] == "失败页可以用来验证局部修复只重写坏页。"
+    assert result.pages[0].body_markdown == "通过页可以用来验证本地 accepted 页面在 repair 后仍被保留。"
+    assert result.pages[1].body_markdown == "失败页可以用来验证局部修复只重写坏页。"
     assert len(provider.payloads) == 2
     repair_payload = provider.payloads[1]
     assert repair_payload["repair_contract"]["mode"] == "page_scoped_repair"
@@ -5397,7 +5389,8 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
-        section_bodies={"summary": "通过页摘要。", "detail": "通过页。"},
+        summary="通过页摘要。",
+        body_markdown=draft_body(detail="通过页。"),
         change_summary="创建通过页。",
         source_coverage_notes="accepted。",
     )
@@ -5525,11 +5518,9 @@ def test_cleanup_open_question_unsupported_scope_claims_moves_fact_to_question()
                 page_plan_id="PP-OQ",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_记忆准确性.md",
-                section_bodies={
-                    "summary": "讨论记忆准确性。",
-                    "examples": "例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。如何确保召回准确性？",
-                    "open_questions": "- 如何确认召回结果？",
-                },
+                summary="讨论记忆准确性。",
+                body_markdown=draft_body(examples="例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。如何确保召回准确性？"),
+                open_questions="- 如何确认召回结果？",
                 change_summary="创建开放问题。",
                 source_coverage_notes="测试。",
             )
@@ -5588,11 +5579,9 @@ def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
                 page_plan_id="PP-OQ",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_记忆准确性.md",
-                section_bodies={
-                    "summary": "讨论记忆准确性。",
-                    "examples": "例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。如何确保召回准确性？",
-                    "open_questions": f"- 如何确认召回结果？\n- {duplicate_question}",
-                },
+                summary="讨论记忆准确性。",
+                body_markdown=draft_body(examples="例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。如何确保召回准确性？"),
+                open_questions=f"- 如何确认召回结果？\n- {duplicate_question}",
                 change_summary="创建开放问题。",
                 source_coverage_notes="测试。",
             )
@@ -5610,8 +5599,8 @@ def test_cleanup_open_question_duplicate_question_still_removes_fact() -> None:
     assert cleaned == draft
     assert report["changed"] is False
     assert report["relocation_count"] == 0
-    assert "导致错误响应" in page.section_bodies["examples"]
-    assert page.section_bodies["open_questions"].count(duplicate_question) == 1
+    assert "导致错误响应" in page.body_markdown
+    assert page.open_questions.count(duplicate_question) == 1
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "记忆召回结果需要确认。").requires_review
 
 
@@ -5640,11 +5629,9 @@ def test_cleanup_open_question_scope_claim_uses_reason_marker_after_sentence_spl
                 page_plan_id="PP-OQ",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_记忆准确性.md",
-                section_bodies={
-                    "summary": "讨论记忆准确性。",
-                    "examples": f"模型可能需要确认记忆。{unsupported_sentence}",
-                    "open_questions": "- 如何确认召回结果？",
-                },
+                summary="讨论记忆准确性。",
+                body_markdown=draft_body(examples=f"模型可能需要确认记忆。{unsupported_sentence}"),
+                open_questions="- 如何确认召回结果？",
                 change_summary="创建开放问题。",
                 source_coverage_notes="测试。",
             )
@@ -5717,11 +5704,9 @@ def test_cleanup_open_question_unsupported_scope_claims_does_not_touch_concepts(
                 page_plan_id="PP-CONCEPT",
                 action="create",
                 canonical_target_path="concepts/Concept_记忆准确性.md",
-                section_bodies={
-                    "summary": "讨论记忆准确性。",
-                    "examples": "例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。",
-                    "open_questions": "- 如何确认召回结果？",
-                },
+                summary="讨论记忆准确性。",
+                body_markdown=draft_body(examples="例如，模型可能召回到某个用户的偏好，但该偏好记忆不准确，导致错误响应。"),
+                open_questions="- 如何确认召回结果？",
                 change_summary="创建概念页。",
                 source_coverage_notes="测试。",
             )
@@ -5851,7 +5836,8 @@ def test_accepted_partial_page_copy_issues_detect_rewritten_accepted_page() -> N
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
-        section_bodies={"summary": "原摘要。", "detail": "原详情。"},
+        summary="原摘要。",
+        body_markdown=draft_body(detail="原详情。"),
         change_summary="创建原页面。",
         source_coverage_notes="测试。",
     )
@@ -5873,10 +5859,8 @@ def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "Claude Code 是一个编码助手，本轮补充待办事项列表和发布速度。",
-                    "examples": "例如，待办事项列表用于帮助模型跟踪任务。",
-                },
+                summary="Claude Code 是一个编码助手，本轮补充待办事项列表和发布速度。",
+                body_markdown=draft_body(examples="例如，待办事项列表用于帮助模型跟踪任务。"),
                 change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
@@ -5913,9 +5897,9 @@ def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None
     assert report["reinforced_section_count"] == 2
     assert pipeline_module.update_preservation_issues(reinforced, pack) == []
     page = reinforced.pages[0]
-    assert "从旧页保留的架构视角看" in page.section_bodies["summary"]
+    assert "从旧页保留的架构视角看" in page.summary
     assert "从旧页保留的架构视角看" in page.body_markdown
-    assert "从旧页保留的架构视角看" in page.section_bodies["detail"]
+    assert "从旧页保留的架构视角看" in page.body_markdown
 
 
 def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_english_dump() -> None:
@@ -5925,9 +5909,7 @@ def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_en
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "detail": "Claude Code 本轮补充产品发布速度和 PM 协作流程。",
-                },
+                body_markdown=draft_body(detail="Claude Code 本轮补充产品发布速度和 PM 协作流程。"),
                 change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
@@ -5964,7 +5946,7 @@ def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_en
 
     reinforced, report = pipeline_module.reinforce_update_preservation(draft, pack)
 
-    body = reinforced.pages[0].section_bodies["detail"]
+    body = reinforced.pages[0].body_markdown
     assert report["changed"] is True
     assert pipeline_module.update_preservation_issues(reinforced, pack) == []
     assert "从旧页保留的架构视角看" in body
@@ -5981,7 +5963,8 @@ def test_update_preservation_reinforcement_single_concept_does_not_invent_other_
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={"detail": "Claude Code 本轮补充产品发布速度。"},
+                summary="Claude Code 本轮补充产品发布速度。",
+                body_markdown=draft_body(detail="Claude Code 本轮补充产品发布速度。"),
                 change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
@@ -6011,7 +5994,7 @@ def test_update_preservation_reinforcement_single_concept_does_not_invent_other_
 
     reinforced, _report = pipeline_module.reinforce_update_preservation(draft, pack)
 
-    body = reinforced.pages[0].section_bodies["detail"]
+    body = reinforced.pages[0].body_markdown
     assert pipeline_module.update_preservation_issues(reinforced, pack) == []
     assert "Managed Agents / 托管智能体" in body
     assert "会话/持久上下文" not in body
@@ -6062,6 +6045,56 @@ def test_update_preservation_pack_records_concept_obligations() -> None:
     assert "安全边界/权限限制" in labels
     assert detail["min_required_concept_matches"] >= 3
     assert detail["min_required_matches"] == 0
+
+
+def test_update_preservation_pack_reads_current_core_content_section() -> None:
+    item = pipeline_module.WikiMergePlanItem(
+        page_plan_id="PP-UPDATE",
+        source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
+        action="update",
+        canonical_target_path="entities/Entity_Claude Code.md",
+        display_title="Claude Code",
+        page_type="entity",
+        new_understanding="补充产品视角。",
+        section_plans={"detail": "详情"},
+        reason="测试当前正式页核心内容保留。",
+        matched_page="entities/Entity_Claude Code.md",
+    )
+    snapshot = pipeline_module.WikiContextSnapshot(
+        log_date="2026-06-06",
+        source_target_path="sources/Source_Test.md",
+        entries=[
+            pipeline_module.WikiContextEntry(
+                path="wiki/entities/Entity_Claude Code.md",
+                expected_state="present",
+                preimage_sha256="old",
+                content=(
+                    "---\nllmwiki_type: entity\ntitle: Claude Code\nsummary: 旧页。\n---\n\n"
+                    "# Claude Code\n\n"
+                    "## 摘要\n\n旧页摘要。\n\n"
+                    "## 核心内容\n\n"
+                    "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。\n\n"
+                    "### 例子\n\n旧页还记录了 Claude Code 可作为 harness 示例承接托管智能体任务。\n\n"
+                    "## 相关页面\n\n- [[entities/Entity_Anthropic|Anthropic]]\n\n"
+                    "## 矛盾与未决问题\n\n暂无矛盾与未决问题记录。\n"
+                ),
+            )
+        ],
+    )
+
+    pack = pipeline_module.build_update_preservation_pack(
+        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        snapshot,
+    )
+
+    sections = {section["section_key"]: section for section in pack["pages"][0]["sections"]}
+    core = sections["core_content"]
+    assert core["section_key"] == "core_content"
+    assert "Managed Agents / harness" in core["old_text"]
+    assert "Claude Code 可作为 harness 示例" in core["old_text"]
+    labels = [concept["label"] for concept in core["concept_obligations"]]
+    assert "Managed Agents / 托管智能体" in labels
+    assert "harness / 适配框架" in labels
 
 
 def test_update_preservation_concepts_do_not_match_bare_session_substrings() -> None:
@@ -6257,8 +6290,9 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={"detail": "Claude Code 延续 Managed Agents 产品视角，但这里只讨论发布速度。"},
-                change_summary="更新。",
+                summary="Claude Code 延续 Managed Agents 产品视角。",
+                body_markdown=draft_body(detail="Claude Code 延续 Managed Agents 产品视角，但这里只讨论发布速度。"),
+                change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
         ]
@@ -6325,8 +6359,9 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={"detail": "Claude Code 延续 Managed Agents 产品视角，但这里只讨论发布速度。"},
-                change_summary="更新。",
+                summary="Claude Code 延续 Managed Agents 产品视角。",
+                body_markdown=draft_body(detail="Claude Code 延续 Managed Agents 产品视角，但这里只讨论发布速度。"),
+                change_summary="补充产品视角。",
                 source_coverage_notes="测试。",
             )
         ]
@@ -6810,7 +6845,7 @@ def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
     )
 
     section_keys = [section["section_key"] for section in pack["pages"][0]["sections"]]
-    assert section_keys == ["detail"]
+    assert section_keys == ["detail", "examples"]
     assert pack["pages"][0]["sections"][0]["min_required_matches"] == 0
 
 
@@ -6855,8 +6890,9 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={"detail": "新材料只讨论待办事项列表和发布速度。"},
-                change_summary="更新。",
+                summary="新材料只讨论待办事项列表和发布速度。",
+                body_markdown=draft_body(detail="新材料只讨论待办事项列表和发布速度。"),
+                change_summary="补充待办事项列表和发布速度。",
                 source_coverage_notes="测试。",
             )
         ]
@@ -6940,7 +6976,8 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
                 action="update",
                 canonical_target_path="concepts/Concept_X.md",
                 preimage_sha256="old",
-                section_bodies={"summary": "模型新摘要。", "detail": "模型新详情。"},
+                summary="模型新摘要。",
+                body_markdown=draft_body(detail="模型新详情。"),
                 change_summary="更新页面。",
                 source_coverage_notes="测试。",
             )
@@ -7258,10 +7295,8 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 page_plan_id="PP-CLAUDE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude_Code.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "open_questions": "Claude Code的产品体验提升会不会掩盖harness安全边界的重要性？Eval的设计如何避免过度拟合？",
-                },
+                summary="摘要。",
+                open_questions="Claude Code的产品体验提升会不会掩盖harness安全边界的重要性？Eval的设计如何避免过度拟合？",
                 change_summary="更新。",
                 source_coverage_notes="测试。",
             ),
@@ -7269,10 +7304,8 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 page_plan_id="PP-ITERATION",
                 action="create",
                 canonical_target_path="concepts/Concept_AI产品快速迭代.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "open_questions": "快速迭代是否可能牺牲长期质量或安全？研究预览策略如何管理用户预期？流程扩展到更大团队时是否仍有效？",
-                },
+                summary="摘要。",
+                open_questions="快速迭代是否可能牺牲长期质量或安全？研究预览策略如何管理用户预期？流程扩展到更大团队时是否仍有效？",
                 change_summary="创建。",
                 source_coverage_notes="测试。",
             ),
@@ -7280,10 +7313,8 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 page_plan_id="PP-EVAL",
                 action="create",
                 canonical_target_path="concepts/Concept_Eval.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "open_questions": "1. Eval的维护成本是否随产品复杂度线性增长？",
-                },
+                summary="摘要。",
+                open_questions="1. Eval的维护成本是否随产品复杂度线性增长？",
                 change_summary="创建。",
                 source_coverage_notes="测试。",
             ),
@@ -7465,7 +7496,7 @@ def test_create_draft_with_raw_contradiction_stops_at_draft_review(tmp_path: Pat
         if name == "raw_prepare.json":
             data["prepared_markdown"] += "\n\nAnthropic 收购了 OpenAI。"
         if name == "draft_rendering.json":
-            data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
+            data["pages"][0]["body_markdown"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug="grounding")
@@ -7572,11 +7603,8 @@ def test_grounding_examples_do_not_require_raw_exact_match_for_generic_prompts()
                 page_plan_id="PP-X",
                 action="create",
                 canonical_target_path="concepts/Concept_X.md",
-                section_bodies={
-                    "summary": "示例提示。",
-                    "detail": "这个页面说明如何处理通用问题。",
-                    "examples": "- “公司报销政策是什么？”\n- “你是一位客服代表，用礼貌的语气回答。”",
-                },
+                summary="示例提示。",
+                body_markdown=draft_body(detail="这个页面说明如何处理通用问题。", examples="- “公司报销政策是什么？”\n- “你是一位客服代表，用礼貌的语气回答。”"),
                 change_summary="创建示例提示页面。",
                 source_coverage_notes="测试。",
             )
@@ -7622,11 +7650,8 @@ def build_examples_grounding_case(
                 page_plan_id="PP-EXAMPLES",
                 action="create",
                 canonical_target_path="concepts/Concept_Examples.md",
-                section_bodies={
-                    "summary": "例子页。",
-                    "detail": detail,
-                    "examples": examples,
-                },
+                summary="例子页。",
+                body_markdown=draft_body(detail=detail, examples=examples),
                 change_summary="创建例子页。",
                 source_coverage_notes="测试。",
             )
@@ -7689,7 +7714,7 @@ def test_cleanup_unsupported_example_literals_replaces_identifier_placeholder() 
     assert [claim.text for claim in review_before.warnings] == ["ABC123"]
     assert report["changed"] is False
     assert report["replacement_count"] == 0
-    assert "ABC123" in cleaned.pages[0].section_bodies["examples"]
+    assert "ABC123" in cleaned.pages[0].body_markdown
     assert not review_after.requires_review
 
 
@@ -7707,7 +7732,7 @@ def test_cleanup_unsupported_example_literals_replaces_time_period_placeholder()
 
     assert report["changed"] is False
     assert report["replacement_count"] == 0
-    assert "2025年第三季度" in cleaned.pages[0].section_bodies["examples"]
+    assert "2025年第三季度" in cleaned.pages[0].body_markdown
     assert not pipeline_module.build_draft_grounding_review(cleaned, plan, snapshot, "").requires_review
 
 
@@ -8245,6 +8270,29 @@ def test_grounding_severe_factual_relationship_blocks_when_raw_contradicts() -> 
 
     assert review.requires_review is True
     assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic。"]
+    assert "明显不符" in review.unsupported_new_facts[0].reason
+
+
+def test_grounding_scans_body_markdown_heading_text_for_contradictions() -> None:
+    _draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
+    draft = pipeline_module.DraftRenderingArtifact(
+        pages=[
+            pipeline_module.DraftPageItem(
+                page_plan_id="PP-EXAMPLES",
+                action="create",
+                canonical_target_path="concepts/Concept_Examples.md",
+                summary="标题里的事实关系也需要来源一致。",
+                body_markdown="### OpenAI 收购了 Anthropic\n\n正文只补充说明这个标题。",
+                change_summary="创建页面。",
+                source_coverage_notes="测试。",
+            )
+        ]
+    )
+
+    review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "Anthropic 收购了 OpenAI。")
+
+    assert review.requires_review is True
+    assert [claim.text for claim in review.unsupported_new_facts] == ["OpenAI 收购了 Anthropic"]
     assert "明显不符" in review.unsupported_new_facts[0].reason
 
 
@@ -8911,9 +8959,9 @@ def test_grounding_unquoted_dynamic_scenario_scanner_ignores_quoted_claims() -> 
 def test_grounding_unquoted_dynamic_scenario_scanner_ignores_open_questions_section() -> None:
     draft, plan, snapshot = build_examples_grounding_case("暂无相关例子记录。")
     page = draft.pages[0]
-    section_bodies = dict(page.section_bodies)
-    section_bodies["open_questions"] = "- 待补来源：用户订单状态场景是否适合语义缓存？"
-    draft = draft.model_copy(update={"pages": [page.model_copy(update={"section_bodies": section_bodies})]})
+    draft = draft.model_copy(
+        update={"pages": [page.model_copy(update={"open_questions": "- 待补来源：用户订单状态场景是否适合语义缓存？"})]}
+    )
     review = pipeline_module.build_draft_grounding_review(draft, plan, snapshot, "")
 
     assert review.requires_review is False
@@ -9121,11 +9169,8 @@ def test_grounding_examples_hard_facts_warn_without_support() -> None:
                 page_plan_id="PP-FACT-EXAMPLE",
                 action="create",
                 canonical_target_path="concepts/Concept_Fact_Example.md",
-                section_bodies={
-                    "summary": "事实例子。",
-                    "detail": "这个页面说明事实型例子需要来源。",
-                    "examples": "- “销量增长三倍”",
-                },
+                summary="事实例子。",
+                body_markdown=draft_body(detail="这个页面说明事实型例子需要来源。", examples="- “销量增长三倍”"),
                 change_summary="创建事实例子页面。",
                 source_coverage_notes="测试。",
             )
@@ -9180,11 +9225,8 @@ def test_grounding_detail_illustrative_examples_do_not_require_raw_exact_match()
                 page_plan_id="PP-STYLE",
                 action="create",
                 canonical_target_path="concepts/Concept_Style.md",
-                section_bodies={
-                    "summary": "写作风格示例。",
-                    "detail": "解释性风格提供理由，如“因为性能原因，使用列表推导”；条件性风格指定条件，如“如果代码量超过 100 行，请拆分”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="写作风格示例。",
+                body_markdown=draft_body(detail="解释性风格提供理由，如“因为性能原因，使用列表推导”；条件性风格指定条件，如“如果代码量超过 100 行，请拆分”。", examples="暂无相关例子记录。"),
                 change_summary="创建写作风格页面。",
                 source_coverage_notes="测试。",
             )
@@ -9231,11 +9273,8 @@ def test_grounding_memory_example_questions_do_not_require_raw_exact_match() -> 
                 page_plan_id="PP-MEMORY",
                 action="create",
                 canonical_target_path="concepts/Concept_记忆评估示例.md",
-                section_bodies={
-                    "summary": "MemBench 用短样例解释不同记忆任务。",
-                    "detail": "事实记忆的问题示例包括“用户哥哥的名字是什么？”，反思记忆示例包括“用户喜欢重口味”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="MemBench 用短样例解释不同记忆任务。",
+                body_markdown=draft_body(detail="事实记忆的问题示例包括“用户哥哥的名字是什么？”，反思记忆示例包括“用户喜欢重口味”。", examples="暂无相关例子记录。"),
                 change_summary="创建记忆评估示例页面。",
                 source_coverage_notes="测试。",
             )
@@ -9283,15 +9322,10 @@ def test_grounding_detail_memory_examples_do_not_require_raw_exact_match() -> No
                 page_plan_id="PP-MEM-DETAIL",
                 action="create",
                 canonical_target_path="concepts/Concept_Memory_Detail.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": (
-                        "事实记忆的子任务包括单跳（如“用户表哥的名字？”）和知识更新"
+                summary="摘要。",
+                body_markdown=draft_body(detail="事实记忆的子任务包括单跳（如“用户表哥的名字？”）和知识更新"
                         "（如“用户修改了年龄后，现在多大？”）。在参与场景中，例如，用户说"
-                        "“我的表哥Ethan身高162cm”，智能体回应“明白了，Ethan身高162厘米”。"
-                    ),
-                    "examples": "暂无相关例子记录。",
-                },
+                        "“我的表哥Ethan身高162cm”，智能体回应“明白了，Ethan身高162厘米”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -9344,11 +9378,8 @@ def test_grounding_short_concept_phrases_do_not_require_raw_exact_match() -> Non
                 page_plan_id="PP-SCALING",
                 action="create",
                 canonical_target_path="concepts/Concept_Scaling.md",
-                section_bodies={
-                    "summary": "页面围绕“宠物 vs 牛”和“解耦大脑与双手”两个概念展开。",
-                    "detail": "还保留“会话作为持久上下文对象”这个标题式表达。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="页面围绕“宠物 vs 牛”和“解耦大脑与双手”两个概念展开。",
+                body_markdown=draft_body(detail="还保留“会话作为持久上下文对象”这个标题式表达。", examples="暂无相关例子记录。"),
                 change_summary="创建 Scaling 页面。",
                 source_coverage_notes="测试。",
             )
@@ -9445,11 +9476,8 @@ def test_grounding_external_backing_claim_uses_trigger_sentence() -> None:
                 page_plan_id="PP-EVAL",
                 action="create",
                 canonical_target_path="concepts/Concept_Eval.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "在Anthropic，评估被广泛使用于产品开发。Cat Wu指出，评估的重要性因功能而异。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="在Anthropic，评估被广泛使用于产品开发。Cat Wu指出，评估的重要性因功能而异。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -9551,11 +9579,8 @@ def test_grounding_external_backing_detects_adoption_and_best_practice_real_path
                 page_plan_id="PP-REDIS",
                 action="create",
                 canonical_target_path="concepts/Concept_Redis.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "Redis 被广泛采用作为缓存和消息代理。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="Redis 被广泛采用作为缓存和消息代理。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             ),
@@ -9563,11 +9588,9 @@ def test_grounding_external_backing_detects_adoption_and_best_practice_real_path
                 page_plan_id="PP-SEARCH",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_混合搜索策略.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "整理仍需确认的策略问题。",
-                    "open_questions": "- 目前是否存在最佳实践？",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="整理仍需确认的策略问题。"),
+                open_questions="- 目前是否存在最佳实践？",
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             ),
@@ -9642,11 +9665,8 @@ def test_grounding_external_backing_quote_only_detail_does_not_bypass_as_concept
                 page_plan_id="PP-REDIS",
                 action="create",
                 canonical_target_path="concepts/Concept_Redis.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "主题写成“Redis 被广泛采用”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="主题写成“Redis 被广泛采用”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -9695,11 +9715,8 @@ def test_grounding_external_backing_supported_quote_does_not_hide_later_unsuppor
                 page_plan_id="PP-REDIS",
                 action="create",
                 canonical_target_path="concepts/Concept_Redis.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "材料写到“Redis 被广泛采用作为缓存”，因此 MongoDB 被广泛采用。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="材料写到“Redis 被广泛采用作为缓存”，因此 MongoDB 被广泛采用。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -9760,11 +9777,8 @@ def test_grounding_external_backing_supported_quote_does_not_hide_different_late
                 page_plan_id="PP-REDIS",
                 action="create",
                 canonical_target_path="concepts/Concept_Redis.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"材料写到“Redis 被广泛采用作为缓存”，{outside_claim}",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"材料写到“Redis 被广泛采用作为缓存”，{outside_claim}", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -9813,11 +9827,8 @@ def test_grounding_external_backing_does_not_flag_internal_multiple_components()
                 page_plan_id="PP-MANY-HANDS",
                 action="create",
                 canonical_target_path="concepts/Concept_Many_Hands.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "一个沙箱可以被多个适配框架共享以保持状态一致性。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="一个沙箱可以被多个适配框架共享以保持状态一致性。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -9868,11 +9879,8 @@ def test_grounding_flags_unsupported_scope_speculation() -> None:
                 page_plan_id="PP-COWORK",
                 action="create",
                 canonical_target_path="entities/Entity_Cowork.md",
-                section_bodies={
-                    "summary": "Cowork 是知识工作产品。",
-                    "detail": "Cowork 用于综合信息和创建文档。",
-                    "additional_notes": "源代码泄露事件中，Cowork 的组件可能也受到影响，但访谈中未详细说明。",
-                },
+                summary="Cowork 是知识工作产品。",
+                body_markdown=draft_body(detail="Cowork 用于综合信息和创建文档。", additional_notes="源代码泄露事件中，Cowork 的组件可能也受到影响，但访谈中未详细说明。"),
                 change_summary="创建 Cowork 页面。",
                 source_coverage_notes="测试。",
             )
@@ -9925,11 +9933,9 @@ def test_grounding_scope_speculation_allows_open_question() -> None:
                 page_plan_id="PP-QUESTION",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_发布一致性.md",
-                section_bodies={
-                    "summary": "快速发布和产品一致性之间存在张力。",
-                    "detail": "访谈提到团队追求快速发布。",
-                    "open_questions": "快速发布是否可能影响长期产品一致性？",
-                },
+                summary="快速发布和产品一致性之间存在张力。",
+                body_markdown=draft_body(detail="访谈提到团队追求快速发布。"),
+                open_questions="快速发布是否可能影响长期产品一致性？",
                 change_summary="创建未决问题页面。",
                 source_coverage_notes="测试。",
             )
@@ -9973,7 +9979,8 @@ def test_grounding_open_question_repair_message_moves_speculation_to_open_questi
 
     message = pipeline_module.grounding_issue_message(claim)
 
-    assert "section_bodies.open_questions" in message
+    assert "open_questions" in message
+    assert "section_bodies" not in message
     assert "改写成问题" in message
     assert "待补来源" in message
     assert "detail/examples" in message
@@ -9999,11 +10006,8 @@ def test_grounding_external_backing_accepts_english_widely_used_anchor() -> None
                 page_plan_id="PP-NYU-CTF",
                 action="create",
                 canonical_target_path="entities/Entity_NYU CTF Bench.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "NYU CTF Bench 被广泛用于评估 LLM 智能体在网络安全任务中的表现。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="NYU CTF Bench 被广泛用于评估 LLM 智能体在网络安全任务中的表现。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10055,10 +10059,8 @@ def test_grounding_external_backing_accepts_widely_across_tasks_anchor() -> None
                 page_plan_id="PP-CLAUDE-CODE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "Claude Code 是 Anthropic 开发的 harness，在团队内部被广泛使用。",
-                    "detail": "Claude Code 作为 Managed Agents 的一个 harness 示例，被广泛用于多种任务。",
-                },
+                summary="Claude Code 是 Anthropic 开发的 harness，在团队内部被广泛使用。",
+                body_markdown=draft_body(detail="Claude Code 作为 Managed Agents 的一个 harness 示例，被广泛用于多种任务。"),
                 change_summary="更新页面。",
                 source_coverage_notes="测试。",
             )
@@ -10108,10 +10110,8 @@ def test_grounding_external_backing_accepts_retained_existing_fact_with_bridge_p
                 page_plan_id="PP-CLAUDE-CODE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "Claude Code 是 Anthropic 开发的一款编程助手产品。",
-                    "detail": "从 Managed Agents / 托管智能体 等旧页视角看，本材料将 Claude Code 描述为“出色的 harness”，在各种任务中广泛使用。",
-                },
+                summary="Claude Code 是 Anthropic 开发的一款编程助手产品。",
+                body_markdown=draft_body(detail="从 Managed Agents / 托管智能体 等旧页视角看，本材料将 Claude Code 描述为“出色的 harness”，在各种任务中广泛使用。"),
                 change_summary="更新页面。",
                 source_coverage_notes="测试。",
             )
@@ -10160,11 +10160,8 @@ def test_grounding_external_backing_uses_same_line_pronoun_context() -> None:
                 page_plan_id="PP-NYU-PRONOUN",
                 action="create",
                 canonical_target_path="entities/Entity_NYU CTF Bench.md",
-                section_bodies={
-                    "summary": "NYU CTF Bench 是用于评估 LLM 智能体的 CTF 基准。它被广泛使用，但存在数据污染风险。",
-                    "detail": "静态 CTF 基准可能高估模型表现，实时 CTF 可以降低公开题解带来的污染。",
-                    "examples": "例如，公开 write-up 会影响静态题库。",
-                },
+                summary="NYU CTF Bench 是用于评估 LLM 智能体的 CTF 基准。它被广泛使用，但存在数据污染风险。",
+                body_markdown=draft_body(detail="静态 CTF 基准可能高估模型表现，实时 CTF 可以降低公开题解带来的污染。", examples="例如，公开 write-up 会影响静态题库。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10215,11 +10212,8 @@ def test_grounding_external_backing_requires_specific_anchor_not_only_generic_wi
                 page_plan_id="PP-FAKE-BENCH",
                 action="create",
                 canonical_target_path="entities/Entity_FooBench.md",
-                section_bodies={
-                    "summary": "FooBench 是用于评估 LLM 智能体的基准。它被广泛使用，但存在数据污染风险。",
-                    "detail": "静态基准可能高估模型表现。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="FooBench 是用于评估 LLM 智能体的基准。它被广泛使用，但存在数据污染风险。",
+                body_markdown=draft_body(detail="静态基准可能高估模型表现。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10268,11 +10262,8 @@ def test_grounding_quoted_conceptual_release_process_is_not_direct_quote() -> No
                 page_plan_id="PP-RESEARCH-PREVIEW",
                 action="create",
                 canonical_target_path="designs/Design_Research_Preview.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "该模式与“可重复发布流程”和“设定清晰目标”形成配套。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="该模式与“可重复发布流程”和“设定清晰目标”形成配套。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10321,11 +10312,8 @@ def test_grounding_quoted_product_choice_label_context_is_not_direct_quote() -> 
                 page_plan_id="PP-PRODUCT-CHOICE",
                 action="create",
                 canonical_target_path="concepts/Concept_Claude_Code_Cowork_Choice.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"本概念源自访谈中关于“{quote}”的讨论。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"本概念源自访谈中关于“{quote}”的讨论。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10374,11 +10362,8 @@ def test_grounding_concept_label_after_broad_mention_is_not_direct_quote() -> No
                 page_plan_id="PP-HARNESS",
                 action="create",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"文中提到它是“{quote}”，展示了元适配框架可以容纳不同类型的 harness。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"文中提到它是“{quote}”，展示了元适配框架可以容纳不同类型的 harness。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10427,11 +10412,8 @@ def test_grounding_attributed_concept_label_is_not_dequoted_or_bypassed() -> Non
                 page_plan_id="PP-ATTRIBUTED-LABEL",
                 action="create",
                 canonical_target_path="concepts/Concept_Context_Object.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"文中称“{quote}”，因此该页面保留这个概念。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"文中称“{quote}”，因此该页面保留这个概念。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10459,7 +10441,7 @@ def test_grounding_attributed_concept_label_is_not_dequoted_or_bypassed() -> Non
     )
 
     assert report["changed"] is False
-    assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
+    assert f"“{quote}”" in rewritten.pages[0].body_markdown
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == [quote]
 
@@ -10483,11 +10465,8 @@ def test_grounding_attributed_concept_label_with_punctuation_is_not_bypassed() -
                 page_plan_id="PP-ATTRIBUTED-PUNCTUATION",
                 action="create",
                 canonical_target_path="concepts/Concept_Context_Object.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"文中称：“{quote}”，因此该页面保留这个概念。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"文中称：“{quote}”，因此该页面保留这个概念。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10515,7 +10494,7 @@ def test_grounding_attributed_concept_label_with_punctuation_is_not_bypassed() -
     )
 
     assert report["changed"] is False
-    assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
+    assert f"“{quote}”" in rewritten.pages[0].body_markdown
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == [quote]
 
@@ -10539,11 +10518,8 @@ def test_grounding_quoted_abstract_trend_label_context_is_not_direct_quote() -> 
                 page_plan_id="PP-PM-SKILLS",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_AI_PM_Skills.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"本问题源自她提到的“{quote}”的趋势。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"本问题源自她提到的“{quote}”的趋势。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10591,11 +10567,8 @@ def test_grounding_explicit_direct_quote_mismatch_warns_without_review() -> None
                 page_plan_id="PP-QUOTE",
                 action="create",
                 canonical_target_path="concepts/Concept_Quote.md",
-                section_bodies={
-                    "summary": "原文说“解耦大脑与双手”。",
-                    "detail": "暂无更多细节。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="原文说“解耦大脑与双手”。",
+                body_markdown=draft_body(detail="暂无更多细节。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10644,11 +10617,8 @@ def test_grounding_direct_quote_accepts_normalized_source_match() -> None:
                 page_plan_id="PP-PAPER",
                 action="create",
                 canonical_target_path="designs/Design_Paper.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"源摘录中提到“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"源摘录中提到“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10702,11 +10672,8 @@ def test_grounding_direct_quote_accepts_time_range_transcript_variant() -> None:
                 page_plan_id="PP-PM-ROLE",
                 action="create",
                 canonical_target_path="concepts/Concept_PM角色演变.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"Cat Wu提到，PM的工作是“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"Cat Wu提到，PM的工作是“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10787,11 +10754,8 @@ def test_grounding_direct_quote_time_range_variant_requires_same_numbers() -> No
                 page_plan_id="PP-PM-ROLE",
                 action="create",
                 canonical_target_path="concepts/Concept_PM角色演变.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"Cat Wu提到，PM的工作是“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"Cat Wu提到，PM的工作是“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10840,11 +10804,8 @@ def test_grounding_short_domain_quote_accepts_normalized_source_match() -> None:
                 page_plan_id="PP-CLAUDE-CODE",
                 action="create",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"源材料在正文中提到，Claude Code 已经作为“{quote}”被集成到 Managed Agents 架构中。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"源材料在正文中提到，Claude Code 已经作为“{quote}”被集成到 Managed Agents 架构中。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10895,11 +10856,8 @@ def test_grounding_domain_quote_accepts_source_match_with_parenthetical_translat
                 page_plan_id="PP-CLAUDE-CODE-LONG",
                 action="create",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"原文提到“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"原文提到“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -10950,11 +10908,8 @@ def test_grounding_short_numeric_quote_accepts_exact_numeric_source_match() -> N
                 page_plan_id="PP-BORIS",
                 action="create",
                 canonical_target_path="entities/Entity_Boris Cherny.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"Cat 形容他们的合作“{quote}”，剩余 20% 由各自在意的事情驱动。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"Cat 形容他们的合作“{quote}”，剩余 20% 由各自在意的事情驱动。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11005,11 +10960,8 @@ def test_grounding_short_numeric_quote_does_not_match_decimal_collapse() -> None
                 page_plan_id="PP-BORIS",
                 action="create",
                 canonical_target_path="entities/Entity_Boris Cherny.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"Cat 形容他们的合作“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"Cat 形容他们的合作“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11062,14 +11014,9 @@ def test_grounding_ascii_closing_quote_is_not_treated_as_new_quote_start() -> No
                 page_plan_id="PP-PETS-CATTLE",
                 action="create",
                 canonical_target_path="concepts/Concept_Pets_Cattle.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": (
-                        '解耦后，container 变成"牲畜"——如果它死了，harness 将失败捕获为工具调用错误，'
-                        f'传回 Claude。原文描述："{quote}"'
-                    ),
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail='解耦后，container 变成"牲畜"——如果它死了，harness 将失败捕获为工具调用错误，'
+                        f'传回 Claude。原文描述："{quote}"', examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11117,11 +11064,8 @@ def test_grounding_quoted_evaluation_question_template_is_not_direct_quote() -> 
                 page_plan_id="PP-EVAL-QUESTION",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_Eval.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": "不是“是否回答正确”，而是“在多少比例下用户满意”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes="不是“是否回答正确”，而是“在多少比例下用户满意”。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11170,11 +11114,8 @@ def test_grounding_quoted_compact_paraphrase_uses_nearby_source_support() -> Non
                 page_plan_id="PP-FAST-ITERATION",
                 action="create",
                 canonical_target_path="concepts/Concept_Fast_Iteration.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"设定清晰目标（如“{quote}”）可以减少 LLM 通用性带来的模糊。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"设定清晰目标（如“{quote}”）可以减少 LLM 通用性带来的模糊。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11230,11 +11171,8 @@ def test_grounding_quoted_method_goal_paraphrase_uses_nearby_source_support() ->
                 page_plan_id="PP-FAST-SHIPPING",
                 action="create",
                 canonical_target_path="concepts/Concept_Fast_Shipping.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"PM 关注的是“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"PM 关注的是“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11290,11 +11228,8 @@ def test_grounding_quoted_method_goal_paraphrase_warns_without_nearby_support() 
                 page_plan_id="PP-FAST-SHIPPING",
                 action="create",
                 canonical_target_path="concepts/Concept_Fast_Shipping.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"PM 关注的是“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"PM 关注的是“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11342,11 +11277,8 @@ def test_grounding_numeric_reliability_paraphrase_rewrites_to_source_sentence() 
                 page_plan_id="PP-AUTOMATION-RELIABILITY",
                 action="create",
                 canonical_target_path="concepts/Concept_AI自动化可靠性.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": "100%可靠性原则也适用于AI产品自身的质量，正如Cat Wu所说“95%对AI来说就是失败”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes="100%可靠性原则也适用于AI产品自身的质量，正如Cat Wu所说“95%对AI来说就是失败”。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11367,7 +11299,7 @@ def test_grounding_numeric_reliability_paraphrase_rewrites_to_source_sentence() 
     )
 
     rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, raw)
-    body = rewritten.pages[0].section_bodies["additional_notes"]
+    body = rewritten.pages[0].body_markdown
     review = pipeline_module.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
@@ -11401,11 +11333,8 @@ def test_grounding_numeric_reliability_paraphrase_warns_without_source_sentence(
                 page_plan_id="PP-AUTOMATION-RELIABILITY",
                 action="create",
                 canonical_target_path="concepts/Concept_AI自动化可靠性.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"正如Cat Wu所说“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"正如Cat Wu所说“{quote}”。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11444,11 +11373,8 @@ def test_grounding_rewrite_translates_known_english_harness_quote() -> None:
                 page_plan_id="PP-CLAUDE-CODE",
                 action="create",
                 canonical_target_path="entities/Entity_Claude Code.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "Claude Code 被描述为“an excellent harness that provides a focused coding experience”，可接入 Managed Agents。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="Claude Code 被描述为“an excellent harness that provides a focused coding experience”，可接入 Managed Agents。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11456,7 +11382,7 @@ def test_grounding_rewrite_translates_known_english_harness_quote() -> None:
     )
 
     rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    body = rewritten.pages[0].section_bodies["detail"]
+    body = rewritten.pages[0].body_markdown
 
     assert report["changed"] is True
     assert "an excellent harness" not in body
@@ -11482,11 +11408,8 @@ def test_grounding_rewrite_dequotes_internal_digest_paraphrase() -> None:
                 page_plan_id="PP-SECURITY",
                 action="create",
                 canonical_target_path="designs/Design_Security.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"该设计对应 approved_digest 中 D001 的 why_matters 描述：“{quote}”",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"该设计对应 approved_digest 中 D001 的 why_matters 描述：“{quote}”"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11506,7 +11429,7 @@ def test_grounding_rewrite_dequotes_internal_digest_paraphrase() -> None:
     )
 
     rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "")
-    body = rewritten.pages[0].section_bodies["additional_notes"]
+    body = rewritten.pages[0].body_markdown
     review = pipeline_module.build_draft_grounding_review(
         rewritten,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
@@ -11540,11 +11463,8 @@ def test_grounding_rewrite_dequotes_non_explicit_scope_paraphrase() -> None:
                 page_plan_id="PP-CONTEXT",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_Context.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"本材料中提到“{quote}”，这正是该问题的来源。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"本材料中提到“{quote}”，这正是该问题的来源。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11572,7 +11492,7 @@ def test_grounding_rewrite_dequotes_non_explicit_scope_paraphrase() -> None:
     )
 
     assert report["changed"] is True
-    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["additional_notes"]
+    assert f"“{quote}”" not in rewritten.pages[0].body_markdown
     assert review.requires_review is False
 
 
@@ -11598,11 +11518,8 @@ def test_grounding_rewrite_dequotes_long_non_explicit_paraphrase_with_fact_marke
                 page_plan_id="PP-MANY-HANDS",
                 action="create",
                 canonical_target_path="concepts/Concept_Many_Hands.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"材料指出：“{quote}”解耦后，资源可以位于任何位置。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"材料指出：“{quote}”解耦后，资源可以位于任何位置。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11630,7 +11547,7 @@ def test_grounding_rewrite_dequotes_long_non_explicit_paraphrase_with_fact_marke
     )
 
     assert report["changed"] is True
-    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["detail"]
+    assert f"“{quote}”" not in rewritten.pages[0].body_markdown
     assert review.requires_review is False
 
 
@@ -11653,11 +11570,8 @@ def test_grounding_rewrite_dequotes_open_question_quote_with_growth_marker() -> 
                 page_plan_id="PP-LOG-GROWTH",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_Log_Growth.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"该开放问题来自来源材料中明确提到的“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"该开放问题来自来源材料中明确提到的“{quote}”。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11685,7 +11599,7 @@ def test_grounding_rewrite_dequotes_open_question_quote_with_growth_marker() -> 
     )
 
     assert report["changed"] is True
-    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["additional_notes"]
+    assert f"“{quote}”" not in rewritten.pages[0].body_markdown
     assert review.requires_review is False
 
 
@@ -11708,11 +11622,8 @@ def test_grounding_rewrite_dequotes_source_local_context_window_paraphrase() -> 
                 page_plan_id="PP-CONTEXT-WINDOW",
                 action="create",
                 canonical_target_path="open_questions/Open_Question_Context_Window.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": "暂无更多细节。",
-                    "examples": f"原文提到“{quote}”，但未说明未来原生长上下文是否会改变当前架构。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail="暂无更多细节。", examples=f"原文提到“{quote}”，但未说明未来原生长上下文是否会改变当前架构。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11740,7 +11651,7 @@ def test_grounding_rewrite_dequotes_source_local_context_window_paraphrase() -> 
     )
 
     assert report["changed"] is True
-    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["examples"]
+    assert f"“{quote}”" not in rewritten.pages[0].body_markdown
     assert review.requires_review is False
 
 
@@ -11752,11 +11663,8 @@ def test_grounding_rewrite_dequotes_short_slogan_label() -> None:
                 page_plan_id="PP-META-CULTURE",
                 action="create",
                 canonical_target_path="comparisons/Comparison_Meta_Culture.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"Meta 速度实验驱动：推崇“{quote}”，产品决策依赖 A/B 测试和快速迭代。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"Meta 速度实验驱动：推崇“{quote}”，产品决策依赖 A/B 测试和快速迭代。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11769,8 +11677,8 @@ def test_grounding_rewrite_dequotes_short_slogan_label() -> None:
     )
 
     assert report["changed"] is True
-    assert f"“{quote}”" not in rewritten.pages[0].section_bodies["detail"]
-    assert "推崇快速行动，打破常规" in rewritten.pages[0].section_bodies["detail"]
+    assert f"“{quote}”" not in rewritten.pages[0].body_markdown
+    assert "推崇快速行动，打破常规" in rewritten.pages[0].body_markdown
 
 
 def test_grounding_rewrite_does_not_dequote_short_hard_fact_label() -> None:
@@ -11781,11 +11689,8 @@ def test_grounding_rewrite_does_not_dequote_short_hard_fact_label() -> None:
                 page_plan_id="PP-HARD-FACT",
                 action="create",
                 canonical_target_path="concepts/Concept_Hard_Fact.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"报告称“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"报告称“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11795,7 +11700,7 @@ def test_grounding_rewrite_does_not_dequote_short_hard_fact_label() -> None:
     rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, "源材料没有这句话。")
 
     assert report["changed"] is False
-    assert f"“{quote}”" in rewritten.pages[0].section_bodies["detail"]
+    assert f"“{quote}”" in rewritten.pages[0].body_markdown
 
 
 def test_grounding_numeric_reliability_rewrite_does_not_match_decimal_percent() -> None:
@@ -11806,10 +11711,8 @@ def test_grounding_numeric_reliability_rewrite_does_not_match_decimal_percent() 
                 page_plan_id="PP-AUTOMATION-RELIABILITY",
                 action="create",
                 canonical_target_path="concepts/Concept_AI自动化可靠性.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"正如Cat Wu所说“{quote}”。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(additional_notes=f"正如Cat Wu所说“{quote}”。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11822,7 +11725,7 @@ def test_grounding_numeric_reliability_rewrite_does_not_match_decimal_percent() 
     )
 
     assert report["changed"] is False
-    assert rewritten.pages[0].section_bodies["additional_notes"] == draft.pages[0].section_bodies["additional_notes"]
+    assert rewritten.pages[0].body_markdown == draft.pages[0].body_markdown
 
 
 def test_grounding_attributed_paraphrase_warns_without_exact_match() -> None:
@@ -11844,11 +11747,8 @@ def test_grounding_attributed_paraphrase_warns_without_exact_match() -> None:
                 page_plan_id="PP-FAST-SHIPPING",
                 action="create",
                 canonical_target_path="concepts/Concept_Fast_Shipping.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"Cat Wu指出“{quote}”。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"Cat Wu指出“{quote}”。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11879,7 +11779,7 @@ def test_grounding_attributed_paraphrase_warns_without_exact_match() -> None:
     rewritten, report = pipeline_module.rewrite_grounding_sensitive_paraphrases(draft, raw)
 
     assert report["changed"] is False
-    assert rewritten.pages[0].section_bodies["detail"] == draft.pages[0].section_bodies["detail"]
+    assert rewritten.pages[0].body_markdown == draft.pages[0].body_markdown
     assert review.requires_review is False
     assert [claim.text for claim in review.warnings] == [quote]
 
@@ -11903,11 +11803,8 @@ def test_grounding_named_tool_concept_label_with_digits_is_not_direct_quote() ->
                 page_plan_id="PP-AGENT",
                 action="create",
                 canonical_target_path="concepts/Concept_AI_Agent.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"本页可与设计模式“{quote}”联动阅读。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"本页可与设计模式“{quote}”联动阅读。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -11956,11 +11853,8 @@ def test_grounding_named_tool_label_with_numeric_fact_warns_without_support() ->
                 page_plan_id="PP-AGENT-FACT",
                 action="create",
                 canonical_target_path="concepts/Concept_AI_Agent.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "additional_notes": f"本页暂以“{quote}”作为结构提示。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(examples="暂无相关例子记录。", additional_notes=f"本页暂以“{quote}”作为结构提示。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -12008,11 +11902,8 @@ def test_grounding_quoted_compact_paraphrase_warns_without_support_for_each_part
                 page_plan_id="PP-FAST-ITERATION",
                 action="create",
                 canonical_target_path="concepts/Concept_Fast_Iteration.md",
-                section_bodies={
-                    "summary": "摘要。",
-                    "detail": f"设定清晰目标（如“{quote}”）可以减少 LLM 通用性带来的模糊。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="摘要。",
+                body_markdown=draft_body(detail=f"设定清晰目标（如“{quote}”）可以减少 LLM 通用性带来的模糊。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -12060,11 +11951,8 @@ def test_grounding_short_fact_phrases_warn_without_exact_match() -> None:
                 page_plan_id="PP-FACT",
                 action="create",
                 canonical_target_path="concepts/Concept_Fact.md",
-                section_bodies={
-                    "summary": "结果包括例如“销量增长三倍”、“裁撤一半团队”和“预算超过百万”。",
-                    "detail": "暂无更多细节。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="结果包括例如“销量增长三倍”、“裁撤一半团队”和“预算超过百万”。",
+                body_markdown=draft_body(detail="暂无更多细节。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -12111,11 +11999,8 @@ def test_grounding_quoted_release_event_warns_without_exact_match() -> None:
                 page_plan_id="PP-RELEASE-FACT",
                 action="create",
                 canonical_target_path="concepts/Concept_Release_Fact.md",
-                section_bodies={
-                    "summary": "团队“发布了重大功能”。",
-                    "detail": "暂无更多细节。",
-                    "examples": "暂无相关例子记录。",
-                },
+                summary="团队“发布了重大功能”。",
+                body_markdown=draft_body(detail="暂无更多细节。", examples="暂无相关例子记录。"),
                 change_summary="创建页面。",
                 source_coverage_notes="测试。",
             )
@@ -12149,7 +12034,8 @@ def test_draft_page_item_coerces_quality_risks_string_to_list() -> None:
         page_plan_id="PP-RISK",
         action="create",
         canonical_target_path="concepts/Concept_Risk.md",
-        section_bodies={"summary": "摘要"},
+        summary="摘要",
+        body_markdown="风险页面正文。",
         change_summary="创建页面。",
         source_coverage_notes="测试。",
         quality_risks="样本范围有限；需要后续验证",
@@ -12165,7 +12051,7 @@ def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path:
     for name in ["raw_prepare.json", "source_digest.json", "candidate_resolution.json", "wiki_merge_planning.json"]:
         write_json(fixture_dir / name, read_json(FIXTURE_ROOT / "mock" / name))
     bad_draft = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")
-    bad_draft["pages"][0]["section_bodies"].pop("summary")
+    bad_draft["pages"][0].pop("summary")
     write_json(fixture_dir / "draft_rendering.1.json", bad_draft)
     write_json(fixture_dir / "draft_rendering.2.json", read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json"))
 
@@ -12178,8 +12064,11 @@ def test_draft_rendering_business_validation_repairs_before_persisting(tmp_path:
     assert manifest_after.status == OperationStatus.drafted
     assert repair_report["repair_count"] == 1
     assert repair_report["attempts"][0]["issues"][0]["issue_code"] == "missing_field"
+    assert repair_report["attempts"][0]["issues"][0]["field_path"] == "summary"
     assert repair_report["attempts"][1]["repair_prompt_ref"] == "repair_prompts/attempt-2.json"
-    assert (run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json").exists()
+    repair_prompt = read_json(run_dir / "draft_rendering" / "repair_prompts" / "attempt-2.json")
+    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["issues"], ensure_ascii=False)
+    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["schema"], ensure_ascii=False)
     assert any(ref.relative_path.endswith("repair_prompts/attempt-2.json") for ref in draft_step.outputs)
 
 
@@ -12336,8 +12225,14 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
         draft_page = json.loads(json.dumps(draft_template))
         draft_page["page_plan_id"] = page_plan_id
         draft_page["canonical_target_path"] = target_path
-        draft_page["section_bodies"]["summary"] = candidate["one_sentence_summary"]
-        draft_page["section_bodies"]["detail"] = f"{title} 的详情来自测试源材料。"
+        draft_page["summary"] = candidate["one_sentence_summary"]
+        draft_page["body_markdown"] = (
+            f"### 运行机制\n\n"
+            f"{title} 的详情来自测试源材料。它把一个独立流程环节放进可验证的 ingest 管线中，"
+            "例如可以用固定输入检查状态推进、artifact 写入和后续审核边界。\n\n"
+            "### 价值\n\n"
+            "这个主题的价值在于让批量渲染测试能区分相邻页面，避免多个页面挤成同一个泛化摘要。"
+        )
         draft_page["change_summary"] = f"创建 {title}。"
         draft_page["source_coverage_notes"] = f"覆盖 {candidate_id}。"
         draft_pages.append(draft_page)
@@ -12402,6 +12297,8 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
         draft_pages[4]["page_plan_id"],
         draft_pages[5]["page_plan_id"],
     ]
+    assert "section_bodies" not in json.dumps(repair_prompt["accepted_partial_pages"], ensure_ascii=False)
+    assert "section_bodies" not in json.dumps(repair_prompt["repair_contract"]["schema"], ensure_ascii=False)
     assert repair_prompt["missing_page_payload"]["required_page_plan_ids"] == [draft_pages[6]["page_plan_id"]]
     assert repair_report["provider"] == "batched:mock"
     assert repair_report["attempt_count"] == 3
@@ -13058,7 +12955,7 @@ def test_resume_cannot_skip_awaiting_draft_review(tmp_path: Path, from_step: str
         if name == "raw_prepare.json":
             data["prepared_markdown"] += "\n\nAnthropic 收购了 OpenAI。"
         if name == "draft_rendering.json":
-            data["pages"][0]["section_bodies"]["detail"] += "\n\nOpenAI 收购了 Anthropic。"
+            data["pages"][0]["body_markdown"] += "\n\nOpenAI 收购了 Anthropic。"
         write_json(fixture_dir / name, data)
 
     run_simplified_ingest(vault=vault, raw_file=raw, fixture_dir=fixture_dir, slug=f"skip-{from_step}")
