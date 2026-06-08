@@ -109,7 +109,7 @@ class ProfileSpec(StrictModel):
 
     @field_validator("page_types")
     @classmethod
-    def page_type_keys_match_names(cls, value: dict[str, PageTypeSpec]) -> dict[str, PageTypeSpec]:
+    def page_type_keys_match_names(_cls, value: dict[str, PageTypeSpec]) -> dict[str, PageTypeSpec]:
         for key, spec in value.items():
             if spec.name != key:
                 raise ValueError(f"page_types key {key!r} does not match spec name {spec.name!r}")
@@ -284,7 +284,7 @@ class SourceBasis(StrictModel):
 
     @field_validator("source_candidate_ids", "prepared_discovered_candidates")
     @classmethod
-    def normalize_candidate_refs(cls, value: list[str]) -> list[str]:
+    def normalize_candidate_refs(_cls, value: list[str]) -> list[str]:
         refs: list[str] = []
         for item in value:
             ref = str(item).strip()
@@ -533,7 +533,7 @@ class DraftPageItem(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def coerce_page_values(cls, data: Any) -> Any:
+    def coerce_page_values(_cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
         data = dict(data)

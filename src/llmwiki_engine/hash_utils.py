@@ -6,9 +6,6 @@ from pathlib import Path
 from .models import ArtifactRef, ArtifactVisibility
 
 
-MISSING_SHA = "__MISSING__"
-
-
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -37,4 +34,3 @@ def artifact_ref(
         required_for_resume=required_for_resume,
         visibility=visibility,
     )
-

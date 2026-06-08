@@ -406,7 +406,7 @@ class _TitleParser(HTMLParser):
         title = " ".join(" ".join(self._parts).split()).strip()
         return title or None
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() == "title":
             self._in_title = True
 
@@ -452,7 +452,7 @@ class _HTMLMarkdownParser(HTMLParser):
         self._target_tag = target_tag
         self._target_depth = 0
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         if self._target_tag is not None:
             if tag == self._target_tag:
