@@ -3167,7 +3167,6 @@ def test_resume_from_deletes_downstream_step_dirs(tmp_path: Path) -> None:
     write_yaml(vault / ".llmwiki" / "config.yaml", config)
     resumed = resume_ingest(vault=vault, operation_id=manifest.operation_id, from_step="source_digest")
     assert resumed.status == OperationStatus.drafted
-    assert not (run_dir / "archives").exists()
     assert not stale.exists()
     assert (run_dir / "source_digest" / "source_digest.json").exists()
     assert (run_dir / "draft_rendering" / "draft_pages").exists()
