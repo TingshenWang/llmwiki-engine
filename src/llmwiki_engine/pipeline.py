@@ -422,19 +422,6 @@ def model_steps_for_raw_prepare_policy(
     return model_steps
 
 
-def model_backed_step_can_run_locally(
-    *,
-    step_name: str,
-    manifest: OperationManifest,
-    provider_runtime_present: bool,
-) -> bool:
-    return (
-        not provider_runtime_present
-        and step_name == "raw_prepare"
-        and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip
-    )
-
-
 def _run_step(
     step_name: str,
     vault: Path,
@@ -452,10 +439,11 @@ def _run_step(
     provider_record = execution_context.record if runner.spec.model_backed else None
     provider_runtime = provider_record.providers.get(step_name) if provider_record else None
     provider_spec_for_attempt = provider_runtime.spec if provider_runtime else None
-    local_model_backed_step = runner.spec.model_backed and model_backed_step_can_run_locally(
-        step_name=step_name,
-        manifest=manifest,
-        provider_runtime_present=provider_runtime is not None,
+    local_model_backed_step = (
+        runner.spec.model_backed
+        and provider_runtime is None
+        and step_name == "raw_prepare"
+        and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip
     )
     logger.emit(
         step_name,
@@ -955,13 +943,15 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
     source_title = source_title_for_raw(digest.source_raw_path)
     log_date = local_date()
     retrieval_config = ctx.manifest.vault_config_snapshot.embedding_retrieval
+    provider_runtimes = list(ctx.execution_context.record.providers.values()) if ctx.execution_context.record else []
+    force_exact_backend = bool(provider_runtimes) and all(provider.spec.startswith("mock:") for provider in provider_runtimes)
     snapshot = build_wiki_context_snapshot(
         ctx.vault,
         resolution,
         log_date=log_date,
         source_target_path=f"sources/{safe_filename(source_title)}.md",
         retrieval_config=retrieval_config,
-        force_exact_backend=uses_mock_provider_context(ctx.execution_context),
+        force_exact_backend=force_exact_backend,
     )
     ensure_snapshot_within_limit(snapshot, ctx.manifest.vault_config_snapshot.max_context_chars)
     contexts_path = step_root / "candidate_contexts.json"
@@ -990,13 +980,6 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
             _ref(ctx.run_dir, contexts_md, step_name, "markdown"),
         ],
     )
-
-
-def uses_mock_provider_context(execution_context: ProviderExecutionContext) -> bool:
-    if execution_context.record is None:
-        return False
-    providers = list(execution_context.record.providers.values())
-    return bool(providers) and all(provider.spec.startswith("mock:") for provider in providers)
 
 
 def block_unrepaired_medium_create_reason(plan: WikiMergePlanArtifact) -> WikiMergePlanArtifact:
@@ -1373,7 +1356,10 @@ def run_draft_rendering_model(
             approved_prepared_text=approved_prepared_text,
         )
 
-    batch_items_list = chunks(draftable_items, DRAFT_RENDERING_BATCH_PAGE_LIMIT)
+    batch_items_list = [
+        draftable_items[index : index + DRAFT_RENDERING_BATCH_PAGE_LIMIT]
+        for index in range(0, len(draftable_items), DRAFT_RENDERING_BATCH_PAGE_LIMIT)
+    ]
     provider_spec = ctx.execution_context.runtime_for_task("draft_rendering").spec
     max_parallel_batches = draft_rendering_batch_parallelism(provider_spec, len(batch_items_list))
     parallel = max_parallel_batches > 1
@@ -1512,10 +1498,6 @@ def draft_rendering_batch_parallelism(provider_spec: str | None, batch_count: in
     if provider_spec and provider_spec.startswith("openai_compatible:"):
         return min(DRAFT_RENDERING_MAX_PARALLEL_BATCHES, batch_count)
     return 1
-
-
-def chunks(items: list[WikiMergePlanItem], size: int) -> list[list[WikiMergePlanItem]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
 
 
 PAGE_SCOPED_DRAFT_REPAIR_ISSUE_CODES = {
