@@ -85,7 +85,7 @@ from .models import (
     StructuredRepairReport,
     UpdateMergeReport,
     UpdatePageMergeReport,
-    CandidateContextsArtifact,
+    CandidateContextHit, CandidateContextsArtifact,
     ContextOverlapSignal,
     EmbeddingRetrievalConfig,
     WikiContextEntry,

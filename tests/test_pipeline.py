@@ -15068,7 +15068,6 @@ def test_apply_rejects_draft_missing_grounding_sidecar(tmp_path: Path) -> None:
 def test_plain_apply_records_apply_failed_on_write_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     vault, raw = make_vault(tmp_path)
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="rollback")
-    preview = read_json(RunStore(vault).run_dir(manifest.operation_id) / "apply_preview" / "apply_preview.json")
     real_write = apply_module._write_bytes_atomic
     calls = {"count": 0}
 

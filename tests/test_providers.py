@@ -99,7 +99,6 @@ def test_openai_compatible_live_check_uses_twenty_second_timeout() -> None:
         text = ""
 
         def raise_for_status(self) -> None:
-            nonlocal calls
             if calls == 1:
                 request = httpx.Request("POST", "https://example.test/v1/chat/completions")
                 response = httpx.Response(503, text="temporary", request=request)
