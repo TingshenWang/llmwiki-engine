@@ -15,6 +15,7 @@ import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
+import llmwiki_engine.merge_reporting as merge_reporting_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.planning_payloads as planning_payloads_module
 import llmwiki_engine.run_metrics as run_metrics_module
@@ -690,6 +691,12 @@ def test_retrieval_metadata_uses_shared_frontmatter_list_parser() -> None:
     assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_MAX_SOURCE_RATIO")
     assert not hasattr(pipeline_module, "DRAFT_RENDERING_EXCERPT_MIN_PAGE_CHARS")
     assert not hasattr(pipeline_module, "DRAFT_RENDERING_CONTEXT_ENTRY_EXCERPT_LIMIT")
+    assert not hasattr(pipeline_module, "render_merge_planning_shortcut_report")
+    assert not hasattr(pipeline_module, "render_merge_plan_markdown")
+    assert not hasattr(pipeline_module, "render_merge_plan_review_prompt")
+    assert not hasattr(pipeline_module, "render_candidate_contexts_markdown")
+    assert not hasattr(pipeline_module, "render_merge_decision_report")
+    assert not hasattr(pipeline_module, "merge_plan_create_overlap_risk_items")
 
 
 def test_source_digest_candidate_budget_defers_overflow_by_group() -> None:
@@ -14539,7 +14546,7 @@ def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path:
     assert plan.items[0].action == "needs_human_decision"
     assert plan.items[0].apply_eligibility == "blocked"
     assert "理由不充分" in plan.items[0].blocked_reason
-    report = pipeline_module.render_merge_decision_report(plan, snapshot)
+    report = merge_reporting_module.render_merge_decision_report(plan, snapshot)
     assert "## Create/Update 风险摘要" in report
     assert "Concept_AI_PM_Career.md" in report
     assert "未提供" in report
@@ -14701,7 +14708,7 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
     assert create_item.apply_eligibility == "blocked"
     assert "旧页标题《持久记忆（Agent Memory）》像通用概念页" in create_item.blocked_reason
     assert finalized.items[1].action == "update"
-    report = pipeline_module.render_merge_decision_report(finalized, snapshot)
+    report = merge_reporting_module.render_merge_decision_report(finalized, snapshot)
     assert "旧页标题《持久记忆（Agent Memory）》像通用概念页" in report
 
 
