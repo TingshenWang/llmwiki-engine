@@ -1908,6 +1908,35 @@ def test_step_metadata_and_runners_stay_in_sync() -> None:
     assert tuple(STEP_RUNNERS) == STEP_NAMES
 
 
+def test_pipeline_does_not_expose_internal_control_helpers() -> None:
+    old_helper_names = {
+        "artifact_kind_for_path",
+        "build_raw_prepare_skip_passthrough",
+        "complete_review_step",
+        "default_resume_start",
+        "delete_downstream_step_dirs",
+        "draft_rendering_model_batch_refs",
+        "drafted_wiki_context_drifted",
+        "ensure_wiki_context_current",
+        "ensure_wiki_context_current_before_resume",
+        "execute_ingest",
+        "last_attempt_duration_ms",
+        "refresh_current_draft_grounding_artifacts",
+        "refresh_draft_rendering_artifact_refs",
+        "replace_artifact_ref",
+        "require_upstream_artifacts_current",
+        "safe_timestamp",
+        "step_completion_message",
+        "structured_model_output_refs",
+        "validate_raw_link_cleanup_resume",
+        "validate_resume_start",
+    }
+
+    leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
+
+    assert leaked == []
+
+
 def test_step_output_dir_helpers_use_step_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "run"
     assert step_output_dir(run_dir, "raw_prepare") == run_dir / "raw_prepare"
@@ -7368,7 +7397,7 @@ def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> Non
     ctx = Ctx()
     ctx.run_dir = run_dir
     ctx.manifest = read_manifest(run_dir / "manifest.json")
-    refreshed = pipeline_module.refresh_current_draft_grounding_artifacts(
+    refreshed = pipeline_module._refresh_current_draft_grounding_artifacts(
         ctx,
         pipeline_module.DraftWriteManifest.model_validate(stale_manifest),
         draft_manifest_path,

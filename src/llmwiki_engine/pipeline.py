@@ -172,7 +172,7 @@ def run_simplified_ingest(
     ensure_workspace_layout(vault)
     raw_path, raw_rel = resolve_raw_path(vault, raw_file)
     raw_hash, raw_size = raw_ref(raw_path)
-    operation_id = f"ING-{safe_timestamp()}-{slug or raw_path.stem}"
+    operation_id = f"ING-{_safe_timestamp()}-{slug or raw_path.stem}"
     store = RunStore(vault)
     if profile_name:
         resolved_profile_name = profile_name
@@ -216,7 +216,7 @@ def run_simplified_ingest(
         )
         write_manifest(store.manifest_path(operation_id), manifest)
         with run_lock(vault, operation_id):
-            return execute_ingest(
+            return _execute_ingest(
                 vault,
                 operation_id,
                 start_step=STEP_NAMES[0],
@@ -242,16 +242,16 @@ def resume_ingest(
         if manifest.status == OperationStatus.apply_failed:
             raise _errors.PipelineError("apply_failed operations cannot be resumed; inspect written targets and rerun ingest.")
         require_verified(vault, manifest)
-        start, reset_from_step = default_resume_start(vault, store.run_dir(operation_id), manifest, from_step)
+        start, reset_from_step = _default_resume_start(vault, store.run_dir(operation_id), manifest, from_step)
         if start is None:
             return manifest
         if raw_prepare_policy is not None:
             if step_index(start) > step_index("raw_prepare"):
                 raise _errors.PipelineError("raw prepare override only applies when raw_prepare will rerun; resume from raw_prepare or earlier.")
             manifest.vault_config_snapshot.raw_prepare_policy = raw_prepare_policy
-        validate_raw_link_cleanup_resume(run_dir=store.run_dir(operation_id), manifest=manifest, start=start)
-        validate_resume_start(manifest, start)
-        ensure_wiki_context_current_before_resume(vault, store.run_dir(operation_id), start)
+        _validate_raw_link_cleanup_resume(run_dir=store.run_dir(operation_id), manifest=manifest, start=start)
+        _validate_resume_start(manifest, start)
+        _ensure_wiki_context_current_before_resume(vault, store.run_dir(operation_id), start)
         resumable_step_names = set(downstream_steps(start))
         model_steps = [step for step in MODEL_BACKED_STEPS if step in resumable_step_names]
         if "raw_prepare" in model_steps and manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip:
@@ -268,12 +268,12 @@ def resume_ingest(
             manifest.provider_contexts.append(provider_execution_context.record)
         if reset_from_step is not None:
             write_manifest(store.manifest_path(operation_id), manifest)
-            delete_downstream_step_dirs(vault, operation_id, reset_from_step)
+            _delete_downstream_step_dirs(vault, operation_id, reset_from_step)
             mark_from_pending(manifest, reset_from_step)
             write_manifest(store.manifest_path(operation_id), manifest)
         else:
             write_manifest(store.manifest_path(operation_id), manifest)
-        return execute_ingest(
+        return _execute_ingest(
             vault,
             operation_id,
             start_step=start,
@@ -282,7 +282,7 @@ def resume_ingest(
         )
 
 
-def default_resume_start(
+def _default_resume_start(
     vault: Path,
     run_dir: Path,
     manifest: OperationManifest,
@@ -293,12 +293,12 @@ def default_resume_start(
     start = first_resumable_step(manifest)
     if start is not None:
         return start, None
-    if manifest.status == OperationStatus.drafted and drafted_wiki_context_drifted(vault, run_dir):
+    if manifest.status == OperationStatus.drafted and _drafted_wiki_context_drifted(vault, run_dir):
         return "wiki_context_snapshot", "wiki_context_snapshot"
     return None, None
 
 
-def drafted_wiki_context_drifted(vault: Path, run_dir: Path) -> bool:
+def _drafted_wiki_context_drifted(vault: Path, run_dir: Path) -> bool:
     snapshot_path = require_step_output_dir(run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json"
     if not snapshot_path.exists():
         return False
@@ -306,7 +306,7 @@ def drafted_wiki_context_drifted(vault: Path, run_dir: Path) -> bool:
     return bool(wiki_context_drift_messages(vault, snapshot))
 
 
-def ensure_wiki_context_current_before_resume(vault: Path, run_dir: Path, start_step: str) -> None:
+def _ensure_wiki_context_current_before_resume(vault: Path, run_dir: Path, start_step: str) -> None:
     if step_index(start_step) <= step_index("wiki_context_snapshot"):
         return
     snapshot_path = require_step_output_dir(run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json"
@@ -318,7 +318,7 @@ def ensure_wiki_context_current_before_resume(vault: Path, run_dir: Path, start_
         raise _errors.PipelineError("; ".join(messages))
 
 
-def execute_ingest(
+def _execute_ingest(
     vault: Path,
     operation_id: str,
     *,
@@ -332,7 +332,7 @@ def execute_ingest(
     manifest = read_manifest(store.manifest_path(operation_id))
     profile = load_profile(vault / ".llmwiki" / "profiles" / manifest.profile)
     raw_path = vault / manifest.raw_bindings[0].relative_path
-    validate_resume_start(manifest, start_step)
+    _validate_resume_start(manifest, start_step)
     start_index = STEP_NAMES.index(start_step)
     for step_name in STEP_NAMES[start_index:]:
         if step_satisfied(get_step(manifest, step_name).status):
@@ -354,7 +354,7 @@ def execute_ingest(
             fail_step(manifest, step_name, message)
             write_manifest(store.manifest_path(operation_id), manifest)
             _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
-            logger.emit(step_name, "failed", status="failed", message=message, duration_ms=last_attempt_duration_ms(manifest, step_name))
+            logger.emit(step_name, "failed", status="failed", message=message, duration_ms=_last_attempt_duration_ms(manifest, step_name))
             raise _errors.PipelineError(message) from exc
         write_manifest(store.manifest_path(operation_id), manifest)
         _run_metrics.refresh_run_metrics(run_dir, manifest, warning_console=console)
@@ -373,7 +373,7 @@ def execute_ingest(
     return manifest
 
 
-def validate_resume_start(manifest: OperationManifest, start_step: str) -> None:
+def _validate_resume_start(manifest: OperationManifest, start_step: str) -> None:
     start_index = step_index(start_step)
     for step in manifest.steps[:start_index]:
         if not step_satisfied(step.status):
@@ -447,8 +447,8 @@ def _run_step(
         step_name,
         "completed",
         status=status,
-        message=step_completion_message(ctx, step_name),
-        duration_ms=last_attempt_duration_ms(manifest, step_name),
+        message=_step_completion_message(ctx, step_name),
+        duration_ms=_last_attempt_duration_ms(manifest, step_name),
     )
 
 
@@ -505,28 +505,6 @@ def _run_raw_link_cleanup(ctx: StepRunContext) -> None:
     )
 
 
-def build_raw_prepare_skip_passthrough(
-    *,
-    raw_path: Path,
-    raw_rel: str,
-    input_raw_sha256: str,
-    cleanup_ref: str,
-) -> RawPreparationArtifact:
-    if raw_path.suffix.lower() not in {".md", ".markdown", ".mdown"}:
-        raise _errors.PipelineError("--prepare skip requires Markdown raw; use --prepare auto or --prepare force for non-Markdown raw.")
-    raw_text = raw_path.read_text(encoding="utf-8")
-    if not raw_text.strip():
-        raise _errors.PipelineError("--prepare skip requires non-empty raw Markdown.")
-    return RawPreparationArtifact(
-        source_raw_path=raw_rel,
-        input_raw_sha256=input_raw_sha256,
-        raw_link_cleanup_ref=cleanup_ref,
-        prepared_markdown=raw_text.rstrip() + "\n",
-        operations_applied=["user_skip_markdown_passthrough"],
-        omission_policy="none",
-    )
-
-
 def _write_raw_prepare_outputs(ctx: StepRunContext, preparation: RawPreparationArtifact, *, include_model_outputs: bool) -> None:
     step_name = "raw_prepare"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
@@ -541,7 +519,7 @@ def _write_raw_prepare_outputs(ctx: StepRunContext, preparation: RawPreparationA
         _ref(ctx.run_dir, prepared, step_name, "markdown"),
     ]
     if include_model_outputs:
-        outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
+        outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=outputs)
 
 
@@ -554,11 +532,18 @@ def _run_raw_prepare(ctx: StepRunContext) -> None:
     cleanup_ref = cleanup_path.relative_to(ctx.run_dir).as_posix()
     raw_prepare_policy = ctx.manifest.vault_config_snapshot.raw_prepare_policy
     if raw_prepare_policy == RawPreparePolicy.skip:
-        preparation = build_raw_prepare_skip_passthrough(
-            raw_path=ctx.raw_path,
-            raw_rel=raw_rel,
+        if ctx.raw_path.suffix.lower() not in {".md", ".markdown", ".mdown"}:
+            raise _errors.PipelineError("--prepare skip requires Markdown raw; use --prepare auto or --prepare force for non-Markdown raw.")
+        raw_text = ctx.raw_path.read_text(encoding="utf-8")
+        if not raw_text.strip():
+            raise _errors.PipelineError("--prepare skip requires non-empty raw Markdown.")
+        preparation = RawPreparationArtifact(
+            source_raw_path=raw_rel,
             input_raw_sha256=input_raw_sha256,
-            cleanup_ref=cleanup_ref,
+            raw_link_cleanup_ref=cleanup_ref,
+            prepared_markdown=raw_text.rstrip() + "\n",
+            operations_applied=["user_skip_markdown_passthrough"],
+            omission_policy="none",
         )
         _write_raw_prepare_outputs(ctx, preparation, include_model_outputs=False)
         return
@@ -640,7 +625,7 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
-    complete_review_step(
+    _complete_review_step(
         ctx.manifest,
         step_name,
         outputs=[
@@ -716,7 +701,7 @@ def _run_source_digest(ctx: StepRunContext) -> None:
         _ref(ctx.run_dir, budget_report_path, step_name, "json", "source_digest_budget_report.v1"),
         _ref(ctx.run_dir, budget_report_md, step_name, "markdown"),
     ]
-    outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=outputs)
 
 
@@ -754,7 +739,7 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
-    complete_review_step(
+    _complete_review_step(
         ctx.manifest,
         step_name,
         outputs=[
@@ -867,7 +852,7 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
         _ref(ctx.run_dir, out, step_name, "json", "candidate_resolution.v3"),
         _ref(ctx.run_dir, table, step_name, "markdown"),
     ]
-    outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(
         ctx.manifest,
         step_name,
@@ -1180,7 +1165,7 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
         _ref(ctx.run_dir, table, step_name, "markdown"),
         _ref(ctx.run_dir, report, step_name, "markdown"),
     ]
-    outputs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(
         ctx.manifest,
         step_name,
@@ -1237,7 +1222,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
-    complete_review_step(
+    _complete_review_step(
         ctx.manifest,
         step_name,
         outputs=[
@@ -1262,7 +1247,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
     validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
     validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
-    ensure_wiki_context_current(ctx.vault, snapshot)
+    _ensure_wiki_context_current(ctx.vault, snapshot)
     approved_prepared_path = require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md"
     approved_prepared_text = approved_prepared_path.read_text(encoding="utf-8")
     draftable_count = len([item for item in merge_plan.items if item.action in {"create", "update"}])
@@ -1321,8 +1306,8 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         root_model_input_sidecars=root_model_input_sidecars,
     )
     refs = [_draft_rendering_ref(ctx.run_dir, path, step_name) for path in outputs]
-    refs.extend(structured_model_output_refs(ctx.run_dir, step_root, step_name))
-    refs.extend(draft_rendering_model_batch_refs(ctx.run_dir, step_root, step_name))
+    refs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    refs.extend(_draft_rendering_model_batch_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=refs)
 
 
@@ -1343,7 +1328,7 @@ def _run_validation(ctx: StepRunContext) -> None:
     validate_raw_preparation(preparation)
     validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
     validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
-    ensure_wiki_context_current(ctx.vault, snapshot)
+    _ensure_wiki_context_current(ctx.vault, snapshot)
     if any(item.action == "needs_human_decision" for item in merge_plan.items):
         raise _errors.PipelineError("needs_human_decision must be revised to create/update/noop before validation.")
     if not digest.ingest_candidates() and not any(
@@ -1360,14 +1345,14 @@ def _run_validation(ctx: StepRunContext) -> None:
 def _run_apply_preview(ctx: StepRunContext) -> None:
     step_name = "apply_preview"
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
-    ensure_wiki_context_current(ctx.vault, snapshot)
+    _ensure_wiki_context_current(ctx.vault, snapshot)
     preview = _apply_preview.build_apply_preview(ctx.vault, ctx.run_dir)
     out = require_step_output_dir(ctx.run_dir, step_name) / "apply_preview.json"
     write_json(out, preview)
     complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "apply_preview.v2")])
 
 
-def refresh_current_draft_grounding_artifacts(
+def _refresh_current_draft_grounding_artifacts(
     ctx: StepRunContext,
     draft_manifest: DraftWriteManifest,
     draft_manifest_path: Path,
@@ -1379,25 +1364,25 @@ def refresh_current_draft_grounding_artifacts(
     approved_prepared_text = (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8")
     grounding_review = _draft_grounding.build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
     grounding_review_path, grounding_review_md = _draft_grounding.write_draft_grounding_review_outputs(draft_root, grounding_review)
-    refresh_draft_rendering_artifact_refs(ctx, grounding_review_path, grounding_review_md)
+    _refresh_draft_rendering_artifact_refs(ctx, grounding_review_path, grounding_review_md)
     if draft_manifest.requires_grounding_review == grounding_review.requires_review:
         return draft_manifest
     updated_manifest = draft_manifest.model_copy(update={"requires_grounding_review": grounding_review.requires_review})
     write_json(draft_manifest_path, updated_manifest)
-    refresh_draft_rendering_artifact_refs(ctx, draft_manifest_path)
+    _refresh_draft_rendering_artifact_refs(ctx, draft_manifest_path)
     return updated_manifest
 
 
-def refresh_draft_rendering_artifact_refs(ctx: StepRunContext, *paths: Path) -> None:
+def _refresh_draft_rendering_artifact_refs(ctx: StepRunContext, *paths: Path) -> None:
     draft_step = get_step(ctx.manifest, "draft_rendering")
     for path in paths:
         ref = _draft_rendering_ref(ctx.run_dir, path, "draft_rendering")
-        draft_step.outputs = replace_artifact_ref(draft_step.outputs, ref)
+        draft_step.outputs = _replace_artifact_ref(draft_step.outputs, ref)
         for attempt in draft_step.attempts:
-            attempt.outputs = replace_artifact_ref(attempt.outputs, ref)
+            attempt.outputs = _replace_artifact_ref(attempt.outputs, ref)
 
 
-def replace_artifact_ref(refs: list[ArtifactRef], ref: ArtifactRef) -> list[ArtifactRef]:
+def _replace_artifact_ref(refs: list[ArtifactRef], ref: ArtifactRef) -> list[ArtifactRef]:
     replaced = False
     next_refs: list[ArtifactRef] = []
     for existing in refs:
@@ -1416,7 +1401,7 @@ def _run_draft_review(ctx: StepRunContext) -> None:
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     draft_manifest_path = require_step_output_dir(ctx.run_dir, "draft_rendering") / "draft_write_manifest.json"
     draft_manifest = read_model(draft_manifest_path, DraftWriteManifest)
-    draft_manifest = refresh_current_draft_grounding_artifacts(ctx, draft_manifest, draft_manifest_path)
+    draft_manifest = _refresh_current_draft_grounding_artifacts(ctx, draft_manifest, draft_manifest_path)
     approved_manifest_path = step_root / "approved_write_manifest.json"
     approval_path = step_root / "draft_approval.json"
     prompt_path = step_root / "review_prompt.md"
@@ -1440,7 +1425,7 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             notes=auto_approval_notes,
         )
         write_json(approval_path, approval)
-        complete_review_step(
+        _complete_review_step(
             ctx.manifest,
             step_name,
             outputs=[
@@ -1676,7 +1661,7 @@ def _structured_call(
     )
 
 
-def delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str) -> None:
+def _delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str) -> None:
     store = RunStore(vault)
     run_dir = store.run_dir(operation_id)
     for step in downstream_steps(start_step):
@@ -1685,7 +1670,7 @@ def delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str)
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
-def validate_raw_link_cleanup_resume(*, run_dir: Path, manifest: OperationManifest, start: str) -> None:
+def _validate_raw_link_cleanup_resume(*, run_dir: Path, manifest: OperationManifest, start: str) -> None:
     if start != "raw_link_cleanup":
         return
     step = get_step(manifest, "raw_link_cleanup")
@@ -1699,14 +1684,14 @@ def validate_raw_link_cleanup_resume(*, run_dir: Path, manifest: OperationManife
         raise _errors.PipelineError("Cannot resume from raw_link_cleanup after it changed raw; rerun ingest or resume from raw_prepare.")
 
 
-def last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> int | None:
+def _last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> int | None:
     step = get_step(manifest, step_name)
     if not step.attempts:
         return None
     return step.attempts[-1].duration_ms
 
 
-def step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
+def _step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
     if step_name == "raw_prepare":
         if ctx.manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip:
             return "raw_prepare 使用 --prepare skip passthrough，跳过模型清洗"
@@ -1743,7 +1728,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
         manifest = read_manifest(store.manifest_path(operation_id))
         _require_review_step_awaiting(manifest, review_step)
         run_dir = store.run_dir(operation_id)
-        require_upstream_artifacts_current(vault, run_dir, manifest, review_step)
+        _require_upstream_artifacts_current(vault, run_dir, manifest, review_step)
         if review_step == "draft_review":
             step_root = require_step_output_dir(run_dir, "draft_review")
             pending = step_root / "pending_write_manifest.json"
@@ -1770,7 +1755,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                     _ref(run_dir, approval_path, review_step, "json", "draft_review.v2"),
                 ],
             )
-            delete_downstream_step_dirs(vault, operation_id, "validation")
+            _delete_downstream_step_dirs(vault, operation_id, "validation")
             mark_from_pending(manifest, "validation")
             write_manifest(store.manifest_path(operation_id), manifest)
             _run_metrics.refresh_run_metrics(run_dir, manifest)
@@ -1812,7 +1797,7 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                     _ref(run_dir, decision_path, review_step, "json", "review_decision.v2"),
                 ],
             )
-            delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
+            _delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
             mark_from_pending(manifest, "draft_rendering")
             write_manifest(store.manifest_path(operation_id), manifest)
             _run_metrics.refresh_run_metrics(run_dir, manifest)
@@ -1826,12 +1811,12 @@ def revise_review(vault: Path, operation_id: str, review_step: str) -> Operation
         manifest = read_manifest(store.manifest_path(operation_id))
         _require_review_step_awaiting(manifest, review_step)
         run_dir = store.run_dir(operation_id)
-        require_upstream_artifacts_current(vault, run_dir, manifest, review_step)
+        _require_upstream_artifacts_current(vault, run_dir, manifest, review_step)
         if review_step == "merge_plan_review":
-            delete_downstream_step_dirs(vault, operation_id, "wiki_merge_planning")
+            _delete_downstream_step_dirs(vault, operation_id, "wiki_merge_planning")
             mark_from_pending(manifest, "wiki_merge_planning")
         elif review_step == "draft_review":
-            delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
+            _delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
             mark_from_pending(manifest, "draft_rendering")
         else:
             raise _errors.PipelineError(f"Unsupported review step: {review_step}")
@@ -1841,7 +1826,7 @@ def revise_review(vault: Path, operation_id: str, review_step: str) -> Operation
         return manifest
 
 
-def require_upstream_artifacts_current(vault: Path, run_dir: Path, manifest: OperationManifest, review_step: str) -> None:
+def _require_upstream_artifacts_current(vault: Path, run_dir: Path, manifest: OperationManifest, review_step: str) -> None:
     issues: list[str] = []
     for raw in manifest.raw_bindings:
         raw_path = vault / raw.relative_path
@@ -1886,7 +1871,7 @@ def latest_operation(vault: Path) -> str | None:
     return candidates[-1].name if candidates else None
 
 
-def safe_timestamp() -> str:
+def _safe_timestamp() -> str:
     return utc_now().replace("+00:00", "Z").replace(":", "")
 
 
@@ -1908,7 +1893,7 @@ def _ref(
     )
 
 
-def structured_model_output_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
+def _structured_model_output_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
     refs: list[ArtifactRef] = []
     provider_result = step_root / "provider_result.json"
     if provider_result.exists():
@@ -1930,7 +1915,7 @@ def structured_model_output_refs(run_dir: Path, step_root: Path, step_name: str)
     return refs
 
 
-def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
+def _draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
     batch_root = step_root / "model_batches"
     if not batch_root.exists():
         return []
@@ -1952,11 +1937,11 @@ def draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: 
             schema = "update_preservation_reinforcement_report.v1"
         elif path.name == "grounding_paraphrase_rewrite_report.json":
             schema = "grounding_paraphrase_rewrite_report.v1"
-        refs.append(_ref(run_dir, path, step_name, artifact_kind_for_path(path), schema, required_for_resume=required))
+        refs.append(_ref(run_dir, path, step_name, _artifact_kind_for_path(path), schema, required_for_resume=required))
     return refs
 
 
-def artifact_kind_for_path(path: Path) -> str:
+def _artifact_kind_for_path(path: Path) -> str:
     return {
         ".md": "markdown",
         ".json": "json",
@@ -1979,10 +1964,10 @@ def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactR
         "index_open_questions_report.json": "index_open_questions_report.v1",
         "draft_rendering_batch_report.json": "draft_rendering_batch_report.v1",
     }
-    return _ref(run_dir, path, step_name, artifact_kind_for_path(path), schemas.get(path.name))
+    return _ref(run_dir, path, step_name, _artifact_kind_for_path(path), schemas.get(path.name))
 
 
-def complete_review_step(
+def _complete_review_step(
     manifest: OperationManifest,
     name: str,
     *,
@@ -2603,7 +2588,7 @@ def finalize_wiki_merge_plan(
     return WikiMergePlanArtifact(log_date=snapshot.log_date, items=items, context_snapshot_ref=snapshot_ref)
 
 
-def ensure_wiki_context_current(vault: Path, snapshot: WikiContextSnapshot) -> None:
+def _ensure_wiki_context_current(vault: Path, snapshot: WikiContextSnapshot) -> None:
     messages = wiki_context_drift_messages(vault, snapshot)
     if messages:
         raise _errors.PipelineError("; ".join(messages))
