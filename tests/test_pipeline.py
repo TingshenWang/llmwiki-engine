@@ -92,6 +92,7 @@ from llmwiki_engine.steps import (
     step_output_dir,
 )
 from llmwiki_engine.system_pages import local_date
+from llmwiki_engine.validators import ValidationError as ContractValidationError
 from llmwiki_engine.validators import validate_wiki_merge_plan
 from llmwiki_engine.verify import VerifyError, verify_run
 from llmwiki_engine.workspace import RunStore
@@ -1914,6 +1915,13 @@ def test_step_metadata_and_runners_stay_in_sync() -> None:
 
 def test_pipeline_does_not_expose_internal_control_helpers() -> None:
     old_helper_names = {
+        "_complete_review_step",
+        "_ensure_wiki_context_current",
+        "_redacted_model",
+        "_run_prepared_raw_review",
+        "_run_raw_link_cleanup",
+        "_run_raw_prepare",
+        "_structured_call",
         "artifact_kind_for_path",
         "build_raw_prepare_skip_passthrough",
         "complete_review_step",
@@ -4958,7 +4966,7 @@ def test_validate_draft_rendering_rejects_related_block_inside_content() -> None
         "- [[concepts/Concept_代码解释器（Qwen-Agent）.md]]"
     )
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+    with pytest.raises(ContractValidationError) as exc_info:
         draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
@@ -4970,7 +4978,7 @@ def test_validate_draft_rendering_rejects_decorated_related_markdown_links_insid
         "- **相关页面**：建议参见 [Agent 开发框架](concepts/Concept_Agent 开发框架（Qwen-Agent）.md)"
     )
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+    with pytest.raises(ContractValidationError) as exc_info:
         draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
@@ -4983,7 +4991,7 @@ def test_validate_draft_rendering_rejects_related_markdown_link_bullets_inside_c
         "- [Code interpreter](concepts/Concept_Code interpreter.md)"
     )
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+    with pytest.raises(ContractValidationError) as exc_info:
         draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
@@ -4992,7 +5000,7 @@ def test_validate_draft_rendering_rejects_related_markdown_link_bullets_inside_c
 def test_validate_draft_rendering_rejects_self_wikilink_inside_content() -> None:
     draft = qwen_related_block_draft("可与 [[entities/Entity_Qwen-Agent.md|Qwen-Agent]] 页面保持一致。")
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+    with pytest.raises(ContractValidationError) as exc_info:
         draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
@@ -5001,7 +5009,7 @@ def test_validate_draft_rendering_rejects_self_wikilink_inside_content() -> None
 def test_validate_draft_rendering_rejects_basename_self_wikilink_inside_content() -> None:
     draft = qwen_related_block_draft("可与 [[Entity_Qwen-Agent.md|Qwen-Agent]] 页面保持一致。")
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+    with pytest.raises(ContractValidationError) as exc_info:
         draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"
@@ -5010,7 +5018,7 @@ def test_validate_draft_rendering_rejects_basename_self_wikilink_inside_content(
 def test_validate_draft_rendering_rejects_display_title_self_wikilink_inside_content() -> None:
     draft = qwen_related_block_draft("可与 [[Qwen-Agent|Qwen-Agent]] 页面保持一致。")
 
-    with pytest.raises(pipeline_module.ContractValidationError) as exc_info:
+    with pytest.raises(ContractValidationError) as exc_info:
         draft_validation_module.validate_draft_rendering(draft, qwen_related_block_plan(), language="zh-CN")
 
     assert exc_info.value.issues[0].issue_code == "stray_related_links_in_content"

@@ -4,17 +4,15 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from rich.console import Console
-from pydantic import BaseModel
 
 from . import __version__
 from . import artifact_refs as _artifact_refs
 from . import apply_guards as _apply_guards
 from . import apply_preview as _apply_preview
 from . import candidate_resolution as _candidate_resolution
-from . import diff_utils as _diff_utils
 from . import draft_grounding as _draft_grounding
 from . import draft_rendering_runner as _draft_rendering_runner
 from . import draft_rendering_payloads as _draft_rendering_payloads
@@ -26,6 +24,8 @@ from . import merge_plan_refinement as _merge_plan_refinement
 from . import merge_planning as _merge_planning
 from . import merge_reporting as _merge_reporting
 from . import planning_payloads as _planning_payloads
+from . import raw_steps as _raw_steps
+from . import step_runtime as _step_runtime
 from . import source_digest_budget as _source_digest_budget
 from . import source_digest_payload as _source_digest_payload
 from . import source_digest_rendering as _source_digest_rendering
@@ -51,7 +51,6 @@ from .manifest import (
     write_manifest,
 )
 from .models import (
-    ArtifactRef,
     CandidateResolutionArtifact,
     DraftRenderingArtifact,
     DraftWriteManifest,
@@ -65,7 +64,6 @@ from .models import (
     ReviewDecision,
     SourceDigestArtifact,
     StepStatus,
-    StructuredIssue,
     CandidateContextsArtifact,
     WikiContextSnapshot,
     WikiMergePlanArtifact,
@@ -73,7 +71,6 @@ from .models import (
 )
 from .provider_config import ProviderExecutionContext, build_provider_execution_context
 from .profiles import load_profile, profile_to_yaml_data, safe_filename
-from .raw_cleanup import cleanup_raw_wikilinks, render_raw_link_cleanup_markdown
 from .rendering import source_title_for_raw
 from .retrieval import (
     resolve_cache_dir,
@@ -89,13 +86,11 @@ from .steps import (
     step_index,
     step_output_dir,
 )
-from .structured import StructuredModelCall
 from .system_pages import (
     ensure_system_pages,
     local_date,
 )
 from .validators import (
-    ValidationError as ContractValidationError,
     nonempty_prepared_discovered_candidates,
     validate_candidate_resolution,
     validate_raw_preparation,
@@ -105,17 +100,6 @@ from .validators import (
 from .verify import require_verified
 from .vault_config import read_vault_config, write_default_vault_config
 from .workspace import RunStore, apply_lock, ensure_workspace_layout, relative_to_vault, resolve_raw_path, run_lock
-
-
-RAW_PREPARE_CONTRACT = {
-    "goal": "Create a higher-quality canonical prepared raw for downstream knowledge compilation.",
-    "rules": [
-        "Do not add facts that are not supported by the original raw.",
-        "Remove or relocate non-content noise such as navigation fragments, boilerplate, self-promotion, and obvious formatting artifacts.",
-        "Correct obvious wording or formatting errors only when the surrounding context makes the correction clear.",
-        "Return prepared_markdown as clean Markdown suitable for source_digest and downstream knowledge digestion.",
-    ],
-}
 
 
 def init_vault(vault: Path, *, profile_name: str = "project_basic") -> None:
@@ -409,7 +393,7 @@ def _run_step(
     else:
         begin_step_attempt(manifest, step_name)
     write_manifest(manifest_path, manifest)
-    ctx = StepRunContext(
+    ctx = _step_runtime.StepRunContext(
         vault=vault,
         run_dir=run_dir,
         raw_path=raw_path,
@@ -431,193 +415,7 @@ def _run_step(
     )
 
 
-@dataclass(frozen=True)
-class StepRunContext:
-    vault: Path
-    run_dir: Path
-    raw_path: Path
-    profile: Any
-    manifest: OperationManifest
-    execution_context: ProviderExecutionContext
-
-
-def _run_raw_link_cleanup(ctx: StepRunContext) -> None:
-    step_name = "raw_link_cleanup"
-    step_root = require_step_output_dir(ctx.run_dir, step_name)
-    raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
-    original_text = ctx.raw_path.read_text(encoding="utf-8")
-    pre_hash = sha256_file(ctx.raw_path)
-    cleaned_text, links, warnings, preserved_media_count = cleanup_raw_wikilinks(original_text)
-    changed = cleaned_text != original_text
-    if changed:
-        if sha256_file(ctx.raw_path) != pre_hash:
-            raise _errors.PipelineError("raw changed during raw_link_cleanup; rerun ingest")
-        tmp = ctx.raw_path.with_name(f".{ctx.raw_path.name}.tmp")
-        tmp.write_text(cleaned_text, encoding="utf-8")
-        tmp.replace(ctx.raw_path)
-    post_hash, post_size = raw_ref(ctx.raw_path)
-    ctx.manifest.raw_bindings = [RawBinding(relative_path=raw_rel, sha256=post_hash, size_bytes=post_size)]
-    artifact = RawLinkCleanupArtifact(
-        raw_path=raw_rel,
-        changed=changed,
-        pre_cleanup_sha256=pre_hash,
-        post_cleanup_sha256=post_hash,
-        cleaned_link_count=len(links),
-        preserved_media_embed_count=preserved_media_count,
-        links=links,
-        warnings=warnings,
-    )
-    out = step_root / "raw_link_cleanup.json"
-    write_json(out, artifact)
-    report = step_root / "raw_link_cleanup.md"
-    report.write_text(render_raw_link_cleanup_markdown(artifact), encoding="utf-8")
-    diff_path = step_root / "cleanup.diff"
-    diff_path.write_text(_diff_utils.render_update_diff(original_text, cleaned_text, f"pre/{raw_rel}", f"post/{raw_rel}"), encoding="utf-8")
-    complete_step(
-        ctx.manifest,
-        step_name,
-        outputs=[
-            _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "raw_link_cleanup.v1"),
-            _artifact_refs.ref(ctx.run_dir, report, step_name, "markdown"),
-            _artifact_refs.ref(ctx.run_dir, diff_path, step_name, "diff"),
-        ],
-    )
-
-
-def _write_raw_prepare_outputs(ctx: StepRunContext, preparation: RawPreparationArtifact, *, include_model_outputs: bool) -> None:
-    step_name = "raw_prepare"
-    step_root = require_step_output_dir(ctx.run_dir, step_name)
-    validate_raw_preparation(preparation)
-    out = step_root / "raw_preparation.json"
-    write_json(out, preparation)
-    prepared = step_root / "prepared.md"
-    prepared.parent.mkdir(parents=True, exist_ok=True)
-    prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
-    outputs = [
-        _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
-        _artifact_refs.ref(ctx.run_dir, prepared, step_name, "markdown"),
-    ]
-    if include_model_outputs:
-        outputs.extend(_artifact_refs.structured_model_output_refs(ctx.run_dir, step_root, step_name))
-    complete_step(ctx.manifest, step_name, outputs=outputs)
-
-
-def _run_raw_prepare(ctx: StepRunContext) -> None:
-    step_name = "raw_prepare"
-    raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
-    cleanup_path = require_step_output_dir(ctx.run_dir, "raw_link_cleanup") / "raw_link_cleanup.json"
-    cleanup = read_model(cleanup_path, RawLinkCleanupArtifact)
-    input_raw_sha256 = sha256_file(ctx.raw_path)
-    cleanup_ref = cleanup_path.relative_to(ctx.run_dir).as_posix()
-    raw_prepare_policy = ctx.manifest.vault_config_snapshot.raw_prepare_policy
-    if raw_prepare_policy == RawPreparePolicy.skip:
-        if ctx.raw_path.suffix.lower() not in {".md", ".markdown", ".mdown"}:
-            raise _errors.PipelineError("--prepare skip requires Markdown raw; use --prepare auto or --prepare force for non-Markdown raw.")
-        raw_text = ctx.raw_path.read_text(encoding="utf-8")
-        if not raw_text.strip():
-            raise _errors.PipelineError("--prepare skip requires non-empty raw Markdown.")
-        preparation = RawPreparationArtifact(
-            source_raw_path=raw_rel,
-            input_raw_sha256=input_raw_sha256,
-            raw_link_cleanup_ref=cleanup_ref,
-            prepared_markdown=raw_text.rstrip() + "\n",
-            operations_applied=["user_skip_markdown_passthrough"],
-            omission_policy="none",
-        )
-        _write_raw_prepare_outputs(ctx, preparation, include_model_outputs=False)
-        return
-
-    payload = {
-        "source_raw_path": raw_rel,
-        "source_raw_sha256": input_raw_sha256,
-        "raw_prepare_policy": raw_prepare_policy.value,
-        "raw_markdown": ctx.raw_path.read_text(encoding="utf-8"),
-        "raw_link_cleanup_ref": cleanup_ref,
-        "raw_link_cleanup": {
-            "changed": cleanup.changed,
-            "cleaned_link_count": cleanup.cleaned_link_count,
-            "preserved_media_embed_count": cleanup.preserved_media_embed_count,
-            "cleanup_rule_version": cleanup.cleanup_rule_version,
-        },
-        "contract": RAW_PREPARE_CONTRACT,
-    }
-
-    def validate_raw_prepare_model(model: RawPreparationArtifact) -> None:
-        candidate = model.model_copy(
-            update={
-                "input_raw_sha256": input_raw_sha256,
-                "raw_link_cleanup_ref": cleanup_ref,
-            }
-        )
-        validate_raw_preparation(candidate)
-        if candidate.source_raw_path != raw_rel:
-            raise ContractValidationError(
-                f"raw_prepare source path mismatch: {candidate.source_raw_path} != {raw_rel}",
-                issues=[
-                    StructuredIssue(
-                        issue_code="source_path_mismatch",
-                        field_path="source_raw_path",
-                        validator_id="validate_raw_prepare_model",
-                        message=f"raw_prepare source path mismatch: {candidate.source_raw_path} != {raw_rel}",
-                        repairability="repairable",
-                    )
-                ],
-            )
-
-    preparation, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
-        step_name,
-        payload,
-        RawPreparationArtifact,
-        validator=validate_raw_prepare_model,
-    )
-    preparation = _redacted_model(ctx, preparation, RawPreparationArtifact)
-    preparation = preparation.model_copy(
-        update={
-            "input_raw_sha256": input_raw_sha256,
-            "raw_link_cleanup_ref": cleanup_ref,
-        }
-    )
-    if preparation.source_raw_path != raw_rel:
-        raise _errors.PipelineError(f"raw_prepare source path mismatch: {preparation.source_raw_path} != {raw_rel}")
-    _write_raw_prepare_outputs(ctx, preparation, include_model_outputs=True)
-
-
-def _run_prepared_raw_review(ctx: StepRunContext) -> None:
-    step_name = "prepared_raw_review"
-    step_root = require_step_output_dir(ctx.run_dir, step_name)
-    prepared = require_step_output_dir(ctx.run_dir, "raw_prepare") / "prepared.md"
-    approved = step_root / "approved_prepared.md"
-    approved.write_text(prepared.read_text(encoding="utf-8"), encoding="utf-8")
-    prompt = step_root / "review_prompt.md"
-    prompt.write_text(
-        "# Prepared Raw 审核\n\n"
-        "当前运行自动批准 prepared raw；下游步骤会继续基于 Approved Raw 校验。\n",
-        encoding="utf-8",
-    )
-    feedback = step_root / "review_feedback.jsonl"
-    feedback.write_text("", encoding="utf-8")
-    decision = ReviewDecision(
-        review_step=step_name,
-        decision="approved",
-        auto_approved=True,
-        notes="当前运行自动批准；交互式审核尚未接入。",
-    )
-    decision_path = step_root / "review_decision.json"
-    write_json(decision_path, decision)
-    _complete_review_step(
-        ctx.manifest,
-        step_name,
-        outputs=[
-            _artifact_refs.ref(ctx.run_dir, prompt, step_name, "markdown"),
-            _artifact_refs.ref(ctx.run_dir, feedback, step_name, "jsonl"),
-            _artifact_refs.ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
-            _artifact_refs.ref(ctx.run_dir, approved, step_name, "markdown"),
-        ],
-        review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
-    )
-
-
-def _run_source_digest(ctx: StepRunContext) -> None:
+def _run_source_digest(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "source_digest"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     raw_rel = relative_to_vault(ctx.vault, ctx.raw_path)
@@ -649,13 +447,13 @@ def _run_source_digest(ctx: StepRunContext) -> None:
         profile=ctx.profile.model_dump(mode="json"),
         vault_config=ctx.manifest.vault_config_snapshot,
     )
-    digest, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
+    digest, _ = _step_runtime.structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
         step_name,
         payload,
         SourceDigestArtifact,
         validator=lambda model: validate_source_digest(model, language=ctx.manifest.vault_config_snapshot.wiki_language),
     )
-    digest = _redacted_model(ctx, digest, SourceDigestArtifact)
+    digest = _step_runtime.redacted_model(ctx, digest, SourceDigestArtifact)
     if digest.source_raw_path != raw_rel:
         raise _errors.PipelineError(f"source_digest source path mismatch: {digest.source_raw_path} != {raw_rel}")
     digest = _source_digest_budget.augment_source_digest_anchor_entities(digest, approved_prepared_text)
@@ -684,7 +482,7 @@ def _run_source_digest(ctx: StepRunContext) -> None:
     complete_step(ctx.manifest, step_name, outputs=outputs)
 
 
-def _run_source_digest_review(ctx: StepRunContext) -> None:
+def _run_source_digest_review(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "source_digest_review"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     digest_json = require_step_output_dir(ctx.run_dir, "source_digest") / "source_digest.json"
@@ -718,7 +516,7 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
-    _complete_review_step(
+    _step_runtime.complete_review_step(
         ctx.manifest,
         step_name,
         outputs=[
@@ -732,7 +530,7 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
     )
 
 
-def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
+def _run_source_duplicate_guard(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "source_duplicate_guard"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
@@ -764,7 +562,7 @@ def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
     )
 
 
-def _run_candidate_resolution(ctx: StepRunContext) -> None:
+def _run_candidate_resolution(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "candidate_resolution"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
@@ -811,13 +609,13 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
         candidate = _candidate_resolution.finalize_candidate_resolution(ctx.vault, ctx.profile, model, digest)
         validate_candidate_resolution(digest, candidate)
 
-    artifact, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
+    artifact, _ = _step_runtime.structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
         step_name,
         payload,
         CandidateResolutionArtifact,
         validator=validate_candidate_resolution_model,
     )
-    artifact = _redacted_model(ctx, artifact, CandidateResolutionArtifact)
+    artifact = _step_runtime.redacted_model(ctx, artifact, CandidateResolutionArtifact)
     artifact = _candidate_resolution.backfill_missing_candidate_resolution_items(artifact, digest, ctx.profile)
     artifact = _candidate_resolution.finalize_candidate_resolution(ctx.vault, ctx.profile, artifact, digest)
     validate_candidate_resolution(digest, artifact)
@@ -839,7 +637,7 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
     )
 
 
-def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
+def _run_wiki_context_snapshot(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "wiki_context_snapshot"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     resolution = read_model(
@@ -894,7 +692,7 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
     )
 
 
-def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
+def _run_wiki_merge_planning(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "wiki_merge_planning"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     resolution = read_model(
@@ -1008,13 +806,13 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
         )
         validate_wiki_merge_plan(digest, candidate, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
 
-    plan, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
+    plan, _ = _step_runtime.structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
         step_name,
         payload,
         WikiMergePlanArtifact,
         validator=validate_merge_model,
     )
-    plan = _redacted_model(ctx, plan, WikiMergePlanArtifact)
+    plan = _step_runtime.redacted_model(ctx, plan, WikiMergePlanArtifact)
     plan = _merge_planning.finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_ref, medium_missing_policy="preserve")
     plan = _merge_planning.block_unrepaired_medium_create_reason(plan)
     validate_wiki_merge_plan(digest, plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
@@ -1039,7 +837,7 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     )
 
 
-def _run_merge_plan_review(ctx: StepRunContext) -> None:
+def _run_merge_plan_review(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "merge_plan_review"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     plan_path = require_step_output_dir(ctx.run_dir, "wiki_merge_planning") / "wiki_merge_plan.json"
@@ -1088,7 +886,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     )
     decision_path = step_root / "review_decision.json"
     write_json(decision_path, decision)
-    _complete_review_step(
+    _step_runtime.complete_review_step(
         ctx.manifest,
         step_name,
         outputs=[
@@ -1101,7 +899,7 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
     )
 
 
-def _run_draft_rendering(ctx: StepRunContext) -> None:
+def _run_draft_rendering(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "draft_rendering"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     digest = read_model(require_step_output_dir(ctx.run_dir, "source_digest_review") / "approved_digest.json", SourceDigestArtifact)
@@ -1113,7 +911,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
     validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
     validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
-    _ensure_wiki_context_current(ctx.vault, snapshot)
+    _step_runtime.ensure_wiki_context_current(ctx.vault, snapshot)
     approved_prepared_path = require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md"
     approved_prepared_text = approved_prepared_path.read_text(encoding="utf-8")
     draftable_count = len([item for item in merge_plan.items if item.action in {"create", "update"}])
@@ -1177,7 +975,7 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
     complete_step(ctx.manifest, step_name, outputs=refs)
 
 
-def _run_validation(ctx: StepRunContext) -> None:
+def _run_validation(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "validation"
     preparation = read_model(
         require_step_output_dir(ctx.run_dir, "raw_prepare") / "raw_preparation.json",
@@ -1194,7 +992,7 @@ def _run_validation(ctx: StepRunContext) -> None:
     validate_raw_preparation(preparation)
     validate_source_digest(digest, language=ctx.manifest.vault_config_snapshot.wiki_language)
     validate_wiki_merge_plan(digest, merge_plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)
-    _ensure_wiki_context_current(ctx.vault, snapshot)
+    _step_runtime.ensure_wiki_context_current(ctx.vault, snapshot)
     if any(item.action == "needs_human_decision" for item in merge_plan.items):
         raise _errors.PipelineError("needs_human_decision must be revised to create/update/noop before validation.")
     if not digest.ingest_candidates() and not any(
@@ -1208,10 +1006,10 @@ def _run_validation(ctx: StepRunContext) -> None:
     complete_step(ctx.manifest, step_name)
 
 
-def _run_apply_preview(ctx: StepRunContext) -> None:
+def _run_apply_preview(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "apply_preview"
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
-    _ensure_wiki_context_current(ctx.vault, snapshot)
+    _step_runtime.ensure_wiki_context_current(ctx.vault, snapshot)
     preview = _apply_preview.build_apply_preview(ctx.vault, ctx.run_dir)
     out = require_step_output_dir(ctx.run_dir, step_name) / "apply_preview.json"
     write_json(out, preview)
@@ -1219,7 +1017,7 @@ def _run_apply_preview(ctx: StepRunContext) -> None:
 
 
 def _refresh_current_draft_grounding_artifacts(
-    ctx: StepRunContext,
+    ctx: _step_runtime.StepRunContext,
     draft_manifest: DraftWriteManifest,
     draft_manifest_path: Path,
 ) -> DraftWriteManifest:
@@ -1239,7 +1037,7 @@ def _refresh_current_draft_grounding_artifacts(
     return updated_manifest
 
 
-def _refresh_draft_rendering_artifact_refs(ctx: StepRunContext, *paths: Path) -> None:
+def _refresh_draft_rendering_artifact_refs(ctx: _step_runtime.StepRunContext, *paths: Path) -> None:
     draft_step = get_step(ctx.manifest, "draft_rendering")
     for path in paths:
         ref = _artifact_refs.draft_rendering_ref(ctx.run_dir, path, "draft_rendering")
@@ -1248,7 +1046,7 @@ def _refresh_draft_rendering_artifact_refs(ctx: StepRunContext, *paths: Path) ->
             attempt.outputs = _artifact_refs.replace_artifact_ref(attempt.outputs, ref)
 
 
-def _run_draft_review(ctx: StepRunContext) -> None:
+def _run_draft_review(ctx: _step_runtime.StepRunContext) -> None:
     step_name = "draft_review"
     step_root = require_step_output_dir(ctx.run_dir, step_name)
     draft_manifest_path = require_step_output_dir(ctx.run_dir, "draft_rendering") / "draft_write_manifest.json"
@@ -1277,7 +1075,7 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             notes=auto_approval_notes,
         )
         write_json(approval_path, approval)
-        _complete_review_step(
+        _step_runtime.complete_review_step(
             ctx.manifest,
             step_name,
             outputs=[
@@ -1313,9 +1111,9 @@ class StepRunner:
 
 
 _STEP_RUN_FUNCTIONS = {
-    "raw_link_cleanup": _run_raw_link_cleanup,
-    "raw_prepare": _run_raw_prepare,
-    "prepared_raw_review": _run_prepared_raw_review,
+    "raw_link_cleanup": _raw_steps.run_raw_link_cleanup,
+    "raw_prepare": _raw_steps.run_raw_prepare,
+    "prepared_raw_review": _raw_steps.run_prepared_raw_review,
     "source_digest": _run_source_digest,
     "source_digest_review": _run_source_digest_review,
     "source_duplicate_guard": _run_source_duplicate_guard,
@@ -1332,29 +1130,6 @@ _STEP_RUN_FUNCTIONS = {
 STEP_RUNNERS: dict[str, StepRunner] = {
     spec.name: StepRunner(spec, _STEP_RUN_FUNCTIONS[spec.name]) for spec in STEP_SPECS
 }
-
-
-TModel = TypeVar("TModel", bound=BaseModel)
-
-
-def _redacted_model(ctx: StepRunContext, model: TModel, model_type: type[TModel]) -> TModel:
-    data = ctx.execution_context.redactor.redact(model.model_dump(mode="json"))
-    return model_type.model_validate(data)
-
-
-def _structured_call(
-    run_dir: Path,
-    execution_context: ProviderExecutionContext,
-    task: str,
-    *,
-    result_filename: str = "provider_result.json",
-) -> StructuredModelCall:
-    return StructuredModelCall(
-        execution_context.provider_for_task(task),
-        output_dir=step_output_dir(run_dir, task),
-        result_filename=result_filename,
-        redactor=execution_context.redactor,
-    )
 
 
 def _delete_downstream_step_dirs(vault: Path, operation_id: str, start_step: str) -> None:
@@ -1387,7 +1162,7 @@ def _last_attempt_duration_ms(manifest: OperationManifest, step_name: str) -> in
     return step.attempts[-1].duration_ms
 
 
-def _step_completion_message(ctx: StepRunContext, step_name: str) -> str | None:
+def _step_completion_message(ctx: _step_runtime.StepRunContext, step_name: str) -> str | None:
     if step_name == "raw_prepare":
         if ctx.manifest.vault_config_snapshot.raw_prepare_policy == RawPreparePolicy.skip:
             return "raw_prepare 使用 --prepare skip passthrough，跳过模型清洗"
@@ -1569,25 +1344,3 @@ def latest_operation(vault: Path) -> str | None:
 
 def _safe_timestamp() -> str:
     return utc_now().replace("+00:00", "Z").replace(":", "")
-
-
-def _complete_review_step(
-    manifest: OperationManifest,
-    name: str,
-    *,
-    outputs: list[ArtifactRef],
-    review_decision_ref: str,
-) -> None:
-    complete_step(manifest, name, outputs=outputs)
-    step = get_step(manifest, name)
-    step.review_state = "approved"
-    step.review_reason = None
-    step.awaiting_since = None
-    step.resolved_at = step.completed_at
-    step.review_decision_ref = review_decision_ref
-
-
-def _ensure_wiki_context_current(vault: Path, snapshot: WikiContextSnapshot) -> None:
-    messages = _wiki_context.wiki_context_drift_messages(vault, snapshot)
-    if messages:
-        raise _errors.PipelineError("; ".join(messages))
