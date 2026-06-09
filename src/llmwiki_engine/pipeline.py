@@ -1378,10 +1378,7 @@ def refresh_current_draft_grounding_artifacts(
     snapshot = read_model(require_step_output_dir(ctx.run_dir, "wiki_context_snapshot") / "wiki_context_snapshot.json", WikiContextSnapshot)
     approved_prepared_text = (require_step_output_dir(ctx.run_dir, "prepared_raw_review") / "approved_prepared.md").read_text(encoding="utf-8")
     grounding_review = _draft_grounding.build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
-    grounding_review_path = draft_root / "draft_grounding_review.json"
-    grounding_review_md = draft_root / "draft_grounding_review.md"
-    write_json(grounding_review_path, grounding_review)
-    grounding_review_md.write_text(_draft_grounding.render_draft_grounding_review(grounding_review), encoding="utf-8")
+    grounding_review_path, grounding_review_md = _draft_grounding.write_draft_grounding_review_outputs(draft_root, grounding_review)
     refresh_draft_rendering_artifact_refs(ctx, grounding_review_path, grounding_review_md)
     if draft_manifest.requires_grounding_review == grounding_review.requires_review:
         return draft_manifest

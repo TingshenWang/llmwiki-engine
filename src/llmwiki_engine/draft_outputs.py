@@ -4,7 +4,6 @@ import json
 import re
 from typing import Any
 
-from . import draft_grounding as _draft_grounding
 from . import page_sections as _page_sections
 from . import related_pages as _related_pages
 from . import section_merge as _section_merge
@@ -14,7 +13,6 @@ from . import wiki_markup as _wiki_markup
 from .models import (
     DraftPageItem,
     DraftRenderingArtifact,
-    GroundingClaim,
     RawLinkCleanupArtifact,
     RelatedCandidateReport,
     RelatedMergeReport,
@@ -42,9 +40,7 @@ def assemble_knowledge_page(
     log_date: str,
     update_reports: list[UpdatePageMergeReport] | None = None,
     related_reports: list[RelatedCandidateReport] | None = None,
-    grounding_claims: list[GroundingClaim] | None = None,
     known_related_paths: set[str] | None = None,
-    approved_raw_text: str = "",
 ) -> str:
     existing_sections = _page_sections.parse_existing_sections(existing_entry.content)
     summary = _update_preservation.draft_page_summary(page) or item.new_understanding
@@ -110,14 +106,6 @@ def assemble_knowledge_page(
                 noop_covered_by_update=item.noop_covered_by_update,
                 sections=section_changes,
             )
-        )
-    if grounding_claims is not None:
-        _draft_grounding.collect_grounding_claims(
-            item=item,
-            page=page,
-            existing_entry=existing_entry,
-            approved_raw_text=approved_raw_text,
-            claims=grounding_claims,
         )
     source_raw_paths = _append_unique(metadata.source_raw_paths if metadata is not None else [], raw_path)
     source_raw_hashes = _append_unique(metadata.source_raw_hashes if metadata is not None else [], raw_hash)

@@ -13,7 +13,6 @@ from .models import (
     DraftRenderingArtifact,
     DraftWriteManifest,
     DraftWriteTarget,
-    GroundingClaim,
     ProfileSpec,
     RawLinkCleanupArtifact,
     RelatedCandidateReport,
@@ -55,7 +54,6 @@ def assemble_draft_write_outputs(
     action_by_id = {item.page_plan_id: item for item in merge_plan.items}
     update_report_pages: list[UpdatePageMergeReport] = []
     related_report_candidates: list[RelatedCandidateReport] = []
-    grounding_claims: list[GroundingClaim] = []
     known_related_paths = _known_related_paths(snapshot, merge_plan)
     knowledge_changed_paths: list[str] = []
     no_change_pages = [item.canonical_target_path for item in merge_plan.items if item.action == "noop"]
@@ -76,9 +74,7 @@ def assemble_draft_write_outputs(
             log_date=snapshot.log_date,
             update_reports=update_report_pages,
             related_reports=related_report_candidates,
-            grounding_claims=grounding_claims,
             known_related_paths=known_related_paths,
-            approved_raw_text=approved_prepared_text,
         )
         target.write_text(markdown, encoding="utf-8")
         outputs.append(target)
@@ -235,11 +231,8 @@ def assemble_draft_write_outputs(
     related_report_md = step_root / "related_merge_report.md"
     write_json(related_report_path, related_report)
     related_report_md.write_text(_draft_outputs.render_related_merge_report(related_report), encoding="utf-8")
-    grounding_review = _draft_grounding.draft_grounding_review_from_claims(grounding_claims)
-    grounding_review_path = step_root / "draft_grounding_review.json"
-    grounding_review_md = step_root / "draft_grounding_review.md"
-    write_json(grounding_review_path, grounding_review)
-    grounding_review_md.write_text(_draft_grounding.render_draft_grounding_review(grounding_review), encoding="utf-8")
+    grounding_review = _draft_grounding.build_draft_grounding_review(draft_artifact, merge_plan, snapshot, approved_prepared_text)
+    grounding_review_path, grounding_review_md = _draft_grounding.write_draft_grounding_review_outputs(step_root, grounding_review)
     outputs.extend([update_report_path, update_report_md, related_report_path, related_report_md, grounding_review_path, grounding_review_md])
 
     write_manifest = DraftWriteManifest(

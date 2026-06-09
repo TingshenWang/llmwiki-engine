@@ -7335,6 +7335,8 @@ def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> Non
     manifest = run_simplified_ingest(vault=vault, raw_file=raw, mock_fixture_dir=FIXTURE_ROOT / "mock", slug="stale-grounding")
     run_dir = RunStore(vault).run_dir(manifest.operation_id)
     draft_manifest_path = run_dir / "draft_rendering" / "draft_write_manifest.json"
+    initial_grounding = read_json(run_dir / "draft_rendering" / "draft_grounding_review.json")
+    initial_grounding_markdown = (run_dir / "draft_rendering" / "draft_grounding_review.md").read_text(encoding="utf-8")
     stale_manifest = read_json(draft_manifest_path)
     stale_manifest["requires_grounding_review"] = True
     write_json(draft_manifest_path, stale_manifest)
@@ -7358,6 +7360,7 @@ def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> Non
             "requires_review": True,
         },
     )
+    (run_dir / "draft_rendering" / "draft_grounding_review.md").write_text("# stale grounding\n", encoding="utf-8")
 
     class Ctx:
         pass
@@ -7371,17 +7374,26 @@ def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> Non
         draft_manifest_path,
     )
     grounding = read_json(run_dir / "draft_rendering" / "draft_grounding_review.json")
+    grounding_markdown = (run_dir / "draft_rendering" / "draft_grounding_review.md").read_text(encoding="utf-8")
     draft_step = [step for step in ctx.manifest.steps if step.name == "draft_rendering"][0]
     write_manifest_ref = [
         ref
         for ref in draft_step.outputs
         if ref.relative_path == "draft_rendering/draft_write_manifest.json"
     ][0]
+    grounding_md_ref = [
+        ref
+        for ref in draft_step.outputs
+        if ref.relative_path == "draft_rendering/draft_grounding_review.md"
+    ][0]
 
     assert refreshed.requires_grounding_review is False
     assert grounding["requires_review"] is False
+    assert grounding == initial_grounding
+    assert grounding_markdown == initial_grounding_markdown
     assert read_json(draft_manifest_path)["requires_grounding_review"] is False
     assert write_manifest_ref.sha256 == sha256_file(draft_manifest_path)
+    assert grounding_md_ref.sha256 == sha256_file(run_dir / "draft_rendering" / "draft_grounding_review.md")
 
 
 def test_draft_page_item_coerces_quality_risks_string_to_list() -> None:

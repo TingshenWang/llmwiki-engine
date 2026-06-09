@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from pathlib import Path
 from typing import Any
 
 from . import draft_validation as _draft_validation
@@ -9,6 +10,7 @@ from . import markdown_utils as _markdown_utils
 from . import page_sections as _page_sections
 from . import source_excerpt as _source_excerpt
 from . import update_preservation as _update_preservation
+from .io import write_json
 from .models import (
     DraftGroundingReview,
     DraftPageItem,
@@ -1356,7 +1358,7 @@ def remove_grounding_quote_spans_for_scan(text: str) -> str:
     return "".join(chars)
 
 
-def collect_grounding_claims(
+def _collect_grounding_claims(
     *,
     item: WikiMergePlanItem,
     page: DraftPageItem,
@@ -2740,14 +2742,14 @@ def build_draft_grounding_review(
             continue
         grounding_page = draft_page_for_grounding(page)
         entry = snapshot_entry(snapshot, f"wiki/{page.canonical_target_path}")
-        collect_grounding_claims(
+        _collect_grounding_claims(
             item=item,
             page=grounding_page,
             existing_entry=entry,
             approved_raw_text=approved_raw_text,
             claims=claims,
         )
-    return draft_grounding_review_from_claims(claims)
+    return _draft_grounding_review_from_claims(claims)
 
 
 def draft_page_for_grounding(page: DraftPageItem) -> DraftPageItem:
@@ -2863,7 +2865,15 @@ def looks_like_metric_or_outcome_literal(compact: str) -> bool:
     return any(marker in compact for marker in metric_markers)
 
 
-def draft_grounding_review_from_claims(claims: list[GroundingClaim]) -> DraftGroundingReview:
+def write_draft_grounding_review_outputs(step_root: Path, review: DraftGroundingReview) -> tuple[Path, Path]:
+    grounding_review_path = step_root / "draft_grounding_review.json"
+    grounding_review_md = step_root / "draft_grounding_review.md"
+    write_json(grounding_review_path, review)
+    grounding_review_md.write_text(render_draft_grounding_review(review), encoding="utf-8")
+    return grounding_review_path, grounding_review_md
+
+
+def _draft_grounding_review_from_claims(claims: list[GroundingClaim]) -> DraftGroundingReview:
     unsupported_new_facts = [
         claim
         for claim in claims
