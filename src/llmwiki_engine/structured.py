@@ -142,7 +142,6 @@ class StructuredModelCall:
         self._persist(task, final_result)
         duration_ms = round((monotonic() - started) * 1000)
         self._persist_report(
-            task,
             StructuredRepairReport(
                 task=task,
                 provider=self.provider.name,
@@ -201,27 +200,31 @@ class StructuredModelCall:
         write_json(self.output_dir / ref, self.redactor.redact(payload))
         return ref
 
-    def _persist_report(self, task: str, report: StructuredRepairReport) -> None:
+    def _persist_report(self, report: StructuredRepairReport) -> None:
         if self.output_dir is None:
             return
         write_json(self.output_dir / "structured_repair_report.json", report)
-        lines = [
-            "# 结构化输出返工报告",
-            "",
-            f"- 任务：`{task}`",
-            f"- Provider：`{report.provider}`",
-            f"- 结果：`{report.final_outcome}`",
-            f"- 尝试次数：{report.attempt_count}",
-            f"- 返工次数：{report.repair_count}",
-            "",
-            "## 尝试记录",
-            "",
-        ]
-        for attempt in report.attempts:
-            issue_text = "; ".join(f"{issue.issue_code}: {issue.message}" for issue in attempt.issues) or "无"
-            prompt_text = f"；返工 prompt：`{attempt.repair_prompt_ref}`" if attempt.repair_prompt_ref else ""
-            lines.append(f"- 第 {attempt.attempt} 次：`{attempt.provider_result_ref}`{prompt_text}；问题：{issue_text}")
-        (self.output_dir / "structured_repair_report.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        (self.output_dir / "structured_repair_report.md").write_text(render_structured_repair_report_markdown(report), encoding="utf-8")
+
+
+def render_structured_repair_report_markdown(report: StructuredRepairReport) -> str:
+    lines = [
+        "# 结构化输出返工报告",
+        "",
+        f"- 任务：`{report.task}`",
+        f"- Provider：`{report.provider}`",
+        f"- 结果：`{report.final_outcome}`",
+        f"- 尝试次数：{report.attempt_count}",
+        f"- 返工次数：{report.repair_count}",
+        "",
+        "## 尝试记录",
+        "",
+    ]
+    for attempt in report.attempts:
+        issue_text = "; ".join(f"{issue.issue_code}: {issue.message}" for issue in attempt.issues) or "无"
+        prompt_text = f"；返工 prompt：`{attempt.repair_prompt_ref}`" if attempt.repair_prompt_ref else ""
+        lines.append(f"- 第 {attempt.attempt} 次：`{attempt.provider_result_ref}`{prompt_text}；问题：{issue_text}")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _parse_json(raw: str) -> tuple[dict[str, Any], bool]:

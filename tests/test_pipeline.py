@@ -15,6 +15,7 @@ import llmwiki_engine.apply as apply_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.draft_outputs as draft_outputs_module
+import llmwiki_engine.draft_rendering_runner as draft_rendering_runner
 import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
 import llmwiki_engine.draft_reviewing as draft_reviewing_module
 import llmwiki_engine.merge_plan_refinement as merge_plan_refinement_module
@@ -44,17 +45,23 @@ from llmwiki_engine.models import (
     CandidateContextHit,
     CandidateContextItem,
     CandidateContextsArtifact,
+    DraftPageItem,
     DraftRenderingArtifact,
+    OperationConfigSnapshot,
     OperationStatus,
     RawPreparePolicy,
     SourceBasis,
     SourceDigestArtifact,
     SourceDigestCandidate,
     StepStatus,
+    StructuredIssue,
     VerificationStatus,
     WeakOrNoiseItem,
+    WikiContextEntry,
+    WikiContextSnapshot,
     WikiKnowledgePoolEntry,
     WikiMergePlanArtifact,
+    WikiMergePlanItem,
 )
 from llmwiki_engine.pipeline import (
     STEP_RUNNERS,
@@ -106,6 +113,24 @@ def assert_draft_rendering_schema_page_fields(schema: dict) -> None:
     page_schema = schema["$defs"]["DraftPageItem"]
     assert set(page_schema["properties"]) == CURRENT_DRAFT_PAGE_FIELDS
     assert page_schema["additionalProperties"] is False
+
+
+class NoopRedactor:
+    def redact(self, data: object) -> object:
+        return data
+
+    def redact_text(self, text: str) -> str:
+        return text
+
+
+def draft_runner_context(profile: object, *, execution_context: object | None = None) -> draft_rendering_runner.DraftRenderingRunContext:
+    config = OperationConfigSnapshot()
+    return draft_rendering_runner.DraftRenderingRunContext(
+        execution_context=execution_context or types.SimpleNamespace(redactor=NoopRedactor()),
+        profile_payload=profile.model_dump(mode="json"),
+        language_contract=config.model_dump(mode="json"),
+        wiki_language=config.wiki_language,
+    )
 
 
 def make_vault(tmp_path: Path) -> tuple[Path, Path]:
@@ -732,7 +757,7 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
         WikiMergePlanArtifact(
             log_date="2026-06-06",
             items=[
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-AGG",
                     source_basis=SourceBasis(source_candidate_ids=[aggregate.candidate_id]),
                     action="create",
@@ -1123,7 +1148,7 @@ def test_draft_source_excerpt_pack_expands_aggregation_child_candidate_cues() ->
     merge_plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-AGG",
                 source_basis=SourceBasis(source_candidate_ids=["AGG-concepts-demo"], source_locator="聚合"),
                 action="create",
@@ -1186,7 +1211,7 @@ def test_source_excerpt_packs_expand_prepared_discovered_budget_deferred_cues() 
     merge_plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-C005",
                 source_basis=SourceBasis(prepared_discovered_candidates=["C005"], source_locator="prepared discovered"),
                 action="create",
@@ -1210,7 +1235,7 @@ def test_source_excerpt_packs_expand_prepared_discovered_budget_deferred_cues() 
         approved_prepared_text=text + ("\n额外填充段落。\n" * 2000),
         digest=digest,
         resolution=resolution,
-        snapshot=pipeline_module.WikiContextSnapshot(log_date="2026-06-06", source_target_path="sources/Source_Test.md"),
+        snapshot=WikiContextSnapshot(log_date="2026-06-06", source_target_path="sources/Source_Test.md"),
         candidate_contexts=pipeline_module.CandidateContextsArtifact(retrieval_backend="exact"),
         snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
     )
@@ -1268,7 +1293,7 @@ def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_de
     merge_plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-C1",
                 source_basis=SourceBasis(source_candidate_ids=["C1"]),
                 action="create",
@@ -1279,7 +1304,7 @@ def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_de
                 section_plans={"summary": "摘要"},
                 reason="test",
             ),
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-AGG",
                 source_basis=SourceBasis(source_candidate_ids=["AGG-concepts-demo"]),
                 action="create",
@@ -1290,7 +1315,7 @@ def test_draft_rendering_digest_projection_keeps_batch_candidates_and_related_de
                 section_plans={"summary": "摘要"},
                 reason="test",
             ),
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-NOOP",
                 source_basis=SourceBasis(source_candidate_ids=["D1"]),
                 action="noop",
@@ -2593,7 +2618,7 @@ def test_draft_rendering_payload_uses_excerpt_pack_for_long_prepared_source(
 
 
 def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspected() -> None:
-    update_item = pipeline_module.WikiMergePlanItem(
+    update_item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["C001"]),
         action="update",
@@ -2611,7 +2636,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
         section_plans={"detail": "详情"},
         reason="测试 draft context projection。",
     )
-    create_item = pipeline_module.WikiMergePlanItem(
+    create_item = WikiMergePlanItem(
         page_plan_id="PP-CREATE",
         source_basis=SourceBasis(source_candidate_ids=["C002"]),
         action="create",
@@ -2631,41 +2656,41 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
         inspected_context_paths=["concepts/Concept_大脑与双手解耦.md"],
         reason="测试 create related 保留 metadata，但 weak inspected 不进入 draft payload。",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old-claude",
                 content="# Claude Code\n\n旧页 Managed Agents / harness 架构视角。\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Managed Agents.md",
                 expected_state="present",
                 preimage_sha256="old-managed",
                 content="# Managed Agents\n\n" + ("相关旧页正文不应进入 create draft payload。\n" * 40),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Update_Strongest.md",
                 expected_state="present",
                 preimage_sha256="old-update-strongest",
                 content="# Update Strongest\n\n" + ("update inspected context 正文不应进入 draft payload。\n" * 40),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Update_Inspected.md",
                 expected_state="present",
                 preimage_sha256="old-update-inspected",
                 content="# Update Inspected\n\n" + ("update inspected context 正文不应进入 draft payload。\n" * 40),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_大脑与双手解耦.md",
                 expected_state="present",
                 preimage_sha256="old-brain",
                 content="# 大脑与双手解耦\n\n" + ("inspected context 正文也不应进入 create draft payload。\n" * 40),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_New.md",
                 expected_state="missing",
                 preimage_sha256=None,
@@ -2701,7 +2726,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
 
 
 def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> None:
-    medium_item = pipeline_module.WikiMergePlanItem(
+    medium_item = WikiMergePlanItem(
         page_plan_id="PP-MEDIUM",
         source_basis=SourceBasis(source_candidate_ids=["C001"]),
         action="create",
@@ -2718,7 +2743,7 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
         section_plans={"detail": "详情"},
         reason="测试 medium create 保留 inspected metadata。",
     )
-    strong_item = pipeline_module.WikiMergePlanItem(
+    strong_item = WikiMergePlanItem(
         page_plan_id="PP-STRONG",
         source_basis=SourceBasis(source_candidate_ids=["C002"]),
         action="create",
@@ -2735,41 +2760,41 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
         section_plans={"detail": "详情"},
         reason="测试 strong create 保留 strongest overlap 正文。",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Medium_Context.md",
                 expected_state="present",
                 preimage_sha256="medium-context",
                 content="# Medium Context\n\n" + ("medium overlap 正文不应进入 create payload。\n" * 20),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Medium_Inspected.md",
                 expected_state="present",
                 preimage_sha256="medium-inspected",
                 content="# Medium Inspected\n\n" + ("medium inspected 正文不应进入 create payload。\n" * 20),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Strong_Context.md",
                 expected_state="present",
                 preimage_sha256="strong-context",
                 content="# Strong Context\n\nstrong overlap 正文应进入 create payload。\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Strong_Inspected.md",
                 expected_state="present",
                 preimage_sha256="strong-inspected",
                 content="# Strong Inspected\n\n" + ("strong inspected 只保留 metadata。\n" * 20),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Medium_New.md",
                 expected_state="missing",
                 preimage_sha256=None,
                 content="",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Strong_New.md",
                 expected_state="missing",
                 preimage_sha256=None,
@@ -3021,11 +3046,11 @@ def test_empty_vault_merge_shortcut_accepts_prepared_discovered_candidate_refs()
             )
         ]
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_多脑多手架构.md",
                 expected_state="missing",
             )
@@ -3441,7 +3466,7 @@ def test_model_related_pages_are_deterministically_resolved_before_rendering(tmp
 
 
 def test_related_renderer_filters_and_caps_candidates() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-CAND001",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="create",
@@ -3493,7 +3518,7 @@ def test_related_renderer_filters_and_caps_candidates() -> None:
     report: list[pipeline_module.RelatedCandidateReport] = []
     rendered = related_pages_module.render_related_pages(
         item,
-        existing_entry=pipeline_module.WikiContextEntry(
+        existing_entry=WikiContextEntry(
             path="wiki/concepts/Concept_Current.md",
             expected_state="present",
             preimage_sha256="old",
@@ -3519,7 +3544,7 @@ def test_related_renderer_filters_and_caps_candidates() -> None:
 
 
 def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-CURRENT",
         source_basis=SourceBasis(source_candidate_ids=["C001"]),
         action="create",
@@ -3569,13 +3594,13 @@ def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> 
 
 
 def test_draft_rendering_model_schema_uses_current_page_fields() -> None:
-    schema = pipeline_module.DraftRenderingArtifact.model_json_schema()
+    schema = DraftRenderingArtifact.model_json_schema()
     assert_draft_rendering_schema_page_fields(schema)
 
     page = read_json(FIXTURE_ROOT / "mock" / "draft_rendering.json")["pages"][0]
     page["unexpected_page_field"] = "This field is not part of the current draft page contract."
     with pytest.raises(Exception, match="unexpected_page_field"):
-        pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
+        DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
 
 
 def test_draft_rendering_model_schema_rejects_unexpected_source_coverage_field() -> None:
@@ -3584,7 +3609,7 @@ def test_draft_rendering_model_schema_rejects_unexpected_source_coverage_field()
     page["unexpected_source_coverage_field"] = "This field is not part of the current draft page contract."
 
     with pytest.raises(Exception, match="unexpected_source_coverage_field"):
-        pipeline_module.DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
+        DraftRenderingArtifact.model_validate({"schema_version": "draft_rendering.v3", "pages": [page]})
 
 
 def test_draft_rendering_model_output_is_canonicalized_for_internal_pipeline() -> None:
@@ -3592,7 +3617,7 @@ def test_draft_rendering_model_output_is_canonicalized_for_internal_pipeline() -
     page["page_plan_id"] = "PP-QWEN"
     page["canonical_target_path"] = "entities/Entity_Qwen-Agent.md"
     page["source_coverage_notes"] = "严格按照源内容，无额外添加。"
-    draft = pipeline_module.DraftRenderingArtifact.model_validate(
+    draft = DraftRenderingArtifact.model_validate(
         {"schema_version": "draft_rendering.v3", "pages": [page]}
     )
 
@@ -3607,9 +3632,9 @@ def test_draft_rendering_model_output_is_canonicalized_for_internal_pipeline() -
 
 def test_validate_draft_rendering_accepts_freeform_body_markdown() -> None:
     plan = qwen_related_block_plan()
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-QWEN",
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
@@ -3633,11 +3658,11 @@ def test_validate_draft_rendering_accepts_freeform_body_markdown() -> None:
 
 def test_finalize_draft_rendering_preserves_freeform_body_markdown() -> None:
     plan = qwen_related_block_plan()
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Qwen-Agent.md",
                 expected_state="missing",
                 preimage_sha256=None,
@@ -3645,9 +3670,9 @@ def test_finalize_draft_rendering_preserves_freeform_body_markdown() -> None:
             )
         ],
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-QWEN",
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
@@ -3666,7 +3691,7 @@ def test_finalize_draft_rendering_preserves_freeform_body_markdown() -> None:
         ]
     )
 
-    finalized = pipeline_module.finalize_draft_rendering(draft, plan, snapshot)
+    finalized = draft_rendering_runner.finalize_draft_rendering(draft, plan, snapshot)
     body = finalized.pages[0].body_markdown
 
     assert "### 自定义核心" in body
@@ -3676,9 +3701,9 @@ def test_finalize_draft_rendering_preserves_freeform_body_markdown() -> None:
 
 def test_validate_draft_rendering_strips_system_heading_inside_body_markdown() -> None:
     plan = qwen_related_block_plan()
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-QWEN",
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
@@ -3990,7 +4015,7 @@ def test_draft_aux_report_writes_only_when_active(tmp_path: Path) -> None:
     output_dir = tmp_path / "draft_rendering"
     output_dir.mkdir()
 
-    skipped = pipeline_module.write_draft_aux_report_if_active(
+    skipped = draft_rendering_runner.write_draft_aux_report_if_active(
         output_dir=output_dir,
         stem="grounding_paraphrase_rewrite_report",
         report={
@@ -4007,7 +4032,7 @@ def test_draft_aux_report_writes_only_when_active(tmp_path: Path) -> None:
     assert not (output_dir / "grounding_paraphrase_rewrite_report.json").exists()
     assert not (output_dir / "grounding_paraphrase_rewrite_report.md").exists()
 
-    written = pipeline_module.write_draft_aux_report_if_active(
+    written = draft_rendering_runner.write_draft_aux_report_if_active(
         output_dir=output_dir,
         stem="grounding_paraphrase_rewrite_report",
         report={
@@ -4557,7 +4582,7 @@ def test_merge_update_section_additional_notes_reports_absorbed_and_removed_unit
 
 
 def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-TYPO",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="create",
@@ -4576,9 +4601,9 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
             )
         ],
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-TYPO",
                 action="create",
                 canonical_target_path="entities/Entity_Cat Wu.md",
@@ -4589,11 +4614,11 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
             )
         ]
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Cat Wu.md",
                 expected_state="missing",
                 preimage_sha256=None,
@@ -4602,7 +4627,7 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
         ],
     )
 
-    finalized = pipeline_module.finalize_draft_rendering(
+    finalized = draft_rendering_runner.finalize_draft_rendering(
         draft,
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
@@ -4627,7 +4652,7 @@ def test_validate_draft_rendering_rejects_model_self_talk() -> None:
     plan = pipeline_module.WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-SELF-TALK",
                 source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                 action="create",
@@ -4640,9 +4665,9 @@ def test_validate_draft_rendering_rejects_model_self_talk() -> None:
             )
         ],
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-SELF-TALK",
                 action="create",
                 canonical_target_path="concepts/Concept_静态基准评估.md",
@@ -4663,9 +4688,9 @@ def test_validate_draft_rendering_rejects_model_self_talk() -> None:
 
 
 def test_validate_draft_rendering_rejects_wiki_state_leak() -> None:
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-STATE-LEAK",
                 action="create",
                 canonical_target_path="entities/Entity_Cowork.md",
@@ -4688,7 +4713,7 @@ def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
     plan = pipeline_module.WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-CAUTION",
                 source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                 action="create",
@@ -4701,9 +4726,9 @@ def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
             )
         ],
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-CAUTION",
                 action="create",
                 canonical_target_path="concepts/Concept_高风险部署.md",
@@ -4722,7 +4747,7 @@ def qwen_related_block_plan() -> pipeline_module.WikiMergePlanArtifact:
     return pipeline_module.WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-QWEN",
                 source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                 action="create",
@@ -4737,10 +4762,10 @@ def qwen_related_block_plan() -> pipeline_module.WikiMergePlanArtifact:
     )
 
 
-def qwen_related_block_draft(additional_notes: str) -> pipeline_module.DraftRenderingArtifact:
-    return pipeline_module.DraftRenderingArtifact(
+def qwen_related_block_draft(additional_notes: str) -> DraftRenderingArtifact:
+    return DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-QWEN",
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
@@ -4838,9 +4863,9 @@ def test_validate_draft_rendering_allows_related_word_without_link_block() -> No
 
 def test_canonicalize_draft_rendering_strips_system_sections_from_free_body() -> None:
     plan = qwen_related_block_plan()
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-QWEN",
                 action="create",
                 canonical_target_path="entities/Entity_Qwen-Agent.md",
@@ -4886,7 +4911,7 @@ def test_validate_draft_rendering_allows_tilde_fenced_related_markdown_example()
 
 def test_stray_related_links_issue_is_page_scoped_repairable() -> None:
     issues = [
-        pipeline_module.StructuredIssue(
+        StructuredIssue(
             issue_code="stray_related_links_in_content",
             field_path="pages.PP-QWEN.body_markdown",
             validator_id="validate_draft_rendering",
@@ -4895,13 +4920,13 @@ def test_stray_related_links_issue_is_page_scoped_repairable() -> None:
         )
     ]
 
-    assert pipeline_module.draft_repair_page_plan_ids_from_issues(issues, qwen_related_block_plan()) == {"PP-QWEN"}
+    assert draft_rendering_runner.draft_repair_page_plan_ids_from_issues(issues, qwen_related_block_plan()) == {"PP-QWEN"}
 
 
 def test_update_preservation_issues_detect_missing_old_key_phrases() -> None:
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -4940,7 +4965,7 @@ def test_update_preservation_issues_detect_missing_old_key_phrases() -> None:
 
 
 def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None:
-    update_item = pipeline_module.WikiMergePlanItem(
+    update_item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -4952,7 +4977,7 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
         section_plans={"detail": "详情"},
         reason="测试 partial draft。",
     )
-    missing_item = pipeline_module.WikiMergePlanItem(
+    missing_item = WikiMergePlanItem(
         page_plan_id="PP-MISSING",
         source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
         action="create",
@@ -4963,9 +4988,9 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
         section_plans={"detail": "详情"},
         reason="测试 partial draft。",
     )
-    partial = pipeline_module.DraftRenderingArtifact(
+    partial = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -4994,10 +5019,10 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
         ],
     }
 
-    extracted = pipeline_module.extract_valid_partial_draft_rendering(
+    extracted = draft_rendering_runner.extract_valid_partial_draft_rendering(
         json.dumps(partial.model_dump(mode="json"), ensure_ascii=False),
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, missing_item]),
-        pipeline_module.WikiContextSnapshot(
+        WikiContextSnapshot(
             log_date="2026-06-06",
             source_target_path="sources/Source_Test.md",
             entries=[],
@@ -5011,7 +5036,7 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
 
 
 def test_partial_draft_extraction_preserves_example_literals_without_cleanup_report() -> None:
-    ok_item = pipeline_module.WikiMergePlanItem(
+    ok_item = WikiMergePlanItem(
         page_plan_id="PP-OK",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="create",
@@ -5022,7 +5047,7 @@ def test_partial_draft_extraction_preserves_example_literals_without_cleanup_rep
         section_plans={"summary": "摘要", "examples": "例子"},
         reason="测试 partial draft。",
     )
-    missing_item = pipeline_module.WikiMergePlanItem(
+    missing_item = WikiMergePlanItem(
         page_plan_id="PP-MISSING",
         source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
         action="create",
@@ -5033,9 +5058,9 @@ def test_partial_draft_extraction_preserves_example_literals_without_cleanup_rep
         section_plans={"detail": "详情"},
         reason="测试 partial draft。",
     )
-    partial = pipeline_module.DraftRenderingArtifact(
+    partial = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-OK",
                 action="create",
                 canonical_target_path="concepts/Concept_OK.md",
@@ -5047,16 +5072,16 @@ def test_partial_draft_extraction_preserves_example_literals_without_cleanup_rep
         ]
     )
     plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, missing_item])
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_Missing.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_Missing.md", expected_state="missing"),
         ],
     )
 
-    extracted = pipeline_module.extract_valid_partial_draft_rendering(
+    extracted = draft_rendering_runner.extract_valid_partial_draft_rendering(
         json.dumps(partial.model_dump(mode="json"), ensure_ascii=False),
         plan,
         snapshot,
@@ -5072,10 +5097,7 @@ def test_partial_draft_extraction_preserves_example_literals_without_cleanup_rep
 def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_failing_page(tmp_path: Path) -> None:
     vault, _raw = make_vault(tmp_path)
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
-    ctx = types.SimpleNamespace(
-        profile=profile,
-        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.OperationConfigSnapshot()),
-    )
+    ctx = draft_runner_context(profile)
     digest = SourceDigestArtifact(
         source_raw_path="raw/sample.md",
         summary="测试 page scoped repair。",
@@ -5100,7 +5122,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
             ),
         ],
     )
-    ok_item = pipeline_module.WikiMergePlanItem(
+    ok_item = WikiMergePlanItem(
         page_plan_id="PP-OK",
         source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
         action="create",
@@ -5111,7 +5133,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
         section_plans={"summary": "摘要", "detail": "详情"},
         reason="test",
     )
-    bad_item = pipeline_module.WikiMergePlanItem(
+    bad_item = WikiMergePlanItem(
         page_plan_id="PP-BAD",
         source_basis=SourceBasis(source_candidate_ids=["C-BAD"]),
         action="create",
@@ -5123,12 +5145,12 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
         reason="test",
     )
     merge_plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, bad_item])
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
         ],
     )
     raw_text = (
@@ -5138,9 +5160,9 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
     )
     source_excerpt_pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
     update_preservation_pack = update_preservation_module.build_update_preservation_pack(merge_plan, snapshot)
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-OK",
                 action="create",
                 canonical_target_path="concepts/Concept_OK.md",
@@ -5149,7 +5171,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
                 change_summary="创建通过页。",
                 source_coverage_notes="依据测试材料生成。",
             ),
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-BAD",
                 action="create",
                 canonical_target_path="concepts/Concept_BAD.md",
@@ -5161,7 +5183,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
         ]
     )
     issues = [
-        pipeline_module.StructuredIssue(
+        StructuredIssue(
             issue_code="unsupported_new_fact",
             field_path="pages.PP-BAD.examples",
             validator_id="draft_grounding_review",
@@ -5170,11 +5192,11 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
         )
     ]
 
-    repair_prompt = pipeline_module.build_draft_rendering_page_repair_payload(
+    repair_prompt = draft_rendering_runner.build_draft_rendering_page_repair_payload(
         task="draft_rendering",
         raw=json.dumps(draft.model_dump(mode="json"), ensure_ascii=False),
         issues=issues,
-        output_model=pipeline_module.DraftRenderingArtifact,
+        output_model=DraftRenderingArtifact,
         ctx=ctx,
         digest=digest,
         merge_plan=merge_plan,
@@ -5204,7 +5226,7 @@ def test_draft_page_scoped_repair_payload_keeps_accepted_pages_and_targets_faili
 
 
 def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy() -> None:
-    ok_item = pipeline_module.WikiMergePlanItem(
+    ok_item = WikiMergePlanItem(
         page_plan_id="PP-OK",
         source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
         action="create",
@@ -5215,7 +5237,7 @@ def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy
         section_plans={"summary": "摘要", "detail": "详情"},
         reason="test",
     )
-    bad_item = pipeline_module.WikiMergePlanItem(
+    bad_item = WikiMergePlanItem(
         page_plan_id="PP-BAD",
         source_basis=SourceBasis(source_candidate_ids=["C-BAD"]),
         action="create",
@@ -5227,7 +5249,7 @@ def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy
         reason="test",
     )
     merge_plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, bad_item])
-    accepted_ok = pipeline_module.DraftPageItem(
+    accepted_ok = DraftPageItem(
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
@@ -5239,7 +5261,7 @@ def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy
     returned_ok = accepted_ok.model_copy(
         update={"summary": "模型错误改写的通过页。", "body_markdown": "不应采纳。"}
     )
-    repaired_bad = pipeline_module.DraftPageItem(
+    repaired_bad = DraftPageItem(
         page_plan_id="PP-BAD",
         action="create",
         canonical_target_path="concepts/Concept_BAD.md",
@@ -5249,8 +5271,8 @@ def test_merge_repaired_draft_with_accepted_pages_ignores_returned_accepted_copy
         source_coverage_notes="repair。",
     )
 
-    merged = pipeline_module.merge_repaired_draft_with_accepted_pages(
-        pipeline_module.DraftRenderingArtifact(pages=[returned_ok, repaired_bad]),
+    merged = draft_rendering_runner.merge_repaired_draft_with_accepted_pages(
+        DraftRenderingArtifact(pages=[returned_ok, repaired_bad]),
         accepted_pages_by_id={"PP-OK": accepted_ok.model_dump(mode="json")},
         repair_page_plan_ids={"PP-BAD"},
         merge_plan=merge_plan,
@@ -5294,7 +5316,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
             ),
         ],
     )
-    ok_item = pipeline_module.WikiMergePlanItem(
+    ok_item = WikiMergePlanItem(
         page_plan_id="PP-OK",
         source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
         action="create",
@@ -5305,7 +5327,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         section_plans={"summary": "摘要", "detail": "详情"},
         reason="test",
     )
-    bad_item = pipeline_module.WikiMergePlanItem(
+    bad_item = WikiMergePlanItem(
         page_plan_id="PP-BAD",
         source_basis=SourceBasis(source_candidate_ids=["C-BAD"]),
         action="create",
@@ -5317,15 +5339,15 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         reason="test",
     )
     merge_plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, bad_item])
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
         ],
     )
-    accepted_ok = pipeline_module.DraftPageItem(
+    accepted_ok = DraftPageItem(
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
@@ -5334,7 +5356,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         change_summary="通过页摘要。",
         source_coverage_notes="通过页可以用来验证本地 accepted 页面在 repair 后仍被保留。",
     )
-    bad_with_self_talk = pipeline_module.DraftPageItem(
+    bad_with_self_talk = DraftPageItem(
         page_plan_id="PP-BAD",
         action="create",
         canonical_target_path="concepts/Concept_BAD.md",
@@ -5343,7 +5365,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         change_summary="失败页摘要。",
         source_coverage_notes="失败页可以用来验证局部修复只重写坏页。",
     )
-    repaired_bad = pipeline_module.DraftPageItem(
+    repaired_bad = DraftPageItem(
         page_plan_id="PP-BAD",
         action="create",
         canonical_target_path="concepts/Concept_BAD.md",
@@ -5359,8 +5381,8 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
         def __init__(self) -> None:
             self.payloads: list[dict[str, object]] = []
             self.outputs = [
-                pipeline_module.DraftRenderingArtifact(pages=[accepted_ok, bad_with_self_talk]),
-                pipeline_module.DraftRenderingArtifact(pages=[repaired_bad]),
+                DraftRenderingArtifact(pages=[accepted_ok, bad_with_self_talk]),
+                DraftRenderingArtifact(pages=[repaired_bad]),
             ]
 
         def generate_raw(self, task: str, payload: dict[str, object], output_model: type[object]) -> str:
@@ -5369,26 +5391,12 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
             output = draft_validation_module.canonicalize_draft_artifact(output, merge_plan)
             return json.dumps(output.model_dump(mode="json"), ensure_ascii=False)
 
-    class NoopRedactor:
-        def redact(self, data: object) -> object:
-            return data
-
-        def redact_text(self, text: str) -> str:
-            return text
-
     provider = SequenceProvider()
     output_dir = tmp_path / "draft-output"
     output_dir.mkdir()
-    ctx = types.SimpleNamespace(
-        vault=vault,
-        run_dir=tmp_path / "run",
-        raw_path=raw_path,
-        profile=profile,
-        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.OperationConfigSnapshot()),
-        execution_context=types.SimpleNamespace(redactor=NoopRedactor()),
-    )
+    ctx = draft_runner_context(profile)
 
-    result = pipeline_module.run_single_draft_rendering_model_call(
+    result = draft_rendering_runner.run_single_draft_rendering_model_call(
         ctx=ctx,
         provider=provider,
         output_dir=output_dir,
@@ -5419,10 +5427,7 @@ def test_run_single_draft_rendering_merges_repair_only_result(tmp_path: Path) ->
 def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_repair(tmp_path: Path) -> None:
     vault, _raw = make_vault(tmp_path)
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
-    ctx = types.SimpleNamespace(
-        profile=profile,
-        manifest=types.SimpleNamespace(vault_config_snapshot=pipeline_module.OperationConfigSnapshot()),
-    )
+    ctx = draft_runner_context(profile)
     digest = SourceDigestArtifact(
         source_raw_path="raw/sample.md",
         summary="测试 missing repair page。",
@@ -5447,7 +5452,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
             ),
         ],
     )
-    ok_item = pipeline_module.WikiMergePlanItem(
+    ok_item = WikiMergePlanItem(
         page_plan_id="PP-OK",
         source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
         action="create",
@@ -5458,7 +5463,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
         section_plans={"summary": "摘要"},
         reason="test",
     )
-    bad_item = pipeline_module.WikiMergePlanItem(
+    bad_item = WikiMergePlanItem(
         page_plan_id="PP-BAD",
         source_basis=SourceBasis(source_candidate_ids=["C-BAD"]),
         action="create",
@@ -5470,18 +5475,18 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
         reason="test",
     )
     merge_plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, bad_item])
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_OK.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_BAD.md", expected_state="missing"),
         ],
     )
     raw_text = "# 测试材料\n\n## 通过页\n\n通过页。\n\n## 失败页\n\n失败页。\n"
     source_excerpt_pack = draft_rendering_payloads_module.build_draft_source_excerpt_pack(raw_text, digest, merge_plan, full_source_limit=10)
     update_preservation_pack = update_preservation_module.build_update_preservation_pack(merge_plan, snapshot)
-    accepted_ok = pipeline_module.DraftPageItem(
+    accepted_ok = DraftPageItem(
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
@@ -5491,7 +5496,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
         source_coverage_notes="accepted。",
     )
     issues = [
-        pipeline_module.StructuredIssue(
+        StructuredIssue(
             issue_code="missing_repair_page",
             field_path="pages.PP-BAD",
             validator_id="draft_page_scoped_repair",
@@ -5500,11 +5505,11 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
         )
     ]
 
-    repair_prompt = pipeline_module.build_draft_rendering_page_repair_payload(
+    repair_prompt = draft_rendering_runner.build_draft_rendering_page_repair_payload(
         task="draft_rendering",
         raw=json.dumps({"schema_version": "draft_rendering.v3", "pages": []}, ensure_ascii=False),
         issues=issues,
-        output_model=pipeline_module.DraftRenderingArtifact,
+        output_model=DraftRenderingArtifact,
         ctx=ctx,
         digest=digest,
         merge_plan=merge_plan,
@@ -5523,7 +5528,7 @@ def test_missing_repair_page_issue_reuses_local_accepted_pages_for_page_scoped_r
 
 def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_missing_issue() -> None:
     issues = [
-        pipeline_module.StructuredIssue(
+        StructuredIssue(
             issue_code="missing_repair_page",
             field_path="pages.PP-BAD-2",
             validator_id="draft_page_scoped_repair",
@@ -5532,7 +5537,7 @@ def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_mis
         )
     ]
 
-    expanded = pipeline_module.preserve_active_repair_page_issues(
+    expanded = draft_rendering_runner.preserve_active_repair_page_issues(
         issues,
         {"PP-BAD-1", "PP-BAD-2"},
     )
@@ -5542,7 +5547,7 @@ def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_mis
 
 
 def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_page_issue() -> None:
-    bad_1_issue = pipeline_module.StructuredIssue(
+    bad_1_issue = StructuredIssue(
         issue_code="unsupported_new_fact",
         field_path="pages.PP-BAD-1.examples.0",
         validator_id="draft_grounding",
@@ -5550,7 +5555,7 @@ def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_pag
         repairability="repairable",
     )
 
-    expanded = pipeline_module.preserve_active_repair_page_issues(
+    expanded = draft_rendering_runner.preserve_active_repair_page_issues(
         [bad_1_issue],
         {"PP-BAD-1", "PP-BAD-2"},
     )
@@ -5558,12 +5563,12 @@ def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_pag
     assert [issue.field_path for issue in expanded] == ["pages.PP-BAD-1.examples.0", "pages.PP-BAD-2"]
     assert expanded[0] is bad_1_issue
     assert expanded[1].issue_code == "missing_repair_page"
-    assert pipeline_module.draft_repair_page_plan_ids_from_issues(
+    assert draft_rendering_runner.draft_repair_page_plan_ids_from_issues(
         expanded,
         WikiMergePlanArtifact(
             log_date="2026-06-06",
             items=[
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-BAD-1",
                     source_basis=SourceBasis(source_candidate_ids=["C-BAD-1"]),
                     action="create",
@@ -5574,7 +5579,7 @@ def test_preserve_active_repair_page_issues_keeps_full_active_repair_set_for_pag
                     section_plans={"summary": "摘要"},
                     reason="test",
                 ),
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-BAD-2",
                     source_basis=SourceBasis(source_candidate_ids=["C-BAD-2"]),
                     action="create",
@@ -5594,7 +5599,7 @@ def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> Non
     merge_plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-OK",
                 source_basis=SourceBasis(source_candidate_ids=["C-OK"]),
                 action="create",
@@ -5608,14 +5613,14 @@ def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> Non
         ],
     )
     issues = [
-        pipeline_module.StructuredIssue(
+        StructuredIssue(
             issue_code="unsupported_new_fact",
             field_path="pages.PP-OK.examples",
             validator_id="draft_grounding_review",
             message="unsupported",
             repairability="repairable",
         ),
-        pipeline_module.StructuredIssue(
+        StructuredIssue(
             issue_code="missing_page_plan_coverage",
             field_path="pages",
             validator_id="validate_draft_rendering",
@@ -5624,11 +5629,11 @@ def test_draft_page_scoped_repair_falls_back_for_global_or_mixed_issues() -> Non
         ),
     ]
 
-    assert pipeline_module.draft_repair_page_plan_ids_from_issues(issues, merge_plan) is None
+    assert draft_rendering_runner.draft_repair_page_plan_ids_from_issues(issues, merge_plan) is None
 
 
 def test_accepted_partial_page_copy_issues_detect_rewritten_accepted_page() -> None:
-    accepted = pipeline_module.DraftPageItem(
+    accepted = DraftPageItem(
         page_plan_id="PP-OK",
         action="create",
         canonical_target_path="concepts/Concept_OK.md",
@@ -5639,8 +5644,8 @@ def test_accepted_partial_page_copy_issues_detect_rewritten_accepted_page() -> N
     )
     changed = accepted.model_copy(update={"change_summary": "被模型改写。"})
 
-    issues = pipeline_module.accepted_partial_page_copy_issues(
-        pipeline_module.DraftRenderingArtifact(pages=[changed]),
+    issues = draft_rendering_runner.accepted_partial_page_copy_issues(
+        DraftRenderingArtifact(pages=[changed]),
         {"PP-OK": accepted.model_dump(mode="json")},
     )
 
@@ -5649,9 +5654,9 @@ def test_accepted_partial_page_copy_issues_detect_rewritten_accepted_page() -> N
 
 
 def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None:
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -5699,9 +5704,9 @@ def test_update_preservation_reinforcement_fills_missing_old_knowledge() -> None
 
 
 def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_english_dump() -> None:
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -5753,9 +5758,9 @@ def test_update_preservation_reinforcement_synthesizes_concept_bridge_without_en
 
 
 def test_update_preservation_reinforcement_single_concept_does_not_invent_other_concepts() -> None:
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -5799,7 +5804,7 @@ def test_update_preservation_reinforcement_single_concept_does_not_invent_other_
 
 
 def test_update_preservation_pack_records_concept_obligations() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -5811,11 +5816,11 @@ def test_update_preservation_pack_records_concept_obligations() -> None:
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -5844,7 +5849,7 @@ def test_update_preservation_pack_records_concept_obligations() -> None:
 
 
 def test_update_preservation_pack_reads_current_core_content_section() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -5856,11 +5861,11 @@ def test_update_preservation_pack_reads_current_core_content_section() -> None:
         reason="测试当前正式页核心内容保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -5924,7 +5929,7 @@ def test_update_preservation_concepts_match_brain_ampersand_hands_without_global
 
 
 def test_update_preservation_pack_does_not_turn_interview_sessions_into_context_obligation() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -5936,11 +5941,11 @@ def test_update_preservation_pack_does_not_turn_interview_sessions_into_context_
         reason="测试普通 sessions 不应变成持久上下文。",
         matched_page="entities/Entity_User Research.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_User Research.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6047,7 +6052,7 @@ def test_update_preservation_morphology_absorption_uses_explicit_variants() -> N
 
 
 def test_update_preservation_issues_detect_missing_persistent_context_obligation() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6059,11 +6064,11 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
         reason="测试 persistent context 旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6080,9 +6085,9 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -6105,7 +6110,7 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
 
 
 def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligation() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6117,11 +6122,11 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
         reason="测试 brain & hands 旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6149,9 +6154,9 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
     )
     assert absorbed["absorbed"] is True
 
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -6169,7 +6174,7 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
 
 
 def test_update_preservation_pack_reads_english_section_headings() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6181,11 +6186,11 @@ def test_update_preservation_pack_reads_english_section_headings() -> None:
         reason="测试英文旧页标题。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6261,7 +6266,7 @@ def test_parse_existing_sections_reads_casefold_english_headings() -> None:
 
 
 def test_update_preservation_pack_keeps_mixed_placeholder_section_with_core_knowledge() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6273,11 +6278,11 @@ def test_update_preservation_pack_keeps_mixed_placeholder_section_with_core_know
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6305,7 +6310,7 @@ def test_update_preservation_pack_keeps_mixed_placeholder_section_with_core_know
 
 
 def test_update_preservation_pack_keeps_mixed_empty_placeholder_section_with_core_knowledge() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6317,11 +6322,11 @@ def test_update_preservation_pack_keeps_mixed_empty_placeholder_section_with_cor
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6349,7 +6354,7 @@ def test_update_preservation_pack_keeps_mixed_empty_placeholder_section_with_cor
 
 
 def test_update_preservation_pack_keeps_core_after_placeholder_prefix_colon() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6361,11 +6366,11 @@ def test_update_preservation_pack_keeps_core_after_placeholder_prefix_colon() ->
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6391,7 +6396,7 @@ def test_update_preservation_pack_keeps_core_after_placeholder_prefix_colon() ->
 
 @pytest.mark.parametrize("placeholder", ["暂无相关补充。", "没有相关补充。", "N/A"])
 def test_update_preservation_pack_skips_pure_placeholder_sections(placeholder: str) -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6403,11 +6408,11 @@ def test_update_preservation_pack_skips_pure_placeholder_sections(placeholder: s
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6429,7 +6434,7 @@ def test_update_preservation_pack_skips_pure_placeholder_sections(placeholder: s
 
 
 def test_update_preservation_pack_skips_placeholder_even_when_it_mentions_known_concept() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6441,11 +6446,11 @@ def test_update_preservation_pack_skips_placeholder_even_when_it_mentions_known_
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6467,7 +6472,7 @@ def test_update_preservation_pack_skips_placeholder_even_when_it_mentions_known_
 
 
 def test_update_preservation_pack_keeps_english_phrase_with_na_substring() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6479,11 +6484,11 @@ def test_update_preservation_pack_keeps_english_phrase_with_na_substring() -> No
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6508,7 +6513,7 @@ def test_update_preservation_pack_keeps_english_phrase_with_na_substring() -> No
 
 
 def test_update_preservation_pack_does_not_use_placeholder_segment_concepts() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6520,11 +6525,11 @@ def test_update_preservation_pack_does_not_use_placeholder_segment_concepts() ->
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6552,7 +6557,7 @@ def test_update_preservation_pack_does_not_use_placeholder_segment_concepts() ->
 
 
 def test_update_preservation_pack_filters_mixed_ascii_placeholder_segment() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6564,11 +6569,11 @@ def test_update_preservation_pack_filters_mixed_ascii_placeholder_segment() -> N
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6595,7 +6600,7 @@ def test_update_preservation_pack_filters_mixed_ascii_placeholder_segment() -> N
 
 
 def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6607,11 +6612,11 @@ def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6648,7 +6653,7 @@ def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
 def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> None:
     tail = "Managed Agents / harness 视角强调安全边界、隔离容器、工具权限和会话对象。"
     old_detail = ("普通背景。" * 400) + tail
-    item = pipeline_module.WikiMergePlanItem(
+    item = WikiMergePlanItem(
         page_plan_id="PP-UPDATE",
         source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
         action="update",
@@ -6660,11 +6665,11 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
         reason="测试旧知识保留。",
         matched_page="entities/Entity_Claude Code.md",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude Code.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6680,9 +6685,9 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-UPDATE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude Code.md",
@@ -6713,11 +6718,11 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
         created="2026-01-01",
         updated="2026-01-02",
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-05",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_X.md",
                 expected_state="present",
                 preimage_sha256="old",
@@ -6751,7 +6756,7 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
         log_date="2026-06-05",
         context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-X",
                 source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                 action="update",
@@ -6765,9 +6770,9 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
             )
         ],
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-X",
                 action="update",
                 canonical_target_path="concepts/Concept_X.md",
@@ -6788,11 +6793,11 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
 
 
 def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> None:
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Product_Taste.md",
                 expected_state="present",
                 preimage_sha256="a",
@@ -6805,7 +6810,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
                 ),
                 content="# Product Taste\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n- 待补来源：MIT报告的具体引用。\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/designs/Design_AI_PM.md",
                 expected_state="present",
                 preimage_sha256="b",
@@ -6818,7 +6823,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
                 ),
                 content="# AI PM\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/open_questions/Open_Question_PM角色.md",
                 expected_state="present",
                 preimage_sha256="c",
@@ -6834,7 +6839,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
         ],
     )
     plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[])
-    draft = pipeline_module.DraftRenderingArtifact(pages=[])
+    draft = DraftRenderingArtifact(pages=[])
 
     rows, report = open_questions_module.build_open_question_rows_with_report(plan, draft, snapshot)
     questions = [row["question"] for row in rows]
@@ -6847,11 +6852,11 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
 
 
 def test_index_open_questions_representative_prefers_high_signal_over_newer_source_gap() -> None:
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Product_Taste.md",
                 expected_state="present",
                 preimage_sha256="a",
@@ -6864,7 +6869,7 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
                 ),
                 content="# Product Taste\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/designs/Design_AI_PM.md",
                 expected_state="present",
                 preimage_sha256="b",
@@ -6882,7 +6887,7 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
 
     rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
-        pipeline_module.DraftRenderingArtifact(pages=[]),
+        DraftRenderingArtifact(pages=[]),
         snapshot,
     )
 
@@ -6893,11 +6898,11 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
 
 
 def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> None:
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_A.md",
                 expected_state="present",
                 preimage_sha256="a",
@@ -6910,7 +6915,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
                 ),
                 content="# AI PM A\n\n## 矛盾与未决问题\n\n- AGI到来后PM角色会消失吗？\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_B.md",
                 expected_state="present",
                 preimage_sha256="b",
@@ -6923,7 +6928,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
                 ),
                 content="# AI PM B\n\n## 矛盾与未决问题\n\n- AGI后PM是否必要？\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_C.md",
                 expected_state="present",
                 preimage_sha256="c",
@@ -6940,7 +6945,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
     )
     rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
-        pipeline_module.DraftRenderingArtifact(pages=[]),
+        DraftRenderingArtifact(pages=[]),
         snapshot,
     )
 
@@ -6953,11 +6958,11 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
 
 
 def test_index_open_questions_semantically_dedupes_product_judgement_training_variants() -> None:
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Taste.md",
                 expected_state="present",
                 preimage_sha256="a",
@@ -6970,7 +6975,7 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
                 ),
                 content="# 产品品味\n\n## 矛盾与未决问题\n\n- 产品品味能否通过系统化训练提升？\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Judgement.md",
                 expected_state="present",
                 preimage_sha256="b",
@@ -6987,7 +6992,7 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
     )
     rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
-        pipeline_module.DraftRenderingArtifact(pages=[]),
+        DraftRenderingArtifact(pages=[]),
         snapshot,
     )
 
@@ -7008,11 +7013,11 @@ def test_index_open_questions_keeps_pm_necessity_and_evolution_separate() -> Non
 
 
 def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> None:
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Claude_Code.md",
                 expected_state="present",
                 preimage_sha256="a",
@@ -7028,7 +7033,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                     "- Claude Code 的产品体验提升，会不会掩盖 harness 安全边界的重要性？\n"
                 ),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Fast_Iteration.md",
                 expected_state="present",
                 preimage_sha256="b",
@@ -7050,7 +7055,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
         log_date="2026-06-06",
         context_snapshot_ref="x",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-CLAUDE",
                 source_basis=SourceBasis(source_candidate_ids=["C1"]),
                 action="update",
@@ -7061,7 +7066,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 section_plans={"open_questions": "问题"},
                 reason="测试。",
             ),
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-ITERATION",
                 source_basis=SourceBasis(source_candidate_ids=["C2"]),
                 action="create",
@@ -7072,7 +7077,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 section_plans={"open_questions": "问题"},
                 reason="测试。",
             ),
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-EVAL",
                 source_basis=SourceBasis(source_candidate_ids=["C3"]),
                 action="create",
@@ -7085,9 +7090,9 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
             ),
         ],
     )
-    draft = pipeline_module.DraftRenderingArtifact(
+    draft = DraftRenderingArtifact(
         pages=[
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-CLAUDE",
                 action="update",
                 canonical_target_path="entities/Entity_Claude_Code.md",
@@ -7096,7 +7101,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 change_summary="更新。",
                 source_coverage_notes="测试。",
             ),
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-ITERATION",
                 action="create",
                 canonical_target_path="concepts/Concept_AI产品快速迭代.md",
@@ -7105,7 +7110,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 change_summary="创建。",
                 source_coverage_notes="测试。",
             ),
-            pipeline_module.DraftPageItem(
+            DraftPageItem(
                 page_plan_id="PP-EVAL",
                 action="create",
                 canonical_target_path="concepts/Concept_Eval.md",
@@ -7131,11 +7136,11 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
 
 
 def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_separate() -> None:
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/entities/Entity_Managed_Agents.md",
                 expected_state="present",
                 preimage_sha256="a",
@@ -7152,7 +7157,7 @@ def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_
                     "- 当多个大脑共享同一双手时，并发和状态同步如何保证？\n"
                 ),
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/designs/Design_Managed_Agents.md",
                 expected_state="present",
                 preimage_sha256="b",
@@ -7172,7 +7177,7 @@ def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_
     )
     rows, report = open_questions_module.build_open_question_rows_with_report(
         pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
-        pipeline_module.DraftRenderingArtifact(pages=[]),
+        DraftRenderingArtifact(pages=[]),
         snapshot,
     )
 
@@ -7380,7 +7385,7 @@ def test_draft_review_refreshes_stale_grounding_artifacts(tmp_path: Path) -> Non
 
 
 def test_draft_page_item_coerces_quality_risks_string_to_list() -> None:
-    page = pipeline_module.DraftPageItem(
+    page = DraftPageItem(
         page_plan_id="PP-RISK",
         action="create",
         canonical_target_path="concepts/Concept_Risk.md",
@@ -8005,7 +8010,7 @@ def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> 
             log_date="",
             context_snapshot_ref="",
             items=[
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-CAND001",
                     source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                     action="update",
@@ -8017,7 +8022,7 @@ def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> 
                     section_plans={"summary": "Summary"},
                     reason="更新已有页。",
                 ),
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-CAND002",
                     source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
                     action="noop",
@@ -8083,8 +8088,8 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
         target_path: str,
         title: str,
         related_pages: list[pipeline_module.RelatedPageRef] | None = None,
-    ) -> pipeline_module.WikiMergePlanItem:
-        return pipeline_module.WikiMergePlanItem(
+    ) -> WikiMergePlanItem:
+        return WikiMergePlanItem(
             page_plan_id=page_plan_id,
             source_basis=SourceBasis(source_candidate_ids=[candidate_id]),
             action="create",
@@ -8121,7 +8126,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
                         ],
                     ),
                     plan_item("PP-CAND002", "CAND002", "comparison", "comparisons/Comparison_Workflow vs Agent.md", "Workflow vs Agent"),
-                    pipeline_module.WikiMergePlanItem(
+                    WikiMergePlanItem(
                         page_plan_id="PP-CAND003",
                         source_basis=SourceBasis(source_candidate_ids=["CAND003"]),
                         action="create",
@@ -8143,7 +8148,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
                         ],
                         reason="RAG 概念值得沉淀。",
                     ),
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-CAND004",
                     source_basis=SourceBasis(source_candidate_ids=["CAND004"]),
                     action="create",
@@ -8759,12 +8764,12 @@ def test_related_pages_resolve_prepared_discovered_candidate_refs() -> None:
             ),
         ]
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
         entries=[
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_主候选.md", expected_state="missing"),
-            pipeline_module.WikiContextEntry(path="wiki/concepts/Concept_延后候选.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_主候选.md", expected_state="missing"),
+            WikiContextEntry(path="wiki/concepts/Concept_延后候选.md", expected_state="missing"),
         ],
     )
 
@@ -8850,7 +8855,7 @@ def test_strong_context_create_is_finalized_to_needs_human_decision(tmp_path: Pa
             log_date="",
             context_snapshot_ref="",
             items=[
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-CAND001",
                     source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                     action="create",
@@ -8878,8 +8883,8 @@ def merge_review_create_item(
     *,
     strength: str = "none",
     why_not_update: str = "",
-) -> pipeline_module.WikiMergePlanItem:
-    return pipeline_module.WikiMergePlanItem(
+) -> WikiMergePlanItem:
+    return WikiMergePlanItem(
         page_plan_id=page_plan_id,
         source_basis=SourceBasis(source_candidate_ids=[page_plan_id]),
         action="create",
@@ -8903,7 +8908,7 @@ def merge_review_create_item(
     )
 
 
-def merge_review_plan(*items: pipeline_module.WikiMergePlanItem) -> pipeline_module.WikiMergePlanArtifact:
+def merge_review_plan(*items: WikiMergePlanItem) -> pipeline_module.WikiMergePlanArtifact:
     return pipeline_module.WikiMergePlanArtifact(log_date="2026-06-07", context_snapshot_ref="", items=list(items))
 
 
@@ -9660,7 +9665,7 @@ def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path:
             log_date="",
             context_snapshot_ref="",
             items=[
-                pipeline_module.WikiMergePlanItem(
+                WikiMergePlanItem(
                     page_plan_id="PP-CAND001",
                     source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                     action="create",
@@ -9747,7 +9752,7 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
             ),
         ]
     )
-    snapshot = pipeline_module.WikiContextSnapshot(
+    snapshot = WikiContextSnapshot(
         log_date="2026-06-07",
         source_target_path="sources/Source_Test.md",
         candidate_contexts=CandidateContextsArtifact(
@@ -9778,18 +9783,18 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
             ],
         ),
         entries=[
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_Agent 记忆系统.md",
                 expected_state="missing",
                 content="",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_持久记忆（Agent Memory）.md",
                 expected_state="present",
                 preimage_sha256="old-memory",
                 content="# 持久记忆（Agent Memory）\n\n旧页已有通用 Agent memory 概念。\n",
             ),
-            pipeline_module.WikiContextEntry(
+            WikiContextEntry(
                 path="wiki/concepts/Concept_已有更新.md",
                 expected_state="present",
                 preimage_sha256="old-update",
@@ -9801,7 +9806,7 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
         log_date="2026-06-07",
         context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
         items=[
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-CAND001",
                 source_basis=SourceBasis(source_candidate_ids=["CAND001"]),
                 action="create",
@@ -9816,7 +9821,7 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
                 section_plans={"summary": "摘要。"},
                 reason="模型尝试新建。",
             ),
-            pipeline_module.WikiMergePlanItem(
+            WikiMergePlanItem(
                 page_plan_id="PP-CAND002",
                 source_basis=SourceBasis(source_candidate_ids=["CAND002"]),
                 action="update",
