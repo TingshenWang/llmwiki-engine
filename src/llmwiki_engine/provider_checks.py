@@ -131,15 +131,11 @@ def _run_live_checks(
         provider_name = spec.partition(":")[0]
         if provider_name != "openai_compatible":
             continue
-        label = credential_labels.get(key, "credential #1")
+        label = credential_labels[key]
         client = http_client_factory() if http_client_factory is not None else None
         try:
             provider = execution_context.provider_for_task(steps[0], http_client=client)
-            check_live = getattr(provider, "check_live", None)
-            if check_live is None:
-                result.error(f"{spec} {label} live check is not supported for steps {', '.join(steps)}.")
-                continue
-            raw = check_live()
+            raw = provider.check_live()
             _validate_live_probe_content(raw)
         except (ProviderError, httpx.HTTPError) as exc:
             message = execution_context.redactor.redact_text(str(exc))
