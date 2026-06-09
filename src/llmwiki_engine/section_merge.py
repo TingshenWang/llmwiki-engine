@@ -60,7 +60,7 @@ def merge_update_section(
                 preserved_old.extend(preserved_notes)
                 removed.extend(removed_notes)
                 removal_reason = (
-                    "高信号旧补充观察已自动保留为 legacy note；无需阻塞审批，建议后续按需整理。"
+                    "高信号旧补充观察已自动保留为旧页补充观察；无需阻塞审批，建议后续按需整理。"
                     "低信号或已覆盖的旧补充观察不机械保留。"
                 )
             elif absorbed_notes:
@@ -157,7 +157,7 @@ def _old_additional_note_units(text: str) -> list[str]:
 def _strip_old_additional_note_label(text: str) -> str:
     stripped = text.strip()
     while True:
-        next_value = re.sub(r"^(?:旧页补充观察|旧页保留观察)[:：]\s*", "", stripped).strip()
+        next_value = re.sub(r"^旧页补充观察[:：]\s*", "", stripped).strip()
         if next_value == stripped:
             break
         stripped = next_value

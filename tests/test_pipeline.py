@@ -4436,6 +4436,8 @@ def test_merge_update_section_additional_notes_preserves_high_signal_boundary_no
     assert change.removed == []
     assert change.needs_manual_resolution is False
     assert "高信号旧补充观察" in change.removal_reason
+    assert "旧页补充观察" in change.removal_reason
+    assert "legacy" not in change.removal_reason
 
 
 def test_merge_update_section_additional_notes_keeps_only_high_signal_units() -> None:
@@ -4636,7 +4638,7 @@ def test_merge_update_section_additional_notes_negative_confirmation_is_supersed
     assert change.removed == [old]
 
 
-def test_merge_update_section_additional_notes_strips_legacy_label_before_preserving() -> None:
+def test_merge_update_section_additional_notes_strips_current_label_idempotently_before_preserving() -> None:
     note = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
     old = f"旧页补充观察：旧页补充观察：{note}"
     new = "本页面补充 Redis 等实现方式。"
@@ -4648,6 +4650,19 @@ def test_merge_update_section_additional_notes_strips_legacy_label_before_preser
     assert f"旧页补充观察：旧页补充观察：{note}" not in merged
     assert change.retained == [note]
     assert change.preserved_old == [note]
+
+
+def test_merge_update_section_additional_notes_does_not_strip_old_retained_observation_label() -> None:
+    note = "文档提醒：回忆的记忆应视为有帮助的上下文而非绝对真实，重要决定需要用户确认。"
+    old = f"旧页保留观察：{note}"
+    new = "本页面补充 Redis 等实现方式。"
+
+    merged, change = section_merge_module.merge_update_section("additional_notes", old, new)
+
+    assert f"旧页补充观察：旧页保留观察：{note}" in merged
+    assert f"旧页补充观察：{note}" not in merged
+    assert change.retained == [old]
+    assert change.preserved_old == [old]
 
 
 def test_merge_update_section_additional_notes_keeps_boundary_even_when_open_question_overlaps() -> None:
