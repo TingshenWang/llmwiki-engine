@@ -20,6 +20,7 @@ import llmwiki_engine.draft_rendering_runner as draft_rendering_runner
 import llmwiki_engine.draft_rendering_payloads as draft_rendering_payloads_module
 import llmwiki_engine.draft_reviewing as draft_reviewing_module
 import llmwiki_engine.merge_plan_refinement as merge_plan_refinement_module
+import llmwiki_engine.merge_planning as merge_planning_module
 import llmwiki_engine.merge_reporting as merge_reporting_module
 import llmwiki_engine.pipeline as pipeline_module
 import llmwiki_engine.planning_payloads as planning_payloads_module
@@ -47,11 +48,13 @@ from llmwiki_engine.models import (
     CandidateContextHit,
     CandidateContextItem,
     CandidateContextsArtifact,
+    ContextOverlapSignal,
     DraftPageItem,
     DraftRenderingArtifact,
     OperationConfigSnapshot,
     OperationStatus,
     RawPreparePolicy,
+    RelatedPageRef,
     SourceBasis,
     SourceDigestArtifact,
     SourceDigestCandidate,
@@ -64,11 +67,11 @@ from llmwiki_engine.models import (
     WikiKnowledgePoolEntry,
     WikiMergePlanArtifact,
     WikiMergePlanItem,
+    WikiPageMetadata,
 )
 from llmwiki_engine.pipeline import (
     STEP_RUNNERS,
     _STEP_RUN_FUNCTIONS,
-    build_wiki_merge_plan,
     init_vault,
     latest_operation,
     approve_review,
@@ -1965,6 +1968,24 @@ def test_pipeline_does_not_reexport_wiki_context_helpers() -> None:
     assert leaked == []
 
 
+def test_pipeline_does_not_reexport_merge_planning_helpers() -> None:
+    old_helper_names = {
+        "MODEL_RELATED_SUGGESTION_LIMIT",
+        "_related_debug_label",
+        "_resolve_single_model_related",
+        "block_unrepaired_medium_create_reason",
+        "build_wiki_merge_plan",
+        "empty_vault_create_merge_planning_shortcut_report",
+        "finalize_wiki_merge_plan",
+        "resolve_model_related_pages",
+        "resolve_related_pages",
+    }
+
+    leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
+
+    assert leaked == []
+
+
 def test_step_output_dir_helpers_use_step_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "run"
     assert step_output_dir(run_dir, "raw_prepare") == run_dir / "raw_prepare"
@@ -2683,7 +2704,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
         matched_page="entities/Entity_Claude Code.md",
         display_title="Claude Code",
         page_type="entity",
-        strongest_overlap=pipeline_module.ContextOverlapSignal(
+        strongest_overlap=ContextOverlapSignal(
             strength="weak",
             path="concepts/Concept_Update_Strongest.md",
             reason="weak update overlap should still keep metadata",
@@ -2703,7 +2724,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
         new_understanding="新增概念。",
         section_plans={"detail": "详情"},
         related_pages=[
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="entities/Entity_Managed Agents.md",
                 display_title="Managed Agents",
                 source="wiki_context",
@@ -2756,7 +2777,7 @@ def test_draft_context_projection_keeps_related_metadata_and_omits_weak_inspecte
         ],
     )
     metadata_paths, content_paths = draft_rendering_payloads_module.draft_rendering_relevant_wiki_paths(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, create_item])
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, create_item])
     )
     projection = draft_rendering_payloads_module.compact_snapshot_for_draft_rendering(
         snapshot,
@@ -2790,7 +2811,7 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
         canonical_target_path="concepts/Concept_Medium_New.md",
         display_title="Medium New",
         page_type="concept",
-        strongest_overlap=pipeline_module.ContextOverlapSignal(
+        strongest_overlap=ContextOverlapSignal(
             strength="medium",
             path="concepts/Concept_Medium_Context.md",
             reason="medium overlap should keep metadata",
@@ -2807,7 +2828,7 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
         canonical_target_path="concepts/Concept_Strong_New.md",
         display_title="Strong New",
         page_type="concept",
-        strongest_overlap=pipeline_module.ContextOverlapSignal(
+        strongest_overlap=ContextOverlapSignal(
             strength="strong",
             path="concepts/Concept_Strong_Context.md",
             reason="strong overlap should keep content",
@@ -2861,7 +2882,7 @@ def test_draft_context_projection_keeps_medium_metadata_and_strong_content() -> 
     )
 
     metadata_paths, content_paths = draft_rendering_payloads_module.draft_rendering_relevant_wiki_paths(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[medium_item, strong_item])
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[medium_item, strong_item])
     )
     projection = draft_rendering_payloads_module.compact_snapshot_for_draft_rendering(
         snapshot,
@@ -3118,8 +3139,8 @@ def test_empty_vault_merge_shortcut_accepts_prepared_discovered_candidate_refs()
         items=[],
     )
 
-    report = pipeline_module.empty_vault_create_merge_planning_shortcut_report(digest, resolution, snapshot, contexts)
-    plan = pipeline_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-06")
+    report = merge_planning_module.empty_vault_create_merge_planning_shortcut_report(digest, resolution, snapshot, contexts)
+    plan = merge_planning_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-06")
 
     assert report["used"] is True
     assert report["blocking_conditions"] == []
@@ -3533,37 +3554,37 @@ def test_related_renderer_filters_and_caps_candidates() -> None:
         new_understanding="当前主题。",
         section_plans={"summary": "Summary"},
         related_pages=[
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_A.md",
                 display_title="A",
                 source="wiki_context",
                 reason="A 与当前主题最相关。",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_A.md",
                 display_title="A duplicate",
                 source="wiki_context",
                 reason="重复链接。",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_B.md",
                 display_title="B",
                 source="source_digest",
                 reason="B 是同源互补主题。",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_C.md",
                 display_title="C",
                 source="wiki_context",
                 reason="C 是召回到的补充背景。",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_D.md",
                 display_title="D",
                 source="wiki_context",
                 reason="D 会因为 cap 被截断。",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="sources/Source_Bad.md",
                 display_title="Source",
                 source="wiki_context",
@@ -3611,19 +3632,19 @@ def test_related_renderer_scrubs_internal_candidate_ids_from_public_reason() -> 
         new_understanding="当前主题。",
         section_plans={"summary": "Summary"},
         related_pages=[
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_A.md",
                 display_title="A",
                 source="source_digest",
                 reason="来源摘要把 `E001` 标记为相关候选，本页与该候选属于同一材料中的互补主题。",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_B.md",
                 display_title="B",
                 source="source_digest",
                 reason="source digest says CON-001 is related.",
             ),
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="concepts/Concept_C.md",
                 display_title="C",
                 source="source_digest",
@@ -4650,7 +4671,7 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
         section_plans={"detail": "详情"},
         reason="测试 typo 修正。",
         related_pages=[
-            pipeline_module.RelatedPageRef(
+            RelatedPageRef(
                 target_path="entities/Entity_Claude Code.md",
                 display_title="Claude Code",
                 source="source_digest",
@@ -4686,7 +4707,7 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
 
     finalized = draft_rendering_runner.finalize_draft_rendering(
         draft,
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
     related = related_pages_module.render_related_pages(
@@ -4706,7 +4727,7 @@ def test_stable_brand_typos_are_normalized_in_draft_and_related() -> None:
 
 
 def test_validate_draft_rendering_rejects_model_self_talk() -> None:
-    plan = pipeline_module.WikiMergePlanArtifact(
+    plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
             WikiMergePlanItem(
@@ -4767,7 +4788,7 @@ def test_validate_draft_rendering_rejects_wiki_state_leak() -> None:
 
 
 def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
-    plan = pipeline_module.WikiMergePlanArtifact(
+    plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
             WikiMergePlanItem(
@@ -4800,8 +4821,8 @@ def test_validate_draft_rendering_allows_normal_caution_wording() -> None:
     draft_validation_module.validate_draft_rendering(draft, plan, language="zh-CN")
 
 
-def qwen_related_block_plan() -> pipeline_module.WikiMergePlanArtifact:
-    return pipeline_module.WikiMergePlanArtifact(
+def qwen_related_block_plan() -> WikiMergePlanArtifact:
+    return WikiMergePlanArtifact(
         log_date="2026-06-06",
         items=[
             WikiMergePlanItem(
@@ -5078,7 +5099,7 @@ def test_partial_draft_extraction_rejects_update_missing_old_knowledge() -> None
 
     extracted = draft_rendering_runner.extract_valid_partial_draft_rendering(
         json.dumps(partial.model_dump(mode="json"), ensure_ascii=False),
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, missing_item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[update_item, missing_item]),
         WikiContextSnapshot(
             log_date="2026-06-06",
             source_target_path="sources/Source_Test.md",
@@ -5128,7 +5149,7 @@ def test_partial_draft_extraction_preserves_example_literals_without_cleanup_rep
             )
         ]
     )
-    plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, missing_item])
+    plan = WikiMergePlanArtifact(log_date="2026-06-06", items=[ok_item, missing_item])
     snapshot = WikiContextSnapshot(
         log_date="2026-06-06",
         source_target_path="sources/Source_Test.md",
@@ -5892,7 +5913,7 @@ def test_update_preservation_pack_records_concept_obligations() -> None:
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -5941,7 +5962,7 @@ def test_update_preservation_pack_reads_current_core_content_section() -> None:
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6017,7 +6038,7 @@ def test_update_preservation_pack_does_not_turn_interview_sessions_into_context_
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6139,7 +6160,7 @@ def test_update_preservation_issues_detect_missing_persistent_context_obligation
         ],
     )
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
     draft = DraftRenderingArtifact(
@@ -6197,7 +6218,7 @@ def test_update_preservation_issues_detect_missing_brain_ampersand_hands_obligat
         ],
     )
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
     section = pack["pages"][0]["sections"][0]
@@ -6271,7 +6292,7 @@ def test_update_preservation_pack_reads_english_section_headings() -> None:
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6355,7 +6376,7 @@ def test_update_preservation_pack_keeps_mixed_placeholder_section_with_core_know
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6399,7 +6420,7 @@ def test_update_preservation_pack_keeps_mixed_empty_placeholder_section_with_cor
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6441,7 +6462,7 @@ def test_update_preservation_pack_keeps_core_after_placeholder_prefix_colon() ->
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6483,7 +6504,7 @@ def test_update_preservation_pack_skips_pure_placeholder_sections(placeholder: s
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6521,7 +6542,7 @@ def test_update_preservation_pack_skips_placeholder_even_when_it_mentions_known_
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6560,7 +6581,7 @@ def test_update_preservation_pack_keeps_english_phrase_with_na_substring() -> No
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6602,7 +6623,7 @@ def test_update_preservation_pack_does_not_use_placeholder_segment_concepts() ->
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6646,7 +6667,7 @@ def test_update_preservation_pack_filters_mixed_ascii_placeholder_segment() -> N
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6698,7 +6719,7 @@ def test_update_preservation_pack_keeps_only_reusable_core_sections() -> None:
     )
 
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
 
@@ -6739,7 +6760,7 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
         ],
     )
     pack = update_preservation_module.build_update_preservation_pack(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
+        WikiMergePlanArtifact(log_date="2026-06-06", items=[item]),
         snapshot,
     )
     draft = DraftRenderingArtifact(
@@ -6767,7 +6788,7 @@ def test_update_preservation_uses_pack_concepts_when_old_text_is_truncated() -> 
 
 
 def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
-    metadata = pipeline_module.WikiPageMetadata(
+    metadata = WikiPageMetadata(
         path="concepts/Concept_X.md",
         llmwiki_type="concept",
         title="旧标题",
@@ -6809,7 +6830,7 @@ def test_index_update_uses_snapshot_title_not_model_display_title() -> None:
             )
         ],
     )
-    plan = pipeline_module.WikiMergePlanArtifact(
+    plan = WikiMergePlanArtifact(
         log_date="2026-06-05",
         context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
         items=[
@@ -6858,7 +6879,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
                 path="wiki/concepts/Concept_Product_Taste.md",
                 expected_state="present",
                 preimage_sha256="a",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_Product_Taste.md",
                     llmwiki_type="concept",
                     title="Product Taste",
@@ -6871,7 +6892,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
                 path="wiki/designs/Design_AI_PM.md",
                 expected_state="present",
                 preimage_sha256="b",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="designs/Design_AI_PM.md",
                     llmwiki_type="design",
                     title="AI PM",
@@ -6884,7 +6905,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
                 path="wiki/open_questions/Open_Question_PM角色.md",
                 expected_state="present",
                 preimage_sha256="c",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="open_questions/Open_Question_PM角色.md",
                     llmwiki_type="open_question",
                     title="PM角色如何演变",
@@ -6895,7 +6916,7 @@ def test_index_open_questions_keeps_high_signal_and_filters_source_gaps() -> Non
             ),
         ],
     )
-    plan = pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[])
+    plan = WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[])
     draft = DraftRenderingArtifact(pages=[])
 
     rows, report = open_questions_module.build_open_question_rows_with_report(plan, draft, snapshot)
@@ -6917,7 +6938,7 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
                 path="wiki/concepts/Concept_Product_Taste.md",
                 expected_state="present",
                 preimage_sha256="a",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_Product_Taste.md",
                     llmwiki_type="concept",
                     title="Product Taste",
@@ -6930,7 +6951,7 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
                 path="wiki/designs/Design_AI_PM.md",
                 expected_state="present",
                 preimage_sha256="b",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="designs/Design_AI_PM.md",
                     llmwiki_type="design",
                     title="AI PM",
@@ -6943,7 +6964,7 @@ def test_index_open_questions_representative_prefers_high_signal_over_newer_sour
     )
 
     rows, report = open_questions_module.build_open_question_rows_with_report(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         DraftRenderingArtifact(pages=[]),
         snapshot,
     )
@@ -6963,7 +6984,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
                 path="wiki/concepts/Concept_A.md",
                 expected_state="present",
                 preimage_sha256="a",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_A.md",
                     llmwiki_type="concept",
                     title="AI PM A",
@@ -6976,7 +6997,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
                 path="wiki/concepts/Concept_B.md",
                 expected_state="present",
                 preimage_sha256="b",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_B.md",
                     llmwiki_type="concept",
                     title="AI PM B",
@@ -6989,7 +7010,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
                 path="wiki/concepts/Concept_C.md",
                 expected_state="present",
                 preimage_sha256="c",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_C.md",
                     llmwiki_type="concept",
                     title="模型能力",
@@ -7001,7 +7022,7 @@ def test_index_open_questions_semantically_dedupes_common_ai_pm_variants() -> No
         ],
     )
     rows, report = open_questions_module.build_open_question_rows_with_report(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         DraftRenderingArtifact(pages=[]),
         snapshot,
     )
@@ -7023,7 +7044,7 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
                 path="wiki/concepts/Concept_Taste.md",
                 expected_state="present",
                 preimage_sha256="a",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_Taste.md",
                     llmwiki_type="concept",
                     title="产品品味",
@@ -7036,7 +7057,7 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
                 path="wiki/concepts/Concept_Judgement.md",
                 expected_state="present",
                 preimage_sha256="b",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_Judgement.md",
                     llmwiki_type="concept",
                     title="产品判断",
@@ -7048,7 +7069,7 @@ def test_index_open_questions_semantically_dedupes_product_judgement_training_va
         ],
     )
     rows, report = open_questions_module.build_open_question_rows_with_report(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         DraftRenderingArtifact(pages=[]),
         snapshot,
     )
@@ -7078,7 +7099,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 path="wiki/entities/Entity_Claude_Code.md",
                 expected_state="present",
                 preimage_sha256="a",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="entities/Entity_Claude_Code.md",
                     llmwiki_type="entity",
                     title="Claude Code",
@@ -7094,7 +7115,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
                 path="wiki/concepts/Concept_Fast_Iteration.md",
                 expected_state="present",
                 preimage_sha256="b",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="concepts/Concept_Fast_Iteration.md",
                     llmwiki_type="concept",
                     title="快速迭代",
@@ -7108,7 +7129,7 @@ def test_index_open_questions_dedupes_catwu_harness_and_iteration_variants() -> 
             ),
         ],
     )
-    plan = pipeline_module.WikiMergePlanArtifact(
+    plan = WikiMergePlanArtifact(
         log_date="2026-06-06",
         context_snapshot_ref="x",
         items=[
@@ -7201,7 +7222,7 @@ def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_
                 path="wiki/entities/Entity_Managed_Agents.md",
                 expected_state="present",
                 preimage_sha256="a",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="entities/Entity_Managed_Agents.md",
                     llmwiki_type="entity",
                     title="Managed Agents",
@@ -7218,7 +7239,7 @@ def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_
                 path="wiki/designs/Design_Managed_Agents.md",
                 expected_state="present",
                 preimage_sha256="b",
-                metadata=pipeline_module.WikiPageMetadata(
+                metadata=WikiPageMetadata(
                     path="designs/Design_Managed_Agents.md",
                     llmwiki_type="design",
                     title="Managed Agents 架构",
@@ -7233,7 +7254,7 @@ def test_index_open_questions_dedupes_agent_hand_transfer_but_keeps_concurrency_
         ],
     )
     rows, report = open_questions_module.build_open_question_rows_with_report(
-        pipeline_module.WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
+        WikiMergePlanArtifact(log_date="2026-06-06", context_snapshot_ref="x", items=[]),
         DraftRenderingArtifact(pages=[]),
         snapshot,
     )
@@ -8074,8 +8095,8 @@ def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> 
         log_date="2026-06-03",
         source_target_path="sources/Source_Test.md",
     )
-    plan = pipeline_module.finalize_wiki_merge_plan(
-        pipeline_module.WikiMergePlanArtifact(
+    plan = merge_planning_module.finalize_wiki_merge_plan(
+        WikiMergePlanArtifact(
             log_date="",
             context_snapshot_ref="",
             items=[
@@ -8156,7 +8177,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
         page_type: str,
         target_path: str,
         title: str,
-        related_pages: list[pipeline_module.RelatedPageRef] | None = None,
+        related_pages: list[RelatedPageRef] | None = None,
     ) -> WikiMergePlanItem:
         return WikiMergePlanItem(
             page_plan_id=page_plan_id,
@@ -8174,8 +8195,8 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
             reason=f"{title} 值得沉淀。",
         )
 
-    plan = pipeline_module.finalize_wiki_merge_plan(
-        pipeline_module.WikiMergePlanArtifact(
+    plan = merge_planning_module.finalize_wiki_merge_plan(
+        WikiMergePlanArtifact(
             log_date="2026-06-06",
             context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
                 items=[
@@ -8186,7 +8207,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
                         "concepts/Concept_Agent 与 Workflow 对比.md",
                         "Agent 与 Workflow 对比",
                         related_pages=[
-                            pipeline_module.RelatedPageRef(
+                            RelatedPageRef(
                                 target_path="comparisons/Comparison_Workflow vs Agent.md",
                                 display_title="Workflow vs Agent",
                                 source="source_digest",
@@ -8208,7 +8229,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
                         value_points=["帮助判断什么时候需要检索增强。"],
                         section_plans={"summary": "RAG 概念摘要。", "detail": "RAG 概念讨论检索增强生成的定义和边界。"},
                         related_pages=[
-                            pipeline_module.RelatedPageRef(
+                            RelatedPageRef(
                                 target_path="concepts/Concept_Agent 与 Workflow 对比.md",
                                 display_title="Agent 与 Workflow 对比",
                                 source="source_digest",
@@ -8771,7 +8792,7 @@ def test_related_pages_resolve_deterministically_from_candidates_and_snapshot(tm
         source_target_path="sources/Source_Test.md",
     )
 
-    plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
+    plan = merge_planning_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
     first = plan.items[0]
     assert [(item.target_path, item.display_title, item.source) for item in first.related_pages] == [
         ("concepts/Concept_Review loop.md", "Review loop", "source_digest"),
@@ -8842,7 +8863,7 @@ def test_related_pages_resolve_prepared_discovered_candidate_refs() -> None:
         ],
     )
 
-    plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-06")
+    plan = merge_planning_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-06")
     first = plan.items[0]
 
     assert [(item.target_path, item.display_title, item.source) for item in first.related_pages] == [
@@ -8919,8 +8940,8 @@ def test_strong_context_create_is_finalized_to_needs_human_decision(tmp_path: Pa
         log_date="2026-06-03",
         source_target_path="sources/Source_Test.md",
     )
-    plan = pipeline_module.finalize_wiki_merge_plan(
-        pipeline_module.WikiMergePlanArtifact(
+    plan = merge_planning_module.finalize_wiki_merge_plan(
+        WikiMergePlanArtifact(
             log_date="",
             context_snapshot_ref="",
             items=[
@@ -8962,7 +8983,7 @@ def merge_review_create_item(
         display_title=f"Concept {page_plan_id}",
         page_type="concept",
         inspected_context_paths=[f"concepts/Concept_Old_{page_plan_id}.md"] if strength != "none" else [],
-        strongest_overlap=pipeline_module.ContextOverlapSignal(
+        strongest_overlap=ContextOverlapSignal(
             strength=strength,
             match_basis="embedding" if strength != "none" else "",
             path=f"concepts/Concept_Old_{page_plan_id}.md" if strength != "none" else "",
@@ -8977,8 +8998,8 @@ def merge_review_create_item(
     )
 
 
-def merge_review_plan(*items: WikiMergePlanItem) -> pipeline_module.WikiMergePlanArtifact:
-    return pipeline_module.WikiMergePlanArtifact(log_date="2026-06-07", context_snapshot_ref="", items=list(items))
+def merge_review_plan(*items: WikiMergePlanItem) -> WikiMergePlanArtifact:
+    return WikiMergePlanArtifact(log_date="2026-06-07", context_snapshot_ref="", items=list(items))
 
 
 def test_all_create_medium_with_concrete_reason_does_not_force_review() -> None:
@@ -9046,7 +9067,7 @@ def test_all_create_medium_generic_old_title_scope_dismissal_waits_for_review() 
         update={
             "display_title": "Agent 记忆系统",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9076,7 +9097,7 @@ def test_all_create_medium_ai_agent_neicun_alias_waits_for_review() -> None:
         update={
             "display_title": "AI Agent 内存",
             "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9106,7 +9127,7 @@ def test_all_create_medium_existing_knowledge_page_marker_waits_for_review() -> 
         update={
             "display_title": "AI Agent 内存",
             "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9136,7 +9157,7 @@ def test_all_create_medium_old_title_comma_scope_predicate_waits_for_review() ->
         update={
             "display_title": "AI Agent 内存",
             "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9165,7 +9186,7 @@ def test_all_create_medium_added_page_marker_waits_for_review() -> None:
         update={
             "display_title": "AI Agent 内存",
             "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9194,7 +9215,7 @@ def test_all_create_medium_added_knowledge_page_marker_waits_for_review() -> Non
         update={
             "display_title": "AI Agent 内存",
             "canonical_target_path": "concepts/Concept_AI Agent 内存.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9223,7 +9244,7 @@ def test_all_create_medium_pure_english_memory_old_title_waits_for_review() -> N
         update={
             "display_title": "Agent Memory System",
             "canonical_target_path": "concepts/Concept_Agent Memory System.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_Persistent Memory.md",
@@ -9252,7 +9273,7 @@ def test_all_create_medium_rapid_memory_is_not_api_specific() -> None:
         update={
             "display_title": "Rapid Memory",
             "canonical_target_path": "concepts/Concept_Rapid Memory.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_Rapid Memory.md",
@@ -9282,7 +9303,7 @@ def test_all_create_medium_old_specific_negation_with_generic_old_scope_does_not
         update={
             "display_title": "Agent 记忆系统写入策略",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统写入策略.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9309,7 +9330,7 @@ def test_all_create_medium_old_title_no_product_token_does_not_force_review() ->
         update={
             "display_title": "Agent 记忆系统淘汰策略",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统淘汰策略.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9335,7 +9356,7 @@ def test_all_create_medium_bare_negation_still_reviews_when_new_is_generic() -> 
         update={
             "display_title": "Agent 记忆系统",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9361,7 +9382,7 @@ def test_all_create_medium_adversarial_negation_still_waits_for_review() -> None
         update={
             "display_title": "Agent 记忆系统",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9387,7 +9408,7 @@ def test_all_create_medium_adversarial_negation_without_new_generic_still_waits_
         update={
             "display_title": "Agent 记忆系统",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9413,7 +9434,7 @@ def test_all_create_medium_english_not_merely_specific_still_waits_for_review() 
         update={
             "display_title": "Agent Memory System",
             "canonical_target_path": "concepts/Concept_Agent Memory System.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_Persistent Memory.md",
@@ -9439,7 +9460,7 @@ def test_all_create_medium_old_not_generic_new_generic_still_waits_for_review() 
         update={
             "display_title": "Agent 记忆系统",
             "canonical_target_path": "concepts/Concept_Agent 记忆系统.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9465,7 +9486,7 @@ def test_all_create_medium_english_old_not_generic_new_generic_still_waits_for_r
         update={
             "display_title": "Agent Memory System",
             "canonical_target_path": "concepts/Concept_Agent Memory System.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_Persistent Memory.md",
@@ -9492,7 +9513,7 @@ def test_all_create_medium_product_specific_old_title_can_auto_pass() -> None:
         update={
             "display_title": "AI Agent 记忆系统",
             "canonical_target_path": "concepts/Concept_AI Agent 记忆系统.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_Mem0 多级记忆实现.md",
@@ -9520,7 +9541,7 @@ def test_all_create_medium_source_specific_old_title_with_neicun_can_auto_pass()
             "display_title": "基于 Redis 的 Agent 内存架构",
             "canonical_target_path": "designs/Design_基于 Redis 的 Agent 内存架构.md",
             "page_type": "design",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="entities/Entity_Cloudflare Agent Memory.md",
@@ -9547,7 +9568,7 @@ def test_all_create_medium_runtime_neicun_does_not_become_agent_memory_review() 
         update={
             "display_title": "Redis 内存配置",
             "canonical_target_path": "concepts/Concept_Redis 内存配置.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9573,7 +9594,7 @@ def test_all_create_medium_runtime_neicun_generic_wording_still_auto_passes() ->
         update={
             "display_title": "Redis 内存配置",
             "canonical_target_path": "concepts/Concept_Redis 内存配置.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9600,7 +9621,7 @@ def test_all_create_medium_later_source_delta_does_not_make_old_page_specific() 
         update={
             "display_title": "AI Agent 内存写入策略",
             "canonical_target_path": "concepts/Concept_AI Agent 内存写入策略.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_持久记忆（Agent Memory）.md",
@@ -9627,7 +9648,7 @@ def test_all_create_medium_agent_only_title_overlap_does_not_force_review() -> N
         update={
             "display_title": "Agent 路由设计",
             "canonical_target_path": "designs/Design_Agent 路由设计.md",
-            "strongest_overlap": pipeline_module.ContextOverlapSignal(
+            "strongest_overlap": ContextOverlapSignal(
                 strength="medium",
                 match_basis="embedding",
                 path="concepts/Concept_Agent 监控指标.md",
@@ -9729,8 +9750,8 @@ def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path:
         log_date="2026-06-03",
         source_target_path="sources/Source_Test.md",
     )
-    plan = pipeline_module.finalize_wiki_merge_plan(
-        pipeline_module.WikiMergePlanArtifact(
+    plan = merge_planning_module.finalize_wiki_merge_plan(
+        WikiMergePlanArtifact(
             log_date="",
             context_snapshot_ref="",
             items=[
@@ -9871,7 +9892,7 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
             ),
         ],
     )
-    plan = pipeline_module.WikiMergePlanArtifact(
+    plan = WikiMergePlanArtifact(
         log_date="2026-06-07",
         context_snapshot_ref="wiki_context_snapshot/wiki_context_snapshot.json",
         items=[
@@ -9906,7 +9927,7 @@ def test_mixed_plan_medium_generic_old_title_create_stops_for_review() -> None:
         ],
     )
 
-    finalized = pipeline_module.finalize_wiki_merge_plan(
+    finalized = merge_planning_module.finalize_wiki_merge_plan(
         plan,
         resolution,
         snapshot,
@@ -9971,7 +9992,7 @@ def test_source_type_plan_items_are_defensively_excluded_from_index_and_related(
         log_date="2026-06-03",
         source_target_path="sources/Source_Test.md",
     )
-    plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
+    plan = merge_planning_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
     concept_item = [item for item in plan.items if "CAND001" in item.source_basis.source_candidate_ids][0]
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
     rows = draft_outputs_module.build_index_rows(profile, plan, DraftRenderingArtifact(pages=[]), snapshot)
@@ -10031,7 +10052,7 @@ def test_ambiguous_existing_related_alias_stays_unresolved(tmp_path: Path) -> No
         source_target_path="sources/Source_Test.md",
     )
 
-    plan = build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
+    plan = merge_planning_module.build_wiki_merge_plan(resolution, digest, snapshot, log_date="2026-06-03")
 
     assert plan.items[0].related_pages == []
     assert "Shared Alias" in plan.items[0].related_unresolved
