@@ -649,6 +649,7 @@ def test_run_next_dry_run_selects_unprocessed_raw(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "selected raw" in result.output
+    assert result.output.count("selected raw:") == 1
     assert "raw/next.md" in result.output
     assert "llmwiki ingest run" in result.output
 
@@ -756,6 +757,7 @@ def test_run_next_invokes_ingest_with_selected_raw(monkeypatch: pytest.MonkeyPat
     )
 
     assert result.exit_code == 0
+    assert result.output.count("selected raw:") == 1
     assert seen["vault"] == vault.resolve()
     assert seen["raw_file"] == raw.resolve()
     assert seen["mock_fixture_dir"] == mock_fixture_dir

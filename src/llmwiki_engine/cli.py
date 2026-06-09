@@ -217,12 +217,12 @@ def ingest_run_next(
                     )
                 )
                 return
+        if not json_output:
             console.print(f"selected raw: `{raw_abs}`")
+        if dry_run:
             console.print(f"status: `{candidate.status}`")
             console.print(f"next: `llmwiki ingest run {report.vault} {raw_abs}{prepare_cli_suffix}`")
             return
-        if not json_output:
-            console.print(f"selected raw: `{raw_abs}`")
         run_console = Console(file=io.StringIO()) if json_output else console
         manifest = run_simplified_ingest(
             vault=Path(report.vault),
