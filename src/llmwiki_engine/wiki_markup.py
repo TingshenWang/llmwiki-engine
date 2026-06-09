@@ -4,6 +4,7 @@ from pathlib import Path
 
 __all__ = (
     "clean_display_title",
+    "normalize_related_key",
     "normalize_related_candidate_path",
     "obsidian_alias_link",
     "obsidian_link",
@@ -17,6 +18,14 @@ def clean_display_title(title: str) -> str:
         if stripped.lower().startswith(prefix.lower()):
             return stripped[len(prefix) :].strip()
     return stripped
+
+
+def normalize_related_key(value: str) -> str:
+    text = value.strip().lower()
+    for prefix in ["concept_", "entity_", "design_", "comparison_", "overview_", "event_", "memory_", "idea_", "open_question_"]:
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return text
 
 
 def normalize_related_candidate_path(value: str) -> str | None:

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -14,6 +12,7 @@ from pydantic import BaseModel
 from . import __version__
 from . import apply_guards as _apply_guards
 from . import apply_preview as _apply_preview
+from . import candidate_resolution as _candidate_resolution
 from . import diff_utils as _diff_utils
 from . import draft_grounding as _draft_grounding
 from . import draft_rendering_runner as _draft_rendering_runner
@@ -34,7 +33,7 @@ from . import source_refs as _source_refs
 from . import update_preservation as _update_preservation
 from . import wiki_markup as _wiki_markup
 from .events import EventLogger
-from .hash_utils import artifact_ref, sha256_bytes, sha256_file
+from .hash_utils import artifact_ref, sha256_file
 from .io import read_model, read_yaml, write_json, write_yaml
 from .manifest import (
     begin_model_step_attempt,
@@ -67,7 +66,6 @@ from .models import (
     RawPreparationArtifact,
     ReviewDecision,
     RelatedPageRef,
-    SourceBasis,
     SourceDigestArtifact,
     SourceDigestCandidate,
     StepStatus,
@@ -83,7 +81,7 @@ from .models import (
     utc_now,
 )
 from .provider_config import ProviderExecutionContext, build_provider_execution_context
-from .profiles import load_profile, page_output_path, profile_to_yaml_data, safe_filename
+from .profiles import load_profile, profile_to_yaml_data, safe_filename
 from .raw_cleanup import cleanup_raw_wikilinks, render_raw_link_cleanup_markdown
 from .rendering import source_title_for_raw
 from .retrieval import (
@@ -108,7 +106,6 @@ from .steps import (
 from .structured import StructuredModelCall
 from .system_pages import (
     ensure_system_pages,
-    format_markdown_table,
     local_date,
 )
 from .validators import (
@@ -829,7 +826,7 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
         },
     }
     def validate_candidate_resolution_model(model: CandidateResolutionArtifact) -> None:
-        candidate = finalize_candidate_resolution(ctx.vault, ctx.profile, model, digest)
+        candidate = _candidate_resolution.finalize_candidate_resolution(ctx.vault, ctx.profile, model, digest)
         validate_candidate_resolution(digest, candidate)
 
     artifact, _ = _structured_call(ctx.run_dir, ctx.execution_context, step_name).run(
@@ -839,13 +836,13 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
         validator=validate_candidate_resolution_model,
     )
     artifact = _redacted_model(ctx, artifact, CandidateResolutionArtifact)
-    artifact = backfill_missing_candidate_resolution_items(artifact, digest, ctx.profile)
-    artifact = finalize_candidate_resolution(ctx.vault, ctx.profile, artifact, digest)
+    artifact = _candidate_resolution.backfill_missing_candidate_resolution_items(artifact, digest, ctx.profile)
+    artifact = _candidate_resolution.finalize_candidate_resolution(ctx.vault, ctx.profile, artifact, digest)
     validate_candidate_resolution(digest, artifact)
     out = step_root / "candidate_resolution.json"
     write_json(out, artifact)
     table = step_root / "candidate_resolution.md"
-    table.write_text(render_candidate_resolution_markdown(artifact), encoding="utf-8")
+    table.write_text(_candidate_resolution.render_candidate_resolution_markdown(artifact), encoding="utf-8")
     outputs = [
         _ref(ctx.run_dir, source_pack_path, step_name, "json", "candidate_resolution_source_excerpt_pack.v1"),
         _ref(ctx.run_dir, source_pack_md, step_name, "markdown"),
@@ -1582,7 +1579,7 @@ def resolve_related_pages(
     for other in resolution.items:
         if other.page_type.lower() == "source":
             continue
-        by_current_title.setdefault(normalize_related_key(other.display_title), []).append(other)
+        by_current_title.setdefault(_wiki_markup.normalize_related_key(other.display_title), []).append(other)
     metadata_lookup: dict[str, list[WikiPageMetadata]] = {}
     for pool_entry in snapshot.knowledge_metadata_pool:
         metadata = pool_entry.metadata
@@ -1591,7 +1588,7 @@ def resolve_related_pages(
         if metadata.llmwiki_type.lower() == "source":
             continue
         for key in [metadata.title, *metadata.aliases]:
-            metadata_lookup.setdefault(normalize_related_key(key), []).append(metadata)
+            metadata_lookup.setdefault(_wiki_markup.normalize_related_key(key), []).append(metadata)
     related: list[RelatedPageRef] = []
     unresolved: list[str] = []
     seen_paths: set[str] = set()
@@ -1602,7 +1599,7 @@ def resolve_related_pages(
         resolved: RelatedPageRef | None = None
         other = by_candidate_id.get(raw)
         if other is None:
-            matches = by_current_title.get(normalize_related_key(raw), [])
+            matches = by_current_title.get(_wiki_markup.normalize_related_key(raw), [])
             if len(matches) == 1:
                 other = matches[0]
             elif len(matches) > 1:
@@ -1616,7 +1613,7 @@ def resolve_related_pages(
                 reason=f"`{other.display_title}` 与本页同属本次材料中的互补主题，可帮助补足上下游理解。",
             )
         if resolved is None:
-            metadata_matches = metadata_lookup.get(normalize_related_key(raw), [])
+            metadata_matches = metadata_lookup.get(_wiki_markup.normalize_related_key(raw), [])
             if len(metadata_matches) > 1:
                 unresolved.append(raw)
                 continue
@@ -1636,15 +1633,6 @@ def resolve_related_pages(
         seen_paths.add(resolved.target_path)
         related.append(resolved)
     return related, unresolved
-
-
-def normalize_related_key(value: str) -> str:
-    text = value.strip().lower()
-    for prefix in ["concept_", "entity_", "design_", "comparison_", "overview_", "event_", "memory_", "idea_", "open_question_"]:
-        if text.startswith(prefix):
-            return text[len(prefix) :]
-    return text
-
 
 def _structured_call(
     run_dir: Path,
@@ -1983,251 +1971,6 @@ def _complete_review_step(
     step.review_decision_ref = review_decision_ref
 
 
-def backfill_missing_candidate_resolution_items(
-    artifact: CandidateResolutionArtifact,
-    digest: SourceDigestArtifact,
-    profile: Any,
-) -> CandidateResolutionArtifact:
-    covered_ids: set[str] = set()
-    for item in artifact.items:
-        covered_ids.update(item.source_basis.source_candidate_ids)
-    additions: list[CandidateResolutionItem] = []
-    notes = list(artifact.missed_candidate_risks)
-    for group_name, candidates in [
-        ("entities", digest.entities),
-        ("concepts", digest.concepts),
-        ("designs", digest.designs),
-        ("comparisons", digest.comparisons),
-        ("open_questions", digest.open_questions),
-    ]:
-        for candidate in candidates:
-            if candidate.candidate_id in covered_ids:
-                continue
-            page_type = page_type_for_digest_candidate(group_name, candidate, profile)
-            display_title = candidate.suggested_page_title.strip() or candidate.name.strip() or candidate.candidate_id
-            additions.append(
-                CandidateResolutionItem(
-                    source_basis=SourceBasis(
-                        source_candidate_ids=[candidate.candidate_id],
-                        source_locator=candidate.source_locator,
-                    ),
-                    page_type=page_type,
-                    display_title=display_title,
-                    topic_summary=candidate.one_sentence_summary,
-                    why_this_page=candidate.wiki_value or candidate.why_matters or "该候选来自 source_digest，模型在页面规划中遗漏，系统补齐为最小页面计划。",
-                    initial_section_intent="系统补齐的最小页面计划；后续 merge planning / draft rendering 需要重新对照全文消化。",
-                    coverage_notes=f"模型遗漏 approved_digest candidate `{candidate.candidate_id}`，系统已补齐。",
-                    reason="candidate_resolution coverage backfill",
-                )
-            )
-            notes.append(f"candidate_resolution model missed `{candidate.candidate_id}`; deterministic backfill added `{display_title}`.")
-    if not additions:
-        return artifact
-    return CandidateResolutionArtifact(items=[*artifact.items, *additions], missed_candidate_risks=notes)
-
-
-def page_type_for_digest_candidate(group_name: str, candidate: SourceDigestCandidate, profile: Any) -> str:
-    normalized = candidate.type.strip().lower().replace(" ", "_").replace("-", "_")
-    aliases = {
-        "question": "open_question",
-        "open_questions": "open_question",
-        "open_question": "open_question",
-        "concept_overview": "overview",
-        "design_overview": "overview",
-        "entity_index": "overview",
-        "open_question_overview": "open_question",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized in profile.page_types and normalized != profile.source_page_type:
-        return normalized
-    preferred = {
-        "entities": "entity",
-        "concepts": "concept",
-        "designs": "design",
-        "comparisons": "comparison",
-        "open_questions": "open_question",
-    }.get(group_name)
-    if preferred in profile.page_types:
-        return preferred
-    return profile.default_page_type
-
-
-def finalize_candidate_resolution(
-    vault: Path,
-    profile: Any,
-    artifact: CandidateResolutionArtifact,
-    digest: SourceDigestArtifact | None = None,
-) -> CandidateResolutionArtifact:
-    items: list[CandidateResolutionItem] = []
-    seen_paths: dict[str, int] = {}
-    selected_candidate_ids = {candidate.candidate_id for candidate in digest.ingest_candidates()} if digest is not None else set()
-    weak_or_noise_ids = {candidate.candidate_id for candidate in digest.weak_or_noise_items} if digest is not None else set()
-    sanitized_items: list[CandidateResolutionItem] = []
-    sanitation_notes = list(artifact.missed_candidate_risks)
-    for index, item in enumerate(artifact.items):
-        source_ids = list(item.source_basis.source_candidate_ids)
-        leaked_ids = [
-            candidate_id
-            for candidate_id in source_ids
-            if candidate_id in weak_or_noise_ids or candidate_id.strip().lower().startswith(("noise", "weak", "ignore"))
-        ]
-        if leaked_ids:
-            cleaned_ids = [candidate_id for candidate_id in source_ids if candidate_id not in leaked_ids]
-            if not cleaned_ids:
-                sanitation_notes.append(
-                    f"candidate_resolution item `{item.display_title or item.page_plan_id or index}` dropped because it only referenced weak/noise candidates: {sorted(leaked_ids)}."
-                )
-                continue
-            item = item.model_copy(
-                update={
-                    "source_basis": item.source_basis.model_copy(update={"source_candidate_ids": cleaned_ids}),
-                    "coverage_notes": _markdown_utils.merge_markdown_blocks(
-                        item.coverage_notes,
-                        f"系统清理 weak/noise candidate 引用：{', '.join(f'`{candidate_id}`' for candidate_id in leaked_ids)}。",
-                    ),
-                }
-            )
-            sanitation_notes.append(
-                f"candidate_resolution item `{item.display_title or item.page_plan_id or index}` removed weak/noise candidate refs: {sorted(leaked_ids)}."
-            )
-        if digest is not None:
-            unknown_source_ids = [
-                candidate_id
-                for candidate_id in item.source_basis.source_candidate_ids
-                if candidate_id not in selected_candidate_ids
-            ]
-            if unknown_source_ids:
-                prepared_discovered = list(item.source_basis.prepared_discovered_candidates)
-                cleaned_ids = [
-                    candidate_id
-                    for candidate_id in item.source_basis.source_candidate_ids
-                    if candidate_id in selected_candidate_ids
-                ]
-                if prepared_discovered:
-                    for candidate_id in unknown_source_ids:
-                        if candidate_id not in prepared_discovered:
-                            prepared_discovered.append(candidate_id)
-                    unknown_note = "系统将非 source_digest candidate id 移入 prepared_discovered_candidates："
-                    sanitation_note = "moved unknown candidate refs to prepared_discovered_candidates"
-                else:
-                    prepared_discovered = list(unknown_source_ids)
-                    unknown_note = "系统将非 source_digest candidate id 移入 prepared_discovered_candidates："
-                    sanitation_note = "moved unknown-only candidate refs to prepared_discovered_candidates"
-                item = item.model_copy(
-                    update={
-                        "source_basis": item.source_basis.model_copy(
-                            update={
-                                "source_candidate_ids": cleaned_ids,
-                                "prepared_discovered_candidates": prepared_discovered,
-                            }
-                        ),
-                        "coverage_notes": _markdown_utils.merge_markdown_blocks(
-                            item.coverage_notes,
-                            unknown_note + f"{', '.join(f'`{candidate_id}`' for candidate_id in unknown_source_ids)}。",
-                        ),
-                    }
-                )
-                sanitation_notes.append(
-                    f"candidate_resolution item `{item.display_title or item.page_plan_id or index}` {sanitation_note}: {sorted(unknown_source_ids)}."
-                )
-        sanitized_items.append(item)
-    artifact = artifact.model_copy(update={"items": sanitized_items, "missed_candidate_risks": sanitation_notes})
-    issues: list[StructuredIssue] = []
-    for index, item in enumerate(artifact.items):
-        if item.page_type not in profile.page_types:
-            issues.append(
-                StructuredIssue(
-                    issue_code="unknown_page_type",
-                    field_path=f"items.{index}.page_type",
-                    validator_id="finalize_candidate_resolution",
-                    message=(
-                        f"candidate_resolution uses unsupported page_type `{item.page_type}`; "
-                        "remove weak/noise formal items or choose a valid profile page_type."
-                    ),
-                    repairability="repairable",
-                )
-            )
-        if item.reason.strip().lower() in {"ignore", "ignored", "noise", "weak", "弱相关", "噪声"}:
-            issues.append(
-                StructuredIssue(
-                    issue_code="ignore_as_formal_item",
-                    field_path=f"items.{index}.reason",
-                    validator_id="finalize_candidate_resolution",
-                    message="formal page plans must not use ignore/noise as the reason; remove this item.",
-                    repairability="repairable",
-                )
-            )
-    if issues:
-        raise ContractValidationError(
-            "candidate_resolution contains weak/noise formal item(s); repair by deleting those formal items.",
-            issues=issues,
-        )
-    for item in artifact.items:
-        page_type = item.page_type
-        display_title = _wiki_markup.clean_display_title(item.display_title) or item.display_title.strip()
-        source_fingerprint = source_basis_fingerprint(item.source_basis)
-        page_plan_id = stable_page_plan_id(page_type, display_title, source_fingerprint)
-        stem = unicode_safe_stem(display_title)
-        target = page_output_path(vault / "wiki", profile, page_type, stem)
-        rel_target = target.relative_to(vault / "wiki").as_posix()
-        if rel_target in seen_paths:
-            seen_paths[rel_target] += 1
-            path = Path(rel_target)
-            suffix = sha256_bytes(f"{page_type}:{display_title}:{page_plan_id}".encode("utf-8"))[:8]
-            rel_target = path.with_name(f"{path.stem}_{suffix}{path.suffix}").as_posix()
-        else:
-            seen_paths[rel_target] = 1
-        items.append(
-            item.model_copy(
-                update={
-                    "page_plan_id": page_plan_id,
-                    "page_type": page_type,
-                    "display_title": display_title,
-                    "path_stem": stem,
-                    "candidate_target_path": rel_target,
-                }
-            )
-        )
-    return CandidateResolutionArtifact(items=items, missed_candidate_risks=artifact.missed_candidate_risks)
-
-
-def source_basis_fingerprint(source_basis: SourceBasis) -> str:
-    payload = json.dumps(source_basis.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
-    return sha256_bytes(payload.encode("utf-8"))[:12]
-
-
-def stable_page_plan_id(page_type: str, display_title: str, source_fingerprint: str) -> str:
-    base = f"{page_type}:{normalize_related_key(display_title)}:{source_fingerprint}"
-    return f"PP-{sha256_bytes(base.encode('utf-8'))[:12]}"
-
-
-def unicode_safe_stem(value: str) -> str:
-    normalized = unicodedata.normalize("NFC", value)
-    normalized = re.sub(r"\s+", " ", normalized.strip())
-    bad = '\\/:*?"<>|#^[]'
-    cleaned = "".join("_" if char in bad else char for char in normalized).strip(" .")
-    return cleaned or "untitled"
-
-
-def render_candidate_resolution_markdown(artifact: CandidateResolutionArtifact) -> str:
-    rows = [
-        [
-            item.page_plan_id,
-            item.page_type,
-            item.display_title,
-            f"`{item.candidate_target_path}`",
-            ", ".join(item.source_basis.source_candidate_ids),
-            ", ".join(item.source_basis.prepared_discovered_candidates),
-            item.why_this_page,
-        ]
-        for item in artifact.items
-    ]
-    return "# 候选页面规划\n\n" + format_markdown_table(
-        ["页面计划", "类型", "标题", "目标", "来源候选", "Prepared 发现候选", "为什么写"],
-        rows,
-    ) + "\n"
-
-
 def build_wiki_context_snapshot(
     vault: Path,
     resolution: CandidateResolutionArtifact,
@@ -2305,7 +2048,7 @@ def resolve_model_related_pages(
         for path in paths:
             if path:
                 current_by_path[path] = other
-        current_by_title.setdefault(normalize_related_key(other.display_title), []).append(other)
+        current_by_title.setdefault(_wiki_markup.normalize_related_key(other.display_title), []).append(other)
 
     inspected_paths = set(item.inspected_context_paths)
     metadata_by_path: dict[str, WikiPageMetadata] = {}
@@ -2318,7 +2061,7 @@ def resolve_model_related_pages(
             continue
         metadata_by_path[metadata.path] = metadata
         for key in [metadata.title, *metadata.aliases]:
-            metadata_by_title.setdefault(normalize_related_key(key), []).append(metadata)
+            metadata_by_title.setdefault(_wiki_markup.normalize_related_key(key), []).append(metadata)
 
     related: list[RelatedPageRef] = []
     unresolved: list[str] = []
@@ -2343,7 +2086,7 @@ def resolve_model_related_pages(
             unresolved.append(_related_debug_label(suggestion))
             continue
         if resolved.source == "wiki_context" and resolved.target_path not in inspected_paths:
-            exact_key = normalize_related_key(resolved.display_title)
+            exact_key = _wiki_markup.normalize_related_key(resolved.display_title)
             if exact_key not in metadata_by_title:
                 unresolved.append(_related_debug_label(suggestion))
                 continue
@@ -2383,7 +2126,7 @@ def _resolve_single_model_related(
                     source="wiki_context",
                     reason=_related_pages.chinese_related_reason(fallback_reason, f"召回旧页 `{_wiki_markup.clean_display_title(metadata.title)}` 与该主题存在可复用背景。"),
                 )
-        key = normalize_related_key(raw)
+        key = _wiki_markup.normalize_related_key(raw)
         current_matches = current_by_title.get(key, [])
         if len(current_matches) == 1 and current_matches[0].canonical_target_path != self_path:
             current = current_matches[0]
@@ -2427,7 +2170,7 @@ def finalize_wiki_merge_plan(
             title_matches = [
                 candidate
                 for candidate in resolution.items
-                if normalize_related_key(candidate.display_title) == normalize_related_key(item.display_title)
+                if _wiki_markup.normalize_related_key(candidate.display_title) == _wiki_markup.normalize_related_key(item.display_title)
             ]
             typed_matches = [candidate for candidate in title_matches if candidate.page_type == item.page_type]
             resolution_item = (typed_matches or title_matches or [None])[0] if len(typed_matches or title_matches) == 1 else None

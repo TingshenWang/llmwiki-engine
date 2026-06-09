@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from helpers import copy_fixture_raw, draft_body
 import llmwiki_engine.apply as apply_module
+import llmwiki_engine.candidate_resolution as candidate_resolution_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
 import llmwiki_engine.draft_outputs as draft_outputs_module
@@ -66,7 +67,6 @@ from llmwiki_engine.models import (
 from llmwiki_engine.pipeline import (
     STEP_RUNNERS,
     _STEP_RUN_FUNCTIONS,
-    backfill_missing_candidate_resolution_items,
     build_wiki_context_snapshot,
     build_wiki_merge_plan,
     init_vault,
@@ -781,12 +781,12 @@ def test_source_digest_candidate_budget_promotes_deferred_aggregation_without_in
 
     vault, _ = make_vault(tmp_path)
     profile = pipeline_module.load_profile(vault / ".llmwiki" / "profiles" / "project_basic")
-    resolution = pipeline_module.backfill_missing_candidate_resolution_items(
+    resolution = candidate_resolution_module.backfill_missing_candidate_resolution_items(
         CandidateResolutionArtifact(items=[]),
         capped,
         profile,
     )
-    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, resolution, capped)
+    finalized = candidate_resolution_module.finalize_candidate_resolution(vault, profile, resolution, capped)
     aggregate_plan = [item for item in finalized.items if item.source_basis.source_candidate_ids == [aggregate.candidate_id]][0]
     assert aggregate_plan.page_type == "overview"
     assert aggregate_plan.candidate_target_path.startswith("overviews/Overview_")
@@ -1930,6 +1930,22 @@ def test_pipeline_does_not_expose_internal_control_helpers() -> None:
         "structured_model_output_refs",
         "validate_raw_link_cleanup_resume",
         "validate_resume_start",
+    }
+
+    leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
+
+    assert leaked == []
+
+
+def test_pipeline_does_not_reexport_candidate_resolution_helpers() -> None:
+    old_helper_names = {
+        "backfill_missing_candidate_resolution_items",
+        "finalize_candidate_resolution",
+        "page_type_for_digest_candidate",
+        "render_candidate_resolution_markdown",
+        "source_basis_fingerprint",
+        "stable_page_plan_id",
+        "unicode_safe_stem",
     }
 
     leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
@@ -3145,8 +3161,8 @@ def test_candidate_resolution_backfills_missed_open_question_candidates(tmp_path
         ]
     )
 
-    backfilled = backfill_missing_candidate_resolution_items(artifact, digest, profile)
-    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, backfilled)
+    backfilled = candidate_resolution_module.backfill_missing_candidate_resolution_items(artifact, digest, profile)
+    finalized = candidate_resolution_module.finalize_candidate_resolution(vault, profile, backfilled)
 
     assert {item.source_basis.source_candidate_ids[0] for item in finalized.items} == {"CAND001", "oq-1"}
     open_question = [item for item in finalized.items if item.source_basis.source_candidate_ids == ["oq-1"]][0]
@@ -7576,10 +7592,10 @@ def test_draft_rendering_batches_large_page_sets(tmp_path: Path) -> None:
             "prepared_discovered_candidates": [],
             "source_locator": f"测试 / 第 {index} 段",
         }
-        page_plan_id = pipeline_module.stable_page_plan_id(
+        page_plan_id = candidate_resolution_module.stable_page_plan_id(
             "concept",
             title,
-            pipeline_module.source_basis_fingerprint(SourceBasis.model_validate(source_basis)),
+            candidate_resolution_module.source_basis_fingerprint(SourceBasis.model_validate(source_basis)),
         )
         target_path = f"concepts/Concept_{title}.md"
         candidate = json.loads(json.dumps(concept_template))
@@ -7804,7 +7820,7 @@ def test_candidate_resolution_moves_prepared_discovered_unknown_ids_out_of_sourc
         ]
     )
 
-    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    finalized = candidate_resolution_module.finalize_candidate_resolution(vault, profile, artifact, digest)
     pipeline_module.validate_candidate_resolution(digest, finalized)
     discovered = [item for item in finalized.items if item.display_title == "AI PM基础"][0]
 
@@ -7851,7 +7867,7 @@ def test_candidate_resolution_moves_unknown_only_source_ids_to_prepared_discover
         ]
     )
 
-    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    finalized = candidate_resolution_module.finalize_candidate_resolution(vault, profile, artifact, digest)
     pipeline_module.validate_candidate_resolution(digest, finalized)
     item = [item for item in finalized.items if item.display_title == "Prepared 新主题"][0]
 
@@ -7909,7 +7925,7 @@ def test_candidate_resolution_moves_budget_deferred_source_ids_to_prepared_disco
         ]
     )
 
-    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    finalized = candidate_resolution_module.finalize_candidate_resolution(vault, profile, artifact, digest)
     pipeline_module.validate_candidate_resolution(digest, finalized)
     item = [item for item in finalized.items if item.display_title == "Deferred candidate"][0]
 
@@ -7949,7 +7965,7 @@ def test_candidate_resolution_moves_deferred_source_ids_when_no_selected_candida
         ]
     )
 
-    finalized = pipeline_module.finalize_candidate_resolution(vault, profile, artifact, digest)
+    finalized = candidate_resolution_module.finalize_candidate_resolution(vault, profile, artifact, digest)
     pipeline_module.validate_candidate_resolution(digest, finalized)
     item = finalized.items[0]
 
@@ -7974,7 +7990,7 @@ def test_candidate_resolution_markdown_shows_prepared_discovered_candidates() ->
         ]
     )
 
-    rendered = pipeline_module.render_candidate_resolution_markdown(artifact)
+    rendered = candidate_resolution_module.render_candidate_resolution_markdown(artifact)
 
     assert "Prepared 发现候选" in rendered
     assert "new-topic" in rendered
