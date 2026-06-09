@@ -35,6 +35,7 @@ from llmwiki_engine import retrieval as retrieval_module
 from llmwiki_engine import section_merge as section_merge_module
 from llmwiki_engine import source_records as source_records_module
 from llmwiki_engine import update_preservation as update_preservation_module
+from llmwiki_engine import wiki_context as wiki_context_module
 from llmwiki_engine.apply import ApplyError, apply_operation
 from llmwiki_engine.hash_utils import sha256_file
 from llmwiki_engine.io import read_json, read_jsonl, read_yaml, write_json, write_yaml
@@ -67,7 +68,6 @@ from llmwiki_engine.models import (
 from llmwiki_engine.pipeline import (
     STEP_RUNNERS,
     _STEP_RUN_FUNCTIONS,
-    build_wiki_context_snapshot,
     build_wiki_merge_plan,
     init_vault,
     latest_operation,
@@ -1946,6 +1946,18 @@ def test_pipeline_does_not_reexport_candidate_resolution_helpers() -> None:
         "source_basis_fingerprint",
         "stable_page_plan_id",
         "unicode_safe_stem",
+    }
+
+    leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
+
+    assert leaked == []
+
+
+def test_pipeline_does_not_reexport_wiki_context_helpers() -> None:
+    old_helper_names = {
+        "build_wiki_context_snapshot",
+        "snapshot_entry",
+        "wiki_context_drift_messages",
     }
 
     leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
@@ -8056,7 +8068,7 @@ def test_update_and_noop_same_target_are_merged_by_finalizer(tmp_path: Path) -> 
             ),
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -8136,7 +8148,7 @@ def test_same_source_duplicate_create_items_are_merged_without_losing_coverage(t
             resolution_item("CAND004", page_type="design", target_path="designs/Design_RAG 系统设计.md", display_title="RAG 系统设计"),
         ]
     )
-    snapshot = build_wiki_context_snapshot(vault, resolution, log_date="2026-06-06", source_target_path="sources/Source_Test.md")
+    snapshot = wiki_context_module.build_wiki_context_snapshot(vault, resolution, log_date="2026-06-06", source_target_path="sources/Source_Test.md")
 
     def plan_item(
         page_plan_id: str,
@@ -8674,7 +8686,7 @@ def test_wiki_context_snapshot_includes_source_daily_target_and_existing_metadat
             )
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -8752,7 +8764,7 @@ def test_related_pages_resolve_deterministically_from_candidates_and_snapshot(tm
             ),
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -8860,7 +8872,7 @@ def test_wiki_context_snapshot_writes_candidate_contexts_and_metadata_poor_fallb
         ]
     )
 
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -8901,7 +8913,7 @@ def test_strong_context_create_is_finalized_to_needs_human_decision(tmp_path: Pa
             )
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -9711,7 +9723,7 @@ def test_medium_context_create_without_why_not_update_stops_for_review(tmp_path:
             )
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -9953,7 +9965,7 @@ def test_source_type_plan_items_are_defensively_excluded_from_index_and_related(
             ),
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",
@@ -10012,7 +10024,7 @@ def test_ambiguous_existing_related_alias_stays_unresolved(tmp_path: Path) -> No
             )
         ]
     )
-    snapshot = build_wiki_context_snapshot(
+    snapshot = wiki_context_module.build_wiki_context_snapshot(
         vault,
         resolution,
         log_date="2026-06-03",

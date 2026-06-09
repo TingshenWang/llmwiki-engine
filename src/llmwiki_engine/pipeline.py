@@ -31,6 +31,7 @@ from . import source_digest_payload as _source_digest_payload
 from . import source_digest_rendering as _source_digest_rendering
 from . import source_refs as _source_refs
 from . import update_preservation as _update_preservation
+from . import wiki_context as _wiki_context
 from . import wiki_markup as _wiki_markup
 from .events import EventLogger
 from .hash_utils import artifact_ref, sha256_file
@@ -72,8 +73,6 @@ from .models import (
     StructuredIssue,
     CandidateContextsArtifact,
     ContextOverlapSignal,
-    EmbeddingRetrievalConfig,
-    WikiContextEntry,
     WikiContextSnapshot,
     WikiMergePlanArtifact,
     WikiMergePlanItem,
@@ -85,11 +84,6 @@ from .profiles import load_profile, profile_to_yaml_data, safe_filename
 from .raw_cleanup import cleanup_raw_wikilinks, render_raw_link_cleanup_markdown
 from .rendering import source_title_for_raw
 from .retrieval import (
-    RetrievalError,
-    build_candidate_contexts,
-    build_knowledge_pool,
-    candidate_pool_sha256,
-    metadata_from_text,
     resolve_cache_dir,
 )
 from . import run_metrics as _run_metrics
@@ -119,7 +113,6 @@ from .validators import (
 )
 from .verify import require_verified
 from .vault_config import read_vault_config, write_default_vault_config
-from .wiki_context import snapshot_entry, wiki_context_drift_messages
 from .workspace import RunStore, apply_lock, ensure_workspace_layout, relative_to_vault, resolve_raw_path, run_lock
 
 
@@ -300,7 +293,7 @@ def _drafted_wiki_context_drifted(vault: Path, run_dir: Path) -> bool:
     if not snapshot_path.exists():
         return False
     snapshot = read_model(snapshot_path, WikiContextSnapshot)
-    return bool(wiki_context_drift_messages(vault, snapshot))
+    return bool(_wiki_context.wiki_context_drift_messages(vault, snapshot))
 
 
 def _ensure_wiki_context_current_before_resume(vault: Path, run_dir: Path, start_step: str) -> None:
@@ -310,7 +303,7 @@ def _ensure_wiki_context_current_before_resume(vault: Path, run_dir: Path, start
     if not snapshot_path.exists():
         return
     snapshot = read_model(snapshot_path, WikiContextSnapshot)
-    messages = wiki_context_drift_messages(vault, snapshot)
+    messages = _wiki_context.wiki_context_drift_messages(vault, snapshot)
     if messages:
         raise _errors.PipelineError("; ".join(messages))
 
@@ -870,7 +863,7 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
     retrieval_config = ctx.manifest.vault_config_snapshot.embedding_retrieval
     provider_runtimes = list(ctx.execution_context.record.providers.values()) if ctx.execution_context.record else []
     force_exact_backend = bool(provider_runtimes) and all(provider.spec.startswith("mock:") for provider in provider_runtimes)
-    snapshot = build_wiki_context_snapshot(
+    snapshot = _wiki_context.build_wiki_context_snapshot(
         ctx.vault,
         resolution,
         log_date=log_date,
@@ -1971,64 +1964,6 @@ def _complete_review_step(
     step.review_decision_ref = review_decision_ref
 
 
-def build_wiki_context_snapshot(
-    vault: Path,
-    resolution: CandidateResolutionArtifact,
-    *,
-    log_date: str,
-    source_target_path: str,
-    retrieval_config: EmbeddingRetrievalConfig | None = None,
-    force_exact_backend: bool = False,
-) -> WikiContextSnapshot:
-    retrieval_config = retrieval_config or EmbeddingRetrievalConfig(backend="exact")
-    knowledge_pool = build_knowledge_pool(vault)
-    try:
-        candidate_contexts = build_candidate_contexts(
-            resolution=resolution,
-            knowledge_pool=knowledge_pool,
-            config=retrieval_config,
-            vault=vault,
-            force_exact_backend=force_exact_backend,
-        )
-    except RetrievalError as exc:
-        raise _errors.PipelineError(str(exc)) from exc
-    paths = {
-        "wiki/index.md",
-        "wiki/log.md",
-        f"wiki/logs/{log_date}.md",
-        f"wiki/{source_target_path}",
-    }
-    for item in resolution.items:
-        paths.add(f"wiki/{item.candidate_target_path}")
-    for context_item in candidate_contexts.items:
-        for hit in context_item.hits:
-            paths.add(f"wiki/{hit.path}")
-    entries: list[WikiContextEntry] = []
-    for rel in sorted(paths):
-        path = vault / rel
-        if path.exists():
-            text = path.read_text(encoding="utf-8")
-            entries.append(
-                WikiContextEntry(
-                    path=rel,
-                    expected_state="present",
-                    preimage_sha256=sha256_file(path),
-                    content=text,
-                    metadata=metadata_from_text(text, rel),
-                )
-            )
-        else:
-            entries.append(WikiContextEntry(path=rel, expected_state="missing", preimage_sha256=None, content=""))
-    return WikiContextSnapshot(
-        log_date=log_date,
-        source_target_path=source_target_path,
-        candidate_pool_sha256=candidate_pool_sha256(knowledge_pool),
-        knowledge_metadata_pool=knowledge_pool,
-        candidate_contexts=candidate_contexts,
-        entries=entries,
-    )
-
-
 def resolve_model_related_pages(
     item: WikiMergePlanItem,
     resolution_item: CandidateResolutionItem,
@@ -2207,7 +2142,7 @@ def finalize_wiki_merge_plan(
             matched_page = None
         if f"wiki/{canonical}" not in snapshot_paths:
             raise _errors.PipelineError(f"wiki_merge_plan target is outside wiki_context_snapshot: wiki/{canonical}")
-        entry = snapshot_entry(snapshot, f"wiki/{canonical}")
+        entry = _wiki_context.snapshot_entry(snapshot, f"wiki/{canonical}")
         if action == "needs_human_decision":
             pass
         elif entry.expected_state == "present":
@@ -2332,6 +2267,6 @@ def finalize_wiki_merge_plan(
 
 
 def _ensure_wiki_context_current(vault: Path, snapshot: WikiContextSnapshot) -> None:
-    messages = wiki_context_drift_messages(vault, snapshot)
+    messages = _wiki_context.wiki_context_drift_messages(vault, snapshot)
     if messages:
         raise _errors.PipelineError("; ".join(messages))
