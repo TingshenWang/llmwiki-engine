@@ -3,6 +3,7 @@ from __future__ import annotations
 from . import artifact_refs as _artifact_refs
 from . import diff_utils as _diff_utils
 from . import errors as _errors
+from . import redaction as _redaction
 from .hash_utils import sha256_file
 from .io import read_model, write_json
 from .manifest import complete_step, raw_ref
@@ -15,7 +16,7 @@ from .models import (
     StructuredIssue,
 )
 from .raw_cleanup import cleanup_raw_wikilinks, render_raw_link_cleanup_markdown
-from .step_runtime import StepRunContext, complete_review_step, redacted_model, structured_call
+from .step_runtime import StepRunContext, complete_review_step, structured_call
 from .steps import require_step_output_dir
 from .validators import ValidationError as ContractValidationError
 from .validators import validate_raw_preparation
@@ -162,7 +163,7 @@ def run_raw_prepare(ctx: StepRunContext) -> None:
         RawPreparationArtifact,
         validator=validate_raw_prepare_model,
     )
-    preparation = redacted_model(ctx, preparation, RawPreparationArtifact)
+    preparation = _redaction.redact_model(ctx.execution_context.redactor, preparation, RawPreparationArtifact)
     preparation = preparation.model_copy(
         update={
             "input_raw_sha256": input_raw_sha256,

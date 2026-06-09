@@ -25,6 +25,7 @@ from . import merge_planning as _merge_planning
 from . import merge_reporting as _merge_reporting
 from . import planning_payloads as _planning_payloads
 from . import raw_steps as _raw_steps
+from . import redaction as _redaction
 from . import step_runtime as _step_runtime
 from . import source_digest_budget as _source_digest_budget
 from . import source_digest_payload as _source_digest_payload
@@ -453,7 +454,7 @@ def _run_source_digest(ctx: _step_runtime.StepRunContext) -> None:
         SourceDigestArtifact,
         validator=lambda model: validate_source_digest(model, language=ctx.manifest.vault_config_snapshot.wiki_language),
     )
-    digest = _step_runtime.redacted_model(ctx, digest, SourceDigestArtifact)
+    digest = _redaction.redact_model(ctx.execution_context.redactor, digest, SourceDigestArtifact)
     if digest.source_raw_path != raw_rel:
         raise _errors.PipelineError(f"source_digest source path mismatch: {digest.source_raw_path} != {raw_rel}")
     digest = _source_digest_budget.augment_source_digest_anchor_entities(digest, approved_prepared_text)
@@ -615,7 +616,7 @@ def _run_candidate_resolution(ctx: _step_runtime.StepRunContext) -> None:
         CandidateResolutionArtifact,
         validator=validate_candidate_resolution_model,
     )
-    artifact = _step_runtime.redacted_model(ctx, artifact, CandidateResolutionArtifact)
+    artifact = _redaction.redact_model(ctx.execution_context.redactor, artifact, CandidateResolutionArtifact)
     artifact = _candidate_resolution.backfill_missing_candidate_resolution_items(artifact, digest, ctx.profile)
     artifact = _candidate_resolution.finalize_candidate_resolution(ctx.vault, ctx.profile, artifact, digest)
     validate_candidate_resolution(digest, artifact)
@@ -812,7 +813,7 @@ def _run_wiki_merge_planning(ctx: _step_runtime.StepRunContext) -> None:
         WikiMergePlanArtifact,
         validator=validate_merge_model,
     )
-    plan = _step_runtime.redacted_model(ctx, plan, WikiMergePlanArtifact)
+    plan = _redaction.redact_model(ctx.execution_context.redactor, plan, WikiMergePlanArtifact)
     plan = _merge_planning.finalize_wiki_merge_plan(plan, resolution, snapshot, snapshot_ref, medium_missing_policy="preserve")
     plan = _merge_planning.block_unrepaired_medium_create_reason(plan)
     validate_wiki_merge_plan(digest, plan, resolution, snapshot, language=ctx.manifest.vault_config_snapshot.wiki_language)

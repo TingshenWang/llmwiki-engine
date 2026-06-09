@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
 
 
 @dataclass(frozen=True)
@@ -28,3 +30,11 @@ class Redactor:
 
 
 NO_REDACTION = Redactor()
+
+
+TModel = TypeVar("TModel", bound=BaseModel)
+
+
+def redact_model(redactor: Redactor, model: TModel, model_type: type[TModel]) -> TModel:
+    data = redactor.redact(model.model_dump(mode="json"))
+    return model_type.model_validate(data)

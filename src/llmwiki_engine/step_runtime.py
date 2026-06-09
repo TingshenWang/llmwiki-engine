@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
-
-from pydantic import BaseModel
+from typing import Any
 
 from . import errors as _errors
 from . import wiki_context as _wiki_context
@@ -23,14 +21,6 @@ class StepRunContext:
     profile: Any
     manifest: OperationManifest
     execution_context: ProviderExecutionContext
-
-
-TModel = TypeVar("TModel", bound=BaseModel)
-
-
-def redacted_model(ctx: StepRunContext, model: TModel, model_type: type[TModel]) -> TModel:
-    data = ctx.execution_context.redactor.redact(model.model_dump(mode="json"))
-    return model_type.model_validate(data)
 
 
 def structured_call(

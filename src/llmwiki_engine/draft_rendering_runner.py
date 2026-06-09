@@ -5,12 +5,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import BaseModel
 
 from . import draft_grounding as _draft_grounding
 from . import draft_rendering_payloads as _draft_rendering_payloads
+from . import redaction as _redaction
 from . import draft_validation as _draft_validation
 from . import run_metrics as _run_metrics
 from . import update_preservation as _update_preservation
@@ -45,14 +46,6 @@ class DraftRenderingRunContext:
     profile_payload: dict[str, Any]
     language_contract: dict[str, Any]
     wiki_language: str
-
-
-TModel = TypeVar("TModel", bound=BaseModel)
-
-
-def redacted_model(ctx: DraftRenderingRunContext, model: TModel, model_type: type[TModel]) -> TModel:
-    data = ctx.execution_context.redactor.redact(model.model_dump(mode="json"))
-    return model_type.model_validate(data)
 
 
 def write_draft_aux_report_if_active(
@@ -756,7 +749,7 @@ def run_single_draft_rendering_model_call(
     )
     if last_merged_repair_artifact is not None and accepted_repair_pages_by_id and active_repair_page_plan_ids:
         draft_artifact = last_merged_repair_artifact
-    draft_artifact = redacted_model(ctx, draft_artifact, DraftRenderingArtifact)
+    draft_artifact = _redaction.redact_model(ctx.execution_context.redactor, draft_artifact, DraftRenderingArtifact)
     draft_artifact = finalize_draft_rendering(draft_artifact, merge_plan, snapshot)
     draft_artifact, reinforcement_report = _update_preservation.reinforce_update_preservation(draft_artifact, update_preservation_pack)
     draft_artifact, grounding_rewrite_report = _draft_grounding.rewrite_grounding_sensitive_paraphrases(draft_artifact, approved_prepared_text)
