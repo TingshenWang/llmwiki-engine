@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from helpers import copy_fixture_raw, draft_body
 import llmwiki_engine.apply as apply_module
+import llmwiki_engine.artifact_refs as artifact_refs_module
 import llmwiki_engine.candidate_resolution as candidate_resolution_module
 import llmwiki_engine.draft_validation as draft_validation_module
 import llmwiki_engine.draft_grounding as draft_grounding
@@ -1938,6 +1939,85 @@ def test_pipeline_does_not_expose_internal_control_helpers() -> None:
     leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
 
     assert leaked == []
+
+
+def test_pipeline_does_not_reexport_artifact_ref_helpers() -> None:
+    old_helper_names = {
+        "_artifact_kind_for_path",
+        "_draft_rendering_model_batch_refs",
+        "_draft_rendering_ref",
+        "_ref",
+        "_replace_artifact_ref",
+        "_structured_model_output_refs",
+    }
+
+    leaked = sorted(name for name in old_helper_names if hasattr(pipeline_module, name))
+
+    assert leaked == []
+
+
+def test_artifact_refs_preserve_resume_requirements(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    step_root = run_dir / "source_digest"
+    (step_root / "provider_results").mkdir(parents=True)
+    (step_root / "repair_prompts").mkdir()
+    for path in [
+        step_root / "provider_result.json",
+        step_root / "structured_repair_report.json",
+        step_root / "structured_repair_report.md",
+        step_root / "provider_results" / "attempt-1.json",
+        step_root / "repair_prompts" / "attempt-1.json",
+    ]:
+        path.write_text("{}", encoding="utf-8")
+
+    refs = {
+        ref.relative_path: ref
+        for ref in artifact_refs_module.structured_model_output_refs(run_dir, step_root, "source_digest")
+    }
+
+    assert refs["source_digest/provider_result.json"].required_for_resume
+    assert refs["source_digest/provider_result.json"].kind == "provider_result"
+    assert refs["source_digest/provider_result.json"].schema_version == "provider_result.v1"
+    assert refs["source_digest/structured_repair_report.json"].required_for_resume
+    assert refs["source_digest/structured_repair_report.json"].schema_version == "structured_repair_report.v1"
+    assert refs["source_digest/structured_repair_report.md"].required_for_resume
+    assert not refs["source_digest/provider_results/attempt-1.json"].required_for_resume
+    assert refs["source_digest/provider_results/attempt-1.json"].schema_version == "provider_result.v1"
+    assert not refs["source_digest/repair_prompts/attempt-1.json"].required_for_resume
+
+    draft_root = run_dir / "draft_rendering"
+    batch_root = draft_root / "model_batches" / "batch-001"
+    (batch_root / "provider_results").mkdir(parents=True)
+    (batch_root / "repair_prompts").mkdir()
+    for path in [
+        batch_root / "draft_source_excerpt_pack.json",
+        batch_root / "provider_results" / "attempt-1.json",
+        batch_root / "repair_prompts" / "attempt-2.json",
+    ]:
+        path.write_text("{}", encoding="utf-8")
+
+    batch_refs = {
+        ref.relative_path: ref
+        for ref in artifact_refs_module.draft_rendering_model_batch_refs(run_dir, draft_root, "draft_rendering")
+    }
+
+    assert batch_refs["draft_rendering/model_batches/batch-001/draft_source_excerpt_pack.json"].required_for_resume
+    assert (
+        batch_refs["draft_rendering/model_batches/batch-001/draft_source_excerpt_pack.json"].schema_version
+        == "draft_source_excerpt_pack.v1"
+    )
+    assert not batch_refs["draft_rendering/model_batches/batch-001/provider_results/attempt-1.json"].required_for_resume
+    assert (
+        batch_refs["draft_rendering/model_batches/batch-001/provider_results/attempt-1.json"].schema_version
+        == "provider_result.v1"
+    )
+    assert not batch_refs["draft_rendering/model_batches/batch-001/repair_prompts/attempt-2.json"].required_for_resume
+
+    draft_manifest_path = draft_root / "draft_write_manifest.json"
+    draft_manifest_path.write_text("{}", encoding="utf-8")
+    draft_ref = artifact_refs_module.draft_rendering_ref(run_dir, draft_manifest_path, "draft_rendering")
+    assert draft_ref.kind == "json"
+    assert draft_ref.schema_version == "draft_write_manifest.v1"
 
 
 def test_pipeline_does_not_reexport_candidate_resolution_helpers() -> None:

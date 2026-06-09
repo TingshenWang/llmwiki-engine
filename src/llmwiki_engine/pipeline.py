@@ -10,6 +10,7 @@ from rich.console import Console
 from pydantic import BaseModel
 
 from . import __version__
+from . import artifact_refs as _artifact_refs
 from . import apply_guards as _apply_guards
 from . import apply_preview as _apply_preview
 from . import candidate_resolution as _candidate_resolution
@@ -31,7 +32,7 @@ from . import source_digest_rendering as _source_digest_rendering
 from . import update_preservation as _update_preservation
 from . import wiki_context as _wiki_context
 from .events import EventLogger
-from .hash_utils import artifact_ref, sha256_file
+from .hash_utils import sha256_file
 from .io import read_model, read_yaml, write_json, write_yaml
 from .manifest import (
     begin_model_step_attempt,
@@ -476,9 +477,9 @@ def _run_raw_link_cleanup(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, out, step_name, "json", "raw_link_cleanup.v1"),
-            _ref(ctx.run_dir, report, step_name, "markdown"),
-            _ref(ctx.run_dir, diff_path, step_name, "diff"),
+            _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "raw_link_cleanup.v1"),
+            _artifact_refs.ref(ctx.run_dir, report, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, diff_path, step_name, "diff"),
         ],
     )
 
@@ -493,11 +494,11 @@ def _write_raw_prepare_outputs(ctx: StepRunContext, preparation: RawPreparationA
     prepared.parent.mkdir(parents=True, exist_ok=True)
     prepared.write_text(preparation.prepared_markdown.rstrip() + "\n", encoding="utf-8")
     outputs = [
-        _ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
-        _ref(ctx.run_dir, prepared, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "raw_preparation.v1"),
+        _artifact_refs.ref(ctx.run_dir, prepared, step_name, "markdown"),
     ]
     if include_model_outputs:
-        outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
+        outputs.extend(_artifact_refs.structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=outputs)
 
 
@@ -607,10 +608,10 @@ def _run_prepared_raw_review(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, prompt, step_name, "markdown"),
-            _ref(ctx.run_dir, feedback, step_name, "jsonl"),
-            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
-            _ref(ctx.run_dir, approved, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, prompt, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, feedback, step_name, "jsonl"),
+            _artifact_refs.ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
+            _artifact_refs.ref(ctx.run_dir, approved, step_name, "markdown"),
         ],
         review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
     )
@@ -669,17 +670,17 @@ def _run_source_digest(ctx: StepRunContext) -> None:
     write_json(budget_report_path, budget_report)
     budget_report_md.write_text(_source_digest_budget.render_source_digest_budget_report(budget_report), encoding="utf-8")
     outputs = [
-        _ref(ctx.run_dir, source_map_path, step_name, "json", "source_digest_source_map.v1"),
-        _ref(ctx.run_dir, source_map_md, step_name, "markdown"),
-        _ref(ctx.run_dir, source_map_payload_path, step_name, "json", "source_digest_source_map_payload.v1"),
-        _ref(ctx.run_dir, source_kind_hints_path, step_name, "json", "source_kind_hints.v1"),
-        _ref(ctx.run_dir, source_kind_hints_md, step_name, "markdown"),
-        _ref(ctx.run_dir, out, step_name, "json", "source_digest.v2"),
-        _ref(ctx.run_dir, digest_md, step_name, "markdown"),
-        _ref(ctx.run_dir, budget_report_path, step_name, "json", "source_digest_budget_report.v1"),
-        _ref(ctx.run_dir, budget_report_md, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, source_map_path, step_name, "json", "source_digest_source_map.v1"),
+        _artifact_refs.ref(ctx.run_dir, source_map_md, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, source_map_payload_path, step_name, "json", "source_digest_source_map_payload.v1"),
+        _artifact_refs.ref(ctx.run_dir, source_kind_hints_path, step_name, "json", "source_kind_hints.v1"),
+        _artifact_refs.ref(ctx.run_dir, source_kind_hints_md, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "source_digest.v2"),
+        _artifact_refs.ref(ctx.run_dir, digest_md, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, budget_report_path, step_name, "json", "source_digest_budget_report.v1"),
+        _artifact_refs.ref(ctx.run_dir, budget_report_md, step_name, "markdown"),
     ]
-    outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    outputs.extend(_artifact_refs.structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=outputs)
 
 
@@ -721,11 +722,11 @@ def _run_source_digest_review(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, prompt, step_name, "markdown"),
-            _ref(ctx.run_dir, feedback, step_name, "jsonl"),
-            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
-            _ref(ctx.run_dir, approved_json, step_name, "json", "source_digest.v2"),
-            _ref(ctx.run_dir, approved_md, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, prompt, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, feedback, step_name, "jsonl"),
+            _artifact_refs.ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
+            _artifact_refs.ref(ctx.run_dir, approved_json, step_name, "json", "source_digest.v2"),
+            _artifact_refs.ref(ctx.run_dir, approved_md, step_name, "markdown"),
         ],
         review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
     )
@@ -757,8 +758,8 @@ def _run_source_duplicate_guard(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, out, step_name, "json", "source_duplicate_guard.v1"),
-            _ref(ctx.run_dir, md, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "source_duplicate_guard.v1"),
+            _artifact_refs.ref(ctx.run_dir, md, step_name, "markdown"),
         ],
     )
 
@@ -825,12 +826,12 @@ def _run_candidate_resolution(ctx: StepRunContext) -> None:
     table = step_root / "candidate_resolution.md"
     table.write_text(_candidate_resolution.render_candidate_resolution_markdown(artifact), encoding="utf-8")
     outputs = [
-        _ref(ctx.run_dir, source_pack_path, step_name, "json", "candidate_resolution_source_excerpt_pack.v1"),
-        _ref(ctx.run_dir, source_pack_md, step_name, "markdown"),
-        _ref(ctx.run_dir, out, step_name, "json", "candidate_resolution.v3"),
-        _ref(ctx.run_dir, table, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, source_pack_path, step_name, "json", "candidate_resolution_source_excerpt_pack.v1"),
+        _artifact_refs.ref(ctx.run_dir, source_pack_md, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "candidate_resolution.v3"),
+        _artifact_refs.ref(ctx.run_dir, table, step_name, "markdown"),
     ]
-    outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    outputs.extend(_artifact_refs.structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(
         ctx.manifest,
         step_name,
@@ -886,9 +887,9 @@ def _run_wiki_context_snapshot(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, snapshot_path, step_name, "json", "wiki_context_snapshot.v3"),
-            _ref(ctx.run_dir, contexts_path, step_name, "json", "candidate_contexts.v2"),
-            _ref(ctx.run_dir, contexts_md, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, snapshot_path, step_name, "json", "wiki_context_snapshot.v3"),
+            _artifact_refs.ref(ctx.run_dir, contexts_path, step_name, "json", "candidate_contexts.v2"),
+            _artifact_refs.ref(ctx.run_dir, contexts_md, step_name, "markdown"),
         ],
     )
 
@@ -942,13 +943,13 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
             ctx.manifest,
             step_name,
             outputs=[
-                _ref(ctx.run_dir, context_pack_path, step_name, "json", "merge_planning_context_pack.v1"),
-                _ref(ctx.run_dir, context_pack_md, step_name, "markdown"),
-                _ref(ctx.run_dir, shortcut_report_path, step_name, "json", "merge_planning_shortcut_report.v1"),
-                _ref(ctx.run_dir, shortcut_report_md, step_name, "markdown"),
-                _ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
-                _ref(ctx.run_dir, table, step_name, "markdown"),
-                _ref(ctx.run_dir, report, step_name, "markdown"),
+                _artifact_refs.ref(ctx.run_dir, context_pack_path, step_name, "json", "merge_planning_context_pack.v1"),
+                _artifact_refs.ref(ctx.run_dir, context_pack_md, step_name, "markdown"),
+                _artifact_refs.ref(ctx.run_dir, shortcut_report_path, step_name, "json", "merge_planning_shortcut_report.v1"),
+                _artifact_refs.ref(ctx.run_dir, shortcut_report_md, step_name, "markdown"),
+                _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
+                _artifact_refs.ref(ctx.run_dir, table, step_name, "markdown"),
+                _artifact_refs.ref(ctx.run_dir, report, step_name, "markdown"),
             ],
         )
         return
@@ -1024,13 +1025,13 @@ def _run_wiki_merge_planning(ctx: StepRunContext) -> None:
     report = step_root / "merge_decision_report.md"
     report.write_text(_merge_reporting.render_merge_decision_report(plan, snapshot), encoding="utf-8")
     outputs = [
-        _ref(ctx.run_dir, context_pack_path, step_name, "json", "merge_planning_context_pack.v1"),
-        _ref(ctx.run_dir, context_pack_md, step_name, "markdown"),
-        _ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
-        _ref(ctx.run_dir, table, step_name, "markdown"),
-        _ref(ctx.run_dir, report, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, context_pack_path, step_name, "json", "merge_planning_context_pack.v1"),
+        _artifact_refs.ref(ctx.run_dir, context_pack_md, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, out, step_name, "json", "wiki_merge_plan.v5"),
+        _artifact_refs.ref(ctx.run_dir, table, step_name, "markdown"),
+        _artifact_refs.ref(ctx.run_dir, report, step_name, "markdown"),
     ]
-    outputs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    outputs.extend(_artifact_refs.structured_model_output_refs(ctx.run_dir, step_root, step_name))
     complete_step(
         ctx.manifest,
         step_name,
@@ -1069,10 +1070,10 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
             ctx.manifest,
             step_name,
             outputs=[
-                _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
-                _ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
-                _ref(ctx.run_dir, pending_path, step_name, "json", "wiki_merge_plan.v5"),
-                _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
+                _artifact_refs.ref(ctx.run_dir, prompt_path, step_name, "markdown"),
+                _artifact_refs.ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
+                _artifact_refs.ref(ctx.run_dir, pending_path, step_name, "json", "wiki_merge_plan.v5"),
+                _artifact_refs.ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
             ],
             reason=all_create_risk or "merge plan requires human decision; run merge-level revise.",
             review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
@@ -1091,10 +1092,10 @@ def _run_merge_plan_review(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
-            _ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
-            _ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
-            _ref(ctx.run_dir, approved_path, step_name, "json", "wiki_merge_plan.v5"),
+            _artifact_refs.ref(ctx.run_dir, prompt_path, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, feedback_path, step_name, "jsonl"),
+            _artifact_refs.ref(ctx.run_dir, decision_path, step_name, "json", "review_decision.v2"),
+            _artifact_refs.ref(ctx.run_dir, approved_path, step_name, "json", "wiki_merge_plan.v5"),
         ],
         review_decision_ref=decision_path.relative_to(ctx.run_dir).as_posix(),
     )
@@ -1170,9 +1171,9 @@ def _run_draft_rendering(ctx: StepRunContext) -> None:
         cleanup=read_model(require_step_output_dir(ctx.run_dir, "raw_link_cleanup") / "raw_link_cleanup.json", RawLinkCleanupArtifact),
         root_model_input_sidecars=root_model_input_sidecars,
     )
-    refs = [_draft_rendering_ref(ctx.run_dir, path, step_name) for path in outputs]
-    refs.extend(_structured_model_output_refs(ctx.run_dir, step_root, step_name))
-    refs.extend(_draft_rendering_model_batch_refs(ctx.run_dir, step_root, step_name))
+    refs = [_artifact_refs.draft_rendering_ref(ctx.run_dir, path, step_name) for path in outputs]
+    refs.extend(_artifact_refs.structured_model_output_refs(ctx.run_dir, step_root, step_name))
+    refs.extend(_artifact_refs.draft_rendering_model_batch_refs(ctx.run_dir, step_root, step_name))
     complete_step(ctx.manifest, step_name, outputs=refs)
 
 
@@ -1214,7 +1215,7 @@ def _run_apply_preview(ctx: StepRunContext) -> None:
     preview = _apply_preview.build_apply_preview(ctx.vault, ctx.run_dir)
     out = require_step_output_dir(ctx.run_dir, step_name) / "apply_preview.json"
     write_json(out, preview)
-    complete_step(ctx.manifest, step_name, outputs=[_ref(ctx.run_dir, out, step_name, "json", "apply_preview.v2")])
+    complete_step(ctx.manifest, step_name, outputs=[_artifact_refs.ref(ctx.run_dir, out, step_name, "json", "apply_preview.v2")])
 
 
 def _refresh_current_draft_grounding_artifacts(
@@ -1241,24 +1242,10 @@ def _refresh_current_draft_grounding_artifacts(
 def _refresh_draft_rendering_artifact_refs(ctx: StepRunContext, *paths: Path) -> None:
     draft_step = get_step(ctx.manifest, "draft_rendering")
     for path in paths:
-        ref = _draft_rendering_ref(ctx.run_dir, path, "draft_rendering")
-        draft_step.outputs = _replace_artifact_ref(draft_step.outputs, ref)
+        ref = _artifact_refs.draft_rendering_ref(ctx.run_dir, path, "draft_rendering")
+        draft_step.outputs = _artifact_refs.replace_artifact_ref(draft_step.outputs, ref)
         for attempt in draft_step.attempts:
-            attempt.outputs = _replace_artifact_ref(attempt.outputs, ref)
-
-
-def _replace_artifact_ref(refs: list[ArtifactRef], ref: ArtifactRef) -> list[ArtifactRef]:
-    replaced = False
-    next_refs: list[ArtifactRef] = []
-    for existing in refs:
-        if existing.relative_path == ref.relative_path:
-            next_refs.append(ref)
-            replaced = True
-        else:
-            next_refs.append(existing)
-    if not replaced:
-        next_refs.append(ref)
-    return next_refs
+            attempt.outputs = _artifact_refs.replace_artifact_ref(attempt.outputs, ref)
 
 
 def _run_draft_review(ctx: StepRunContext) -> None:
@@ -1294,9 +1281,9 @@ def _run_draft_review(ctx: StepRunContext) -> None:
             ctx.manifest,
             step_name,
             outputs=[
-                _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
-                _ref(ctx.run_dir, approved_manifest_path, step_name, "json", "draft_write_manifest.v1"),
-                _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
+                _artifact_refs.ref(ctx.run_dir, prompt_path, step_name, "markdown"),
+                _artifact_refs.ref(ctx.run_dir, approved_manifest_path, step_name, "json", "draft_write_manifest.v1"),
+                _artifact_refs.ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
             ],
             review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
         )
@@ -1310,9 +1297,9 @@ def _run_draft_review(ctx: StepRunContext) -> None:
         ctx.manifest,
         step_name,
         outputs=[
-            _ref(ctx.run_dir, prompt_path, step_name, "markdown"),
-            _ref(ctx.run_dir, pending_manifest, step_name, "json", "draft_write_manifest.v1"),
-            _ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
+            _artifact_refs.ref(ctx.run_dir, prompt_path, step_name, "markdown"),
+            _artifact_refs.ref(ctx.run_dir, pending_manifest, step_name, "json", "draft_write_manifest.v1"),
+            _artifact_refs.ref(ctx.run_dir, approval_path, step_name, "json", "draft_review.v2"),
         ],
         reason=review_reason,
         review_decision_ref=approval_path.relative_to(ctx.run_dir).as_posix(),
@@ -1458,10 +1445,10 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                 manifest,
                 review_step,
                 outputs=[
-                    _ref(run_dir, step_root / "review_prompt.md", review_step, "markdown"),
-                    _ref(run_dir, step_root / "pending_write_manifest.json", review_step, "json", "draft_write_manifest.v1"),
-                    _ref(run_dir, approved, review_step, "json", "draft_write_manifest.v1"),
-                    _ref(run_dir, approval_path, review_step, "json", "draft_review.v2"),
+                    _artifact_refs.ref(run_dir, step_root / "review_prompt.md", review_step, "markdown"),
+                    _artifact_refs.ref(run_dir, step_root / "pending_write_manifest.json", review_step, "json", "draft_write_manifest.v1"),
+                    _artifact_refs.ref(run_dir, approved, review_step, "json", "draft_write_manifest.v1"),
+                    _artifact_refs.ref(run_dir, approval_path, review_step, "json", "draft_review.v2"),
                 ],
             )
             _delete_downstream_step_dirs(vault, operation_id, "validation")
@@ -1500,10 +1487,10 @@ def approve_review(vault: Path, operation_id: str, review_step: str) -> Operatio
                 manifest,
                 review_step,
                 outputs=[
-                    _ref(run_dir, step_root / "review_prompt.md", review_step, "markdown"),
-                    _ref(run_dir, pending, review_step, "json", "wiki_merge_plan.v5"),
-                    _ref(run_dir, approved, review_step, "json", "wiki_merge_plan.v5"),
-                    _ref(run_dir, decision_path, review_step, "json", "review_decision.v2"),
+                    _artifact_refs.ref(run_dir, step_root / "review_prompt.md", review_step, "markdown"),
+                    _artifact_refs.ref(run_dir, pending, review_step, "json", "wiki_merge_plan.v5"),
+                    _artifact_refs.ref(run_dir, approved, review_step, "json", "wiki_merge_plan.v5"),
+                    _artifact_refs.ref(run_dir, decision_path, review_step, "json", "review_decision.v2"),
                 ],
             )
             _delete_downstream_step_dirs(vault, operation_id, "draft_rendering")
@@ -1582,98 +1569,6 @@ def latest_operation(vault: Path) -> str | None:
 
 def _safe_timestamp() -> str:
     return utc_now().replace("+00:00", "Z").replace(":", "")
-
-
-def _ref(
-    run_dir: Path,
-    path: Path,
-    producer_step: str,
-    kind: str,
-    schema_version: str | None = None,
-    required_for_resume: bool = True,
-) -> ArtifactRef:
-    return artifact_ref(
-        base=run_dir,
-        path=path,
-        kind=kind,
-        producer_step=producer_step,
-        schema_version=schema_version,
-        required_for_resume=required_for_resume,
-    )
-
-
-def _structured_model_output_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
-    refs: list[ArtifactRef] = []
-    provider_result = step_root / "provider_result.json"
-    if provider_result.exists():
-        refs.append(_ref(run_dir, provider_result, step_name, "provider_result", "provider_result.v1"))
-    report_json = step_root / "structured_repair_report.json"
-    if report_json.exists():
-        refs.append(_ref(run_dir, report_json, step_name, "json", "structured_repair_report.v1"))
-    report_md = step_root / "structured_repair_report.md"
-    if report_md.exists():
-        refs.append(_ref(run_dir, report_md, step_name, "markdown"))
-    provider_results = step_root / "provider_results"
-    if provider_results.exists():
-        for path in sorted(provider_results.glob("attempt-*.json")):
-            refs.append(_ref(run_dir, path, step_name, "provider_result", "provider_result.v1", required_for_resume=False))
-    repair_prompts = step_root / "repair_prompts"
-    if repair_prompts.exists():
-        for path in sorted(repair_prompts.glob("attempt-*.json")):
-            refs.append(_ref(run_dir, path, step_name, "json", required_for_resume=False))
-    return refs
-
-
-def _draft_rendering_model_batch_refs(run_dir: Path, step_root: Path, step_name: str) -> list[ArtifactRef]:
-    batch_root = step_root / "model_batches"
-    if not batch_root.exists():
-        return []
-    refs: list[ArtifactRef] = []
-    for path in sorted(batch_root.rglob("*")):
-        if not path.is_file():
-            continue
-        required = not any(part in {"provider_results", "repair_prompts"} for part in path.relative_to(step_root).parts)
-        schema = None
-        if path.name == "provider_result.json" or (path.parent.name == "provider_results" and path.name.startswith("attempt-")):
-            schema = "provider_result.v1"
-        elif path.name == "structured_repair_report.json":
-            schema = "structured_repair_report.v1"
-        elif path.name == "draft_source_excerpt_pack.json":
-            schema = "draft_source_excerpt_pack.v1"
-        elif path.name == "update_preservation_pack.json":
-            schema = "update_preservation_pack.v1"
-        elif path.name == "update_preservation_reinforcement_report.json":
-            schema = "update_preservation_reinforcement_report.v1"
-        elif path.name == "grounding_paraphrase_rewrite_report.json":
-            schema = "grounding_paraphrase_rewrite_report.v1"
-        refs.append(_ref(run_dir, path, step_name, _artifact_kind_for_path(path), schema, required_for_resume=required))
-    return refs
-
-
-def _artifact_kind_for_path(path: Path) -> str:
-    return {
-        ".md": "markdown",
-        ".json": "json",
-        ".jsonl": "jsonl",
-        ".diff": "diff",
-    }.get(path.suffix, "text")
-
-
-def _draft_rendering_ref(run_dir: Path, path: Path, step_name: str) -> ArtifactRef:
-    schemas = {
-        "draft_rendering.json": "draft_rendering.v3",
-        "draft_source_excerpt_pack.json": "draft_source_excerpt_pack.v1",
-        "update_preservation_pack.json": "update_preservation_pack.v1",
-        "update_preservation_reinforcement_report.json": "update_preservation_reinforcement_report.v1",
-        "grounding_paraphrase_rewrite_report.json": "grounding_paraphrase_rewrite_report.v1",
-        "draft_write_manifest.json": "draft_write_manifest.v1",
-        "update_merge_report.json": "update_merge_report.v1",
-        "related_merge_report.json": "related_merge_report.v1",
-        "draft_grounding_review.json": "draft_grounding_review.v1",
-        "index_open_questions_report.json": "index_open_questions_report.v1",
-        "draft_rendering_batch_report.json": "draft_rendering_batch_report.v1",
-    }
-    return _ref(run_dir, path, step_name, _artifact_kind_for_path(path), schemas.get(path.name))
 
 
 def _complete_review_step(
