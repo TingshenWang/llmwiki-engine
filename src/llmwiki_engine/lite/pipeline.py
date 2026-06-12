@@ -9,7 +9,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 import yaml
 from pydantic import BaseModel
@@ -20,7 +20,7 @@ from llmwiki_engine import __version__
 from . import prompts
 from . import related as related_logic
 from . import system_pages
-from .embeddings import DEFAULT_QWEN_EMBEDDING_MODEL, EmbeddingConfig, build_candidate_contexts, load_embedding_config, sync_page_embedding_cache
+from .embeddings import EmbeddingConfig, build_candidate_contexts, load_embedding_config, sync_page_embedding_cache
 from .io import (
     append_jsonl,
     artifact_hash,
@@ -38,6 +38,7 @@ from .io import (
     write_json,
     write_text,
 )
+from .labels import count_label, step_label
 from .models import (
     ArtifactRef,
     CandidateContext,
@@ -105,7 +106,6 @@ def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
         "embedding": {
             "enabled": True,
             "backend": "sentence_transformers",
-            "model": DEFAULT_QWEN_EMBEDDING_MODEL,
             "cache_dir": ".llmwiki/cache/embeddings",
             "top_k_pages": 5,
             "dimensions": 1024,
@@ -181,16 +181,16 @@ def run_ingest(
         "operation_id": operation_id,
     }
     steps: list[tuple[str, Callable[[], StepOutput]]] = [
-        ("raw_binding", lambda: _step_raw_binding(vault, run_dir, state)),
-        ("source_digest", lambda: _step_source_digest(vault, run_dir, state)),
+        ("raw_binding", lambda: _step_raw_binding(run_dir, state)),
+        ("source_digest", lambda: _step_source_digest(run_dir, state)),
         ("wiki_snapshot", lambda: _step_wiki_snapshot(vault, run_dir, state)),
-        ("candidate_pages", lambda: _step_candidate_pages(vault, run_dir, state)),
-        ("candidate_contexts", lambda: _step_candidate_contexts(vault, run_dir, state)),
-        ("merge_plan", lambda: _step_merge_plan(vault, run_dir, state)),
+        ("candidate_pages", lambda: _step_candidate_pages(run_dir, state)),
+        ("candidate_contexts", lambda: _step_candidate_contexts(run_dir, state)),
+        ("merge_plan", lambda: _step_merge_plan(run_dir, state)),
         ("composition_plan", lambda: _step_composition_plan(vault, run_dir, state)),
         ("final_pages", lambda: _step_final_pages(vault, run_dir, state)),
         ("validation", lambda: _step_validation(vault, run_dir, state)),
-        ("knowledge_write", lambda: _step_knowledge_write(vault, run_dir, state, manifest)),
+        ("knowledge_write", lambda: _step_knowledge_write(vault, run_dir, state)),
         ("source_record_write", lambda: _step_source_record_write(vault, run_dir, state, manifest)),
         ("index_log_write", lambda: _step_index_log_write(vault, run_dir, state, manifest)),
         ("embedding_cache_refresh", lambda: _step_embedding_cache_refresh(vault, run_dir, state)),
@@ -397,7 +397,7 @@ def _page_generation_parallelism(state: dict[str, object], request_count: int) -
     generation = config.get("page_generation")
     if not isinstance(generation, dict):
         return request_count
-    raw_limit = generation.get("max_parallel_requests", generation.get("parallel_requests"))
+    raw_limit = generation.get("max_parallel_requests")
     if raw_limit is None:
         return request_count
     try:
@@ -624,7 +624,6 @@ def _normalize_final_pages(
     composition: CompositionPlan,
     *,
     snapshot: WikiSnapshot | None = None,
-    vault: Path | None = None,
     operation_id: str = "",
 ) -> FinalPages:
     items_by_id = {item.final_page_id: item for item in composition.items}
@@ -639,19 +638,13 @@ def _normalize_final_pages(
         model_title = page.title
         final_title = existing_entry.title if existing_entry is not None and item is not None and item.action == "update" else page.title
         path_titles[page.target_path] = final_title
-        existing_markdown = ""
-        if vault is not None:
-            existing_path = vault / "wiki" / page.target_path
-            if existing_path.exists():
-                existing_markdown = read_text(existing_path)
-        source_refs = _merge_source_refs([*(existing_entry.source_refs if existing_entry else []), *page.source_refs])
+        source_refs = _merge_source_refs(page.source_refs)
         updated_page = page.model_copy(update={"title": final_title, "source_refs": source_refs})
         markdown = _canonical_final_markdown(
             updated_page,
             item,
             operation_id=operation_id,
             existing_entry=existing_entry,
-            existing_markdown=existing_markdown,
             known_paths=known_paths,
             path_titles=path_titles,
             model_title=model_title,
@@ -666,7 +659,6 @@ def _canonical_final_markdown(
     *,
     operation_id: str = "",
     existing_entry: WikiKnowledgeEntry | None = None,
-    existing_markdown: str = "",
     known_paths: set[str] | None = None,
     path_titles: dict[str, str] | None = None,
     model_title: str = "",
@@ -767,7 +759,7 @@ def _dedupe_list(values: list[str]) -> list[str]:
     return result
 
 
-def _step_raw_binding(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+def _step_raw_binding(run_dir: Path, state: dict[str, object]) -> StepOutput:
     raw_abs = state["raw_abs"]  # type: ignore[assignment]
     raw_rel = state["raw_rel"]  # type: ignore[assignment]
     stat = raw_abs.stat()  # type: ignore[union-attr]
@@ -786,7 +778,7 @@ def _step_raw_binding(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     return StepOutput([path], {"raw_size_bytes": stat.st_size})
 
 
-def _step_source_digest(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
     raw_rel: str = state["raw_rel"]  # type: ignore[assignment]
     binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
@@ -808,7 +800,6 @@ def _step_source_digest(vault: Path, run_dir: Path, state: dict[str, object]) ->
     _assert_source_digest_chinese(digest)
     _assert_unique([candidate.candidate_id for candidate in digest.candidates()], "source digest candidate_id")
     state["source_digest"] = digest
-    state["raw_text"] = raw_text
     json_path = out_dir / "source_digest.json"
     md_path = out_dir / "source_digest.md"
     source_map_json = out_dir / "source_map.json"
@@ -867,7 +858,7 @@ def _step_wiki_snapshot(vault: Path, run_dir: Path, state: dict[str, object]) ->
     )
 
 
-def _step_candidate_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput:
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
@@ -911,12 +902,12 @@ def _step_candidate_pages(vault: Path, run_dir: Path, state: dict[str, object]) 
     return StepOutput([*artifacts, *provider_artifacts], counts, model_calls=model_calls)
 
 
-def _step_candidate_contexts(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+def _step_candidate_contexts(run_dir: Path, state: dict[str, object]) -> StepOutput:
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
     page_records: dict[str, dict[str, object]] = state.get("embedding_page_records", {})  # type: ignore[assignment]
-    artifact = build_candidate_contexts(vault, candidate_pages, snapshot.entries, page_records, embedding_config)
+    artifact = build_candidate_contexts(candidate_pages, snapshot.entries, page_records, embedding_config)
     state["candidate_contexts"] = artifact
     out_dir = run_dir / "candidate_contexts"
     json_path = out_dir / "candidate_contexts.json"
@@ -934,7 +925,7 @@ def _step_candidate_contexts(vault: Path, run_dir: Path, state: dict[str, object
     )
 
 
-def _step_merge_plan(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
@@ -965,17 +956,15 @@ def _step_merge_plan(vault: Path, run_dir: Path, state: dict[str, object]) -> St
     state["related_merge_report"] = related_report
     json_path = out_dir / "merge_plan.json"
     md_path = out_dir / "merge_plan.md"
-    report_path = out_dir / "merge_decision_report.md"
     related_report_json = out_dir / "related_merge_report.json"
     related_report_md = out_dir / "related_merge_report.md"
     write_json(json_path, plan)
     rendered = _render_merge_plan_md(plan)
     write_text(md_path, rendered)
-    write_text(report_path, rendered)
     write_json(related_report_json, related_report)
     write_text(related_report_md, related_logic.render_related_report(related_report))
     return StepOutput(
-        [json_path, md_path, report_path, related_report_json, related_report_md, *provider_artifacts],
+        [json_path, md_path, related_report_json, related_report_md, *provider_artifacts],
         {
             **{f"{key}_count": value for key, value in plan.action_counts.items()},
             "related_kept_count": sum(1 for item in related_report.candidates if item.decision == "kept"),
@@ -1097,7 +1086,6 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
 
 def _step_validation(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
     report = _validate_before_write(vault, state)
-    state["validation_report"] = report
     out_dir = run_dir / "validation"
     json_path = out_dir / "validation_report.json"
     md_path = out_dir / "validation_report.md"
@@ -1109,7 +1097,7 @@ def _step_validation(vault: Path, run_dir: Path, state: dict[str, object]) -> St
     return StepOutput([json_path, md_path], {"error_count": 0, "warning_count": sum(1 for issue in report.issues if issue.severity == "warning")})
 
 
-def _step_knowledge_write(vault: Path, run_dir: Path, state: dict[str, object], manifest: OperationManifest) -> StepOutput:
+def _step_knowledge_write(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
     merge_plan: MergePlan = state["merge_plan"]  # type: ignore[assignment]
     _preflight_knowledge_write(vault, final_pages)
@@ -1134,11 +1122,7 @@ def _step_knowledge_write(vault: Path, run_dir: Path, state: dict[str, object], 
     result_path = out_dir / "write_result.json"
     write_json(result_path, result)
     state["write_set_items"] = items
-    state["write_set"] = write_set
-    state["preimages"] = preimages
-    state["knowledge_written_targets"] = sorted(writes)
     state["written_targets"] = sorted(writes)
-    state["knowledge_write_result"] = result
     return StepOutput(
         [write_set_path, preimages_path, result_path],
         {"knowledge_written_count": len(writes), **{f"{key}_count": value for key, value in merge_plan.action_counts.items()}},
@@ -1153,7 +1137,6 @@ def _step_source_record_write(vault: Path, run_dir: Path, state: dict[str, objec
     content = _render_source_page(manifest.operation_id, digest, final_pages)
     item = _write_single_target(vault, source_target, "source", content, label="source record target")
     state["write_set_items"] = [*state.get("write_set_items", []), item]  # type: ignore[list-item]
-    state["source_written_targets"] = [source_target]
     state["written_targets"] = sorted([*state.get("written_targets", []), source_target])  # type: ignore[list-item]
     out_dir = run_dir / "source_record_write"
     result = WriteResult(written_targets=[source_target])
@@ -1187,7 +1170,6 @@ def _step_index_log_write(vault: Path, run_dir: Path, state: dict[str, object], 
         write_text(artifact_path, content)
         rendered_artifacts.append(artifact_path)
     state["write_set_items"] = [*state.get("write_set_items", []), *items]  # type: ignore[list-item]
-    state["system_written_targets"] = sorted(writes)
     state["written_targets"] = sorted([*state.get("written_targets", []), *writes.keys()])  # type: ignore[list-item]
     result = WriteResult(written_targets=sorted(writes))
     result_path = out_dir / "write_result.json"
@@ -1197,11 +1179,11 @@ def _step_index_log_write(vault: Path, run_dir: Path, state: dict[str, object], 
     return StepOutput([result_path, items_path, *rendered_artifacts], {"system_written_count": len(writes), "written_target_count": len(writes)})
 
 
-def _write_single_target(vault: Path, target: str, kind: str, content: str, *, label: str) -> WriteSetItem:
+def _write_single_target(vault: Path, target: str, kind: Literal["source", "system"], content: str, *, label: str) -> WriteSetItem:
     target_abs = ensure_under(vault / "wiki" / target, vault / "wiki", label=label)
     existed = target_abs.exists()
     pre_sha = sha256_file(target_abs) if existed else None
-    item = WriteSetItem(kind=kind, target_path=target, content_sha256=sha256_text(content), preimage_sha256=pre_sha)  # type: ignore[arg-type]
+    item = WriteSetItem(kind=kind, target_path=target, content_sha256=sha256_text(content), preimage_sha256=pre_sha)
     atomic_write_text(target_abs, content)
     return item
 
@@ -1210,8 +1192,7 @@ def _step_embedding_cache_refresh(vault: Path, run_dir: Path, state: dict[str, o
     profile: Profile = state["profile"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
     entries = _scan_wiki_entries(vault, profile)
-    page_records, metrics = sync_page_embedding_cache(vault, entries, embedding_config)
-    state["embedding_page_records"] = page_records
+    _, metrics = sync_page_embedding_cache(vault, entries, embedding_config)
     state["embedding_refresh_metrics"] = metrics
     out_dir = run_dir / "embedding_cache_refresh"
     report_path = out_dir / "embedding_cache_refresh.json"
@@ -1271,7 +1252,7 @@ def _run_step(
     emit_progress: bool,
 ) -> None:
     if emit_progress:
-        console.print(f"[cyan]开始[/] {_step_label(name)}")
+        console.print(f"[cyan]开始[/] {step_label(name)}")
     started = now_utc()
     start_time = time.perf_counter()
     record = StepRecord(name=name, status="running", started_at=started)
@@ -1301,64 +1282,8 @@ def _run_step(
     _write_manifest(run_dir, manifest)
     _write_event(run_dir, "step_completed", {"step": name, "counts": output.counts})
     if emit_progress:
-        count_text = " ".join(f"{_count_label(key)}={value}" for key, value in output.counts.items())
-        console.print(f"[green]完成[/] {_step_label(name)} {record.duration_seconds:.2f}s {count_text}".rstrip())
-
-
-def _step_label(name: str) -> str:
-    return {
-        "raw_binding": "绑定 raw",
-        "source_digest": "来源消化",
-        "wiki_snapshot": "Wiki 快照",
-        "candidate_pages": "候选知识页",
-        "candidate_contexts": "候选召回",
-        "merge_plan": "合并计划",
-        "composition_plan": "写作编排",
-        "final_pages": "最终页面",
-        "validation": "校验",
-        "knowledge_write": "写入知识页",
-        "source_record_write": "写入来源页",
-        "index_log_write": "写入索引日志",
-        "embedding_cache_refresh": "刷新向量缓存",
-        "receipt": "写入回执",
-    }.get(name, name)
-
-
-def _count_label(key: str) -> str:
-    return {
-        "raw_size_bytes": "raw大小",
-        "candidate_count": "候选数",
-        "weak_noise_count": "弱/噪声数",
-        "deferred_count": "延后数",
-        "knowledge_pool_size": "知识池",
-        "candidate_page_count": "候选页数",
-        "covered_digest_candidate_count": "覆盖候选数",
-        "query_count": "查询数",
-        "top_k": "TopK",
-        "create_count": "新建数",
-        "update_count": "更新数",
-        "noop_count": "不改动数",
-        "split_count": "拆分数",
-        "merge_count": "合并数",
-        "related_kept_count": "相关保留数",
-        "related_filtered_count": "相关过滤数",
-        "final_target_count": "最终目标数",
-        "final_page_count": "最终页数",
-        "diff_count": "diff数",
-        "parallel_request_count": "并发请求",
-        "parallel_max_workers": "最大并发",
-        "error_count": "错误数",
-        "warning_count": "警告数",
-        "knowledge_written_count": "知识页写入数",
-        "source_record_count": "来源页数",
-        "system_written_count": "系统页数",
-        "written_target_count": "写入目标数",
-        "receipt_count": "回执数",
-        "cache_hit": "缓存命中",
-        "cache_refreshed": "缓存刷新",
-        "cache_pruned": "缓存清理",
-        "retrieval_backend": "召回后端",
-    }.get(key, key)
+        count_text = " ".join(f"{count_label(key)}={value}" for key, value in output.counts.items())
+        console.print(f"[green]完成[/] {step_label(name)} {record.duration_seconds:.2f}s {count_text}".rstrip())
 
 
 def _chinese_scaffold(text: str, label: str) -> str:
@@ -1385,9 +1310,8 @@ def _scan_wiki_entries(vault: Path, profile: Profile) -> list[WikiKnowledgeEntry
         if page_type == profile.source_page_type:
             continue
         summary = str(frontmatter.get("summary") or summarize(strip_frontmatter(text), max_sentences=2))
-        source_refs = _extract_source_refs(text)
-        source_raw_paths = _frontmatter_list(frontmatter, "source_raw_paths") or _dedupe_list([ref.raw_path for ref in source_refs])
-        source_raw_hashes = _frontmatter_list(frontmatter, "source_raw_hashes") or _dedupe_list([ref.raw_sha256 for ref in source_refs])
+        source_raw_paths = _frontmatter_list(frontmatter, "source_raw_paths")
+        source_raw_hashes = _frontmatter_list(frontmatter, "source_raw_hashes")
         entries.append(
             WikiKnowledgeEntry(
                 path=rel,
@@ -1397,7 +1321,6 @@ def _scan_wiki_entries(vault: Path, profile: Profile) -> list[WikiKnowledgeEntry
                 summary=summary,
                 aliases=_frontmatter_list(frontmatter, "aliases"),
                 created=str(frontmatter.get("created") or ""),
-                source_refs=source_refs,
                 source_raw_paths=source_raw_paths,
                 source_raw_hashes=source_raw_hashes,
                 source_prepared_hashes=_frontmatter_list(frontmatter, "source_prepared_hashes"),
@@ -1795,29 +1718,6 @@ def _title_from_existing_page(text: str, fallback: str) -> str:
     return title_from_markdown(strip_frontmatter(text), fallback)
 
 
-def _extract_source_refs(text: str) -> list[SourceRef]:
-    if not text.startswith("---\n"):
-        return []
-    end = text.find("\n---", 4)
-    if end == -1:
-        return []
-    try:
-        data = yaml.safe_load(text[4:end]) or {}
-    except yaml.YAMLError:
-        return []
-    refs = data.get("source_refs") if isinstance(data, dict) else None
-    if not isinstance(refs, list):
-        return []
-    parsed = []
-    for ref in refs:
-        if isinstance(ref, dict):
-            try:
-                parsed.append(SourceRef.model_validate({**ref, "locator": ref.get("locator", "frontmatter")}))
-            except Exception:
-                continue
-    return parsed
-
-
 def _frontmatter_list(data: dict[str, object], key: str) -> list[str]:
     value = data.get(key)
     if isinstance(value, list):
@@ -1865,25 +1765,7 @@ def _resolve_raw(vault: Path, raw_file: Path) -> Path:
 def _load_config(vault: Path) -> dict[str, object]:
     config_path = vault / ".llmwiki" / "config.json"
     if not config_path.exists():
-        return {
-            "profile": "project_basic",
-            "mode": "full_auto",
-            "embedding": {
-                "enabled": True,
-                "backend": "sentence_transformers",
-                "model": DEFAULT_QWEN_EMBEDDING_MODEL,
-                "cache_dir": ".llmwiki/cache/embeddings",
-                "top_k_pages": 5,
-                "dimensions": 1024,
-                "input_version": "page_card_v1",
-                "max_page_chars": 6000,
-                "max_query_chars": 4000,
-                "batch_size": 8,
-                "normalize_embeddings": True,
-                "query_prompt_name": "query",
-            },
-            "page_generation": {},
-        }
+        raise PipelineError("Lite vault 缺少 .llmwiki/config.json，请先运行 llmwiki init。")
     return read_json(config_path)
 
 

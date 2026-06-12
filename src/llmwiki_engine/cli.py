@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .lite import pipeline
+from .lite.labels import count_label, step_label
 from .lite.providers import ProviderConfigError, load_provider_registry
 
 
@@ -139,32 +140,13 @@ def _print_manifest(manifest: object) -> None:
     table.add_column("耗时")
     table.add_column("计数")
     for step in manifest.steps:
-        counts = " ".join(f"{_count_label(key)}={value}" for key, value in step.counts.items())
+        counts = " ".join(f"{count_label(key)}={value}" for key, value in step.counts.items())
         duration = "" if step.duration_seconds is None else f"{step.duration_seconds:.2f}s"
-        table.add_row(_step_label(step.name), _status_label(step.status), duration, counts)
+        table.add_row(step_label(step.name), _status_label(step.status), duration, counts)
     console.print(f"状态：[bold]{_status_label(manifest.status)}[/]")
     if manifest.receipt_path:
         console.print(f"回执：{manifest.receipt_path}")
     console.print(table)
-
-
-def _step_label(name: str) -> str:
-    return {
-        "raw_binding": "绑定 raw",
-        "source_digest": "来源消化",
-        "wiki_snapshot": "Wiki 快照",
-        "candidate_pages": "候选知识页",
-        "candidate_contexts": "候选召回",
-        "merge_plan": "合并计划",
-        "composition_plan": "写作编排",
-        "final_pages": "最终页面",
-        "validation": "校验",
-        "knowledge_write": "写入知识页",
-        "source_record_write": "写入来源页",
-        "index_log_write": "写入索引日志",
-        "embedding_cache_refresh": "刷新向量缓存",
-        "receipt": "写入回执",
-    }.get(name, name)
 
 
 def _status_label(status: str) -> str:
@@ -184,45 +166,6 @@ def _severity_label(severity: str) -> str:
 
 def _bool_label(value: bool) -> str:
     return "是" if value else "否"
-
-
-def _count_label(key: str) -> str:
-    return {
-        "raw_size_bytes": "raw 大小",
-        "candidate_count": "候选数",
-        "weak_noise_count": "弱/噪声数",
-        "deferred_count": "延后数",
-        "candidate_page_count": "候选页数",
-        "covered_digest_candidate_count": "覆盖候选数",
-        "knowledge_pool_size": "知识池",
-        "query_count": "查询数",
-        "top_k": "召回数量",
-        "retrieval_backend": "召回后端",
-        "final_page_count": "最终页数",
-        "final_target_count": "最终目标数",
-        "update_target_count": "更新目标数",
-        "related_link_count": "相关链接数",
-        "knowledge_written_count": "知识页写入",
-        "source_record_count": "来源页",
-        "system_written_count": "系统页",
-        "written_target_count": "写入目标",
-        "receipt_count": "回执",
-        "cache_hit": "缓存命中",
-        "cache_refreshed": "缓存刷新",
-        "cache_pruned": "缓存清理",
-        "parallel_request_count": "并发请求",
-        "parallel_max_workers": "最大并发",
-        "diff_count": "diff 数",
-        "error_count": "错误数",
-        "warning_count": "警告数",
-        "create_count": "新建数",
-        "update_count": "更新数",
-        "noop_count": "不改动数",
-        "split_count": "拆分数",
-        "merge_count": "合并数",
-        "related_kept_count": "相关保留数",
-        "related_filtered_count": "相关过滤数",
-    }.get(key, key)
 
 
 def _provider_message(message: str) -> str:

@@ -175,7 +175,6 @@ it does not fall back to lexical, title, exact, or hashing recall.
   "embedding": {
     "enabled": true,
     "backend": "sentence_transformers",
-    "model": "Qwen/Qwen3-Embedding-0.6B",
     "dimensions": 1024,
     "top_k_pages": 5,
     "max_page_chars": 6000,

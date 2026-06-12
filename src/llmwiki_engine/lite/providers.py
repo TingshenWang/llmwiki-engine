@@ -274,12 +274,10 @@ def load_provider_registry(vault: Path) -> ProviderRegistry:
         if not isinstance(providers, dict):
             raise ProviderConfigError(f"{path} 中的 providers 必须是 mapping。")
         for name, raw_spec in providers.items():
-            if isinstance(raw_spec, str):
-                merged[str(name)] = {"spec": raw_spec}
-            elif isinstance(raw_spec, dict):
+            if isinstance(raw_spec, dict):
                 merged[str(name)] = raw_spec
             else:
-                raise ProviderConfigError(f"{path} 中的 provider {name} 必须是 string 或 mapping。")
+                raise ProviderConfigError(f"{path} 中的 provider {name} 必须是 mapping。")
     return ProviderRegistry({name: ProviderSpec.model_validate(value) for name, value in merged.items()})
 
 

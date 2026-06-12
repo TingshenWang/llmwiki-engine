@@ -21,8 +21,6 @@ DEFAULT_QWEN_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 class EmbeddingConfig:
     enabled: bool = True
     backend: str = "sentence_transformers"
-    model: str = DEFAULT_QWEN_EMBEDDING_MODEL
-    model_revision: str = ""
     cache_dir: str = ".llmwiki/cache/embeddings"
     top_k_pages: int = 5
     dimensions: int = 1024
@@ -38,21 +36,17 @@ class EmbeddingConfig:
 def load_embedding_config(config: dict[str, object]) -> EmbeddingConfig:
     raw = config.get("embedding")
     if not isinstance(raw, dict):
-        raw = config.get("retrieval") if isinstance(config.get("retrieval"), dict) else {}
+        raw = {}
     backend = str(raw.get("backend", "sentence_transformers"))
-    if backend in {"sentence-transformers", "sentence_transformer", "qwen", "qwen3"}:
-        backend = "sentence_transformers"
     return EmbeddingConfig(
         enabled=bool(raw.get("enabled", True)),
         backend=backend,
-        model=str(raw.get("model", DEFAULT_QWEN_EMBEDDING_MODEL)),
-        model_revision=str(raw.get("model_revision", "")),
         cache_dir=str(raw.get("cache_dir", ".llmwiki/cache/embeddings")),
-        top_k_pages=int(raw.get("top_k_pages", raw.get("top_k", 5))),
+        top_k_pages=int(raw.get("top_k_pages", 5)),
         dimensions=int(raw.get("dimensions", 1024)),
         input_version=str(raw.get("input_version", INPUT_VERSION)),
-        max_page_chars=int(raw.get("max_page_chars", raw.get("max_embedding_page_chars", 6000))),
-        max_query_chars=int(raw.get("max_query_chars", raw.get("max_embedding_query_chars", 4000))),
+        max_page_chars=int(raw.get("max_page_chars", 6000)),
+        max_query_chars=int(raw.get("max_query_chars", 4000)),
         max_excerpt_chars=int(raw.get("max_excerpt_chars", 800)),
         batch_size=int(raw.get("batch_size", 8)),
         normalize_embeddings=bool(raw.get("normalize_embeddings", True)),
@@ -142,8 +136,7 @@ def sync_page_embedding_cache(
     )
     metrics: dict[str, Any] = {
         "backend": config.backend,
-        "model": config.model,
-        "model_revision": config.model_revision,
+        "model": DEFAULT_QWEN_EMBEDDING_MODEL,
         "input_version": config.input_version,
         "dimensions": config.dimensions,
         "max_page_chars": config.max_page_chars,
@@ -165,7 +158,6 @@ def sync_page_embedding_cache(
 
 
 def build_candidate_contexts(
-    vault: Path,
     candidate_pages: CandidatePages,
     entries: list[WikiKnowledgeEntry],
     page_records: dict[str, dict[str, Any]],
@@ -205,7 +197,7 @@ def build_candidate_contexts(
         items.append(CandidateContext(candidate_page_id=page.candidate_page_id, query=query, hits=ranked))
     return CandidateContexts(
         retrieval_backend=config.backend,
-        model=config.model,
+        model=DEFAULT_QWEN_EMBEDDING_MODEL,
         input_version=config.input_version,
         top_k=top_k,
         knowledge_pool_size=len(entries),
@@ -213,8 +205,7 @@ def build_candidate_contexts(
         candidate_pool_hash=stable_json_hash([entry.model_dump(mode="json") for entry in entries]),
         embedding_metrics={
             "backend": config.backend,
-            "model": config.model,
-            "model_revision": config.model_revision,
+            "model": DEFAULT_QWEN_EMBEDDING_MODEL,
             "query_count": len(candidate_pages.pages),
             "page_count": len(entries),
             "top_k": top_k,
@@ -259,7 +250,7 @@ def candidate_query(page: CandidatePage, max_chars: int) -> str:
 def embed_texts(texts: list[str], config: EmbeddingConfig, *, is_query: bool) -> list[list[float]]:
     if config.backend != "sentence_transformers":
         raise RuntimeError(f"不支持的 embedding 后端：{config.backend}")
-    model = _sentence_transformer_model(config.model)
+    model = _sentence_transformer_model(DEFAULT_QWEN_EMBEDDING_MODEL)
     kwargs: dict[str, object] = {
         "batch_size": max(1, config.batch_size),
         "normalize_embeddings": config.normalize_embeddings,
@@ -330,7 +321,7 @@ def _pages_cache_dir(vault: Path, config: EmbeddingConfig) -> Path:
     root = Path(config.cache_dir).expanduser()
     if not root.is_absolute():
         root = vault / root
-    namespace = safe_filename(f"{config.backend}_{config.model}_{config.input_version}_{config.dimensions}")
+    namespace = safe_filename(f"{config.backend}_{DEFAULT_QWEN_EMBEDDING_MODEL}_{config.input_version}_{config.dimensions}")
     return root.resolve() / namespace / "pages"
 
 
@@ -368,8 +359,7 @@ def _read_valid_record(cache_path: Path, entry: WikiKnowledgeEntry, config: Embe
 def embedding_contract(config: EmbeddingConfig) -> dict[str, int | str | bool]:
     return {
         "backend": config.backend,
-        "model": config.model,
-        "model_revision": config.model_revision,
+        "model": DEFAULT_QWEN_EMBEDDING_MODEL,
         "dimensions": config.dimensions,
         "input_version": config.input_version,
         "max_page_chars": config.max_page_chars,

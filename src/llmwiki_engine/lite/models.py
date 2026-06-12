@@ -129,7 +129,6 @@ class WikiKnowledgeEntry(StrictModel):
     summary: str
     aliases: list[str] = Field(default_factory=list)
     created: str = ""
-    source_refs: list[SourceRef] = Field(default_factory=list)
     source_raw_paths: list[str] = Field(default_factory=list)
     source_raw_hashes: list[str] = Field(default_factory=list)
     source_prepared_hashes: list[str] = Field(default_factory=list)

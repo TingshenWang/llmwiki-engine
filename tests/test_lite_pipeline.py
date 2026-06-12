@@ -9,7 +9,6 @@ from typer.testing import CliRunner
 from llmwiki_engine.cli import app
 from llmwiki_engine.lite import embeddings
 from llmwiki_engine.lite import related as related_logic
-from llmwiki_engine.lite import system_pages
 from llmwiki_engine.lite.io import sha256_file, sha256_text
 from llmwiki_engine.lite.models import (
     CandidateContext,
@@ -22,7 +21,6 @@ from llmwiki_engine.lite.models import (
     MergeDecision,
     MergePlan,
     RawBinding,
-    RelatedPageRef,
     SourceDigest,
     SourceDigestCandidate,
     SourceRef,
@@ -129,12 +127,10 @@ def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_pa
         page_type="concept",
         sha256=sha256_file(page_path),
         summary="A page about local Qwen retrieval.",
-        source_refs=[],
         text_excerpt="A page about local Qwen retrieval.",
     )
     config = embeddings.EmbeddingConfig(
         backend="sentence_transformers",
-        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
         dimensions=3,
         max_page_chars=200,
         max_query_chars=200,
@@ -184,7 +180,7 @@ def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_pa
         ]
     )
 
-    contexts = embeddings.build_candidate_contexts(vault, candidate_pages, [entry], cached_records, config)
+    contexts = embeddings.build_candidate_contexts(candidate_pages, [entry], cached_records, config)
 
     assert calls[0][0] is True
     assert contexts.retrieval_backend == "sentence_transformers"
@@ -211,10 +207,10 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
             )
         ]
     )
-    config = embeddings.EmbeddingConfig(backend="unsupported-test", model="unsupported-test", dimensions=256)
+    config = embeddings.EmbeddingConfig(backend="unsupported-test", dimensions=256)
 
     with pytest.raises(RuntimeError, match="真实 embedding"):
-        embeddings.build_candidate_contexts(vault, candidate_pages, [], {}, config)
+        embeddings.build_candidate_contexts(candidate_pages, [], {}, config)
 
 
 def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
@@ -331,7 +327,6 @@ def test_top5_context_can_become_related_but_unknown_paths_are_filtered() -> Non
         page_type="concept",
         sha256="oldsha",
         summary="Old summary.",
-        source_refs=[],
         text_excerpt="Old page.",
     )
     snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="pool", generated_at="2026-06-11T00:00:00Z", entries=[old_entry])
@@ -514,7 +509,6 @@ def test_update_frontmatter_preserves_existing_provenance_and_aliases(tmp_path: 
         summary="old summary",
         aliases=["Old Alias"],
         created="2026-01-01",
-        source_refs=[],
         source_raw_paths=["raw/old.md"],
         source_raw_hashes=["old-raw-hash"],
         source_prepared_hashes=["old-prepared-hash"],
@@ -552,4 +546,3 @@ def test_page_generation_parallelism_defaults_to_request_count_and_supports_limi
     assert _page_generation_parallelism({}, 16) == 16
     assert _page_generation_parallelism({"config": {"page_generation": {}}}, 23) == 23
     assert _page_generation_parallelism({"config": {"page_generation": {"max_parallel_requests": 7}}}, 23) == 7
-    assert _page_generation_parallelism({"config": {"page_generation": {"parallel_requests": 5}}}, 23) == 5

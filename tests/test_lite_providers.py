@@ -416,4 +416,4 @@ def test_run_ingest_requires_real_model_provider_by_default(tmp_path: Path, monk
     except PipelineError as exc:
         assert "必须使用真实模型 provider" in str(exc)
     else:
-        raise AssertionError("run_ingest should reject local heuristic provider by default")
+        raise AssertionError("run_ingest should reject missing real model provider by default")
