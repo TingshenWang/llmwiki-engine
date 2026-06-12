@@ -1,5 +1,7 @@
 # llmwiki-engine Lite
 
+**Language:** English | [中文](README.zh-CN.md)
+
 Fresh Lite branch for a fully automatic LLM-Wiki ingest core.
 
 The first implementation target is a deterministic local pipeline:
@@ -102,76 +104,6 @@ llmwiki ingest raw-candidates ~/my-llmwiki-vault --all
 
 Generated knowledge pages are written under `wiki/`. The original file under
 `raw/` remains the durable evidence layer.
-
-## 中文安装与使用
-
-从 GitHub Release 下载 macOS/Linux 通用包：
-
-```bash
-curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.0/llmwiki-engine-0.2.0-macos-linux.tar.gz
-curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.0/llmwiki-engine-0.2.0-macos-linux.tar.gz.sha256
-```
-
-校验下载文件：
-
-```bash
-shasum -a 256 -c llmwiki-engine-0.2.0-macos-linux.tar.gz.sha256
-```
-
-解压并运行安装脚本：
-
-```bash
-tar -xzf llmwiki-engine-0.2.0-macos-linux.tar.gz
-cd llmwiki-engine-0.2.0-macos-linux
-./install.sh
-```
-
-默认安装位置是 `~/.local/share/llmwiki-engine`，命令入口会链接到
-`~/.local/bin/llmwiki`。如果终端提示找不到 `llmwiki`，把下面这一行加到
-`~/.zshrc` 或 `~/.bashrc`：
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-也可以指定安装目录：
-
-```bash
-./install.sh /path/to/install/llmwiki-engine
-```
-
-配置真实模型 provider。DeepSeek 示例：
-
-```bash
-mkdir -p ~/.llmwiki
-cat > ~/.llmwiki/config.yaml <<'YAML'
-providers:
-  default:
-    spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/v1/chat/completions
-    api_key_env: DEEPSEEK_API_KEY
-    max_tokens: 262144
-    timeout_seconds: 300
-YAML
-
-export DEEPSEEK_API_KEY="你的 API Key"
-```
-
-创建 vault，把 Markdown 原始材料放进 `raw/`，然后运行 Ingest：
-
-```bash
-llmwiki init ~/my-llmwiki-vault
-mkdir -p ~/my-llmwiki-vault/raw
-cp /path/to/example.md ~/my-llmwiki-vault/raw/
-
-llmwiki ingest run ~/my-llmwiki-vault raw/example.md
-llmwiki ingest status ~/my-llmwiki-vault --verify
-llmwiki ingest raw-candidates ~/my-llmwiki-vault --all
-```
-
-生成的知识页会写入 `wiki/`；`raw/` 下的原文会保留为可追溯证据层。第一次使用
-Qwen embedding 时，`sentence-transformers` 可能需要从 Hugging Face 下载模型；
-如果本机已有缓存，会直接复用。
 
 ## Release Build
 

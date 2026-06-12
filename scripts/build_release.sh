@@ -25,6 +25,7 @@ uv build --out-dir "$PACKAGE_DIR"
 
 cp "$PACKAGE_DIR"/* "$BUNDLE_DIR/packages/"
 cp "$ROOT_DIR/README.md" "$BUNDLE_DIR/README.md"
+cp "$ROOT_DIR/README.zh-CN.md" "$BUNDLE_DIR/README.zh-CN.md"
 cp "$ROOT_DIR/docs/lite-ingest-requirements.zh-CN.md" "$BUNDLE_DIR/lite-ingest-requirements.zh-CN.md"
 
 cat > "$BUNDLE_DIR/install.sh" <<'SH'
@@ -78,7 +79,8 @@ cat > "$BUNDLE_DIR/README_RELEASE.md" <<EOF
 
 - \`packages/\`：universal Python wheel 和 sdist。
 - \`install.sh\`：创建本地 venv，并安装 \`llmwiki-engine[embeddings]\`。
-- \`README.md\`：项目使用说明。
+- \`README.md\`：英文项目使用说明。
+- \`README.zh-CN.md\`：中文项目使用说明。
 - \`lite-ingest-requirements.zh-CN.md\`：Lite Ingest 需求文档。
 
 ## 安装
@@ -123,7 +125,7 @@ EOF
 
 (
   cd "$BUNDLE_DIR"
-  shasum -a 256 packages/* install.sh README.md README_RELEASE.md lite-ingest-requirements.zh-CN.md > SHA256SUMS
+  shasum -a 256 packages/* install.sh README.md README.zh-CN.md README_RELEASE.md lite-ingest-requirements.zh-CN.md > SHA256SUMS
 )
 
 tar -czf "$ARCHIVE_PATH" -C "$RELEASE_ROOT" "$BUNDLE_NAME"
