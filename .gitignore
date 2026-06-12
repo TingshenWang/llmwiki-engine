@@ -6,4 +6,4 @@ dist/
 tmp/
 *.egg-info/
 __pycache__/
-
+docs/lite-ingest-requirements.zh-CN.md
