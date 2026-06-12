@@ -37,6 +37,23 @@ llmwiki ingest run /path/to/vault raw/example.md
 llmwiki ingest status /path/to/vault --verify
 ```
 
+## Release Build
+
+Build a macOS/Linux release bundle from the committed source tree:
+
+```bash
+scripts/build_release.sh
+```
+
+The script writes:
+
+- `dist/releases/llmwiki-engine-<version>-macos-linux.tar.gz`
+- `dist/releases/llmwiki-engine-<version>-macos-linux.tar.gz.sha256`
+
+The bundle contains the universal wheel, sdist, install script, README, and
+Lite requirements document. The install script creates a venv and installs
+`llmwiki-engine[embeddings]` so candidate recall uses local Qwen embeddings.
+
 ## Provider Config
 
 New vaults default to deterministic local heuristics in `.llmwiki/config.yaml`:
