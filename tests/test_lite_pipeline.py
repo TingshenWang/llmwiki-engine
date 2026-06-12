@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from llmwiki_engine.cli import app
 from llmwiki_engine.lite import embeddings
+from llmwiki_engine.lite import prompts
 from llmwiki_engine.lite import related as related_logic
 from llmwiki_engine.lite.io import sha256_file, sha256_text
 from llmwiki_engine.lite.models import (
@@ -16,6 +17,8 @@ from llmwiki_engine.lite.models import (
     CandidateContexts,
     CandidatePage,
     CandidatePages,
+    CompositionItem,
+    CompositionPlan,
     FinalPage,
     FinalPages,
     MergeDecision,
@@ -30,6 +33,7 @@ from llmwiki_engine.lite.models import (
 from llmwiki_engine.lite.pipeline import (
     _assert_source_digest_chinese,
     _canonical_final_markdown,
+    _normalize_final_pages,
     _page_generation_parallelism,
     _validate_before_write,
     init_vault,
@@ -546,3 +550,64 @@ def test_page_generation_parallelism_defaults_to_request_count_and_supports_limi
     assert _page_generation_parallelism({}, 16) == 16
     assert _page_generation_parallelism({"config": {"page_generation": {}}}, 23) == 23
     assert _page_generation_parallelism({"config": {"page_generation": {"max_parallel_requests": 7}}}, 23) == 7
+
+
+def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                source_candidate_ids=["CAND-001"],
+                title="项目知识库",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Project_Wiki.md",
+                summary="项目知识库用于沉淀长期知识。",
+                body_markdown="# 项目知识库\n\n项目知识库用于沉淀长期知识。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    plan = MergePlan(
+        action_counts={"create": 1, "update": 0, "noop": 0, "split": 0, "merge": 0},
+        decisions=[MergeDecision(candidate_page_id="CP-001", action="create", target_path="concepts/Concept_Project_Wiki.md", reason="新主题。", source_refs=[ref])],
+    )
+    snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-12T00:00:00Z", entries=[])
+    profile = load_profile(vault)
+
+    composition_prompt = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile)
+
+    assert composition_prompt.schema_name == "llmwiki_lite_composition_plan"
+    item = CompositionItem(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_Project_Wiki.md",
+        action="create",
+        candidate_page_ids=["CP-001"],
+        section_order=["摘要"],
+        source_ref_rules=["保留本次 raw 的来源引用。"],
+        readability_goal="整理成一篇可读的中文知识页。",
+    )
+    final_prompt = prompts.final_page_prompt(composition_item=item, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile)
+    normalized = _normalize_final_pages(
+        FinalPages(
+            pages=[
+                FinalPage(
+                    final_page_id="FP-001",
+                    target_path="concepts/Concept_Project_Wiki.md",
+                    action="create",
+                    title="项目知识库",
+                    page_type="concept",
+                    markdown="# 项目知识库\n\n项目知识库用于沉淀长期知识。",
+                    source_refs=[ref],
+                )
+            ]
+        ),
+        CompositionPlan(items=[item]),
+        snapshot=snapshot,
+        operation_id="ING-20260612T000000Z-test",
+    )
+
+    assert final_prompt.schema_name == "llmwiki_lite_final_pages"
+    assert normalized.pages[0].content_sha256 == sha256_text(normalized.pages[0].markdown)

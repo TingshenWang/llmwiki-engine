@@ -1045,7 +1045,6 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
         artifact,
         composition,
         snapshot=snapshot,
-        vault=vault,
         operation_id=str(state.get("operation_id", "")),
     )
     _assert_final_pages_cover_composition(artifact, composition)
@@ -1251,7 +1250,8 @@ def _run_step(
     *,
     emit_progress: bool,
 ) -> None:
-    if emit_progress:
+    use_live_status = emit_progress and console.is_terminal and name in MODEL_BACKED_STEPS
+    if emit_progress and not use_live_status:
         console.print(f"[cyan]开始[/] {step_label(name)}")
     started = now_utc()
     start_time = time.perf_counter()
@@ -1261,7 +1261,11 @@ def _run_step(
     _write_manifest(run_dir, manifest)
     _write_event(run_dir, "step_started", {"step": name})
     try:
-        output = fn()
+        if use_live_status:
+            with console.status(f"[cyan]运行[/] {step_label(name)}", spinner="dots"):
+                output = fn()
+        else:
+            output = fn()
     except Exception:
         record.status = "failed"
         record.finished_at = now_utc()
@@ -1269,6 +1273,8 @@ def _run_step(
         manifest.updated_at = now_utc()
         _write_manifest(run_dir, manifest)
         _write_event(run_dir, "step_failed", {"step": name})
+        if emit_progress:
+            console.print(f"[red]失败[/] {step_label(name)} {record.duration_seconds:.2f}s")
         raise
     record.status = "completed"
     record.finished_at = now_utc()
@@ -1282,7 +1288,13 @@ def _run_step(
     _write_manifest(run_dir, manifest)
     _write_event(run_dir, "step_completed", {"step": name, "counts": output.counts})
     if emit_progress:
-        count_text = " ".join(f"{count_label(key)}={value}" for key, value in output.counts.items())
+        visible_counts: dict[str, int | float | str] = {
+            "artifact_count": len(output.artifacts),
+            "model_calls": output.model_calls,
+            "repair_count": output.repair_count,
+            **output.counts,
+        }
+        count_text = " ".join(f"{count_label(key)}={value}" for key, value in visible_counts.items())
         console.print(f"[green]完成[/] {step_label(name)} {record.duration_seconds:.2f}s {count_text}".rstrip())
 
 

@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .models import CandidateContexts, CandidatePages, CompositionItem, FinalPages, MergePlan, SourceDigest, SourceDigestCandidate, WikiSnapshot
+from .models import CandidateContexts, CandidatePages, CompositionItem, CompositionPlan, FinalPages, MergePlan, SourceDigest, SourceDigestCandidate, WikiSnapshot
 from .profile import Profile
 from .providers import PromptRequest
 
