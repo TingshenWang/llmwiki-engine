@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from llmwiki_engine.lite.models import (
     CandidateContext,
     CandidateContextHit,
     CandidateContexts,
+    CandidateMergeUnit,
     CandidatePage,
     CandidatePages,
     CompositionItem,
@@ -31,6 +33,7 @@ from llmwiki_engine.lite.models import (
     WikiSnapshot,
 )
 from llmwiki_engine.lite.pipeline import (
+    _assert_merge_plan_consumes_candidates,
     _assert_source_digest_chinese,
     _canonical_final_markdown,
     _normalize_final_pages,
@@ -40,6 +43,7 @@ from llmwiki_engine.lite.pipeline import (
     PipelineError,
 )
 from llmwiki_engine.lite.profile import load_profile
+from llmwiki_engine.lite.providers import ProviderSpec, build_chat_payload
 
 
 def write_raw(vault: Path, name: str = "project_note.md") -> Path:
@@ -51,10 +55,35 @@ def write_raw(vault: Path, name: str = "project_note.md") -> Path:
         "第一阶段先证明 CLI、状态机、artifact 和 validator 能跑通。\n\n"
         "## 简化 Ingest 流程\n\n"
         "简化 Ingest 不进行人工审核，也不需要手动 apply。"
-        "系统会先生成候选页面，再生成 merge plan 和 composition plan，最后自动写入 wiki。\n",
+        "系统会先合并候选，再生成候选页面，然后通过向量召回旧页面并自动写入 wiki。\n",
         encoding="utf-8",
     )
     return raw
+
+
+def make_decision(
+    *,
+    decision_id: str,
+    candidate_page_id: str,
+    action: str,
+    target_path: str | None,
+    title: str,
+    ref: SourceRef,
+    matched_existing_paths: list[str] | None = None,
+) -> MergeDecision:
+    return MergeDecision(
+        decision_id=decision_id,
+        candidate_page_id=candidate_page_id,
+        action=action,  # type: ignore[arg-type]
+        target_path=target_path,
+        title=title,
+        page_type="concept",
+        content_scope=f"写入 {title} 对应的候选内容。",
+        candidate_path_index=["摘要", "核心内容"],
+        matched_existing_paths=matched_existing_paths or [],
+        reason="按候选内容生成合并决策。",
+        source_refs=[ref],
+    )
 
 
 def test_source_digest_rejects_english_user_facing_text() -> None:
@@ -172,6 +201,7 @@ def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_pa
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
                 source_candidate_ids=["CAND-001"],
                 title="Local Embedding Retrieval",
                 proposed_page_type="concept",
@@ -200,6 +230,7 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
                 source_candidate_ids=["CAND-001"],
                 title="RAG 系统",
                 proposed_page_type="concept",
@@ -215,6 +246,209 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="真实 embedding"):
         embeddings.build_candidate_contexts(candidate_pages, [], {}, config)
+
+
+def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault)
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256=sha256_file(raw), locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path="raw/project_note.md",
+        raw_sha256=sha256_file(raw),
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["候选页必须先忠于原文，再进行旧 wiki 召回。"],
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND-001",
+                kind="concept",
+                name="自动化入库",
+                suggested_page_title="自动化入库",
+                summary="自动化入库强调去掉人工审核节点。",
+                source_basis="原文说明流程不再人工审核。",
+                source_refs=[ref],
+            )
+        ],
+    )
+    unit = CandidateMergeUnit(
+        candidate_unit_id="CM-001",
+        source_candidate_ids=["CAND-001"],
+        title="自动化入库",
+        page_type="concept",
+        path_hint="concepts/Concept_Auto_Ingest.md",
+        summary="合并后的候选页单元。",
+        merge_reason="只有一个同义候选，直接生成页面。",
+        must_cover_points=["解释为什么候选页先忠于原文。"],
+        source_refs=[ref],
+    )
+    profile = load_profile(vault)
+
+    merge_prompt = prompts.candidate_merge_prompt(digest=digest, profile=profile)
+    page_prompt = prompts.candidate_page_prompt(
+        digest=digest,
+        candidate_unit=unit,
+        raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        raw_text=raw.read_text(encoding="utf-8"),
+        profile=profile,
+    )
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-001"],
+                title="自动化入库",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Auto_Ingest.md",
+                summary="候选页正文忠于原文。",
+                body_markdown="## 摘要\n\n候选页正文忠于原文。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    contexts = CandidateContexts(
+        retrieval_backend="sentence_transformers",
+        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
+        input_version="test",
+        top_k=5,
+        knowledge_pool_size=0,
+        candidate_page_count=1,
+        candidate_pool_hash="empty",
+        items=[],
+    )
+    merge_plan_prompt = prompts.merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=contexts, profile=profile)
+
+    assert merge_prompt.schema_name == "llmwiki_lite_candidate_merge"
+    assert "wiki_snapshot" not in merge_prompt.user_payload
+    assert "wiki_snapshot_entries" not in page_prompt.user_payload
+    assert "wiki_snapshot" not in merge_plan_prompt.user_payload
+    assert "wiki_snapshot_entries" not in merge_plan_prompt.user_payload
+    assert page_prompt.user_payload["candidate_unit"]["candidate_unit_id"] == "CM-001"
+    assert page_prompt.cache_prefix_payload
+    assert page_prompt.cache_prefix_payload["raw_text"]
+
+
+def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault)
+    raw_text = raw.read_text(encoding="utf-8")
+    raw_sha = sha256_file(raw)
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256=raw_sha, locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path="raw/project_note.md",
+        raw_sha256=raw_sha,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["候选页必须先忠于原文，再进行旧 wiki 召回。"],
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND-001",
+                kind="concept",
+                name="自动化入库",
+                suggested_page_title="自动化入库",
+                summary="自动化入库强调去掉人工审核节点。",
+                source_basis="原文说明流程不再人工审核。",
+                source_refs=[ref],
+            )
+        ],
+    )
+    unit = CandidateMergeUnit(
+        candidate_unit_id="CM-001",
+        source_candidate_ids=["CAND-001"],
+        title="自动化入库",
+        page_type="concept",
+        path_hint="concepts/Concept_Auto_Ingest.md",
+        summary="合并后的候选页单元。",
+        merge_reason="只有一个同义候选，直接生成页面。",
+        must_cover_points=["解释为什么候选页先忠于原文。"],
+        source_refs=[ref],
+    )
+    profile = load_profile(vault)
+    spec = ProviderSpec(spec="openai_compatible:deepseek-v4-flash", endpoint="https://api.deepseek.com/v1/chat/completions", api_key="test-key")
+
+    warmup_prompt = prompts.candidate_pages_warmup_prompt(digest=digest, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
+    page_prompt = prompts.candidate_page_prompt(digest=digest, candidate_unit=unit, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
+    warmup_payload = build_chat_payload(spec, warmup_prompt)
+    page_payload = build_chat_payload(spec, page_prompt)
+
+    assert warmup_prompt.schema_name == "llmwiki_lite_candidate_pages_warmup"
+    assert page_prompt.schema_name == "llmwiki_lite_candidate_pages"
+    assert warmup_payload["messages"][1]["content"] == page_payload["messages"][1]["content"]
+    assert len(warmup_payload["messages"]) == 3
+    assert len(page_payload["messages"]) == 3
+    shared_prefix = json.loads(page_payload["messages"][1]["content"])["cache_prefix"]
+    variable_suffix = json.loads(page_payload["messages"][2]["content"])
+    warmup_suffix = json.loads(warmup_payload["messages"][2]["content"])
+    assert shared_prefix["task"] == "candidate_pages"
+    assert shared_prefix["raw_text"] == raw_text
+    assert "candidate_unit" not in shared_prefix
+    assert variable_suffix["input"]["candidate_unit"]["candidate_unit_id"] == "CM-001"
+    assert "raw_text" not in variable_suffix["input"]
+    assert warmup_suffix["input"]["warmup"] is True
+    assert warmup_suffix["json_output_example"] == {"status": "OK"}
+
+
+def test_merge_plan_allows_split_decisions_but_update_must_use_top5() -> None:
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-001"],
+                title="自动化入库",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Auto_Ingest.md",
+                summary="候选页包含可更新旧页和可新建页面的两部分。",
+                body_markdown="## 摘要\n\n这是一页候选页。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    contexts = CandidateContexts(
+        retrieval_backend="sentence_transformers",
+        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
+        input_version="test",
+        top_k=5,
+        knowledge_pool_size=1,
+        candidate_page_count=1,
+        candidate_pool_hash="hash",
+        items=[
+            CandidateContext(
+                candidate_page_id="CP-001",
+                query="自动化入库",
+                hits=[CandidateContextHit(path="concepts/Concept_Old.md", title="旧页", rank=1, score=0.9, reason="向量相近。")],
+            )
+        ],
+    )
+    plan = MergePlan(
+        action_counts={"create": 1, "update": 1, "noop": 0},
+        decisions=[
+            make_decision(
+                decision_id="MD-001",
+                candidate_page_id="CP-001",
+                action="update",
+                target_path="concepts/Concept_Old.md",
+                title="旧页",
+                ref=ref,
+                matched_existing_paths=["concepts/Concept_Old.md"],
+            ),
+            make_decision(decision_id="MD-002", candidate_page_id="CP-001", action="create", target_path="concepts/Concept_New.md", title="新页", ref=ref),
+        ],
+    )
+
+    _assert_merge_plan_consumes_candidates(plan, candidate_pages, contexts)
+
+    bad_plan = plan.model_copy(
+        update={
+            "decisions": [
+                plan.decisions[0].model_copy(update={"decision_id": "MD-BAD", "target_path": "concepts/Concept_Not_In_Top5.md"}),
+            ]
+        }
+    )
+    with pytest.raises(PipelineError, match="TopK 召回"):
+        _assert_merge_plan_consumes_candidates(bad_plan, candidate_pages, contexts)
 
 
 def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
@@ -243,6 +477,7 @@ def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
                 source_candidate_ids=["CAND-001"],
                 title="First",
                 proposed_page_type="concept",
@@ -254,6 +489,7 @@ def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
             ),
             CandidatePage(
                 candidate_page_id="CP-002",
+                candidate_unit_id="CM-002",
                 source_candidate_ids=["CAND-002"],
                 title="Second",
                 proposed_page_type="concept",
@@ -266,10 +502,10 @@ def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
         ]
     )
     plan = MergePlan(
-        action_counts={"create": 2, "update": 0, "noop": 0, "split": 0, "merge": 0},
+        action_counts={"create": 2, "update": 0, "noop": 0},
         decisions=[
-            MergeDecision(candidate_page_id="CP-001", action="create", target_path="concepts/Concept_First.md", reason="create", source_refs=[ref]),
-            MergeDecision(candidate_page_id="CP-002", action="create", target_path="concepts/Concept_Second.md", reason="create", source_refs=[ref]),
+            make_decision(decision_id="MD-001", candidate_page_id="CP-001", action="create", target_path="concepts/Concept_First.md", title="First", ref=ref),
+            make_decision(decision_id="MD-002", candidate_page_id="CP-002", action="create", target_path="concepts/Concept_Second.md", title="Second", ref=ref),
         ],
     )
     contexts = CandidateContexts(
@@ -314,6 +550,7 @@ def test_top5_context_can_become_related_but_unknown_paths_are_filtered() -> Non
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
                 source_candidate_ids=["CAND-001"],
                 title="New",
                 proposed_page_type="concept",
@@ -354,8 +591,8 @@ def test_top5_context_can_become_related_but_unknown_paths_are_filtered() -> Non
         ],
     )
     plan = MergePlan(
-        action_counts={"create": 1, "update": 0, "noop": 0, "split": 0, "merge": 0},
-        decisions=[MergeDecision(candidate_page_id="CP-001", action="create", target_path="concepts/Concept_New.md", reason="create", source_refs=[ref])],
+        action_counts={"create": 1, "update": 0, "noop": 0},
+        decisions=[make_decision(decision_id="MD-001", candidate_page_id="CP-001", action="create", target_path="concepts/Concept_New.md", title="New", ref=ref)],
     )
 
     resolved, report = related_logic.finalize_merge_plan_related(plan, candidate_pages=candidate_pages, digest=digest, snapshot=snapshot, contexts=contexts)
@@ -559,6 +796,7 @@ def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> 
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
                 source_candidate_ids=["CAND-001"],
                 title="项目知识库",
                 proposed_page_type="concept",
@@ -571,19 +809,20 @@ def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> 
         ]
     )
     plan = MergePlan(
-        action_counts={"create": 1, "update": 0, "noop": 0, "split": 0, "merge": 0},
-        decisions=[MergeDecision(candidate_page_id="CP-001", action="create", target_path="concepts/Concept_Project_Wiki.md", reason="新主题。", source_refs=[ref])],
+        action_counts={"create": 1, "update": 0, "noop": 0},
+        decisions=[make_decision(decision_id="MD-001", candidate_page_id="CP-001", action="create", target_path="concepts/Concept_Project_Wiki.md", title="项目知识库", ref=ref)],
     )
     snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-12T00:00:00Z", entries=[])
     profile = load_profile(vault)
 
-    composition_prompt = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile)
+    composition_prompt = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile)
 
     assert composition_prompt.schema_name == "llmwiki_lite_composition_plan"
     item = CompositionItem(
         final_page_id="FP-001",
         target_path="concepts/Concept_Project_Wiki.md",
         action="create",
+        merge_decision_ids=["MD-001"],
         candidate_page_ids=["CP-001"],
         section_order=["摘要"],
         source_ref_rules=["保留本次 raw 的来源引用。"],

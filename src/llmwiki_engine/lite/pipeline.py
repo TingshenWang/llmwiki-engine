@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Literal
 import yaml
 from pydantic import BaseModel
 from rich.console import Console
+from rich.table import Table
 
 from llmwiki_engine import __version__
 
@@ -43,12 +44,16 @@ from .models import (
     ArtifactRef,
     CandidateContext,
     CandidateContexts,
+    CandidateMergePlan,
+    CandidateMergeUnit,
     CandidatePage,
     CandidatePages,
+    CandidatePagesWarmup,
     CompositionItem,
     CompositionPlan,
     FinalPage,
     FinalPages,
+    MergeDecision,
     MergePlan,
     OperationManifest,
     RawBinding,
@@ -76,6 +81,13 @@ from .text import (
     summarize,
     title_from_markdown,
 )
+from .token_usage import (
+    format_duration_ms,
+    format_percent,
+    format_price_cny,
+    summarize_api_calls,
+    tag_api_calls,
+)
 
 
 class PipelineError(RuntimeError):
@@ -89,6 +101,7 @@ class StepOutput:
     warnings: list[str] | None = None
     model_calls: int = 0
     repair_count: int = 0
+    api_calls: list[dict[str, object]] | None = None
 
 
 def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
@@ -183,8 +196,10 @@ def run_ingest(
     steps: list[tuple[str, Callable[[], StepOutput]]] = [
         ("raw_binding", lambda: _step_raw_binding(run_dir, state)),
         ("source_digest", lambda: _step_source_digest(run_dir, state)),
-        ("wiki_snapshot", lambda: _step_wiki_snapshot(vault, run_dir, state)),
+        ("candidate_merge", lambda: _step_candidate_merge(run_dir, state)),
+        ("candidate_pages_warmup", lambda: _step_candidate_pages_warmup(run_dir, state)),
         ("candidate_pages", lambda: _step_candidate_pages(run_dir, state)),
+        ("wiki_snapshot", lambda: _step_wiki_snapshot(vault, run_dir, state)),
         ("candidate_contexts", lambda: _step_candidate_contexts(run_dir, state)),
         ("merge_plan", lambda: _step_merge_plan(run_dir, state)),
         ("composition_plan", lambda: _step_composition_plan(vault, run_dir, state)),
@@ -316,7 +331,7 @@ def _call_provider_artifact(
     step: str,
     request: BaseModel,
     output_model: type[BaseModel],
-) -> tuple[BaseModel, list[Path], int]:
+) -> tuple[BaseModel, list[Path], int, list[dict[str, object]]]:
     registry: ProviderRegistry = state["provider_registry"]  # type: ignore[assignment]
     spec = registry.provider_for(step)
     provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
@@ -328,10 +343,13 @@ def _call_provider_artifact(
     model_dir = out_dir / "model_calls"
     prompt_path = model_dir / f"{step}.prompt.json"
     result_path = model_dir / f"{step}.provider_result.json"
+    api_calls_path = model_dir / f"{step}.token_usage_calls.json"
+    api_calls = tag_api_calls(result.api_calls, step)
     write_json(prompt_path, result.prompt_artifact)
     write_json(result_path, result.provider_result)
+    write_json(api_calls_path, api_calls)
     provider_contexts[step] = result.sanitized_context
-    return result.output, [prompt_path, result_path], result.model_calls
+    return result.output, [prompt_path, result_path, api_calls_path], result.model_calls, api_calls
 
 
 def _call_provider_artifacts_parallel(
@@ -340,22 +358,23 @@ def _call_provider_artifacts_parallel(
     step: str,
     requests: list[tuple[str, BaseModel]],
     output_model: type[BaseModel],
-) -> tuple[list[BaseModel], list[Path], int]:
+) -> tuple[list[BaseModel], list[Path], int, list[dict[str, object]]]:
     registry: ProviderRegistry = state["provider_registry"]  # type: ignore[assignment]
     spec = registry.provider_for(step)
     provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
     provider_contexts[step] = {**spec.sanitized_context(), "parallel_request_count": len(requests)}
     if not requests:
-        return [], [], 0
+        return [], [], 0, []
 
     max_workers = _page_generation_parallelism(state, len(requests))
     results_by_key: dict[str, BaseModel] = {}
     artifacts_by_key: dict[str, list[Path]] = {}
     model_calls_by_key: dict[str, int] = {}
+    api_calls_by_key: dict[str, list[dict[str, object]]] = {}
     contexts = []
     model_dir = out_dir / "model_calls"
 
-    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel, list[Path], dict[str, object], int]:
+    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel, list[Path], dict[str, object], int, list[dict[str, object]]]:
         try:
             result = registry.call_structured(step, request, output_model)
         except (ProviderConfigError, ProviderCallError, ValueError) as exc:
@@ -365,15 +384,16 @@ def _call_provider_artifacts_parallel(
         result_path = model_dir / f"{artifact_stem}.provider_result.json"
         write_json(prompt_path, result.prompt_artifact)
         write_json(result_path, result.provider_result)
-        return key, result.output, [prompt_path, result_path], result.sanitized_context, result.model_calls
+        return key, result.output, [prompt_path, result_path], result.sanitized_context, result.model_calls, tag_api_calls(result.api_calls, key)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(call_one, key, request) for key, request in requests]
         for future in as_completed(futures):
-            key, output, artifacts, context, model_calls = future.result()
+            key, output, artifacts, context, model_calls, api_calls = future.result()
             results_by_key[key] = output
             artifacts_by_key[key] = artifacts
             model_calls_by_key[key] = model_calls
+            api_calls_by_key[key] = api_calls
             contexts.append(context)
 
     provider_contexts[step] = {
@@ -385,7 +405,27 @@ def _call_provider_artifacts_parallel(
     outputs = [results_by_key[key] for key, _ in requests]
     artifacts = [path for key, _ in requests for path in artifacts_by_key.get(key, [])]
     model_calls = sum(model_calls_by_key.get(key, 0) for key, _ in requests)
-    return outputs, artifacts, model_calls
+    api_calls = [call for key, _ in requests for call in api_calls_by_key.get(key, [])]
+    api_calls_path = out_dir / "token_usage_calls.json"
+    write_json(api_calls_path, api_calls)
+    return outputs, [*artifacts, api_calls_path], model_calls, api_calls
+
+
+def _token_usage_counts(api_calls: list[dict[str, object]]) -> dict[str, int | float]:
+    summary = summarize_api_calls(api_calls)
+    return {
+        "api_call_count": int(summary["api_call_count"]),
+        "api_success_count": int(summary["api_success_count"]),
+        "api_paused_count": int(summary["api_paused_count"]),
+        "prompt_tokens": int(summary["prompt_tokens"]),
+        "prompt_cache_hit_tokens": int(summary["prompt_cache_hit_tokens"]),
+        "prompt_cache_miss_tokens": int(summary["prompt_cache_miss_tokens"]),
+        "completion_tokens": int(summary["completion_tokens"]),
+        "reasoning_tokens": int(summary["reasoning_tokens"]),
+        "total_tokens": int(summary["total_tokens"]),
+        "cache_hit_rate_percent": float(summary["cache_hit_rate_percent"]),
+        "price_cny": float(summary["price_cny"]),
+    }
 
 
 def _page_generation_parallelism(state: dict[str, object], request_count: int) -> int:
@@ -421,6 +461,8 @@ def _assert_unique(values: list[str], label: str) -> None:
 
 def _assert_candidate_pages_have_sources(artifact: CandidatePages) -> None:
     for page in artifact.pages:
+        if not page.candidate_unit_id.strip():
+            raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 candidate_unit_id。")
         if not page.source_refs:
             raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 source_refs。")
         if not page.body_markdown.strip():
@@ -451,9 +493,24 @@ def _assert_candidate_pages_chinese(artifact: CandidatePages) -> None:
             _require_chinese_text(f"{page.candidate_page_id}.evidence_notes[{index}]", item)
 
 
+def _assert_candidate_merge_chinese(plan: CandidateMergePlan) -> None:
+    for unit in plan.units:
+        _require_chinese_title(f"{unit.candidate_unit_id}.title", unit.title, unit.summary, unit.merge_reason)
+        _require_chinese_text(f"{unit.candidate_unit_id}.summary", unit.summary)
+        _require_chinese_text(f"{unit.candidate_unit_id}.merge_reason", unit.merge_reason)
+        for index, item in enumerate(unit.must_cover_points, start=1):
+            _require_chinese_text(f"{unit.candidate_unit_id}.must_cover_points[{index}]", item)
+    for index, item in enumerate(plan.warnings, start=1):
+        _require_chinese_text(f"candidate_merge.warnings[{index}]", item)
+
+
 def _assert_merge_plan_chinese(plan: MergePlan) -> None:
     for decision in plan.decisions:
+        _require_chinese_title(f"{decision.decision_id}.title", decision.title, decision.reason, decision.content_scope)
+        _require_chinese_text(f"{decision.decision_id}.content_scope", decision.content_scope)
         _require_chinese_text(f"{decision.candidate_page_id}.reason", decision.reason)
+        for index, item in enumerate(decision.candidate_path_index, start=1):
+            _require_chinese_text(f"{decision.decision_id}.candidate_path_index[{index}]", item)
         for ref in decision.related_pages:
             _require_chinese_text(f"{decision.candidate_page_id}.related_pages.reason", ref.reason)
         for index, item in enumerate(decision.warnings, start=1):
@@ -501,40 +558,114 @@ def _normalize_candidate_pages(artifact: CandidatePages) -> CandidatePages:
     return artifact.model_copy(update={"pages": pages})
 
 
-def _merge_parallel_candidate_pages(outputs: list[BaseModel], source_candidates: list[SourceDigestCandidate]) -> CandidatePages:
-    if len(outputs) != len(source_candidates):
-        raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但 source candidate 数量是 {len(source_candidates)}。")
+def _normalize_candidate_merge_plan(plan: CandidateMergePlan, digest: SourceDigest, profile: Profile) -> CandidateMergePlan:
+    known_candidates = {candidate.candidate_id: candidate for candidate in digest.candidates()}
+    used_source_ids: list[str] = []
+    units: list[CandidateMergeUnit] = []
+    for index, unit in enumerate(plan.units, start=1):
+        source_ids = _dedupe_list(unit.source_candidate_ids)
+        if not source_ids:
+            raise PipelineError(f"候选合并单元 {unit.candidate_unit_id} 缺少 source_candidate_ids。")
+        unknown = [candidate_id for candidate_id in source_ids if candidate_id not in known_candidates]
+        if unknown:
+            raise PipelineError(f"候选合并单元 {unit.candidate_unit_id} 引用了未知 source candidate：{', '.join(unknown)}")
+        page_type = unit.page_type if unit.page_type in profile.page_types and unit.page_type != profile.source_page_type else profile.default_page_type
+        path_hint = _normalize_path_hint(unit.path_hint, page_type, unit.title, profile)
+        refs = _merge_source_refs([ref for candidate_id in source_ids for ref in known_candidates[candidate_id].source_refs] or unit.source_refs)
+        units.append(
+            unit.model_copy(
+                update={
+                    "candidate_unit_id": f"CM-{index:03d}",
+                    "source_candidate_ids": source_ids,
+                    "page_type": page_type,
+                    "path_hint": path_hint,
+                    "source_refs": refs,
+                    "must_cover_points": unit.must_cover_points or [unit.summary],
+                }
+            )
+        )
+        used_source_ids.extend(source_ids)
+    skipped = _dedupe_list([*plan.skipped_candidate_ids, *(candidate_id for candidate_id in known_candidates if candidate_id not in used_source_ids)])
+    return plan.model_copy(update={"units": units, "skipped_candidate_ids": skipped})
+
+
+def _normalize_path_hint(path_hint: str, page_type: str, title: str, profile: Profile) -> str:
+    spec = profile.page_type(page_type)
+    cleaned = path_hint.strip().replace("\\", "/").lstrip("/")
+    if cleaned and not cleaned.endswith(".md"):
+        cleaned += ".md"
+    if cleaned.startswith(f"{spec.directory}/") and ".." not in Path(cleaned).parts:
+        return cleaned
+    filename = safe_filename(title) or "Untitled"
+    if not filename.startswith(spec.title_prefix):
+        filename = f"{spec.title_prefix}{filename}"
+    return f"{spec.directory}/{filename}.md"
+
+
+def _merge_parallel_candidate_pages(outputs: list[BaseModel], units: list[CandidateMergeUnit]) -> CandidatePages:
+    if len(outputs) != len(units):
+        raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但 candidate unit 数量是 {len(units)}。")
     pages: list[CandidatePage] = []
     skipped: list[str] = []
-    for index, (output, source_candidate) in enumerate(zip(outputs, source_candidates, strict=True), start=1):
+    for index, (output, unit) in enumerate(zip(outputs, units, strict=True), start=1):
         if not isinstance(output, CandidatePages):
             raise PipelineError("候选页并发请求返回了无效 artifact。")
         skipped.extend(output.skipped_candidate_ids)
         if len(output.pages) != 1:
-            raise PipelineError(f"{source_candidate.candidate_id} 的候选页请求必须且只能返回 1 页。")
+            raise PipelineError(f"{unit.candidate_unit_id} 的候选页请求必须且只能返回 1 页。")
         page = output.pages[0]
-        source_ids = _dedupe_list([*page.source_candidate_ids, source_candidate.candidate_id])
-        pages.append(page.model_copy(update={"candidate_page_id": f"CP-{index:03d}", "source_candidate_ids": source_ids}))
+        source_ids = _dedupe_list([*unit.source_candidate_ids, *page.source_candidate_ids])
+        pages.append(
+            page.model_copy(
+                update={
+                    "candidate_page_id": f"CP-{index:03d}",
+                    "candidate_unit_id": unit.candidate_unit_id,
+                    "source_candidate_ids": source_ids,
+                    "proposed_page_type": unit.page_type,
+                    "proposed_path_hint": unit.path_hint,
+                    "source_refs": _merge_source_refs([*unit.source_refs, *page.source_refs]),
+                }
+            )
+        )
     return CandidatePages(pages=pages, skipped_candidate_ids=_dedupe_list(skipped))
 
 
 def _normalize_merge_plan(plan: MergePlan) -> MergePlan:
-    action_counts = {action: 0 for action in ["create", "update", "noop", "split", "merge"]}
-    for decision in plan.decisions:
+    action_counts = {action: 0 for action in ["create", "update", "noop"]}
+    decisions: list[MergeDecision] = []
+    for index, decision in enumerate(plan.decisions, start=1):
         action_counts[decision.action] += 1
-    return plan.model_copy(update={"action_counts": action_counts})
+        decision_id = decision.decision_id.strip() or f"MD-{index:03d}"
+        decisions.append(decision.model_copy(update={"decision_id": decision_id}))
+    return plan.model_copy(update={"decisions": decisions, "action_counts": action_counts})
 
 
-def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: CandidatePages) -> None:
-    expected = sorted(page.candidate_page_id for page in candidate_pages.pages)
-    actual = sorted(decision.candidate_page_id for decision in plan.decisions)
-    if expected != actual:
-        raise PipelineError(f"merge_plan 必须且只能消费每个候选页一次：expected={expected} actual={actual}")
+def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: CandidatePages, contexts: CandidateContexts) -> None:
+    expected = {page.candidate_page_id for page in candidate_pages.pages}
+    actual = {decision.candidate_page_id for decision in plan.decisions}
+    unknown = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    if unknown:
+        raise PipelineError(f"merge_plan 引用了未知候选页：{unknown}")
+    if missing:
+        raise PipelineError(f"merge_plan 必须覆盖每个候选页：{missing}")
+    _assert_unique([decision.decision_id for decision in plan.decisions], "merge decision_id")
+    context_paths = {item.candidate_page_id: {hit.path for hit in item.hits} for item in contexts.items}
     for decision in plan.decisions:
-        if decision.action in {"create", "update", "split", "merge"} and not decision.target_path:
+        if decision.action in {"create", "update"} and not decision.target_path:
             raise PipelineError(f"合并决策 {decision.candidate_page_id} 缺少 target_path。")
-        if decision.action == "update" and not decision.matched_existing_paths:
-            raise PipelineError(f"更新决策 {decision.candidate_page_id} 缺少 matched_existing_paths。")
+        if not decision.source_refs:
+            raise PipelineError(f"合并决策 {decision.decision_id} 缺少 source_refs。")
+        if not decision.content_scope.strip():
+            raise PipelineError(f"合并决策 {decision.decision_id} 缺少 content_scope。")
+        if not decision.candidate_path_index:
+            raise PipelineError(f"合并决策 {decision.decision_id} 缺少 candidate_path_index。")
+        if decision.action == "update":
+            allowed = context_paths.get(decision.candidate_page_id, set())
+            if decision.target_path not in allowed:
+                raise PipelineError(f"更新决策 {decision.decision_id} 的 target_path 不在该候选页 TopK 召回结果中。")
+            if not decision.matched_existing_paths:
+                raise PipelineError(f"更新决策 {decision.decision_id} 缺少 matched_existing_paths。")
 
 
 def _assert_composition_covers_writes(artifact: CompositionPlan, plan: MergePlan) -> None:
@@ -542,11 +673,13 @@ def _assert_composition_covers_writes(artifact: CompositionPlan, plan: MergePlan
     actual = sorted(item.target_path for item in artifact.items)
     if expected != actual:
         raise PipelineError(f"composition_plan 必须覆盖所有可写合并目标：expected={expected} actual={actual}")
-    consumed = sorted(candidate_id for item in artifact.items for candidate_id in item.candidate_page_ids)
-    expected_candidates = sorted(decision.candidate_page_id for decision in plan.decisions if decision.action != "noop")
-    if consumed != expected_candidates:
-        raise PipelineError(f"composition_plan 必须保留所有可写候选页 id：expected={expected_candidates} actual={consumed}")
+    consumed_decisions = sorted(decision_id for item in artifact.items for decision_id in item.merge_decision_ids)
+    expected_decisions = sorted(decision.decision_id for decision in plan.decisions if decision.action != "noop")
+    if consumed_decisions != expected_decisions:
+        raise PipelineError(f"composition_plan 必须覆盖所有可写 merge decision：expected={expected_decisions} actual={consumed_decisions}")
     for item in artifact.items:
+        if not item.merge_decision_ids:
+            raise PipelineError(f"写作编排项 {item.final_page_id} 缺少 merge_decision_ids。")
         if not item.source_ref_rules:
             raise PipelineError(f"写作编排项 {item.final_page_id} 缺少 source_ref_rules。")
 
@@ -561,6 +694,7 @@ def _normalize_composition_plan(plan: CompositionPlan) -> CompositionPlan:
         grouped[item.target_path] = existing.model_copy(
             update={
                 "candidate_page_ids": _dedupe_list([*existing.candidate_page_ids, *item.candidate_page_ids]),
+                "merge_decision_ids": _dedupe_list([*existing.merge_decision_ids, *item.merge_decision_ids]),
                 "existing_page_refs": _dedupe_list([*existing.existing_page_refs, *item.existing_page_refs]),
                 "preserve_rules": _dedupe_list([*existing.preserve_rules, *item.preserve_rules]),
                 "insert_rules": _dedupe_list([*existing.insert_rules, *item.insert_rules]),
@@ -785,7 +919,7 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     raw_text = read_text(raw_abs)
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "source_digest"
-    digest_result, provider_artifacts, model_calls = _call_provider_artifact(
+    digest_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
         state,
         out_dir,
         "source_digest",
@@ -815,12 +949,82 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
         "candidate_count": len(digest.candidates()),
         "weak_noise_count": len(digest.weak_or_noise_items),
         "deferred_count": len(digest.budget_deferred_candidates),
+        **_token_usage_counts(api_calls),
     }
     return StepOutput(
         [json_path, md_path, source_map_json, source_map_md, repair_path, *provider_artifacts],
         counts,
         model_calls=model_calls,
         repair_count=len(repair_report.repairs),
+        api_calls=api_calls,
+    )
+
+
+def _step_candidate_merge(run_dir: Path, state: dict[str, object]) -> StepOutput:
+    digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
+    profile: Profile = state["profile"]  # type: ignore[assignment]
+    out_dir = run_dir / "candidate_merge"
+    plan_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
+        state,
+        out_dir,
+        "candidate_merge",
+        prompts.candidate_merge_prompt(digest=digest, profile=profile),
+        CandidateMergePlan,
+    )
+    if not isinstance(plan_result, CandidateMergePlan):
+        raise PipelineError("candidate_merge provider 返回了无效 artifact。")
+    plan = _normalize_candidate_merge_plan(plan_result, digest, profile)
+    _assert_unique([unit.candidate_unit_id for unit in plan.units], "candidate_unit_id")
+    _assert_candidate_merge_chinese(plan)
+    state["candidate_merge"] = plan
+    json_path = out_dir / "candidate_merge.json"
+    md_path = out_dir / "candidate_merge.md"
+    write_json(json_path, plan)
+    write_text(md_path, _render_candidate_merge_md(plan))
+    return StepOutput(
+        [json_path, md_path, *provider_artifacts],
+        {
+            "candidate_unit_count": len(plan.units),
+            "skipped_candidate_count": len(plan.skipped_candidate_ids),
+            **_token_usage_counts(api_calls),
+        },
+        model_calls=model_calls,
+        api_calls=api_calls,
+    )
+
+
+def _step_candidate_pages_warmup(run_dir: Path, state: dict[str, object]) -> StepOutput:
+    digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
+    candidate_merge: CandidateMergePlan = state["candidate_merge"]  # type: ignore[assignment]
+    raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
+    binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
+    raw_rel: str = state["raw_rel"]  # type: ignore[assignment]
+    profile: Profile = state["profile"]  # type: ignore[assignment]
+    out_dir = run_dir / "candidate_pages_warmup"
+    if not candidate_merge.units:
+        return StepOutput([], {"warmup_count": 0, "candidate_unit_count": 0})
+    raw_text = read_text(raw_abs)
+    warmup_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
+        state,
+        out_dir,
+        "candidate_pages_warmup",
+        prompts.candidate_pages_warmup_prompt(digest=digest, raw_path=raw_rel, raw_sha256=binding.raw_sha256, raw_text=raw_text, profile=profile),
+        CandidatePagesWarmup,
+    )
+    if not isinstance(warmup_result, CandidatePagesWarmup) or warmup_result.status != "OK":
+        raise PipelineError("candidate_pages_warmup provider 返回了无效 artifact。")
+    state["candidate_pages_warmup"] = warmup_result
+    json_path = out_dir / "candidate_pages_warmup.json"
+    write_json(json_path, warmup_result)
+    return StepOutput(
+        [json_path, *provider_artifacts],
+        {
+            "warmup_count": 1,
+            "candidate_unit_count": len(candidate_merge.units),
+            **_token_usage_counts(api_calls),
+        },
+        model_calls=model_calls,
+        api_calls=api_calls,
     )
 
 
@@ -860,25 +1064,36 @@ def _step_wiki_snapshot(vault: Path, run_dir: Path, state: dict[str, object]) ->
 
 def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput:
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
-    snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
+    candidate_merge: CandidateMergePlan = state["candidate_merge"]  # type: ignore[assignment]
+    raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
+    binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
+    raw_rel: str = state["raw_rel"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
+    raw_text = read_text(raw_abs)
     out_dir = run_dir / "candidate_pages"
-    source_candidates = digest.candidates()
-    outputs, provider_artifacts, model_calls = _call_provider_artifacts_parallel(
+    units = candidate_merge.units
+    outputs, provider_artifacts, model_calls, api_calls = _call_provider_artifacts_parallel(
         state,
         out_dir,
         "candidate_pages",
         [
             (
-                candidate.candidate_id,
-                prompts.candidate_page_prompt(digest=digest, candidate=candidate, snapshot=snapshot, profile=profile),
+                unit.candidate_unit_id,
+                prompts.candidate_page_prompt(
+                    digest=digest,
+                    candidate_unit=unit,
+                    raw_path=raw_rel,
+                    raw_sha256=binding.raw_sha256,
+                    raw_text=raw_text,
+                    profile=profile,
+                ),
             )
-            for candidate in source_candidates
+            for unit in units
         ],
         CandidatePages,
     )
-    artifact = _merge_parallel_candidate_pages(outputs, source_candidates)
-    parallel_request_count = len(source_candidates)
+    artifact = _merge_parallel_candidate_pages(outputs, units)
+    parallel_request_count = len(units)
     artifact = _normalize_candidate_pages(artifact)
     _assert_unique([page.candidate_page_id for page in artifact.pages], "candidate_page_id")
     _assert_candidate_pages_have_sources(artifact)
@@ -898,8 +1113,9 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         "covered_digest_candidate_count": len({cid for page in artifact.pages for cid in page.source_candidate_ids}),
         "parallel_request_count": parallel_request_count if model_calls else 0,
         "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
+        **_token_usage_counts(api_calls),
     }
-    return StepOutput([*artifacts, *provider_artifacts], counts, model_calls=model_calls)
+    return StepOutput([*artifacts, *provider_artifacts], counts, model_calls=model_calls, api_calls=api_calls)
 
 
 def _step_candidate_contexts(run_dir: Path, state: dict[str, object]) -> StepOutput:
@@ -932,11 +1148,11 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     contexts: CandidateContexts = state["candidate_contexts"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "merge_plan"
-    plan_result, provider_artifacts, model_calls = _call_provider_artifact(
+    plan_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
         state,
         out_dir,
         "merge_plan",
-        prompts.merge_plan_prompt(candidate_pages=candidate_pages, snapshot=snapshot, candidate_contexts=contexts, profile=profile),
+        prompts.merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=contexts, profile=profile),
         MergePlan,
     )
     if not isinstance(plan_result, MergePlan):
@@ -951,7 +1167,7 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
         snapshot=snapshot,
         contexts=contexts,
     )
-    _assert_merge_plan_consumes_candidates(plan, candidate_pages)
+    _assert_merge_plan_consumes_candidates(plan, candidate_pages, contexts)
     state["merge_plan"] = plan
     state["related_merge_report"] = related_report
     json_path = out_dir / "merge_plan.json"
@@ -969,8 +1185,10 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
             **{f"{key}_count": value for key, value in plan.action_counts.items()},
             "related_kept_count": sum(1 for item in related_report.candidates if item.decision == "kept"),
             "related_filtered_count": sum(1 for item in related_report.candidates if item.decision != "kept"),
+            **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,
+        api_calls=api_calls,
     )
 
 
@@ -980,11 +1198,11 @@ def _step_composition_plan(vault: Path, run_dir: Path, state: dict[str, object])
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "composition_plan"
-    plan_result, provider_artifacts, model_calls = _call_provider_artifact(
+    plan_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
         state,
         out_dir,
         "composition_plan",
-        prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile),
+        prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile),
         CompositionPlan,
     )
     if not isinstance(plan_result, CompositionPlan):
@@ -1014,8 +1232,10 @@ def _step_composition_plan(vault: Path, run_dir: Path, state: dict[str, object])
             "final_target_count": len(artifact.items),
             "update_target_count": sum(1 for item in artifact.items if item.action == "update"),
             "related_link_count": sum(len(item.related_pages) for item in artifact.items),
+            **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,
+        api_calls=api_calls,
     )
 
 
@@ -1026,7 +1246,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     profile: Profile = state["profile"]  # type: ignore[assignment]
     artifacts: list[Path] = []
     out_dir = run_dir / "final_pages"
-    outputs, provider_artifacts, model_calls = _call_provider_artifacts_parallel(
+    outputs, provider_artifacts, model_calls, api_calls = _call_provider_artifacts_parallel(
         state,
         out_dir,
         "final_pages",
@@ -1078,8 +1298,10 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
             "diff_count": len(artifact.pages),
             "parallel_request_count": parallel_request_count if model_calls else 0,
             "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
+            **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,
+        api_calls=api_calls,
     )
 
 
@@ -1288,14 +1510,57 @@ def _run_step(
     _write_manifest(run_dir, manifest)
     _write_event(run_dir, "step_completed", {"step": name, "counts": output.counts})
     if emit_progress:
+        if output.api_calls:
+            _print_api_call_table(console, name, output.api_calls)
         visible_counts: dict[str, int | float | str] = {
             "artifact_count": len(output.artifacts),
             "model_calls": output.model_calls,
             "repair_count": output.repair_count,
             **output.counts,
         }
-        count_text = " ".join(f"{count_label(key)}={value}" for key, value in visible_counts.items())
+        count_text = " ".join(f"{count_label(key)}={_format_count_value(key, value)}" for key, value in visible_counts.items())
         console.print(f"[green]完成[/] {step_label(name)} {record.duration_seconds:.2f}s {count_text}".rstrip())
+
+
+def _print_api_call_table(console: Console, step_name: str, api_calls: list[dict[str, object]]) -> None:
+    models = {str(call.get("model") or "") for call in api_calls if call.get("model")}
+    model_suffix = f" · {next(iter(models))}" if len(models) == 1 else ""
+    table = Table(title=f"{step_label(step_name)} API 调用{model_suffix}")
+    table.add_column("状态", justify="center", no_wrap=True)
+    table.add_column("请求")
+    table.add_column("输入", justify="right")
+    table.add_column("缓存", justify="right")
+    table.add_column("输出", justify="right")
+    table.add_column("思考", justify="right")
+    table.add_column("命中率", justify="right")
+    table.add_column("耗时", justify="right")
+    table.add_column("价格", justify="right")
+    for call in api_calls:
+        status = "[green]✓[/]" if call.get("status") == "success" else "[red]⏸[/]"
+        request_key = str(call.get("request_key") or call.get("step") or "")
+        call_index = int(call.get("call_index") or 0)
+        if call_index > 1:
+            request_key = f"{request_key}#{call_index}"
+        table.add_row(
+            status,
+            request_key,
+            str(call.get("prompt_tokens") or 0),
+            str(call.get("prompt_cache_hit_tokens") or 0),
+            str(call.get("completion_tokens") or 0),
+            str(call.get("reasoning_tokens") or 0),
+            format_percent(call.get("cache_hit_rate_percent")),
+            format_duration_ms(call.get("duration_ms")),
+            format_price_cny(call.get("price_cny")),
+        )
+    console.print(table)
+
+
+def _format_count_value(key: str, value: object) -> object:
+    if key == "price_cny":
+        return format_price_cny(value)
+    if key == "cache_hit_rate_percent":
+        return format_percent(value)
+    return value
 
 
 def _chinese_scaffold(text: str, label: str) -> str:
@@ -1610,6 +1875,8 @@ def _source_page_target(raw_path: str) -> str:
 def _important_artifact_hashes(run_dir: Path) -> dict[str, str]:
     paths = {
         "source_digest": run_dir / "source_digest" / "source_digest.json",
+        "candidate_merge": run_dir / "candidate_merge" / "candidate_merge.json",
+        "candidate_pages_warmup": run_dir / "candidate_pages_warmup" / "candidate_pages_warmup.json",
         "wiki_snapshot": run_dir / "wiki_snapshot" / "wiki_snapshot.json",
         "candidate_pages": run_dir / "candidate_pages" / "candidate_pages.json",
         "candidate_contexts": run_dir / "candidate_contexts" / "candidate_contexts.json",
@@ -1634,6 +1901,25 @@ def _render_source_digest_md(digest: SourceDigest) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_candidate_merge_md(plan: CandidateMergePlan) -> str:
+    lines = ["# 候选合并计划", ""]
+    for unit in plan.units:
+        lines.append(f"## {unit.candidate_unit_id}: {unit.title}")
+        lines.append(f"- 类型：{unit.page_type}")
+        lines.append(f"- 来源候选：{', '.join(unit.source_candidate_ids)}")
+        lines.append(f"- 路径提示：`{unit.path_hint}`")
+        lines.append(f"- 合并理由：{unit.merge_reason}")
+        if unit.must_cover_points:
+            lines.append("- 必须覆盖：")
+            lines.extend(f"  - {item}" for item in unit.must_cover_points)
+        lines.append("")
+    if plan.skipped_candidate_ids:
+        lines.append("## 跳过候选")
+        lines.extend(f"- `{item}`" for item in plan.skipped_candidate_ids)
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _render_contexts_md(contexts: Iterable[CandidateContext]) -> str:
     lines = ["# 候选页召回上下文", ""]
     for context in contexts:
@@ -1651,6 +1937,7 @@ def _render_candidate_pages_md(artifact: CandidatePages) -> str:
     lines = ["# 候选知识页", ""]
     for page in artifact.pages:
         lines.append(f"## {page.candidate_page_id}: {page.title}")
+        lines.append(f"- 候选单元：`{page.candidate_unit_id}`")
         lines.append(f"- 类型：{page.proposed_page_type}")
         lines.append(f"- 路径提示：`{page.proposed_path_hint}`")
         lines.append("")
@@ -1665,9 +1952,14 @@ def _render_merge_plan_md(plan: MergePlan) -> str:
         lines.append(f"- {_action_label(action)}：{count}")
     lines.append("")
     for decision in plan.decisions:
-        lines.append(f"## {decision.candidate_page_id}")
+        lines.append(f"## {decision.decision_id}: {decision.candidate_page_id}")
         lines.append(f"- 动作：{_action_label(decision.action)}")
         lines.append(f"- 目标：`{decision.target_path}`")
+        lines.append(f"- 标题：{decision.title}")
+        lines.append(f"- 类型：{decision.page_type}")
+        lines.append(f"- 内容范围：{decision.content_scope}")
+        if decision.candidate_path_index:
+            lines.append(f"- 候选路径索引：{', '.join(decision.candidate_path_index)}")
         lines.append(f"- 理由：{decision.reason}")
         lines.append(f"- 最强重合度：{decision.strongest_overlap}")
         if decision.related_pages:
@@ -1684,6 +1976,7 @@ def _render_composition_plan_md(plan: CompositionPlan) -> str:
     for item in plan.items:
         lines.append(f"## {item.final_page_id}: {item.target_path}")
         lines.append(f"- 动作：{_action_label(item.action)}")
+        lines.append(f"- 合并决策：{', '.join(item.merge_decision_ids)}")
         lines.append(f"- 章节顺序：{', '.join(item.section_order)}")
         if item.related_pages:
             related = ", ".join(f"`{ref.target_path}`" for ref in item.related_pages)
@@ -1708,8 +2001,6 @@ def _action_label(action: str) -> str:
         "create": "新建",
         "update": "更新",
         "noop": "不改动",
-        "split": "拆分",
-        "merge": "合并",
     }.get(action, action)
 
 

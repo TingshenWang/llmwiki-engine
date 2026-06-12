@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 OperationStatus = Literal["created", "running", "failed", "written", "source_recorded"]
 StepStatus = Literal["running", "completed", "failed"]
-MergeAction = Literal["create", "update", "noop", "split", "merge"]
+MergeAction = Literal["create", "update", "noop"]
 RelatedSource = Literal["source_digest", "wiki_context"]
 
 
@@ -178,8 +178,27 @@ class WikiSnapshot(StrictModel):
     embedding_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class CandidateMergeUnit(StrictModel):
+    candidate_unit_id: str
+    source_candidate_ids: list[str]
+    title: str
+    page_type: str
+    path_hint: str
+    summary: str
+    merge_reason: str
+    must_cover_points: list[str]
+    source_refs: list[SourceRef]
+
+
+class CandidateMergePlan(StrictModel):
+    units: list[CandidateMergeUnit]
+    skipped_candidate_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class CandidatePage(StrictModel):
     candidate_page_id: str
+    candidate_unit_id: str
     source_candidate_ids: list[str]
     title: str
     proposed_page_type: str
@@ -195,6 +214,10 @@ class CandidatePage(StrictModel):
 class CandidatePages(StrictModel):
     pages: list[CandidatePage]
     skipped_candidate_ids: list[str] = Field(default_factory=list)
+
+
+class CandidatePagesWarmup(StrictModel):
+    status: Literal["OK"]
 
 
 class RelatedPageRef(StrictModel):
@@ -227,9 +250,14 @@ class RelatedMergeReport(StrictModel):
 
 
 class MergeDecision(StrictModel):
+    decision_id: str
     candidate_page_id: str
     action: MergeAction
     target_path: str | None = None
+    title: str
+    page_type: str
+    content_scope: str
+    candidate_path_index: list[str]
     matched_existing_paths: list[str] = Field(default_factory=list)
     inspected_context_paths: list[str] = Field(default_factory=list)
     strongest_overlap: float = 0.0
@@ -251,6 +279,7 @@ class CompositionItem(StrictModel):
     final_page_id: str
     target_path: str
     action: MergeAction
+    merge_decision_ids: list[str]
     candidate_page_ids: list[str]
     existing_page_refs: list[str] = Field(default_factory=list)
     section_order: list[str]

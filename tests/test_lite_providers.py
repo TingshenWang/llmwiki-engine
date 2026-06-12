@@ -95,8 +95,27 @@ def test_openai_compatible_retries_truncated_response(tmp_path: Path, monkeypatc
         "weak_or_noise_items": [],
     }
     responses = [
-        {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": '{"source_raw_path": "raw/a.md"'}}]},
-        {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(valid_digest)}}]},
+        {
+            "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": json.dumps({"source_raw_path": "raw/a.md"})}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "prompt_cache_hit_tokens": 2,
+                "prompt_cache_miss_tokens": 8,
+                "completion_tokens": 1,
+                "total_tokens": 11,
+            },
+        },
+        {
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(valid_digest)}}],
+            "usage": {
+                "prompt_tokens": 20,
+                "prompt_cache_hit_tokens": 10,
+                "prompt_cache_miss_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 25,
+                "completion_tokens_details": {"reasoning_tokens": 3},
+            },
+        },
     ]
     posted_payloads: list[dict[str, object]] = []
 
@@ -137,6 +156,16 @@ def test_openai_compatible_retries_truncated_response(tmp_path: Path, monkeypatc
     assert result.output.summary == "A valid digest after retry."
     assert result.provider_result["provider"]["retry_count"] == 1
     assert result.provider_result["provider"]["retry_reason"] == "truncated_response"
+    assert result.api_calls[0]["status"] == "paused"
+    assert result.api_calls[0]["finish_reason"] == "length"
+    assert result.api_calls[0]["prompt_tokens"] == 10
+    assert result.api_calls[0]["prompt_cache_hit_tokens"] == 2
+    assert result.api_calls[0]["error"] == "truncated_response"
+    assert result.api_calls[1]["status"] == "success"
+    assert result.api_calls[1]["finish_reason"] == "stop"
+    assert result.api_calls[1]["completion_tokens"] == 5
+    assert result.api_calls[1]["reasoning_tokens"] == 3
+    assert result.provider_result["api_calls"] == result.api_calls
     assert responses == []
 
 
@@ -337,7 +366,7 @@ def test_providers_check_live_calls_chat_completion(tmp_path: Path, monkeypatch)
         text = "{}"
 
         def json(self) -> dict[str, object]:
-            return {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": '{"ok": true, "message": "模型服务可用。"}'}}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": '{"ok": true}'}}]}
 
         def raise_for_status(self) -> None:
             return None
@@ -363,13 +392,15 @@ def test_providers_check_live_calls_chat_completion(tmp_path: Path, monkeypatch)
     assert result.exit_code == 0, result.output
     assert "真实调用通过" in result.output
     assert len(posted_payloads) == 1
-    assert posted_payloads[0]["max_tokens"] == 128
+    assert posted_payloads[0]["max_tokens"] == 512
     assert posted_payloads[0]["response_format"]["type"] == "json_schema"
     assert posted_payloads[0]["response_format"]["json_schema"]["name"] == "llmwiki_lite_provider_live_check"
+    assert "message" not in posted_payloads[0]["response_format"]["json_schema"]["schema"].get("properties", {})
+    assert "只返回 ok=true" in posted_payloads[0]["messages"][1]["content"]
 
     report = load_provider_registry(vault).check(live=True)[0]
     assert report["context"]["max_tokens"] == 262144
-    assert report["context"]["live_max_tokens"] == 128
+    assert report["context"]["live_max_tokens"] == 512
     assert report["context"]["live_model_calls"] == 1
 
 

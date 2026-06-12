@@ -12,8 +12,10 @@ import httpx
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from .token_usage import api_call_record
 
-MODEL_BACKED_STEPS = ["source_digest", "candidate_pages", "merge_plan", "composition_plan", "final_pages"]
+
+MODEL_BACKED_STEPS = ["source_digest", "candidate_merge", "candidate_pages_warmup", "candidate_pages", "merge_plan", "composition_plan", "final_pages"]
 MAX_OUTPUT_TOKENS = 262144
 
 T = TypeVar("T", bound=BaseModel)
@@ -31,7 +33,6 @@ class ProviderLiveCheckResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    message: str
 
 
 class ProviderSpec(BaseModel):
@@ -93,6 +94,7 @@ class PromptRequest(BaseModel):
     step: str
     schema_name: str
     system_prompt: str
+    cache_prefix_payload: dict[str, Any] | None = None
     user_payload: dict[str, Any]
     response_schema: dict[str, Any]
     json_output_example: dict[str, Any] = Field(default_factory=dict)
@@ -104,6 +106,7 @@ class ProviderCallResult:
     prompt_artifact: dict[str, Any]
     provider_result: dict[str, Any]
     sanitized_context: dict[str, Any]
+    api_calls: list[dict[str, Any]]
     model_calls: int = 1
 
 
@@ -149,7 +152,7 @@ class ProviderRegistry:
                                 "live_max_tokens": _live_check_max_tokens(spec),
                             },
                             "model_calls": result.model_calls,
-                            "provider_message": result.output.message,
+                            "provider_message": "OK",
                         }
                     )
             reports.append(report)
@@ -185,6 +188,7 @@ class ProviderRegistry:
         headers["Authorization"] = f"Bearer {api_key}"
         last_error: Exception | None = None
         calls_made = 0
+        api_calls: list[dict[str, Any]] = []
         retry_reason: str | None = None
         for attempt in range(spec.max_retries + 1):
             attempt_spec = _spec_for_retry_attempt(spec, attempt, retry_reason)
@@ -192,22 +196,61 @@ class ProviderRegistry:
             current_retry_reason: str | None = None
             try:
                 with httpx.Client(timeout=spec.timeout_seconds) as client:
+                    started = time.perf_counter()
                     response = client.post(spec.endpoint, headers=headers, json=payload)
+                    duration_ms = (time.perf_counter() - started) * 1000
                     calls_made += 1
+                    response_record = api_call_record(
+                        step=step,
+                        model=model,
+                        attempt=attempt,
+                        call_index=calls_made,
+                        status="paused",
+                        duration_ms=duration_ms,
+                        response_status_code=response.status_code,
+                    )
+                    api_calls.append(response_record)
                     fallback_used = False
                     if _should_fallback_to_json_object(response, attempt_spec):
+                        response_record["error"] = "json_schema_response_format_fallback"
                         fallback_spec = attempt_spec.model_copy(update={"json_mode": "json_object"})
                         fallback_payload = build_chat_payload(fallback_spec, request)
+                        started = time.perf_counter()
                         response = client.post(spec.endpoint, headers=headers, json=fallback_payload)
+                        duration_ms = (time.perf_counter() - started) * 1000
                         calls_made += 1
+                        response_record = api_call_record(
+                            step=step,
+                            model=model,
+                            attempt=attempt,
+                            call_index=calls_made,
+                            status="paused",
+                            duration_ms=duration_ms,
+                            response_status_code=response.status_code,
+                        )
+                        api_calls.append(response_record)
                         fallback_used = True
                 response.raise_for_status()
                 raw_response = response.json()
+                response_record.update(
+                    api_call_record(
+                        step=step,
+                        model=model,
+                        attempt=attempt,
+                        call_index=calls_made,
+                        status="paused",
+                        duration_ms=duration_ms,
+                        raw_response=raw_response,
+                        response_status_code=response.status_code,
+                    )
+                )
                 if _response_was_truncated(raw_response):
                     current_retry_reason = "truncated_response"
+                    response_record["error"] = current_retry_reason
                     raise ProviderCallError("chat completion 响应被 max_tokens 截断。")
                 parsed = _parse_chat_completion_json(raw_response)
                 output = output_model.model_validate(parsed)
+                response_record["status"] = "success"
                 provider_context = attempt_spec.sanitized_context() | {"retry_count": attempt}
                 if retry_reason:
                     provider_context["retry_reason"] = retry_reason
@@ -219,12 +262,16 @@ class ProviderRegistry:
                     provider_result={
                         "provider": provider_context,
                         "raw_response": _compact_response(raw_response),
+                        "api_calls": api_calls,
                         "parsed": output.model_dump(mode="json"),
                     },
                     sanitized_context=provider_context,
+                    api_calls=api_calls,
                     model_calls=calls_made,
                 )
             except Exception as exc:  # noqa: BLE001 - retry surface should preserve provider failure text.
+                if api_calls and api_calls[-1].get("status") != "success" and not api_calls[-1].get("error"):
+                    api_calls[-1]["error"] = str(exc)
                 last_error = exc
                 retry_reason = current_retry_reason or "provider_or_schema_error"
                 if attempt < spec.max_retries:
@@ -244,14 +291,14 @@ class ProviderRegistry:
             schema_name="llmwiki_lite_provider_live_check",
             system_prompt=(
                 "你是 llmwiki-engine Lite 的模型服务连通性检查。"
-                "只返回符合 schema 的 JSON object，不要输出 Markdown。"
+                "只返回符合 schema 的 JSON object，不要输出 Markdown，不要解释。"
             ),
             user_payload={
                 "provider_name": name,
-                "instruction": "请返回 ok=true，并用中文简短说明模型服务可用。",
+                "instruction": "只返回 ok=true。",
             },
             response_schema=ProviderLiveCheckResult.model_json_schema(),
-            json_output_example={"ok": True, "message": "模型服务可用。"},
+            json_output_example={"ok": True},
         )
         if spec.is_openai_compatible:
             result = self._call_openai_compatible("provider_live_check", request, ProviderLiveCheckResult, smoke_spec)
@@ -259,8 +306,7 @@ class ProviderRegistry:
             raise ProviderConfigError(f"不支持的 provider spec：{spec.spec}")
         output = result.output
         if not isinstance(output, ProviderLiveCheckResult) or not output.ok:
-            message = output.message if isinstance(output, ProviderLiveCheckResult) else "模型服务返回了无效 live check 结果。"
-            raise ProviderCallError(message)
+            raise ProviderCallError("模型服务返回了无效 live check 结果。")
         return result
 
 
@@ -303,8 +349,8 @@ def _is_non_model_provider(spec: ProviderSpec) -> bool:
 
 def _live_check_max_tokens(spec: ProviderSpec) -> int:
     if spec.max_tokens is None:
-        return 128
-    return max(1, min(spec.max_tokens, 128))
+        return 512
+    return max(1, min(spec.max_tokens, 512))
 
 
 def _is_chat_completions_endpoint(endpoint: str) -> bool:
@@ -313,7 +359,8 @@ def _is_chat_completions_endpoint(endpoint: str) -> bool:
 
 
 def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, Any]:
-    user_content = json.dumps(
+    messages = [{"role": "system", "content": request.system_prompt}]
+    suffix_content = json.dumps(
         {
             "task": request.step,
             "input": request.user_payload,
@@ -322,12 +369,14 @@ def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, 
         },
         ensure_ascii=False,
     )
+    if request.cache_prefix_payload is not None:
+        messages.append({"role": "user", "content": json.dumps({"cache_prefix": request.cache_prefix_payload}, ensure_ascii=False)})
+        messages.append({"role": "user", "content": suffix_content})
+    else:
+        messages.append({"role": "user", "content": suffix_content})
     payload: dict[str, Any] = {
         "model": spec.model_name,
-        "messages": [
-            {"role": "system", "content": request.system_prompt},
-            {"role": "user", "content": user_content},
-        ],
+        "messages": messages,
         "temperature": spec.temperature,
     }
     if spec.max_tokens is not None:
@@ -347,7 +396,7 @@ def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, 
 
 
 def _prompt_artifact(request: PromptRequest, spec: ProviderSpec) -> dict[str, Any]:
-    return {
+    artifact = {
         "step": request.step,
         "schema_name": request.schema_name,
         "system_prompt": request.system_prompt,
@@ -355,6 +404,9 @@ def _prompt_artifact(request: PromptRequest, spec: ProviderSpec) -> dict[str, An
         "response_schema": request.response_schema,
         "provider": spec.sanitized_context(),
     }
+    if request.cache_prefix_payload is not None:
+        artifact["cache_prefix_payload"] = request.cache_prefix_payload
+    return artifact
 
 
 def _parse_chat_completion_json(raw_response: dict[str, Any]) -> Any:

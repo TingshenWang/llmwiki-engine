@@ -36,7 +36,9 @@ def finalize_merge_plan_related(
     snapshot: WikiSnapshot,
     contexts: CandidateContexts,
 ) -> tuple[MergePlan, RelatedMergeReport]:
-    decisions_by_candidate = {decision.candidate_page_id: decision for decision in plan.decisions}
+    decisions_by_candidate: dict[str, list[MergeDecision]] = {}
+    for decision in plan.decisions:
+        decisions_by_candidate.setdefault(decision.candidate_page_id, []).append(decision)
     candidate_by_id = {page.candidate_page_id: page for page in candidate_pages.pages}
     candidate_by_source_id = {
         source_id: page
@@ -80,10 +82,14 @@ def finalize_merge_plan_related(
                 related_target = None
                 related_title = related_id
                 if related_page is not None:
-                    related_decision = decisions_by_candidate.get(related_page.candidate_page_id)
-                    if related_decision and related_decision.action != "noop":
-                        related_target = related_decision.target_path
-                    related_title = related_page.title
+                    related_decisions = decisions_by_candidate.get(related_page.candidate_page_id, [])
+                    for related_decision in related_decisions:
+                        if related_decision.action != "noop" and related_decision.target_path:
+                            related_target = related_decision.target_path
+                            related_title = related_decision.title or related_page.title
+                            break
+                    if not related_target:
+                        related_title = related_page.title
                 else:
                     related_target = _resolve_target(related_id, known_paths=known_paths, title_to_path=title_to_path)
                 if not related_target:
@@ -416,14 +422,14 @@ def _known_paths(entries: Iterable[WikiKnowledgeEntry], targets: Iterable[str | 
 def _path_titles(
     entries: Iterable[WikiKnowledgeEntry],
     candidate_pages: CandidatePages | None = None,
-    decisions_by_candidate: dict[str, MergeDecision] | None = None,
+    decisions_by_candidate: dict[str, list[MergeDecision]] | None = None,
 ) -> dict[str, str]:
     titles = {entry.path: entry.title for entry in entries}
     if candidate_pages and decisions_by_candidate:
         for page in candidate_pages.pages:
-            decision = decisions_by_candidate.get(page.candidate_page_id)
-            if decision and decision.target_path:
-                titles[decision.target_path] = page.title
+            for decision in decisions_by_candidate.get(page.candidate_page_id, []):
+                if decision.target_path:
+                    titles[decision.target_path] = decision.title or page.title
     return titles
 
 

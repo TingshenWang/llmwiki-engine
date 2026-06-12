@@ -12,6 +12,7 @@ from rich.table import Table
 from .lite import pipeline
 from .lite.labels import count_label, step_label
 from .lite.providers import ProviderConfigError, load_provider_registry
+from .lite.token_usage import format_duration_seconds, format_percent, format_price_cny, summarize_step_counts
 
 
 app = typer.Typer(help="LLM-Wiki Lite 中文知识编译引擎。")
@@ -140,13 +141,45 @@ def _print_manifest(manifest: object) -> None:
     table.add_column("耗时")
     table.add_column("计数")
     for step in manifest.steps:
-        counts = " ".join(f"{count_label(key)}={value}" for key, value in step.counts.items())
+        counts = " ".join(f"{count_label(key)}={_format_count_value(key, value)}" for key, value in step.counts.items())
         duration = "" if step.duration_seconds is None else f"{step.duration_seconds:.2f}s"
         table.add_row(step_label(step.name), _status_label(step.status), duration, counts)
     console.print(f"状态：[bold]{_status_label(manifest.status)}[/]")
     if manifest.receipt_path:
         console.print(f"回执：{manifest.receipt_path}")
     console.print(table)
+    _print_operation_token_summary(manifest)
+
+
+def _print_operation_token_summary(manifest: object) -> None:
+    duration_seconds = sum(float(step.duration_seconds or 0) for step in manifest.steps)
+    summary = summarize_step_counts([step.counts for step in manifest.steps], duration_seconds=duration_seconds)
+    if not summary.get("api_call_count"):
+        return
+    table = Table(title="本次 Ingest 汇总")
+    table.add_column("总耗时", justify="right")
+    table.add_column("总输入token", justify="right")
+    table.add_column("总缓存token", justify="right")
+    table.add_column("总输出token", justify="right")
+    table.add_column("总缓存命中率", justify="right")
+    table.add_column("总价", justify="right")
+    table.add_row(
+        format_duration_seconds(summary["duration_seconds"]),
+        str(summary["prompt_tokens"]),
+        str(summary["prompt_cache_hit_tokens"]),
+        str(summary["completion_tokens"]),
+        format_percent(summary["cache_hit_rate_percent"]),
+        format_price_cny(summary["price_cny"]),
+    )
+    console.print(table)
+
+
+def _format_count_value(key: str, value: object) -> object:
+    if key == "price_cny":
+        return format_price_cny(value)
+    if key == "cache_hit_rate_percent":
+        return format_percent(value)
+    return value
 
 
 def _status_label(status: str) -> str:
