@@ -61,19 +61,11 @@ def write_raw(vault: Path, name: str = "project_note.md") -> Path:
     return raw
 
 
-@pytest.fixture(autouse=True)
-def fake_sentence_transformer_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_embed_texts(texts: list[str], config: embeddings.EmbeddingConfig, *, is_query: bool) -> list[list[float]]:
-        return [embeddings.hashing_vector(text, config.dimensions) for text in texts]
-
-    monkeypatch.setattr(embeddings, "embed_texts", fake_embed_texts)
-
-
 def test_init_and_ingest_full_auto_writes_wiki_and_receipt(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     raw = write_raw(vault)
 
-    manifest = run_ingest(vault, Path("raw") / raw.name, slug="smoke", emit_progress=False)
+    manifest = run_ingest(vault, Path("raw") / raw.name, slug="smoke", emit_progress=False, allow_test_providers=True)
 
     assert manifest.status == "written"
     assert manifest.receipt_path is not None
@@ -108,6 +100,7 @@ def test_init_and_ingest_full_auto_writes_wiki_and_receipt(tmp_path: Path) -> No
     config = read_json(vault / ".llmwiki" / "config.json")
     assert config["embedding"]["backend"] == "sentence_transformers"
     assert config["embedding"]["model"] == embeddings.DEFAULT_QWEN_EMBEDDING_MODEL
+    assert not (vault / ".llmwiki" / "config.yaml").exists()
     report = verify_operation(vault, manifest.operation_id)
     assert report.ok, report.issues
 
@@ -115,7 +108,7 @@ def test_init_and_ingest_full_auto_writes_wiki_and_receipt(tmp_path: Path) -> No
 def test_cli_status_and_raw_candidates_use_chinese_labels(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     raw = write_raw(vault)
-    run_ingest(vault, Path("raw") / raw.name, slug="cli-cn", emit_progress=False)
+    run_ingest(vault, Path("raw") / raw.name, slug="cli-cn", emit_progress=False, allow_test_providers=True)
     runner = CliRunner()
 
     status_result = runner.invoke(app, ["ingest", "status", str(vault), "--verify"])
@@ -188,7 +181,7 @@ def test_raw_candidates_marks_processed_after_ingest(tmp_path: Path) -> None:
     before = scan_raw_candidates(vault)
     assert before["count"] == 1
 
-    run_ingest(vault, raw, slug="processed", emit_progress=False)
+    run_ingest(vault, raw, slug="processed", emit_progress=False, allow_test_providers=True)
     after = scan_raw_candidates(vault)
     assert after["count"] == 0
     all_items = scan_raw_candidates(vault, include_processed=True)
@@ -204,8 +197,8 @@ def test_cli_json_run(tmp_path: Path) -> None:
 
     result = runner.invoke(app, ["ingest", "run", str(vault), str(raw), "--slug", "cli", "--json"])
 
-    assert result.exit_code == 0, result.output
-    assert '"status": "written"' in result.output
+    assert result.exit_code != 0
+    assert "必须使用真实模型 provider" in result.output
 
 
 def test_candidate_contexts_are_per_generated_page_and_refresh_last(tmp_path: Path) -> None:
@@ -223,7 +216,7 @@ def test_candidate_contexts_are_per_generated_page_and_refresh_last(tmp_path: Pa
     )
     raw = write_raw(vault)
 
-    manifest = run_ingest(vault, raw, slug="contexts", emit_progress=False)
+    manifest = run_ingest(vault, raw, slug="contexts", emit_progress=False, allow_test_providers=True)
 
     run_dir = vault / ".llmwiki" / "runs" / "ingest" / manifest.operation_id
     candidate_pages = read_json(run_dir / "candidate_pages" / "candidate_pages.json")
@@ -249,11 +242,11 @@ def test_embedding_cache_keeps_only_latest_record_per_page(tmp_path: Path) -> No
     existing.parent.mkdir(parents=True, exist_ok=True)
     existing.write_text("# Cache Probe\n\nFirst body about a stable page.\n", encoding="utf-8")
     raw1 = write_raw(vault, "first.md")
-    run_ingest(vault, raw1, slug="cache-first", emit_progress=False)
+    run_ingest(vault, raw1, slug="cache-first", emit_progress=False, allow_test_providers=True)
 
     existing.write_text("# Cache Probe\n\nSecond body with changed current content.\n", encoding="utf-8")
     raw2 = write_raw(vault, "second.md")
-    manifest = run_ingest(vault, raw2, slug="cache-second", emit_progress=False)
+    manifest = run_ingest(vault, raw2, slug="cache-second", emit_progress=False, allow_test_providers=True)
 
     run_dir = vault / ".llmwiki" / "runs" / "ingest" / manifest.operation_id
     report = read_json(run_dir / "wiki_snapshot" / "embedding_cache_report.json")
@@ -405,7 +398,7 @@ def test_system_pages_use_index_log_and_daily_log_contract(tmp_path: Path) -> No
     )
     raw = write_raw(vault)
 
-    manifest = run_ingest(vault, raw, slug="system-pages", emit_progress=False)
+    manifest = run_ingest(vault, raw, slug="system-pages", emit_progress=False, allow_test_providers=True)
     log_date = _operation_date_from_id(manifest.operation_id)
 
     index_text = (vault / "wiki" / "index.md").read_text(encoding="utf-8")

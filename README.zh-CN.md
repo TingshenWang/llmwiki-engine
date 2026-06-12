@@ -77,13 +77,11 @@ cat > ~/.llmwiki/config.yaml <<'YAML'
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/v1/chat/completions
-    api_key_env: DEEPSEEK_API_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    api_key: 你的 DeepSeek API Key
     max_tokens: 262144
     timeout_seconds: 300
 YAML
-
-export DEEPSEEK_API_KEY="你的 API Key"
 ```
 
 创建 vault，把 Markdown 原始材料放进 `raw/`，然后运行 Ingest：
@@ -113,35 +111,28 @@ scripts/build_release.sh
 - `dist/releases/llmwiki-engine-<version>-macos-linux.tar.gz`
 - `dist/releases/llmwiki-engine-<version>-macos-linux.tar.gz.sha256`
 
-包内包含 universal wheel、sdist、安装脚本、英文 README、中文 README 和 Lite
-需求文档。安装脚本会创建 venv 并安装 `llmwiki-engine[embeddings]`，确保候选页
-召回使用本地 Qwen embedding。
+包内包含 universal wheel、sdist、安装脚本、英文 README 和中文 README。安装脚本会
+创建 venv 并安装 `llmwiki-engine[embeddings]`，确保候选页召回使用本地 Qwen
+embedding。
 
 ## Provider 配置
 
-新 vault 默认在 `.llmwiki/config.yaml` 使用确定性的本地启发式 provider：
-
-```yaml
-providers:
-  default:
-    spec: local:heuristic
-```
-
-如果要让模型参与各个步骤，可以配置默认 provider，或为单独步骤配置 provider：
+Lite Ingest 的模型步骤必须使用真实 OpenAI-compatible chat completions
+provider。如果没有配置真实 provider，`llmwiki ingest run` 会在写入任何 wiki 页面前
+直接失败。可以在 `~/.llmwiki/config.yaml` 配置默认 provider，也可以在 vault 内的
+`.llmwiki/config.yaml` 配置默认或分步骤 provider。vault 内配置会覆盖全局配置。
 
 ```yaml
 providers:
   default:
     spec: openai_compatible:gpt-4.1-mini
     endpoint: https://api.openai.com/v1/chat/completions
-    api_key_env: OPENAI_API_KEY
+    api_key: 你的 OpenAI API Key
     json_mode: json_schema
     json_schema_strict: false
     temperature: 0
     max_tokens: 262144
     max_retries: 2
-  merge_plan:
-    spec: local:heuristic
 ```
 
 DeepSeek 示例：
@@ -150,8 +141,8 @@ DeepSeek 示例：
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/v1/chat/completions
-    api_key_env: DEEPSEEK_API_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    api_key: 你的 DeepSeek API Key
     max_tokens: 262144
 ```
 
@@ -162,6 +153,11 @@ response format。
 支持模型调用的步骤 key 包括 `source_digest`、`candidate_pages`、`merge_plan`、
 `composition_plan` 和 `final_pages`。每个步骤的 prompt 和 response schema 会写入
 对应的 `model_calls/` 目录；API key 不会写入 artifact 或 receipt。
+
+如果旧 vault 里已经有 `.llmwiki/config.yaml`，并且内容还是 `local:heuristic`，
+请直接把那份文件替换成真实 provider 配置，或删除它，让全局配置生效。
+`llmwiki providers check --live` 和正常 Ingest 都会拒绝 `local:heuristic` 与
+`mock:fixture`。
 
 ## 本地 Qwen Embeddings
 

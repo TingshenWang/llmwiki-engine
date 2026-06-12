@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
+from urllib.parse import urlparse
 
 import httpx
 import yaml
@@ -35,7 +35,6 @@ class ProviderSpec(BaseModel):
     spec: str = "local:heuristic"
     endpoint: str | None = None
     api_key: str | None = None
-    api_key_env: str | None = None
     fixture_dir: str | None = None
     timeout_seconds: float = 300.0
     max_retries: int = 1
@@ -68,11 +67,7 @@ class ProviderSpec(BaseModel):
         return self.kind == "openai_compatible"
 
     def resolved_api_key(self) -> str | None:
-        if self.api_key:
-            return self.api_key
-        if self.api_key_env:
-            return os.environ.get(self.api_key_env)
-        return None
+        return self.api_key.strip() if self.api_key and self.api_key.strip() else None
 
     def effective_json_mode(self) -> Literal["json_schema", "json_object"]:
         if self.json_mode == "json_schema" and self.endpoint and "api.deepseek.com" in self.endpoint:
@@ -92,7 +87,6 @@ class ProviderSpec(BaseModel):
             "json_mode": self.json_mode,
             "effective_json_mode": self.effective_json_mode(),
             "json_schema_strict": self.json_schema_strict,
-            "api_key_env": self.api_key_env,
             "has_api_key": bool(self.resolved_api_key()),
         }
         return context
@@ -143,15 +137,26 @@ class ProviderRegistry:
         reports = []
         for name, spec in sorted(self.providers.items()):
             report = {"name": name, "ok": True, "context": spec.sanitized_context(), "message": "ok"}
-            if spec.is_openai_compatible:
-                if not spec.endpoint:
-                    report.update({"ok": False, "message": "missing endpoint"})
-                elif live and not spec.resolved_api_key():
-                    report.update({"ok": False, "message": "missing API key"})
-            if spec.is_mock_fixture and not spec.fixture_dir:
-                report.update({"ok": False, "message": "missing fixture_dir"})
+            issue = _real_provider_issue(spec)
+            if issue is not None:
+                report.update({"ok": False, "message": issue})
             reports.append(report)
         return reports
+
+    def require_real_model_providers(self, steps: list[str] | None = None) -> None:
+        step_names = steps or MODEL_BACKED_STEPS
+        issues = []
+        for step in step_names:
+            spec = self.provider_for(step)
+            issue = _real_provider_issue(spec)
+            if issue is not None:
+                issues.append(f"{step}: {issue} ({spec.spec})")
+        if issues:
+            raise ProviderConfigError(
+                "Lite Ingest 必须使用真实模型 provider，请在 ~/.llmwiki/config.yaml 或 vault/.llmwiki/config.yaml 配置 api_key 和完整 chat completions endpoint。"
+                + " 问题："
+                + "；".join(issues)
+            )
 
     def _call_mock_fixture(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
         if not spec.fixture_dir:
@@ -171,13 +176,16 @@ class ProviderRegistry:
     def _call_openai_compatible(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
         if not spec.endpoint:
             raise ProviderConfigError(f"{step} 的 openai_compatible provider 缺少 endpoint。")
+        if not _is_chat_completions_endpoint(spec.endpoint):
+            raise ProviderConfigError(f"{step} 的 endpoint 必须是完整 chat completions URL，例如 https://api.deepseek.com/chat/completions。")
         model = spec.model_name
         if not model:
             raise ProviderConfigError(f"{step} 的 openai_compatible provider spec 缺少 model。")
         headers = {"Content-Type": "application/json"}
         api_key = spec.resolved_api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        if not api_key:
+            raise ProviderConfigError(f"{step} 的 openai_compatible provider 缺少 api_key。")
+        headers["Authorization"] = f"Bearer {api_key}"
         last_error: Exception | None = None
         calls_made = 0
         retry_reason: str | None = None
@@ -244,6 +252,29 @@ def load_provider_registry(vault: Path) -> ProviderRegistry:
             else:
                 raise ProviderConfigError(f"{path} 中的 provider {name} 必须是 string 或 mapping。")
     return ProviderRegistry({name: ProviderSpec.model_validate(value) for name, value in merged.items()})
+
+
+def _real_provider_issue(spec: ProviderSpec) -> str | None:
+    if spec.is_local:
+        return "not a real model provider"
+    if spec.is_mock_fixture:
+        return "mock provider is not live"
+    if not spec.is_openai_compatible:
+        return "unsupported provider spec"
+    if not spec.endpoint:
+        return "missing endpoint"
+    if not _is_chat_completions_endpoint(spec.endpoint):
+        return "endpoint must be chat completions URL"
+    if not spec.model_name:
+        return "missing model"
+    if not spec.resolved_api_key():
+        return "missing API key"
+    return None
+
+
+def _is_chat_completions_endpoint(endpoint: str) -> bool:
+    path = urlparse(endpoint).path.rstrip("/")
+    return path.endswith("/chat/completions")
 
 
 def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, Any]:

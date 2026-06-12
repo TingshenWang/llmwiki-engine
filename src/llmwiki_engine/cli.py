@@ -233,6 +233,11 @@ def _provider_message(message: str) -> str:
         "missing endpoint": "缺少 endpoint",
         "missing API key": "缺少 API key",
         "missing fixture_dir": "缺少 fixture_dir",
+        "not a real model provider": "不是真实模型 provider",
+        "mock provider is not live": "mock 不是 live provider",
+        "unsupported provider spec": "不支持的 provider",
+        "endpoint must be chat completions URL": "endpoint 必须是 chat completions URL",
+        "missing model": "缺少 model",
     }.get(message, message)
 
 

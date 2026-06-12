@@ -124,12 +124,6 @@ def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
         "page_generation": {},
     }
     write_json(vault / ".llmwiki" / "config.json", config)
-    provider_config_path = vault / ".llmwiki" / "config.yaml"
-    if not provider_config_path.exists():
-        write_text(
-            provider_config_path,
-            yaml.safe_dump({"providers": {"default": {"spec": "local:heuristic"}}}, allow_unicode=True, sort_keys=False),
-        )
     applied = vault / ".llmwiki" / "applied" / "operations.jsonl"
     applied.touch(exist_ok=True)
     _ensure_gitignore(vault)
@@ -148,12 +142,18 @@ def run_ingest(
     slug: str | None = None,
     console: Console | None = None,
     emit_progress: bool = True,
+    allow_test_providers: bool = False,
 ) -> OperationManifest:
     vault = vault.expanduser().resolve()
     if not (vault / ".llmwiki").exists():
         init_vault(vault, profile_name or "project_basic")
     config = _load_config(vault)
     provider_registry = load_provider_registry(vault)
+    if not allow_test_providers:
+        try:
+            provider_registry.require_real_model_providers(MODEL_BACKED_STEPS)
+        except ProviderConfigError as exc:
+            raise PipelineError(str(exc)) from exc
     profile = load_profile(vault, profile_name or str(config.get("profile", "project_basic")))
     raw_abs = _resolve_raw(vault, raw_file)
     raw_rel = relative_posix(raw_abs, vault)

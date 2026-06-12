@@ -81,13 +81,11 @@ cat > ~/.llmwiki/config.yaml <<'YAML'
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/v1/chat/completions
-    api_key_env: DEEPSEEK_API_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    api_key: your-deepseek-api-key
     max_tokens: 262144
     timeout_seconds: 300
 YAML
-
-export DEEPSEEK_API_KEY="your-api-key"
 ```
 
 Create a vault, put Markdown files under `raw/`, and run ingest:
@@ -118,36 +116,29 @@ The script writes:
 - `dist/releases/llmwiki-engine-<version>-macos-linux.tar.gz`
 - `dist/releases/llmwiki-engine-<version>-macos-linux.tar.gz.sha256`
 
-The bundle contains the universal wheel, sdist, install script, README, and
-Lite requirements document. The install script creates a venv and installs
+The bundle contains the universal wheel, sdist, install script, and English
+and Chinese READMEs. The install script creates a venv and installs
 `llmwiki-engine[embeddings]` so candidate recall uses local Qwen embeddings.
 
 ## Provider Config
 
-New vaults default to deterministic local heuristics in `.llmwiki/config.yaml`:
-
-```yaml
-providers:
-  default:
-    spec: local:heuristic
-```
-
-To use a real OpenAI-compatible chat completions endpoint for model-backed
-steps, configure the default provider or a step-specific provider:
+Lite Ingest requires a real OpenAI-compatible chat completions provider for
+model-backed steps. If no real provider is configured, `llmwiki ingest run`
+fails before writing any wiki pages. Configure the default provider or
+step-specific providers in `~/.llmwiki/config.yaml` or in the vault-level
+`.llmwiki/config.yaml`. A vault-level config overrides the global config.
 
 ```yaml
 providers:
   default:
     spec: openai_compatible:gpt-4.1-mini
     endpoint: https://api.openai.com/v1/chat/completions
-    api_key_env: OPENAI_API_KEY
+    api_key: your-openai-api-key
     json_mode: json_schema
     json_schema_strict: false
     temperature: 0
     max_tokens: 262144
     max_retries: 2
-  merge_plan:
-    spec: local:heuristic
 ```
 
 For DeepSeek, Lite automatically uses `json_object` mode because DeepSeek's
@@ -158,8 +149,8 @@ rather than JSON Schema response format:
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/v1/chat/completions
-    api_key_env: DEEPSEEK_API_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    api_key: your-deepseek-api-key
     max_tokens: 262144
 ```
 
@@ -167,6 +158,11 @@ Supported model-backed step keys are `source_digest`, `candidate_pages`,
 `merge_plan`, `composition_plan`, and `final_pages`. Provider prompts and
 response schemas are written under each step's `model_calls/` directory; API
 keys are not written to artifacts or receipts.
+
+If an older vault already has `.llmwiki/config.yaml` with `local:heuristic`,
+replace that file with the real provider config or delete it so the global
+config can take effect. `local:heuristic` and `mock:fixture` are rejected by
+`llmwiki providers check --live` and by normal ingest runs.
 
 ## Local Qwen Embeddings
 

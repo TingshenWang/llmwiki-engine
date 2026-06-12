@@ -104,13 +104,14 @@ llmwiki --help
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/v1/chat/completions
-    api_key_env: DEEPSEEK_API_KEY
+    endpoint: https://api.deepseek.com/chat/completions
+    api_key: 你的 DeepSeek API Key
     max_tokens: 262144
     timeout_seconds: 300
 \`\`\`
 
-不要把真实 key 写进 release 包；优先用环境变量。
+把真实 key 写在你自己的 \`~/.llmwiki/config.yaml\` 或 vault 的 \`.llmwiki/config.yaml\`；
+不要把带 key 的配置文件提交到 Git。
 
 ## 基本使用
 
