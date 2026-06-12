@@ -308,6 +308,100 @@ def test_providers_check_live_rejects_local_and_unsupported_providers(tmp_path: 
     assert "不支持的 provider" in result.output
 
 
+def test_providers_check_live_calls_chat_completion(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", home.as_posix())
+    vault = init_vault(tmp_path / "vault")
+    (vault / ".llmwiki" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "default": {
+                        "spec": "openai_compatible:test-model",
+                        "endpoint": "https://example.test/v1/chat/completions",
+                        "api_key": "test-key",
+                        "max_tokens": 262144,
+                        "max_retries": 3,
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    posted_payloads: list[dict[str, object]] = []
+
+    class DummyResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": '{"ok": true, "message": "模型服务可用。"}'}}]}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "DummyClient":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:
+            return False
+
+        def post(self, *args, **kwargs) -> DummyResponse:
+            posted_payloads.append(kwargs["json"])
+            return DummyResponse()
+
+    monkeypatch.setattr("llmwiki_engine.lite.providers.httpx.Client", DummyClient)
+
+    result = CliRunner().invoke(app, ["providers", "check", str(vault), "--live"])
+
+    assert result.exit_code == 0, result.output
+    assert "真实调用通过" in result.output
+    assert len(posted_payloads) == 1
+    assert posted_payloads[0]["max_tokens"] == 128
+    assert posted_payloads[0]["response_format"]["type"] == "json_schema"
+    assert posted_payloads[0]["response_format"]["json_schema"]["name"] == "llmwiki_lite_provider_live_check"
+
+    report = load_provider_registry(vault).check(live=True)[0]
+    assert report["context"]["max_tokens"] == 262144
+    assert report["context"]["live_max_tokens"] == 128
+    assert report["context"]["live_model_calls"] == 1
+
+
+def test_providers_check_live_reports_call_failure(monkeypatch) -> None:
+    spec = ProviderSpec(
+        spec="openai_compatible:test-model",
+        endpoint="https://example.test/v1/chat/completions",
+        api_key="test-key",
+        retry_backoff_seconds=0,
+    )
+
+    class FailingClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FailingClient":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:
+            return False
+
+        def post(self, *args, **kwargs):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr("llmwiki_engine.lite.providers.httpx.Client", FailingClient)
+    reports = ProviderRegistry({"default": spec}).check(live=True)
+
+    assert reports[0]["ok"] is False
+    assert "live check failed" in reports[0]["message"]
+    assert "network down" in reports[0]["message"]
+
+
 def test_run_ingest_requires_real_model_provider_by_default(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()

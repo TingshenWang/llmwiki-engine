@@ -228,6 +228,7 @@ def _count_label(key: str) -> str:
 def _provider_message(message: str) -> str:
     return {
         "ok": "正常",
+        "live ok": "真实调用通过",
         "missing endpoint": "缺少 endpoint",
         "missing API key": "缺少 API key",
         "not a real model provider": "不是真实模型 provider",

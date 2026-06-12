@@ -27,6 +27,13 @@ class ProviderCallError(RuntimeError):
     pass
 
 
+class ProviderLiveCheckResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    message: str
+
+
 class ProviderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -126,6 +133,25 @@ class ProviderRegistry:
             issue = _real_provider_issue(spec)
             if issue is not None:
                 report.update({"ok": False, "message": issue})
+            elif live:
+                try:
+                    result = self._call_live_check(name, spec)
+                except (ProviderConfigError, ProviderCallError, ValueError) as exc:
+                    report.update({"ok": False, "message": f"live check failed: {exc}"})
+                else:
+                    report.update(
+                        {
+                            "message": "live ok",
+                            "context": {
+                                **spec.sanitized_context(),
+                                "live": True,
+                                "live_model_calls": result.model_calls,
+                                "live_max_tokens": _live_check_max_tokens(spec),
+                            },
+                            "model_calls": result.model_calls,
+                            "provider_message": result.output.message,
+                        }
+                    )
             reports.append(report)
         return reports
 
@@ -205,6 +231,38 @@ class ProviderRegistry:
                     time.sleep(spec.retry_backoff_seconds * (attempt + 1))
         raise ProviderCallError(f"{step} provider 调用失败：{last_error}") from last_error
 
+    def _call_live_check(self, name: str, spec: ProviderSpec) -> ProviderCallResult:
+        smoke_spec = spec.model_copy(
+            update={
+                "max_tokens": _live_check_max_tokens(spec),
+                "max_retries": 0,
+                "retry_backoff_seconds": 0,
+            }
+        )
+        request = PromptRequest(
+            step="provider_live_check",
+            schema_name="llmwiki_lite_provider_live_check",
+            system_prompt=(
+                "你是 llmwiki-engine Lite 的模型服务连通性检查。"
+                "只返回符合 schema 的 JSON object，不要输出 Markdown。"
+            ),
+            user_payload={
+                "provider_name": name,
+                "instruction": "请返回 ok=true，并用中文简短说明模型服务可用。",
+            },
+            response_schema=ProviderLiveCheckResult.model_json_schema(),
+            json_output_example={"ok": True, "message": "模型服务可用。"},
+        )
+        if spec.is_openai_compatible:
+            result = self._call_openai_compatible("provider_live_check", request, ProviderLiveCheckResult, smoke_spec)
+        else:
+            raise ProviderConfigError(f"不支持的 provider spec：{spec.spec}")
+        output = result.output
+        if not isinstance(output, ProviderLiveCheckResult) or not output.ok:
+            message = output.message if isinstance(output, ProviderLiveCheckResult) else "模型服务返回了无效 live check 结果。"
+            raise ProviderCallError(message)
+        return result
+
 
 def load_provider_registry(vault: Path) -> ProviderRegistry:
     merged: dict[str, Any] = {"default": {"spec": "unconfigured"}}
@@ -243,6 +301,12 @@ def _real_provider_issue(spec: ProviderSpec) -> str | None:
 
 def _is_non_model_provider(spec: ProviderSpec) -> bool:
     return spec.spec in {"unconfigured", "local:heuristic"}
+
+
+def _live_check_max_tokens(spec: ProviderSpec) -> int:
+    if spec.max_tokens is None:
+        return 128
+    return max(1, min(spec.max_tokens, 128))
 
 
 def _is_chat_completions_endpoint(endpoint: str) -> bool:
