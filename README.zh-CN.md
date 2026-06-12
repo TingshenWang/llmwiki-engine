@@ -77,7 +77,7 @@ cat > ~/.llmwiki/config.yaml <<'YAML'
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/chat/completions
+    endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: 你的 DeepSeek API Key
     max_tokens: 262144
     timeout_seconds: 300
@@ -141,7 +141,7 @@ DeepSeek 示例：
 providers:
   default:
     spec: openai_compatible:deepseek-v4-flash
-    endpoint: https://api.deepseek.com/chat/completions
+    endpoint: https://api.deepseek.com/v1/chat/completions
     api_key: 你的 DeepSeek API Key
     max_tokens: 262144
 ```

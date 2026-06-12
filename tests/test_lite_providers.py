@@ -50,7 +50,7 @@ def test_deepseek_endpoint_uses_json_object_mode(tmp_path: Path) -> None:
     profile = load_profile(vault)
     spec = ProviderSpec(
         spec="openai_compatible:deepseek-v4-flash",
-        endpoint="https://api.deepseek.com/chat/completions",
+        endpoint="https://api.deepseek.com/v1/chat/completions",
         api_key="redacted-test-key",
     )
     request = source_digest_prompt(raw_path="raw/a.md", raw_sha256="abc", raw_text="# A\n\nBody", profile=profile)
@@ -298,7 +298,7 @@ def test_global_provider_config_applies_when_vault_has_no_provider_yaml(tmp_path
                 "providers": {
                     "default": {
                         "spec": "openai_compatible:deepseek-v4-flash",
-                        "endpoint": "https://api.deepseek.com/chat/completions",
+                        "endpoint": "https://api.deepseek.com/v1/chat/completions",
                         "api_key": "redacted-test-key",
                     }
                 }
@@ -313,7 +313,7 @@ def test_global_provider_config_applies_when_vault_has_no_provider_yaml(tmp_path
 
     assert not (vault / ".llmwiki" / "config.yaml").exists()
     assert registry.provider_for("source_digest").spec == "openai_compatible:deepseek-v4-flash"
-    assert registry.provider_for("source_digest").endpoint == "https://api.deepseek.com/chat/completions"
+    assert registry.provider_for("source_digest").endpoint == "https://api.deepseek.com/v1/chat/completions"
 
 
 def test_providers_check_live_rejects_local_and_mock_providers(tmp_path: Path) -> None:

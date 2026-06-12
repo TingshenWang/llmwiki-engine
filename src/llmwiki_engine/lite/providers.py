@@ -177,7 +177,7 @@ class ProviderRegistry:
         if not spec.endpoint:
             raise ProviderConfigError(f"{step} 的 openai_compatible provider 缺少 endpoint。")
         if not _is_chat_completions_endpoint(spec.endpoint):
-            raise ProviderConfigError(f"{step} 的 endpoint 必须是完整 chat completions URL，例如 https://api.deepseek.com/chat/completions。")
+            raise ProviderConfigError(f"{step} 的 endpoint 必须是完整 chat completions URL，例如 https://api.deepseek.com/v1/chat/completions。")
         model = spec.model_name
         if not model:
             raise ProviderConfigError(f"{step} 的 openai_compatible provider spec 缺少 model。")
