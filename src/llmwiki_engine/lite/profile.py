@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from .io import safe_filename, write_text
+from .io import write_text
 
 
 class PageTypeSpec(BaseModel):
@@ -29,14 +29,6 @@ class Profile(BaseModel):
 
     def page_type(self, page_type: str) -> PageTypeSpec:
         return self.page_types.get(page_type, self.page_types[self.default_page_type])
-
-    def route(self, page_type: str, title: str) -> str:
-        spec = self.page_type(page_type)
-        stem = safe_filename(title)
-        if not stem.startswith(spec.title_prefix):
-            stem = f"{spec.title_prefix}{stem}"
-        return f"{spec.directory}/{stem}.md"
-
 
 PROJECT_BASIC = {
     "name": "project_basic",

@@ -5,25 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-STEP_NAMES = [
-    "raw_binding",
-    "source_digest",
-    "wiki_snapshot",
-    "candidate_pages",
-    "candidate_contexts",
-    "merge_plan",
-    "composition_plan",
-    "final_pages",
-    "validation",
-    "knowledge_write",
-    "source_record_write",
-    "index_log_write",
-    "embedding_cache_refresh",
-    "receipt",
-]
-
-OperationStatus = Literal["created", "running", "failed", "validated", "written", "source_recorded"]
-StepStatus = Literal["pending", "running", "completed", "failed"]
+OperationStatus = Literal["created", "running", "failed", "written", "source_recorded"]
+StepStatus = Literal["running", "completed", "failed"]
 MergeAction = Literal["create", "update", "noop", "split", "merge"]
 RelatedSource = Literal["source_digest", "wiki_context"]
 
@@ -185,7 +168,6 @@ class CandidateContexts(StrictModel):
     candidate_pool_hash: str
     embedding_metrics: dict[str, Any] = Field(default_factory=dict)
     items: list[CandidateContext] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
 
 
 class WikiSnapshot(StrictModel):
@@ -330,17 +312,8 @@ class WriteSet(StrictModel):
     write_set_sha256: str
 
 
-class PreimageRecord(StrictModel):
-    target_path: str
-    existed: bool
-    sha256: str | None = None
-
-
 class WriteResult(StrictModel):
     written_targets: list[str]
-    receipt_path: str | None = None
-    embedding_cache_refreshed_count: int = 0
-    embedding_backend: str = ""
 
 
 class Receipt(StrictModel):

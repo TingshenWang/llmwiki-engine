@@ -12,8 +12,6 @@ import httpx
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from .io import read_json
-
 
 MODEL_BACKED_STEPS = ["source_digest", "candidate_pages", "merge_plan", "composition_plan", "final_pages"]
 MAX_OUTPUT_TOKENS = 262144
@@ -32,10 +30,9 @@ class ProviderCallError(RuntimeError):
 class ProviderSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    spec: str = "local:heuristic"
+    spec: str = "unconfigured"
     endpoint: str | None = None
     api_key: str | None = None
-    fixture_dir: str | None = None
     timeout_seconds: float = 300.0
     max_retries: int = 1
     retry_backoff_seconds: float = 1.0
@@ -55,14 +52,6 @@ class ProviderSpec(BaseModel):
         return self.spec.split(":", 1)[1]
 
     @property
-    def is_local(self) -> bool:
-        return self.spec == "local:heuristic"
-
-    @property
-    def is_mock_fixture(self) -> bool:
-        return self.kind == "mock" and self.model_name == "fixture"
-
-    @property
     def is_openai_compatible(self) -> bool:
         return self.kind == "openai_compatible"
 
@@ -78,7 +67,6 @@ class ProviderSpec(BaseModel):
         context = {
             "spec": self.spec,
             "endpoint": self.endpoint,
-            "fixture_dir": self.fixture_dir,
             "timeout_seconds": self.timeout_seconds,
             "max_retries": self.max_retries,
             "retry_backoff_seconds": self.retry_backoff_seconds,
@@ -125,10 +113,8 @@ class ProviderRegistry:
 
     def call_structured(self, step: str, request: PromptRequest, output_model: type[T]) -> ProviderCallResult:
         spec = self.provider_for(step)
-        if spec.is_local:
-            raise ProviderConfigError(f"步骤 {step} 配置为本地 heuristic provider，不能发起模型请求。")
-        if spec.is_mock_fixture:
-            return self._call_mock_fixture(step, request, output_model, spec)
+        if _is_non_model_provider(spec):
+            raise ProviderConfigError(f"步骤 {step} 没有配置真实模型 provider，不能发起模型请求。")
         if spec.is_openai_compatible:
             return self._call_openai_compatible(step, request, output_model, spec)
         raise ProviderConfigError(f"步骤 {step} 使用了不支持的 provider spec：{spec.spec}")
@@ -157,21 +143,6 @@ class ProviderRegistry:
                 + " 问题："
                 + "；".join(issues)
             )
-
-    def _call_mock_fixture(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
-        if not spec.fixture_dir:
-            raise ProviderConfigError(f"{step} 的 mock fixture provider 缺少 fixture_dir。")
-        fixture_path = Path(spec.fixture_dir).expanduser() / f"{step}.json"
-        if not fixture_path.exists():
-            raise ProviderCallError(f"{step} 的 mock fixture 不存在：{fixture_path}")
-        raw_json = read_json(fixture_path)
-        output = output_model.model_validate(raw_json)
-        return ProviderCallResult(
-            output=output,
-            prompt_artifact=_prompt_artifact(request, spec),
-            provider_result={"provider": spec.sanitized_context(), "fixture_path": fixture_path.as_posix(), "parsed": output.model_dump(mode="json")},
-            sanitized_context=spec.sanitized_context(),
-        )
 
     def _call_openai_compatible(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
         if not spec.endpoint:
@@ -236,7 +207,7 @@ class ProviderRegistry:
 
 
 def load_provider_registry(vault: Path) -> ProviderRegistry:
-    merged: dict[str, Any] = {"default": {"spec": "local:heuristic"}}
+    merged: dict[str, Any] = {"default": {"spec": "unconfigured"}}
     for path in [Path.home() / ".llmwiki" / "config.yaml", vault.expanduser().resolve() / ".llmwiki" / "config.yaml"]:
         if not path.exists():
             continue
@@ -255,10 +226,8 @@ def load_provider_registry(vault: Path) -> ProviderRegistry:
 
 
 def _real_provider_issue(spec: ProviderSpec) -> str | None:
-    if spec.is_local:
+    if _is_non_model_provider(spec):
         return "not a real model provider"
-    if spec.is_mock_fixture:
-        return "mock provider is not live"
     if not spec.is_openai_compatible:
         return "unsupported provider spec"
     if not spec.endpoint:
@@ -270,6 +239,10 @@ def _real_provider_issue(spec: ProviderSpec) -> str | None:
     if not spec.resolved_api_key():
         return "missing API key"
     return None
+
+
+def _is_non_model_provider(spec: ProviderSpec) -> bool:
+    return spec.spec in {"unconfigured", "local:heuristic"}
 
 
 def _is_chat_completions_endpoint(endpoint: str) -> bool:

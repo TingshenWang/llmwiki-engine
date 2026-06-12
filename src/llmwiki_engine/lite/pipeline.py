@@ -48,7 +48,6 @@ from .models import (
     CompositionPlan,
     FinalPage,
     FinalPages,
-    MergeDecision,
     MergePlan,
     OperationManifest,
     RawBinding,
@@ -71,14 +70,10 @@ from .models import (
 from .profile import Profile, load_profile, write_profile
 from .providers import MODEL_BACKED_STEPS, ProviderCallError, ProviderConfigError, ProviderRegistry, load_provider_registry
 from .text import (
-    classify_page_type,
     contains_cjk,
-    markdown_sections,
-    split_sentences,
     strip_frontmatter,
     summarize,
     title_from_markdown,
-    top_terms,
 )
 
 
@@ -142,18 +137,16 @@ def run_ingest(
     slug: str | None = None,
     console: Console | None = None,
     emit_progress: bool = True,
-    allow_test_providers: bool = False,
 ) -> OperationManifest:
     vault = vault.expanduser().resolve()
     if not (vault / ".llmwiki").exists():
         init_vault(vault, profile_name or "project_basic")
     config = _load_config(vault)
     provider_registry = load_provider_registry(vault)
-    if not allow_test_providers:
-        try:
-            provider_registry.require_real_model_providers(MODEL_BACKED_STEPS)
-        except ProviderConfigError as exc:
-            raise PipelineError(str(exc)) from exc
+    try:
+        provider_registry.require_real_model_providers(MODEL_BACKED_STEPS)
+    except ProviderConfigError as exc:
+        raise PipelineError(str(exc)) from exc
     profile = load_profile(vault, profile_name or str(config.get("profile", "project_basic")))
     raw_abs = _resolve_raw(vault, raw_file)
     raw_rel = relative_posix(raw_abs, vault)
@@ -323,13 +316,11 @@ def _call_provider_artifact(
     step: str,
     request: BaseModel,
     output_model: type[BaseModel],
-) -> tuple[BaseModel | None, list[Path], int]:
+) -> tuple[BaseModel, list[Path], int]:
     registry: ProviderRegistry = state["provider_registry"]  # type: ignore[assignment]
     spec = registry.provider_for(step)
     provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
     provider_contexts[step] = spec.sanitized_context()
-    if spec.is_local:
-        return None, [], 0
     try:
         result = registry.call_structured(step, request, output_model)
     except (ProviderConfigError, ProviderCallError, ValueError) as exc:
@@ -354,7 +345,7 @@ def _call_provider_artifacts_parallel(
     spec = registry.provider_for(step)
     provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
     provider_contexts[step] = {**spec.sanitized_context(), "parallel_request_count": len(requests)}
-    if spec.is_local or not requests:
+    if not requests:
         return [], [], 0
 
     max_workers = _page_generation_parallelism(state, len(requests))
@@ -413,11 +404,6 @@ def _page_generation_parallelism(state: dict[str, object], request_count: int) -
         return min(request_count, max(1, int(raw_limit)))
     except (TypeError, ValueError):
         return request_count
-
-
-def _provider_is_local(state: dict[str, object], step: str) -> bool:
-    registry: ProviderRegistry = state["provider_registry"]  # type: ignore[assignment]
-    return registry.provider_for(step).is_local
 
 
 def _assert_source_digest_binding(digest: SourceDigest, raw_rel: str, raw_sha256: str) -> None:
@@ -507,30 +493,6 @@ def _require_chinese_text(field_path: str, value: str) -> None:
         raise PipelineError(f"{field_path} 必须使用中文用户可读文本")
 
 
-def _build_local_candidate_pages(digest: SourceDigest, profile: Profile) -> CandidatePages:
-    pages: list[CandidatePage] = []
-    for index, candidate in enumerate(digest.candidates(), start=1):
-        page_type = candidate.kind if candidate.kind in profile.page_types else profile.default_page_type
-        title = candidate.suggested_page_title or candidate.name
-        path_hint = profile.route(page_type, title)
-        pages.append(
-            CandidatePage(
-                candidate_page_id=f"CP-{index:03d}",
-                source_candidate_ids=[candidate.candidate_id],
-                title=title,
-                proposed_page_type=page_type,
-                proposed_path_hint=path_hint,
-                summary=candidate.summary,
-                body_markdown=_candidate_body(candidate, digest),
-                open_questions=[],
-                source_refs=candidate.source_refs,
-                evidence_notes=[candidate.source_basis],
-                confidence=0.72,
-            )
-        )
-    return CandidatePages(pages=pages)
-
-
 def _normalize_candidate_pages(artifact: CandidatePages) -> CandidatePages:
     pages = []
     for page in artifact.pages:
@@ -556,58 +518,6 @@ def _merge_parallel_candidate_pages(outputs: list[BaseModel], source_candidates:
     return CandidatePages(pages=pages, skipped_candidate_ids=_dedupe_list(skipped))
 
 
-def _build_local_merge_plan(
-    candidate_pages: CandidatePages,
-    snapshot: WikiSnapshot,
-    contexts: CandidateContexts,
-    embedding_config: EmbeddingConfig,
-) -> MergePlan:
-    decisions: list[MergeDecision] = []
-    used_targets: Counter[str] = Counter()
-    by_context = {context.candidate_page_id: context for context in contexts.items}
-    for page in candidate_pages.pages:
-        context = by_context.get(page.candidate_page_id)
-        best_hit = context.hits[0] if context and context.hits else None
-        normalized_title = _norm(page.title)
-        title_hit = next((entry for entry in snapshot.entries if _norm(entry.title) == normalized_title), None)
-        if title_hit:
-            action = "update"
-            target = title_hit.path
-            reason = "候选页标题与已有 wiki 页面匹配。"
-            overlap = 1.0
-            matched = [title_hit.path]
-        elif best_hit and best_hit.score >= embedding_config.update_threshold:
-            action = "update"
-            target = best_hit.path
-            reason = "候选页与已有页面在 embedding 或上下文上强匹配。"
-            overlap = best_hit.score
-            matched = [best_hit.path]
-        else:
-            action = "create"
-            target = page.proposed_path_hint
-            reason = "没有已有页面超过 update 阈值。"
-            overlap = best_hit.score if best_hit else 0.0
-            matched = [best_hit.path] if best_hit else []
-        target = _dedupe_target(target, used_targets)
-        used_targets[target] += 1
-        inspected = [hit.path for hit in context.hits] if context else []
-        decisions.append(
-            MergeDecision(
-                candidate_page_id=page.candidate_page_id,
-                action=action,
-                target_path=target,
-                matched_existing_paths=matched,
-                inspected_context_paths=inspected,
-                strongest_overlap=round(overlap, 4),
-                reason=reason,
-                source_refs=page.source_refs,
-                related_pages=[],
-                warnings=[] if action == "update" or overlap < embedding_config.update_threshold else ["中等相似度但仍新建页面。"],
-            )
-        )
-    return _normalize_merge_plan(MergePlan(decisions=decisions, action_counts={}))
-
-
 def _normalize_merge_plan(plan: MergePlan) -> MergePlan:
     action_counts = {action: 0 for action in ["create", "update", "noop", "split", "merge"]}
     for decision in plan.decisions:
@@ -625,34 +535,6 @@ def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: Can
             raise PipelineError(f"合并决策 {decision.candidate_page_id} 缺少 target_path。")
         if decision.action == "update" and not decision.matched_existing_paths:
             raise PipelineError(f"更新决策 {decision.candidate_page_id} 缺少 matched_existing_paths。")
-
-
-def _build_local_composition_plan(plan: MergePlan) -> CompositionPlan:
-    items = []
-    for index, decision in enumerate(plan.decisions, start=1):
-        if decision.action == "noop":
-            continue
-        if decision.target_path is None:
-            raise PipelineError(f"合并决策 {decision.candidate_page_id} 缺少 target_path。")
-        items.append(
-            CompositionItem(
-                final_page_id=f"FP-{index:03d}",
-                target_path=decision.target_path,
-                action=decision.action,
-                candidate_page_ids=[decision.candidate_page_id],
-                existing_page_refs=decision.matched_existing_paths,
-                section_order=["摘要", "核心内容", "相关页面", "矛盾与未决问题"],
-                preserve_rules=["更新时保留有价值的旧内容。"] if decision.action == "update" else [],
-                insert_rules=["把有来源支撑的候选材料写入核心内容。"],
-                delete_rules=[],
-                source_ref_rules=["每个最终页面必须保留 raw 来源引用。"],
-                readability_goal="优先生成可读的中文知识页，而不是机械转录。",
-                related_pages=decision.related_pages,
-                related_absence_reason=decision.related_absence_reason,
-                related_unresolved=decision.related_unresolved,
-            )
-        )
-    return CompositionPlan(items=items)
 
 
 def _assert_composition_covers_writes(artifact: CompositionPlan, plan: MergePlan) -> None:
@@ -911,14 +793,16 @@ def _step_source_digest(vault: Path, run_dir: Path, state: dict[str, object]) ->
     raw_text = read_text(raw_abs)
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "source_digest"
-    provider_digest, provider_artifacts, model_calls = _call_provider_artifact(
+    digest_result, provider_artifacts, model_calls = _call_provider_artifact(
         state,
         out_dir,
         "source_digest",
         prompts.source_digest_prompt(raw_path=raw_rel, raw_sha256=binding.raw_sha256, raw_text=raw_text, profile=profile),
         SourceDigest,
     )
-    digest = provider_digest if isinstance(provider_digest, SourceDigest) else _build_source_digest(raw_rel, binding.raw_sha256, raw_text)
+    if not isinstance(digest_result, SourceDigest):
+        raise PipelineError("source_digest provider 返回了无效 artifact。")
+    digest = digest_result
     _assert_source_digest_binding(digest, raw_rel, binding.raw_sha256)
     digest, repair_report = normalize_source_digest(digest)
     _assert_source_digest_chinese(digest)
@@ -988,27 +872,22 @@ def _step_candidate_pages(vault: Path, run_dir: Path, state: dict[str, object]) 
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "candidate_pages"
-    if _provider_is_local(state, "candidate_pages"):
-        provider_artifacts: list[Path] = []
-        model_calls = 0
-        artifact = _build_local_candidate_pages(digest, profile)
-    else:
-        source_candidates = digest.candidates()
-        outputs, provider_artifacts, model_calls = _call_provider_artifacts_parallel(
-            state,
-            out_dir,
-            "candidate_pages",
-            [
-                (
-                    candidate.candidate_id,
-                    prompts.candidate_page_prompt(digest=digest, candidate=candidate, snapshot=snapshot, profile=profile),
-                )
-                for candidate in source_candidates
-            ],
-            CandidatePages,
-        )
-        artifact = _merge_parallel_candidate_pages(outputs, source_candidates)
-        parallel_request_count = len(source_candidates)
+    source_candidates = digest.candidates()
+    outputs, provider_artifacts, model_calls = _call_provider_artifacts_parallel(
+        state,
+        out_dir,
+        "candidate_pages",
+        [
+            (
+                candidate.candidate_id,
+                prompts.candidate_page_prompt(digest=digest, candidate=candidate, snapshot=snapshot, profile=profile),
+            )
+            for candidate in source_candidates
+        ],
+        CandidatePages,
+    )
+    artifact = _merge_parallel_candidate_pages(outputs, source_candidates)
+    parallel_request_count = len(source_candidates)
     artifact = _normalize_candidate_pages(artifact)
     _assert_unique([page.candidate_page_id for page in artifact.pages], "candidate_page_id")
     _assert_candidate_pages_have_sources(artifact)
@@ -1060,17 +939,18 @@ def _step_merge_plan(vault: Path, run_dir: Path, state: dict[str, object]) -> St
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     contexts: CandidateContexts = state["candidate_contexts"]  # type: ignore[assignment]
-    embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "merge_plan"
-    provider_plan, provider_artifacts, model_calls = _call_provider_artifact(
+    plan_result, provider_artifacts, model_calls = _call_provider_artifact(
         state,
         out_dir,
         "merge_plan",
         prompts.merge_plan_prompt(candidate_pages=candidate_pages, snapshot=snapshot, candidate_contexts=contexts, profile=profile),
         MergePlan,
     )
-    plan = provider_plan if isinstance(provider_plan, MergePlan) else _build_local_merge_plan(candidate_pages, snapshot, contexts, embedding_config)
+    if not isinstance(plan_result, MergePlan):
+        raise PipelineError("merge_plan provider 返回了无效 artifact。")
+    plan = plan_result
     plan = _normalize_merge_plan(plan)
     _assert_merge_plan_chinese(plan)
     plan, related_report = related_logic.finalize_merge_plan_related(
@@ -1111,14 +991,16 @@ def _step_composition_plan(vault: Path, run_dir: Path, state: dict[str, object])
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "composition_plan"
-    provider_plan, provider_artifacts, model_calls = _call_provider_artifact(
+    plan_result, provider_artifacts, model_calls = _call_provider_artifact(
         state,
         out_dir,
         "composition_plan",
         prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile),
         CompositionPlan,
     )
-    artifact = provider_plan if isinstance(provider_plan, CompositionPlan) else _build_local_composition_plan(plan)
+    if not isinstance(plan_result, CompositionPlan):
+        raise PipelineError("composition_plan provider 返回了无效 artifact。")
+    artifact = plan_result
     artifact = _normalize_composition_plan(artifact)
     _assert_composition_plan_chinese(artifact)
     artifact, composition_related_report = related_logic.finalize_composition_related(artifact, snapshot=snapshot, vault=vault)
@@ -1153,53 +1035,23 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
-    candidates_by_id = {page.candidate_page_id: page for page in candidate_pages.pages}
-    entries_by_path = {entry.path: entry for entry in snapshot.entries}
     artifacts: list[Path] = []
     out_dir = run_dir / "final_pages"
-    if _provider_is_local(state, "final_pages"):
-        provider_artifacts: list[Path] = []
-        model_calls = 0
-        final_pages = []
-        for item in composition.items:
-            candidates = [candidates_by_id[candidate_id] for candidate_id in item.candidate_page_ids if candidate_id in candidates_by_id]
-            if not candidates:
-                raise PipelineError(f"写作编排项 {item.final_page_id} 缺少候选页。")
-            candidate = candidates[0]
-            page_type = candidate.proposed_page_type if candidate.proposed_page_type in profile.page_types else profile.default_page_type
-            existing = entries_by_path.get(item.target_path)
-            markdown = _assemble_final_markdown(candidates, item, existing, profile)
-            preimage_sha = existing.sha256 if existing else None
-            final_pages.append(
-                FinalPage(
-                    final_page_id=item.final_page_id,
-                    target_path=item.target_path,
-                    action=item.action,
-                    title=candidate.title,
-                    page_type=page_type,
-                    content_sha256=sha256_text(markdown),
-                    markdown=markdown,
-                    source_refs=_merge_source_refs([ref for page in candidates for ref in page.source_refs]),
-                    preimage_sha256=preimage_sha,
-                )
+    outputs, provider_artifacts, model_calls = _call_provider_artifacts_parallel(
+        state,
+        out_dir,
+        "final_pages",
+        [
+            (
+                item.final_page_id,
+                prompts.final_page_prompt(composition_item=item, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile),
             )
-        artifact = FinalPages(pages=final_pages)
-    else:
-        outputs, provider_artifacts, model_calls = _call_provider_artifacts_parallel(
-            state,
-            out_dir,
-            "final_pages",
-            [
-                (
-                    item.final_page_id,
-                    prompts.final_page_prompt(composition_item=item, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile),
-                )
-                for item in composition.items
-            ],
-            FinalPages,
-        )
-        artifact = _hydrate_provider_final_pages(_merge_parallel_final_pages(outputs, composition), composition, snapshot)
-        parallel_request_count = len(composition.items)
+            for item in composition.items
+        ],
+        FinalPages,
+    )
+    artifact = _hydrate_provider_final_pages(_merge_parallel_final_pages(outputs, composition), composition, snapshot)
+    parallel_request_count = len(composition.items)
     artifact = _normalize_final_pages(
         artifact,
         composition,
@@ -1509,49 +1361,6 @@ def _count_label(key: str) -> str:
     }.get(key, key)
 
 
-def _build_source_digest(raw_rel: str, raw_sha: str, raw_text: str) -> SourceDigest:
-    title = title_from_markdown(raw_text, Path(raw_rel).stem)
-    source_ref = SourceRef(raw_path=raw_rel, raw_sha256=raw_sha, locator="whole_file")
-    sections = markdown_sections(raw_text)
-    usable_sections = [(section_title, body) for section_title, body in sections if section_title and body]
-    candidates = []
-    if usable_sections:
-        for index, (section_title, body) in enumerate(usable_sections[:5], start=1):
-            candidates.append(_digest_candidate(index, section_title, body, source_ref))
-    else:
-        candidates.append(_digest_candidate(1, title, raw_text, source_ref))
-    key_takeaways = [_chinese_scaffold(item, "要点") for item in split_sentences(strip_frontmatter(raw_text))[:5]]
-    if not key_takeaways:
-        key_takeaways = [_chinese_scaffold(summarize(raw_text), "要点")]
-    digest = SourceDigest(
-        source_raw_path=raw_rel,
-        raw_sha256=raw_sha,
-        summary=_chinese_scaffold(summarize(raw_text, max_sentences=3, max_chars=360), "原始材料摘要"),
-        key_takeaways=key_takeaways,
-        concepts=[item for item in candidates if item.kind == "concept"],
-        designs=[item for item in candidates if item.kind == "design"],
-        comparisons=[item for item in candidates if item.kind == "comparison"],
-        open_questions=[item for item in candidates if item.kind == "open_question"],
-    )
-    return digest
-
-
-def _digest_candidate(index: int, title: str, body: str, source_ref: SourceRef) -> SourceDigestCandidate:
-    kind = classify_page_type(title, body)
-    fallback_title = f"候选 {index}"
-    raw_title = title.strip() or fallback_title
-    display_title = raw_title if contains_cjk(raw_title) else f"{fallback_title}：{raw_title}"
-    return SourceDigestCandidate(
-        candidate_id=f"CAND-{index:03d}",
-        kind=kind,
-        name=display_title,
-        suggested_page_title=display_title,
-        summary=_chinese_scaffold(summarize(body, max_sentences=2, max_chars=260) or raw_title, "候选摘要"),
-        source_basis=_chinese_scaffold(summarize(body, max_sentences=1, max_chars=180) or raw_title, "来源依据"),
-        source_refs=[source_ref],
-    )
-
-
 def _chinese_scaffold(text: str, label: str) -> str:
     stripped = text.strip()
     if contains_cjk(stripped):
@@ -1704,33 +1513,6 @@ def _frontmatter_data(markdown: str) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
-def _assemble_final_markdown(candidates: list[CandidatePage], item: CompositionItem, existing: WikiKnowledgeEntry | None, profile: Profile) -> str:
-    candidate = candidates[0]
-    source_refs = [ref.model_dump(mode="json") for ref in _merge_source_refs([ref for page in candidates for ref in page.source_refs])]
-    frontmatter = {
-        "title": candidate.title,
-        "type": candidate.proposed_page_type,
-        "source_refs": source_refs,
-        "llmwiki": {"generated_by": "llmwiki-engine-lite", "candidate_page_ids": item.candidate_page_ids},
-    }
-    yaml_text = yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False).strip()
-    previous = ""
-    if existing:
-        previous_text = _drop_sections(existing.text_excerpt.strip(), {"Related", "相关页面"}).strip()
-        if previous_text:
-            previous = f"\n\n### 旧页保留内容\n\n{previous_text}\n"
-    detail = "\n\n".join(_candidate_detail_block(page) for page in candidates)
-    summary = " ".join(page.summary.strip() for page in candidates if page.summary.strip())
-    return (
-        f"---\n{yaml_text}\n---\n\n"
-        f"# {candidate.title}\n\n"
-        f"## 摘要\n\n{summary or candidate.summary}\n\n"
-        f"## 核心内容\n\n{detail}{previous}\n\n"
-        "## 矛盾与未决问题\n\n"
-        "- 暂无矛盾与未决问题记录。\n"
-    )
-
-
 def _drop_sections(markdown: str, headings: set[str]) -> str:
     wanted = {heading.lower() for heading in headings}
     lines = markdown.splitlines()
@@ -1746,10 +1528,6 @@ def _drop_sections(markdown: str, headings: set[str]) -> str:
         result.append(lines[index])
         index += 1
     return "\n".join(result)
-
-
-def _candidate_detail_block(page: CandidatePage) -> str:
-    return f"### {page.title}\n\n{page.body_markdown.strip()}"
 
 
 def _merge_source_refs(refs: list[SourceRef]) -> list[SourceRef]:
@@ -1787,15 +1565,6 @@ def _yaml_list(key: str, values: list[str]) -> str:
     if not values:
         return f"{key}: []\n"
     return f"{key}:\n" + "".join(f"  - {_yaml_scalar(value)}\n" for value in values)
-
-
-def _candidate_body(candidate: SourceDigestCandidate, digest: SourceDigest) -> str:
-    takeaways = "\n".join(f"- {item}" for item in digest.key_takeaways[:5])
-    return (
-        f"## 摘要\n\n{candidate.summary}\n\n"
-        f"## 来源依据\n\n{candidate.source_basis}\n\n"
-        f"## 关键收获\n\n{takeaways or '- 暂无关键收获记录。'}\n"
-    )
 
 
 def _render_source_page(operation_id: str, digest: SourceDigest, final_pages: FinalPages) -> str:
@@ -1854,7 +1623,6 @@ def _updated_daily_log(vault: Path, log_date: str, operation_id: str, binding: R
         created=merge_plan.action_counts.get("create", 0),
         updated=merge_plan.action_counts.get("update", 0),
         noop=merge_plan.action_counts.get("noop", 0),
-        needs_human=0,
     )
     return system_pages.render_daily_log(date=log_date, operation_id=operation_id, raw_path=binding.raw_path, counts=counts, existing_text=existing)
 
@@ -2064,17 +1832,6 @@ def _page_type_from_path(profile: Profile, rel: str) -> str:
         if rel.startswith(f"{spec.directory}/"):
             return page_type
     return profile.default_page_type
-
-
-def _norm(value: str) -> str:
-    return "".join(ch.lower() for ch in value if ch.isalnum())
-
-
-def _dedupe_target(target: str, used: Counter[str]) -> str:
-    if used[target] == 0:
-        return target
-    path = Path(target)
-    return f"{path.parent.as_posix()}/{path.stem}_{used[target] + 1}{path.suffix}"
 
 
 def _artifact_ref(run_dir: Path, path: Path) -> ArtifactRef:

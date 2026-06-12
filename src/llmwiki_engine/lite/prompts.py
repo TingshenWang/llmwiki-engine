@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .models import CandidateContexts, CandidatePages, CompositionItem, CompositionPlan, FinalPages, MergePlan, SourceDigest, SourceDigestCandidate, WikiSnapshot
+from .models import CandidateContexts, CandidatePages, CompositionItem, FinalPages, MergePlan, SourceDigest, SourceDigestCandidate, WikiSnapshot
 from .profile import Profile
 from .providers import PromptRequest
 
@@ -44,27 +44,6 @@ def source_digest_prompt(*, raw_path: str, raw_sha256: str, raw_text: str, profi
                 "如果 suggested_page_title 不确定，使用 name；不要让 name 为空。",
                 "related_candidates 只用于本 source 内部 candidate_id 关系，例如上下游、补充、反例、使用场景或方法依赖。",
                 "不要在 related_candidates 放 wiki 路径，也不要在本步骤判断 create/update/noop。",
-            ],
-        },
-    )
-
-
-def candidate_pages_prompt(*, digest: SourceDigest, snapshot: WikiSnapshot, profile: Profile) -> PromptRequest:
-    return _request(
-        step="candidate_pages",
-        model=CandidatePages,
-        payload={
-            "source_digest": digest.model_dump(mode="json"),
-            "wiki_snapshot_entries": [item.model_dump(mode="json") for item in snapshot.entries],
-            "profile": profile.model_dump(mode="json"),
-            "instructions": [
-                *CHINESE_OUTPUT_RULES,
-                "生成忠于 source digest 的页面形态候选知识笔记。",
-                "不要在这里判断 create/update/noop。",
-                "不要使用 candidate contexts；召回发生在 candidate pages 之后。",
-                "不要包含 frontmatter。",
-                "不要伪装成写入最终 target path；proposed_path_hint 只是提示。",
-                "每个 candidate page 必须保留 source_refs。",
             ],
         },
     )
@@ -114,7 +93,6 @@ def merge_plan_prompt(*, candidate_pages: CandidatePages, snapshot: WikiSnapshot
                 "每个 candidate_page_id 必须且只能消费一次。",
                 "使用 candidate_contexts.items 作为每个候选页已检查的 top-k 旧 wiki 页面。",
                 "新知识使用 create，匹配旧页使用 update，已经覆盖才使用 noop。",
-                "不要使用人工审核 action。",
                 "update 的 target_path 必须来自 wiki_snapshot.entries.path。",
                 "create 的 target_path 必须留在 profile 路由目录内。",
                 "每个候选项选择 related_pages 前必须检查 top-k context hits。",
@@ -150,36 +128,6 @@ def composition_plan_prompt(
                 "update target 必须保留有价值的旧内容。",
                 "每个 item 必须包含 source_ref_rules，且规则文本用中文。",
                 "把 merge decisions 中的 related_pages、related_absence_reason、related_unresolved 带入匹配的 composition item。",
-            ],
-        },
-    )
-
-
-def final_pages_prompt(
-    *,
-    composition_plan: CompositionPlan,
-    candidate_pages: CandidatePages,
-    snapshot: WikiSnapshot,
-    profile: Profile,
-) -> PromptRequest:
-    return _request(
-        step="final_pages",
-        model=FinalPages,
-        payload={
-            "composition_plan": composition_plan.model_dump(mode="json"),
-            "candidate_pages": candidate_pages.model_dump(mode="json"),
-            "wiki_snapshot_entries": [entry.model_dump(mode="json") for entry in snapshot.entries],
-            "profile": profile.model_dump(mode="json"),
-            "instructions": [
-                *CHINESE_OUTPUT_RULES,
-                "返回最终可写 Markdown 页面。",
-                "引擎会替换最终 frontmatter；专注于中文正文和稳定的中文标题结构。",
-                "每个页面必须保留 source_refs。",
-                "update 页面必须保留有价值的旧笔记，并加入有来源支撑的新材料。",
-                "不要写 Related 或 相关页面章节；引擎会在 validation 之后渲染官方相关页面章节。",
-                "不要创建自链接。",
-                "content_sha256 可以为空；引擎会重新计算。",
-                "不要包含模型自我说明。",
             ],
         },
     )

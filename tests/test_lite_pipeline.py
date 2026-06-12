@@ -10,7 +10,7 @@ from llmwiki_engine.cli import app
 from llmwiki_engine.lite import embeddings
 from llmwiki_engine.lite import related as related_logic
 from llmwiki_engine.lite import system_pages
-from llmwiki_engine.lite.io import read_json, sha256_file, sha256_text
+from llmwiki_engine.lite.io import sha256_file, sha256_text
 from llmwiki_engine.lite.models import (
     CandidateContext,
     CandidateContextHit,
@@ -31,17 +31,11 @@ from llmwiki_engine.lite.models import (
 )
 from llmwiki_engine.lite.pipeline import (
     _assert_source_digest_chinese,
-    _assert_composition_plan_chinese,
-    _build_local_composition_plan,
     _canonical_final_markdown,
-    _normalize_composition_plan,
     _page_generation_parallelism,
     _validate_before_write,
     init_vault,
     PipelineError,
-    run_ingest,
-    scan_raw_candidates,
-    verify_operation,
 )
 from llmwiki_engine.lite.profile import load_profile
 
@@ -59,73 +53,6 @@ def write_raw(vault: Path, name: str = "project_note.md") -> Path:
         encoding="utf-8",
     )
     return raw
-
-
-def test_init_and_ingest_full_auto_writes_wiki_and_receipt(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    raw = write_raw(vault)
-
-    manifest = run_ingest(vault, Path("raw") / raw.name, slug="smoke", emit_progress=False, allow_test_providers=True)
-
-    assert manifest.status == "written"
-    assert manifest.receipt_path is not None
-    assert (vault / manifest.receipt_path).exists()
-    assert (vault / "wiki" / "sources" / "Source_project_note.md").exists()
-    written_pages = list((vault / "wiki").glob("designs/*.md"))
-    assert written_pages
-    text = written_pages[0].read_text(encoding="utf-8")
-    frontmatter_keys = _frontmatter_keys(text)
-    assert frontmatter_keys == [
-        "llmwiki_type",
-        "title",
-        "aliases",
-        "summary",
-        "created",
-        "updated",
-        "source_raw_paths",
-        "source_raw_hashes",
-        "source_prepared_hashes",
-        "source_operation_ids",
-        "last_ingest_operation",
-    ]
-    frontmatter = yaml.safe_load(text.split("---", 2)[1])
-    assert frontmatter["llmwiki_type"] == "design"
-    assert "type" not in frontmatter
-    assert "source_refs" not in frontmatter
-    assert "llmwiki" not in frontmatter
-    assert frontmatter["source_raw_paths"] == ["raw/project_note.md"]
-    assert frontmatter["source_raw_hashes"] == [sha256_file(raw)]
-    assert frontmatter["source_prepared_hashes"] == [sha256_file(raw)]
-    assert frontmatter["source_operation_ids"] == [manifest.operation_id]
-    config = read_json(vault / ".llmwiki" / "config.json")
-    assert config["embedding"]["backend"] == "sentence_transformers"
-    assert config["embedding"]["model"] == embeddings.DEFAULT_QWEN_EMBEDDING_MODEL
-    assert not (vault / ".llmwiki" / "config.yaml").exists()
-    report = verify_operation(vault, manifest.operation_id)
-    assert report.ok, report.issues
-
-
-def test_cli_status_and_raw_candidates_use_chinese_labels(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    raw = write_raw(vault)
-    run_ingest(vault, Path("raw") / raw.name, slug="cli-cn", emit_progress=False, allow_test_providers=True)
-    runner = CliRunner()
-
-    status_result = runner.invoke(app, ["ingest", "status", str(vault), "--verify"])
-    assert status_result.exit_code == 0
-    assert "raw 大小" in status_result.output
-    assert "延后数" in status_result.output
-    assert "召回后端" in status_result.output
-    assert "校验：通过" in status_result.output
-    assert "raw_size_bytes" not in status_result.output
-    assert "deferred_count" not in status_result.output
-    assert "retrieval_backend" not in status_result.output
-
-    raw_result = runner.invoke(app, ["ingest", "raw-candidates", str(vault), "--all"])
-    assert raw_result.exit_code == 0
-    assert "原始材料候选" in raw_result.output
-    assert "是" in raw_result.output
-    assert "True" not in raw_result.output
 
 
 def test_source_digest_rejects_english_user_facing_text() -> None:
@@ -175,20 +102,10 @@ def test_source_digest_allows_proper_noun_name_with_chinese_context() -> None:
     _assert_source_digest_chinese(digest)
 
 
-def test_raw_candidates_marks_processed_after_ingest(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    raw = write_raw(vault)
-    before = scan_raw_candidates(vault)
-    assert before["count"] == 1
-
-    run_ingest(vault, raw, slug="processed", emit_progress=False, allow_test_providers=True)
-    after = scan_raw_candidates(vault)
-    assert after["count"] == 0
-    all_items = scan_raw_candidates(vault, include_processed=True)
-    assert all_items["items"][0]["processed"] is True
-
-
-def test_cli_json_run(tmp_path: Path) -> None:
+def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", home.as_posix())
     vault = tmp_path / "vault"
     runner = CliRunner()
     result = runner.invoke(app, ["init", str(vault)])
@@ -199,63 +116,6 @@ def test_cli_json_run(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "必须使用真实模型 provider" in result.output
-
-
-def test_candidate_contexts_are_per_generated_page_and_refresh_last(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    existing = vault / "wiki" / "designs" / "Design_简化_Ingest_流程.md"
-    existing.parent.mkdir(parents=True, exist_ok=True)
-    existing.write_text(
-        "---\n"
-        "title: 简化 Ingest 流程\n"
-        "type: design\n"
-        "source_refs: []\n"
-        "---\n\n"
-        "# 简化 Ingest 流程\n\n旧页面讨论自动 ingest、状态机、artifact 和 wiki 写入。\n",
-        encoding="utf-8",
-    )
-    raw = write_raw(vault)
-
-    manifest = run_ingest(vault, raw, slug="contexts", emit_progress=False, allow_test_providers=True)
-
-    run_dir = vault / ".llmwiki" / "runs" / "ingest" / manifest.operation_id
-    candidate_pages = read_json(run_dir / "candidate_pages" / "candidate_pages.json")
-    contexts = read_json(run_dir / "candidate_contexts" / "candidate_contexts.json")
-    receipt = read_json(vault / manifest.receipt_path)
-    final_cache_report = read_json(run_dir / "embedding_cache_refresh" / "embedding_cache_refresh.json")
-    step_names = [step.name for step in manifest.steps]
-    assert step_names.index("candidate_pages") < step_names.index("candidate_contexts") < step_names.index("merge_plan")
-    assert step_names.index("index_log_write") < step_names.index("embedding_cache_refresh") < step_names.index("receipt")
-    assert step_names[-1] == "receipt"
-    assert receipt["embedding_metrics"] == final_cache_report
-    assert "embedding_cache_refresh" in receipt["artifact_hashes"]
-    assert final_cache_report["cache_updated_paths"] == ["designs/Design_简化_Ingest_流程.md"]
-    assert len(contexts["items"]) == len(candidate_pages["pages"])
-    assert {item["candidate_page_id"] for item in contexts["items"]} == {page["candidate_page_id"] for page in candidate_pages["pages"]}
-    assert all(len(item["hits"]) <= 5 for item in contexts["items"])
-    assert any(hit["path"] == "designs/Design_简化_Ingest_流程.md" for item in contexts["items"] for hit in item["hits"])
-
-
-def test_embedding_cache_keeps_only_latest_record_per_page(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    existing = vault / "wiki" / "concepts" / "Concept_Cache_Probe.md"
-    existing.parent.mkdir(parents=True, exist_ok=True)
-    existing.write_text("# Cache Probe\n\nFirst body about a stable page.\n", encoding="utf-8")
-    raw1 = write_raw(vault, "first.md")
-    run_ingest(vault, raw1, slug="cache-first", emit_progress=False, allow_test_providers=True)
-
-    existing.write_text("# Cache Probe\n\nSecond body with changed current content.\n", encoding="utf-8")
-    raw2 = write_raw(vault, "second.md")
-    manifest = run_ingest(vault, raw2, slug="cache-second", emit_progress=False, allow_test_providers=True)
-
-    run_dir = vault / ".llmwiki" / "runs" / "ingest" / manifest.operation_id
-    report = read_json(run_dir / "wiki_snapshot" / "embedding_cache_report.json")
-    cache_dir = vault / ".llmwiki" / "cache" / "embeddings" / "sentence_transformers_Qwen_Qwen3-Embedding-0.6B_page_card_v1_1024" / "pages"
-    records = list(cache_dir.glob("*concepts__Concept_Cache_Probe.md.json"))
-    assert report["cache_stale"] >= 1
-    assert "concepts/Concept_Cache_Probe.md" in report["cache_updated_paths"]
-    assert len(records) == 1
-    assert read_json(records[0])["content_sha256"] == sha256_file(existing)
 
 
 def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_path: Path, monkeypatch) -> None:
@@ -351,126 +211,10 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
             )
         ]
     )
-    config = embeddings.EmbeddingConfig(backend="hashing", model="lite-hashing-v1", dimensions=256)
+    config = embeddings.EmbeddingConfig(backend="unsupported-test", model="unsupported-test", dimensions=256)
 
     with pytest.raises(RuntimeError, match="真实 embedding"):
         embeddings.build_candidate_contexts(vault, candidate_pages, [], {}, config)
-
-
-def test_system_pages_use_index_log_and_daily_log_contract(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    (vault / "wiki" / "index.md").write_text(
-        "# 索引\n\n"
-        f"{system_pages.SYSTEM_MARKER}\n\n"
-        "## 概念\n\n"
-        "| 标题 | 页面 | 摘要 | 更新日期 |\n"
-        "| --- | --- | --- | --- |\n"
-        "| Stale | [[concepts/Concept_Stale]] | stale | 2026-01-01 |\n",
-        encoding="utf-8",
-    )
-    existing = vault / "wiki" / "concepts" / "Concept_Old.md"
-    existing.parent.mkdir(parents=True, exist_ok=True)
-    existing.write_text(
-        "---\n"
-        "title: Old Concept\n"
-        "type: concept\n"
-        "llmwiki_type: concept\n"
-        "summary: old summary\n"
-        "updated: 2026-01-01\n"
-        "---\n\n"
-        "# Old Concept\n\n"
-        "## 矛盾与未决问题\n\n"
-        "- 旧概念是否还适用于新的 Agent 工作流？\n",
-        encoding="utf-8",
-    )
-    misplaced_source = vault / "wiki" / "misc" / "Source_Misplaced.md"
-    misplaced_source.parent.mkdir(parents=True, exist_ok=True)
-    misplaced_source.write_text(
-        "---\n"
-        "title: Misplaced Source\n"
-        "type: source\n"
-        "llmwiki_type: source\n"
-        "summary: source summary\n"
-        "updated: 2026-01-02\n"
-        "---\n\n"
-        "# Misplaced Source\n",
-        encoding="utf-8",
-    )
-    raw = write_raw(vault)
-
-    manifest = run_ingest(vault, raw, slug="system-pages", emit_progress=False, allow_test_providers=True)
-    log_date = _operation_date_from_id(manifest.operation_id)
-
-    index_text = (vault / "wiki" / "index.md").read_text(encoding="utf-8")
-    assert index_text.startswith("# 索引")
-    assert system_pages.SYSTEM_MARKER in index_text
-    assert "[[concepts/Concept_Old]]" in index_text
-    assert "旧概念是否还适用于新的 Agent 工作流？" in index_text
-    assert "Concept_Stale" not in index_text
-    assert "Misplaced Source" not in index_text
-    assert "[[sources/" not in index_text
-
-    log_text = (vault / "wiki" / "log.md").read_text(encoding="utf-8")
-    assert f"[[logs/{log_date}]]" in log_text
-    assert f"最新 operation: `{manifest.operation_id}`" in log_text
-    daily_text = (vault / "wiki" / "logs" / f"{log_date}.md").read_text(encoding="utf-8")
-    assert f"`{manifest.operation_id}`" in daily_text
-    assert "`raw/project_note.md`" in daily_text
-
-    source_text = (vault / "wiki" / "sources" / "Source_project_note.md").read_text(encoding="utf-8")
-    assert _frontmatter_keys(source_text) == [
-        "llmwiki_type",
-        "title",
-        "aliases",
-        "summary",
-        "created",
-        "updated",
-        "source_raw_paths",
-        "source_raw_hashes",
-        "source_prepared_hashes",
-        "source_operation_ids",
-        "last_ingest_operation",
-    ]
-    assert "## 派生知识页" in source_text
-    assert "[[" not in source_text
-    assert "`designs/Design_简化_Ingest_流程.md`" in source_text
-
-
-def test_related_links_follow_previous_branch_cap_and_filters() -> None:
-    existing = "# Current\n\n## Related\n\n- [[concepts/Concept_Existing|Existing]]：旧链接。\n"
-    rendered = system_pages.render_related_links(
-        current_path="concepts/Concept_Current.md",
-        candidate_paths=[
-            "concepts/Concept_Current.md",
-            "raw/a.md",
-            "sources/Source_A.md",
-            "Source_Misplaced.md",
-            "logs/2026-06-11.md",
-            "index.md",
-            "concepts/Concept_A.md",
-            "concepts/Concept_B.md",
-            "concepts/Concept_C.md",
-            "concepts/Concept_D.md",
-        ],
-        known_paths={
-            "concepts/Concept_Existing.md",
-            "concepts/Concept_A.md",
-            "concepts/Concept_B.md",
-            "concepts/Concept_C.md",
-            "concepts/Concept_D.md",
-        },
-        existing_markdown=existing,
-    )
-
-    assert rendered.count("[[") == system_pages.RELATED_LINK_LIMIT
-    assert "[[concepts/Concept_Existing|Existing]]" in rendered
-    assert "Concept_Current" not in rendered
-    assert "raw/a" not in rendered
-    assert "Source_A" not in rendered
-    assert "Source_Misplaced" not in rendered
-    assert "logs/2026-06-11" not in rendered
-    assert "index" not in rendered
-    assert "Concept_D" not in rendered
 
 
 def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
@@ -529,8 +273,8 @@ def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
         ],
     )
     contexts = CandidateContexts(
-        retrieval_backend="hashing",
-        model="lite",
+        retrieval_backend="sentence_transformers",
+        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
         input_version="test",
         top_k=5,
         knowledge_pool_size=0,
@@ -592,8 +336,8 @@ def test_top5_context_can_become_related_but_unknown_paths_are_filtered() -> Non
     )
     snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="pool", generated_at="2026-06-11T00:00:00Z", entries=[old_entry])
     contexts = CandidateContexts(
-        retrieval_backend="hashing",
-        model="lite",
+        retrieval_backend="sentence_transformers",
+        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
         input_version="test",
         top_k=5,
         knowledge_pool_size=1,
@@ -619,44 +363,6 @@ def test_top5_context_can_become_related_but_unknown_paths_are_filtered() -> Non
 
     assert [ref.target_path for ref in resolved.decisions[0].related_pages] == ["concepts/Concept_Old.md"]
     assert any(item.target_path == "concepts/Concept_Missing.md" and item.decision == "filtered" for item in report.candidates)
-
-
-def test_duplicate_create_merge_drops_related_self_links_after_composition() -> None:
-    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
-    merge_plan = MergePlan(
-        action_counts={"create": 0, "update": 0, "noop": 0, "split": 0, "merge": 2},
-        decisions=[
-            MergeDecision(
-                candidate_page_id="CP-001",
-                action="merge",
-                target_path="concepts/Concept_A.md",
-                reason="merge one",
-                source_refs=[ref],
-                related_pages=[
-                    RelatedPageRef(
-                        target_path="concepts/Concept_A.md",
-                        display_title="Concept A",
-                        source="source_digest",
-                        reason="分组后会变成自链接。",
-                    )
-                ],
-            ),
-            MergeDecision(
-                candidate_page_id="CP-002",
-                action="merge",
-                target_path="concepts/Concept_A.md",
-                reason="merge two",
-                source_refs=[ref],
-            ),
-        ],
-    )
-
-    composition = _normalize_composition_plan(_build_local_composition_plan(merge_plan))
-
-    assert len(composition.items) == 1
-    assert composition.items[0].related_pages == []
-    assert composition.items[0].warnings == ["多个合并决策指向同一个目标页面，已合并写作规则。"]
-    _assert_composition_plan_chinese(composition)
 
 
 def test_validation_rejects_model_related_sections_and_self_wikilinks(tmp_path: Path) -> None:
@@ -847,13 +553,3 @@ def test_page_generation_parallelism_defaults_to_request_count_and_supports_limi
     assert _page_generation_parallelism({"config": {"page_generation": {}}}, 23) == 23
     assert _page_generation_parallelism({"config": {"page_generation": {"max_parallel_requests": 7}}}, 23) == 7
     assert _page_generation_parallelism({"config": {"page_generation": {"parallel_requests": 5}}}, 23) == 5
-
-
-def _operation_date_from_id(operation_id: str) -> str:
-    raw = operation_id.split("-", 2)[1].split("T", 1)[0]
-    return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
-
-
-def _frontmatter_keys(markdown: str) -> list[str]:
-    body = markdown.split("---", 2)[1]
-    return [line.split(":", 1)[0] for line in body.splitlines() if line and not line.startswith(" ")]

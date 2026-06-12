@@ -19,7 +19,6 @@ class DailyLogCounts:
     created: int = 0
     updated: int = 0
     noop: int = 0
-    needs_human: int = 0
 
 
 def initial_index_text() -> str:
@@ -110,44 +109,16 @@ def render_daily_log(
     counts: DailyLogCounts,
     existing_text: str | None,
 ) -> str:
-    rows = _read_table_rows(existing_text or "")
+    rows = [row[:5] for row in _read_table_rows(existing_text or "")]
     row = [
         f"`{operation_id}`",
         f"`{raw_path}`",
         str(counts.created),
         str(counts.updated),
         str(counts.noop),
-        str(counts.needs_human),
     ]
     merged = _upsert_by_first_cell(rows, row)
-    return "# " + date + "\n\n" + SYSTEM_MARKER + "\n\n" + markdown_table(["操作", "原始材料", "新建数", "实际更新数", "未改动数", "人工决策阻断数"], merged) + "\n"
-
-
-def render_related_links(
-    *,
-    current_path: str,
-    candidate_paths: Iterable[str],
-    known_paths: set[str],
-    existing_markdown: str = "",
-    limit: int = RELATED_LINK_LIMIT,
-) -> str:
-    selected: list[str] = []
-    for value in [*parse_related_paths(existing_markdown), *candidate_paths]:
-        normalized = normalize_related_path(value)
-        if normalized is None:
-            continue
-        if normalized == normalize_related_path(current_path):
-            continue
-        if known_paths and normalized not in known_paths:
-            continue
-        if normalized in selected:
-            continue
-        selected.append(normalized)
-        if len(selected) >= limit:
-            break
-    if not selected:
-        return "- 暂无相关页面记录。"
-    return "\n".join(f"- {obsidian_link(path, _display_title(path))}：相关主题，可作为背景补充。" for path in selected)
+    return "# " + date + "\n\n" + SYSTEM_MARKER + "\n\n" + markdown_table(["操作", "原始材料", "新建数", "实际更新数", "未改动数"], merged) + "\n"
 
 
 def parse_related_paths(markdown: str) -> list[str]:

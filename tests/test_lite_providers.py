@@ -7,7 +7,6 @@ import yaml
 from typer.testing import CliRunner
 
 from llmwiki_engine.cli import app
-from llmwiki_engine.lite.io import read_json
 from llmwiki_engine.lite.pipeline import init_vault, run_ingest
 from llmwiki_engine.lite.profile import load_profile
 from llmwiki_engine.lite.prompts import source_digest_prompt
@@ -221,76 +220,40 @@ def test_parse_chat_completion_json_skips_bad_brace_before_object() -> None:
     assert parsed == {"ok": True}
 
 
-def test_mock_fixture_provider_writes_prompt_and_provider_result_artifacts(tmp_path: Path) -> None:
+def test_load_provider_registry_merges_vault_yaml(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
-    raw = write_raw(vault)
-    fixture_dir = tmp_path / "fixtures"
-    fixture_dir.mkdir()
-    raw_sha = _sha256(raw)
-    (fixture_dir / "source_digest.json").write_text(
-        json.dumps(
-            {
-                "source_raw_path": "raw/project_note.md",
-                "raw_sha256": raw_sha,
-                "summary": "模型 fixture 生成的 digest。",
-                "key_takeaways": ["保留 raw 作为证据。"],
-                "concepts": [
-                    {
-                        "candidate_id": "CAND-FIXTURE",
-                        "kind": "concept",
-                        "name": "测试 Provider",
-                        "suggested_page_title": "测试 Provider",
-                        "summary": "用于验证 provider prompt/schema 分支。",
-                        "source_basis": "fixture 来源依据。",
-                        "source_refs": [{"raw_path": "raw/project_note.md", "raw_sha256": raw_sha, "locator": "whole_file"}],
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
     (vault / ".llmwiki" / "config.yaml").write_text(
         yaml.safe_dump(
             {
                 "providers": {
-                    "default": {"spec": "local:heuristic"},
-                    "source_digest": {"spec": "mock:fixture", "fixture_dir": fixture_dir.as_posix()},
+                    "default": {
+                        "spec": "openai_compatible:deepseek-v4-flash",
+                        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+                        "api_key": "redacted-test-key",
+                    },
+                    "merge_plan": {
+                        "spec": "openai_compatible:merge-model",
+                        "endpoint": "https://example.test/v1/chat/completions",
+                        "api_key": "redacted-test-key",
+                    },
                 }
             },
-            allow_unicode=True,
             sort_keys=False,
         ),
         encoding="utf-8",
     )
 
-    manifest = run_ingest(vault, raw, slug="mock-provider", emit_progress=False, allow_test_providers=True)
-
-    run_dir = vault / ".llmwiki" / "runs" / "ingest" / manifest.operation_id
-    source_step = next(step for step in manifest.steps if step.name == "source_digest")
-    assert source_step.model_calls == 1
-    assert (run_dir / "source_digest" / "model_calls" / "source_digest.prompt.json").exists()
-    provider_result = read_json(run_dir / "source_digest" / "model_calls" / "source_digest.provider_result.json")
-    assert provider_result["provider"]["spec"] == "mock:fixture"
-    receipt = read_json(vault / manifest.receipt_path)
-    assert receipt["provider_contexts"]["source_digest"]["spec"] == "mock:fixture"
-
-
-def test_load_provider_registry_merges_vault_yaml(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    (vault / ".llmwiki" / "config.yaml").write_text(
-        yaml.safe_dump({"providers": {"default": {"spec": "local:heuristic"}, "merge_plan": "local:heuristic"}}, sort_keys=False),
-        encoding="utf-8",
-    )
-
     registry = load_provider_registry(vault)
 
-    assert registry.provider_for("source_digest").spec == "local:heuristic"
-    assert registry.provider_for("merge_plan").spec == "local:heuristic"
+    assert registry.provider_for("source_digest").spec == "openai_compatible:deepseek-v4-flash"
+    assert registry.provider_for("merge_plan").spec == "openai_compatible:merge-model"
 
 
-def test_global_provider_config_applies_when_vault_has_no_provider_yaml(tmp_path: Path) -> None:
-    home_config = Path.home() / ".llmwiki" / "config.yaml"
+def test_global_provider_config_applies_when_vault_has_no_provider_yaml(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", home.as_posix())
+    home_config = home / ".llmwiki" / "config.yaml"
     home_config.parent.mkdir(parents=True, exist_ok=True)
     home_config.write_text(
         yaml.safe_dump(
@@ -316,16 +279,14 @@ def test_global_provider_config_applies_when_vault_has_no_provider_yaml(tmp_path
     assert registry.provider_for("source_digest").endpoint == "https://api.deepseek.com/v1/chat/completions"
 
 
-def test_providers_check_live_rejects_local_and_mock_providers(tmp_path: Path) -> None:
+def test_providers_check_live_rejects_local_and_unsupported_providers(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
-    fixture_dir = tmp_path / "fixtures"
-    fixture_dir.mkdir()
     (vault / ".llmwiki" / "config.yaml").write_text(
         yaml.safe_dump(
             {
                 "providers": {
                     "default": {"spec": "local:heuristic"},
-                    "source_digest": {"spec": "mock:fixture", "fixture_dir": fixture_dir.as_posix()},
+                    "source_digest": {"spec": "unsupported:test-model"},
                 }
             },
             sort_keys=False,
@@ -339,15 +300,18 @@ def test_providers_check_live_rejects_local_and_mock_providers(tmp_path: Path) -
     assert reports["default"]["ok"] is False
     assert reports["default"]["message"] == "not a real model provider"
     assert reports["source_digest"]["ok"] is False
-    assert reports["source_digest"]["message"] == "mock provider is not live"
+    assert reports["source_digest"]["message"] == "unsupported provider spec"
 
     result = CliRunner().invoke(app, ["providers", "check", str(vault), "--live"])
     assert result.exit_code == 2
     assert "不是真实模型 provider" in result.output
-    assert "mock 不是 live provider" in result.output
+    assert "不支持的 provider" in result.output
 
 
-def test_run_ingest_requires_real_model_provider_by_default(tmp_path: Path) -> None:
+def test_run_ingest_requires_real_model_provider_by_default(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", home.as_posix())
     vault = init_vault(tmp_path / "vault")
     raw = write_raw(vault)
 
@@ -359,9 +323,3 @@ def test_run_ingest_requires_real_model_provider_by_default(tmp_path: Path) -> N
         assert "必须使用真实模型 provider" in str(exc)
     else:
         raise AssertionError("run_ingest should reject local heuristic provider by default")
-
-
-def _sha256(path: Path) -> str:
-    import hashlib
-
-    return hashlib.sha256(path.read_bytes()).hexdigest()

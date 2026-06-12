@@ -9,7 +9,7 @@ from typing import Any
 
 from .io import now_utc, read_json, read_text, safe_filename, sha256_text, stable_json_hash, write_json
 from .models import CandidateContext, CandidateContextHit, CandidateContexts, CandidatePage, CandidatePages, WikiKnowledgeEntry
-from .text import strip_frontmatter, tokens
+from .text import strip_frontmatter
 
 
 CACHE_SCHEMA_VERSION = "lite_page_embedding_cache.v1"
@@ -30,7 +30,6 @@ class EmbeddingConfig:
     max_page_chars: int = 6000
     max_query_chars: int = 4000
     max_excerpt_chars: int = 800
-    update_threshold: float = 0.42
     batch_size: int = 8
     normalize_embeddings: bool = True
     query_prompt_name: str = "query"
@@ -41,25 +40,20 @@ def load_embedding_config(config: dict[str, object]) -> EmbeddingConfig:
     if not isinstance(raw, dict):
         raw = config.get("retrieval") if isinstance(config.get("retrieval"), dict) else {}
     backend = str(raw.get("backend", "sentence_transformers"))
-    if backend == "exact":
-        backend = "hashing"
     if backend in {"sentence-transformers", "sentence_transformer", "qwen", "qwen3"}:
         backend = "sentence_transformers"
-    default_model = DEFAULT_QWEN_EMBEDDING_MODEL if backend == "sentence_transformers" else "lite-hashing-v1"
-    default_dimensions = 1024 if backend == "sentence_transformers" else 256
     return EmbeddingConfig(
         enabled=bool(raw.get("enabled", True)),
         backend=backend,
-        model=str(raw.get("model", default_model)),
+        model=str(raw.get("model", DEFAULT_QWEN_EMBEDDING_MODEL)),
         model_revision=str(raw.get("model_revision", "")),
         cache_dir=str(raw.get("cache_dir", ".llmwiki/cache/embeddings")),
         top_k_pages=int(raw.get("top_k_pages", raw.get("top_k", 5))),
-        dimensions=int(raw.get("dimensions", default_dimensions)),
+        dimensions=int(raw.get("dimensions", 1024)),
         input_version=str(raw.get("input_version", INPUT_VERSION)),
         max_page_chars=int(raw.get("max_page_chars", raw.get("max_embedding_page_chars", 6000))),
         max_query_chars=int(raw.get("max_query_chars", raw.get("max_embedding_query_chars", 4000))),
         max_excerpt_chars=int(raw.get("max_excerpt_chars", 800)),
-        update_threshold=float(raw.get("update_threshold", 0.42)),
         batch_size=int(raw.get("batch_size", 8)),
         normalize_embeddings=bool(raw.get("normalize_embeddings", True)),
         query_prompt_name=str(raw.get("query_prompt_name", "query")),
@@ -262,23 +256,7 @@ def candidate_query(page: CandidatePage, max_chars: int) -> str:
     return trim_text("\n\n".join(value for value in values if value.strip()), max_chars)
 
 
-def hashing_vector(text: str, dimensions: int) -> list[float]:
-    dims = max(16, dimensions)
-    vector = [0.0] * dims
-    for term in embedding_terms(text):
-        digest = sha256_text(term)
-        index = int(digest[:8], 16) % dims
-        weight = 1.0 + (int(digest[8:10], 16) / 255.0)
-        vector[index] += weight
-    norm = math.sqrt(sum(value * value for value in vector))
-    if norm == 0:
-        return vector
-    return [round(value / norm, 8) for value in vector]
-
-
 def embed_texts(texts: list[str], config: EmbeddingConfig, *, is_query: bool) -> list[list[float]]:
-    if config.backend == "hashing":
-        return [hashing_vector(text, config.dimensions) for text in texts]
     if config.backend != "sentence_transformers":
         raise RuntimeError(f"不支持的 embedding 后端：{config.backend}")
     model = _sentence_transformer_model(config.model)
@@ -318,14 +296,6 @@ def _coerce_vector(row: Any, config: EmbeddingConfig) -> list[float]:
         if norm:
             vector = [value / norm for value in vector]
     return [round(value, 8) for value in vector]
-
-
-def embedding_terms(text: str) -> list[str]:
-    normalized = text.lower()
-    terms = list(tokens(normalized))
-    for segment in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
-        terms.extend(segment[index : index + 2] for index in range(len(segment) - 1))
-    return terms
 
 
 def cosine(left: list[float], right: list[Any]) -> float:
@@ -390,8 +360,7 @@ def _read_valid_record(cache_path: Path, entry: WikiKnowledgeEntry, config: Embe
         if payload.get(key) != value:
             return None
     vector = payload.get("vector")
-    expected_dimensions = max(16, config.dimensions) if config.backend == "hashing" else config.dimensions
-    if not isinstance(vector, list) or len(vector) != expected_dimensions:
+    if not isinstance(vector, list) or len(vector) != config.dimensions:
         return None
     return payload
 

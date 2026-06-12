@@ -4,7 +4,7 @@
 
 Fresh Lite branch for a fully automatic LLM-Wiki ingest core.
 
-The first implementation target is a deterministic local pipeline:
+The current Lite implementation is a fully automatic ingest pipeline:
 
 ```text
 raw_file
@@ -161,8 +161,8 @@ keys are not written to artifacts or receipts.
 
 If an older vault already has `.llmwiki/config.yaml` with `local:heuristic`,
 replace that file with the real provider config or delete it so the global
-config can take effect. `local:heuristic` and `mock:fixture` are rejected by
-`llmwiki providers check --live` and by normal ingest runs.
+config can take effect. `local:heuristic` is rejected by `llmwiki providers
+check --live` and by normal ingest runs.
 
 ## Local Qwen Embeddings
 
@@ -186,6 +186,5 @@ it does not fall back to lexical, title, exact, or hashing recall.
 }
 ```
 
-The hashing backend remains available only for low-level deterministic tests.
-Ingest candidate recall rejects hashing so the fifth step always uses
-embedding vectors.
+Lite no longer ships a hashing embedding backend. Non-`sentence_transformers`
+embedding configs are rejected before candidate recall.

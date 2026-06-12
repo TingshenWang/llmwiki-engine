@@ -4,7 +4,7 @@
 
 这是一个从零重写的 Lite 分支，核心目标是实现全自动 LLM-Wiki Ingest。
 
-第一版实现的是一条确定性的本地流水线：
+当前 Lite 实现是一条全自动 Ingest 编译流水线：
 
 ```text
 raw_file
@@ -156,8 +156,7 @@ response format。
 
 如果旧 vault 里已经有 `.llmwiki/config.yaml`，并且内容还是 `local:heuristic`，
 请直接把那份文件替换成真实 provider 配置，或删除它，让全局配置生效。
-`llmwiki providers check --live` 和正常 Ingest 都会拒绝 `local:heuristic` 与
-`mock:fixture`。
+`llmwiki providers check --live` 和正常 Ingest 都会拒绝 `local:heuristic`。
 
 ## 本地 Qwen Embeddings
 
@@ -181,5 +180,5 @@ hashing 召回。
 }
 ```
 
-hashing backend 只保留给底层确定性测试使用。Ingest 的候选页召回会拒绝 hashing，
-保证第五步一定使用 embedding 向量。
+Lite 不再内置 hashing embedding backend。非 `sentence_transformers` 的
+embedding 配置会在候选页召回前被拒绝。
