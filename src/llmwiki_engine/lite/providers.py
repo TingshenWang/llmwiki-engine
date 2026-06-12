@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, TypeVar
+
+import httpx
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+from .io import read_json
+
+
+MODEL_BACKED_STEPS = ["source_digest", "candidate_pages", "merge_plan", "composition_plan", "final_pages"]
+MAX_OUTPUT_TOKENS = 262144
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class ProviderConfigError(ValueError):
+    pass
+
+
+class ProviderCallError(RuntimeError):
+    pass
+
+
+class ProviderSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    spec: str = "local:heuristic"
+    endpoint: str | None = None
+    api_key: str | None = None
+    api_key_env: str | None = None
+    fixture_dir: str | None = None
+    timeout_seconds: float = 300.0
+    max_retries: int = 1
+    retry_backoff_seconds: float = 1.0
+    temperature: float = 0.0
+    max_tokens: int | None = MAX_OUTPUT_TOKENS
+    json_mode: Literal["json_schema", "json_object"] = "json_schema"
+    json_schema_strict: bool = False
+
+    @property
+    def kind(self) -> str:
+        return self.spec.split(":", 1)[0]
+
+    @property
+    def model_name(self) -> str | None:
+        if ":" not in self.spec:
+            return None
+        return self.spec.split(":", 1)[1]
+
+    @property
+    def is_local(self) -> bool:
+        return self.spec == "local:heuristic"
+
+    @property
+    def is_mock_fixture(self) -> bool:
+        return self.kind == "mock" and self.model_name == "fixture"
+
+    @property
+    def is_openai_compatible(self) -> bool:
+        return self.kind == "openai_compatible"
+
+    def resolved_api_key(self) -> str | None:
+        if self.api_key:
+            return self.api_key
+        if self.api_key_env:
+            return os.environ.get(self.api_key_env)
+        return None
+
+    def effective_json_mode(self) -> Literal["json_schema", "json_object"]:
+        if self.json_mode == "json_schema" and self.endpoint and "api.deepseek.com" in self.endpoint:
+            return "json_object"
+        return self.json_mode
+
+    def sanitized_context(self) -> dict[str, Any]:
+        context = {
+            "spec": self.spec,
+            "endpoint": self.endpoint,
+            "fixture_dir": self.fixture_dir,
+            "timeout_seconds": self.timeout_seconds,
+            "max_retries": self.max_retries,
+            "retry_backoff_seconds": self.retry_backoff_seconds,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "json_mode": self.json_mode,
+            "effective_json_mode": self.effective_json_mode(),
+            "json_schema_strict": self.json_schema_strict,
+            "api_key_env": self.api_key_env,
+            "has_api_key": bool(self.resolved_api_key()),
+        }
+        return context
+
+
+class PromptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    schema_name: str
+    system_prompt: str
+    user_payload: dict[str, Any]
+    response_schema: dict[str, Any]
+    json_output_example: dict[str, Any] = Field(default_factory=dict)
+
+
+@dataclass
+class ProviderCallResult:
+    output: BaseModel
+    prompt_artifact: dict[str, Any]
+    provider_result: dict[str, Any]
+    sanitized_context: dict[str, Any]
+    model_calls: int = 1
+
+
+class ProviderRegistry:
+    def __init__(self, providers: dict[str, ProviderSpec]):
+        self.providers = providers
+
+    def provider_for(self, step: str) -> ProviderSpec:
+        return self.providers.get(step) or self.providers.get("default") or ProviderSpec()
+
+    def sanitized_contexts(self, steps: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        step_names = steps or MODEL_BACKED_STEPS
+        return {step: self.provider_for(step).sanitized_context() for step in step_names}
+
+    def call_structured(self, step: str, request: PromptRequest, output_model: type[T]) -> ProviderCallResult:
+        spec = self.provider_for(step)
+        if spec.is_local:
+            raise ProviderConfigError(f"步骤 {step} 配置为本地 heuristic provider，不能发起模型请求。")
+        if spec.is_mock_fixture:
+            return self._call_mock_fixture(step, request, output_model, spec)
+        if spec.is_openai_compatible:
+            return self._call_openai_compatible(step, request, output_model, spec)
+        raise ProviderConfigError(f"步骤 {step} 使用了不支持的 provider spec：{spec.spec}")
+
+    def check(self, *, live: bool = False) -> list[dict[str, Any]]:
+        reports = []
+        for name, spec in sorted(self.providers.items()):
+            report = {"name": name, "ok": True, "context": spec.sanitized_context(), "message": "ok"}
+            if spec.is_openai_compatible:
+                if not spec.endpoint:
+                    report.update({"ok": False, "message": "missing endpoint"})
+                elif live and not spec.resolved_api_key():
+                    report.update({"ok": False, "message": "missing API key"})
+            if spec.is_mock_fixture and not spec.fixture_dir:
+                report.update({"ok": False, "message": "missing fixture_dir"})
+            reports.append(report)
+        return reports
+
+    def _call_mock_fixture(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
+        if not spec.fixture_dir:
+            raise ProviderConfigError(f"{step} 的 mock fixture provider 缺少 fixture_dir。")
+        fixture_path = Path(spec.fixture_dir).expanduser() / f"{step}.json"
+        if not fixture_path.exists():
+            raise ProviderCallError(f"{step} 的 mock fixture 不存在：{fixture_path}")
+        raw_json = read_json(fixture_path)
+        output = output_model.model_validate(raw_json)
+        return ProviderCallResult(
+            output=output,
+            prompt_artifact=_prompt_artifact(request, spec),
+            provider_result={"provider": spec.sanitized_context(), "fixture_path": fixture_path.as_posix(), "parsed": output.model_dump(mode="json")},
+            sanitized_context=spec.sanitized_context(),
+        )
+
+    def _call_openai_compatible(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
+        if not spec.endpoint:
+            raise ProviderConfigError(f"{step} 的 openai_compatible provider 缺少 endpoint。")
+        model = spec.model_name
+        if not model:
+            raise ProviderConfigError(f"{step} 的 openai_compatible provider spec 缺少 model。")
+        headers = {"Content-Type": "application/json"}
+        api_key = spec.resolved_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        last_error: Exception | None = None
+        calls_made = 0
+        retry_reason: str | None = None
+        for attempt in range(spec.max_retries + 1):
+            attempt_spec = _spec_for_retry_attempt(spec, attempt, retry_reason)
+            payload = build_chat_payload(attempt_spec, request)
+            current_retry_reason: str | None = None
+            try:
+                with httpx.Client(timeout=spec.timeout_seconds) as client:
+                    response = client.post(spec.endpoint, headers=headers, json=payload)
+                    calls_made += 1
+                    fallback_used = False
+                    if _should_fallback_to_json_object(response, attempt_spec):
+                        fallback_spec = attempt_spec.model_copy(update={"json_mode": "json_object"})
+                        fallback_payload = build_chat_payload(fallback_spec, request)
+                        response = client.post(spec.endpoint, headers=headers, json=fallback_payload)
+                        calls_made += 1
+                        fallback_used = True
+                response.raise_for_status()
+                raw_response = response.json()
+                if _response_was_truncated(raw_response):
+                    current_retry_reason = "truncated_response"
+                    raise ProviderCallError("chat completion 响应被 max_tokens 截断。")
+                parsed = _parse_chat_completion_json(raw_response)
+                output = output_model.model_validate(parsed)
+                provider_context = attempt_spec.sanitized_context() | {"retry_count": attempt}
+                if retry_reason:
+                    provider_context["retry_reason"] = retry_reason
+                if fallback_used:
+                    provider_context = {**provider_context, "response_format_fallback": "json_object"}
+                return ProviderCallResult(
+                    output=output,
+                    prompt_artifact=_prompt_artifact(request, attempt_spec),
+                    provider_result={
+                        "provider": provider_context,
+                        "raw_response": _compact_response(raw_response),
+                        "parsed": output.model_dump(mode="json"),
+                    },
+                    sanitized_context=provider_context,
+                    model_calls=calls_made,
+                )
+            except Exception as exc:  # noqa: BLE001 - retry surface should preserve provider failure text.
+                last_error = exc
+                retry_reason = current_retry_reason or "provider_or_schema_error"
+                if attempt < spec.max_retries:
+                    time.sleep(spec.retry_backoff_seconds * (attempt + 1))
+        raise ProviderCallError(f"{step} provider 调用失败：{last_error}") from last_error
+
+
+def load_provider_registry(vault: Path) -> ProviderRegistry:
+    merged: dict[str, Any] = {"default": {"spec": "local:heuristic"}}
+    for path in [Path.home() / ".llmwiki" / "config.yaml", vault.expanduser().resolve() / ".llmwiki" / "config.yaml"]:
+        if not path.exists():
+            continue
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        providers = data.get("providers", {}) if isinstance(data, dict) else {}
+        if not isinstance(providers, dict):
+            raise ProviderConfigError(f"{path} 中的 providers 必须是 mapping。")
+        for name, raw_spec in providers.items():
+            if isinstance(raw_spec, str):
+                merged[str(name)] = {"spec": raw_spec}
+            elif isinstance(raw_spec, dict):
+                merged[str(name)] = raw_spec
+            else:
+                raise ProviderConfigError(f"{path} 中的 provider {name} 必须是 string 或 mapping。")
+    return ProviderRegistry({name: ProviderSpec.model_validate(value) for name, value in merged.items()})
+
+
+def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, Any]:
+    user_content = json.dumps(
+        {
+            "task": request.step,
+            "input": request.user_payload,
+            "response_schema": request.response_schema,
+            "json_output_example": request.json_output_example,
+        },
+        ensure_ascii=False,
+    )
+    payload: dict[str, Any] = {
+        "model": spec.model_name,
+        "messages": [
+            {"role": "system", "content": request.system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": spec.temperature,
+    }
+    if spec.max_tokens is not None:
+        payload["max_tokens"] = spec.max_tokens
+    if spec.effective_json_mode() == "json_schema":
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": request.schema_name,
+                "schema": request.response_schema,
+                "strict": spec.json_schema_strict,
+            },
+        }
+    else:
+        payload["response_format"] = {"type": "json_object"}
+    return payload
+
+
+def _prompt_artifact(request: PromptRequest, spec: ProviderSpec) -> dict[str, Any]:
+    return {
+        "step": request.step,
+        "schema_name": request.schema_name,
+        "system_prompt": request.system_prompt,
+        "user_payload": request.user_payload,
+        "response_schema": request.response_schema,
+        "provider": spec.sanitized_context(),
+    }
+
+
+def _parse_chat_completion_json(raw_response: dict[str, Any]) -> Any:
+    try:
+        content = raw_response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProviderCallError("chat completion 响应缺少 choices[0].message.content。") from exc
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    if not isinstance(content, str):
+        raise ProviderCallError("chat completion content 不是文本。")
+    return _extract_json_object(content)
+
+
+def _should_fallback_to_json_object(response: httpx.Response, spec: ProviderSpec) -> bool:
+    if spec.json_mode != "json_schema" or response.status_code != 400:
+        return False
+    text = response.text.lower()
+    return "response_format" in text and ("unavailable" in text or "not support" in text or "unsupported" in text)
+
+
+def _response_was_truncated(raw_response: dict[str, Any]) -> bool:
+    choices = raw_response.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if isinstance(choice, dict) and str(choice.get("finish_reason", "")).lower() in {"length", "max_tokens"}:
+            return True
+    return False
+
+
+def _spec_for_retry_attempt(spec: ProviderSpec, attempt: int, retry_reason: str | None) -> ProviderSpec:
+    if attempt <= 0 or retry_reason != "truncated_response" or spec.max_tokens is None:
+        return spec
+    retry_tokens = max(spec.max_tokens + 1, spec.max_tokens * (2**attempt))
+    return spec.model_copy(update={"max_tokens": min(MAX_OUTPUT_TOKENS, retry_tokens)})
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    decoder = json.JSONDecoder()
+    last_error: json.JSONDecodeError | None = None
+    for match in re.finditer(r"\{", stripped):
+        try:
+            parsed, _ = decoder.raw_decode(stripped[match.start() :])
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    if last_error is not None:
+        raise ProviderCallError(f"模型响应没有可解析的 JSON object：{last_error}") from last_error
+    raise ProviderCallError("模型响应没有 JSON object。")
+
+
+def _compact_response(raw_response: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(raw_response)
+    if "choices" in compact:
+        compact["choices"] = [
+            {
+                "index": choice.get("index"),
+                "finish_reason": choice.get("finish_reason"),
+                "message": {"role": choice.get("message", {}).get("role"), "content": choice.get("message", {}).get("content")},
+            }
+            for choice in compact.get("choices", [])
+            if isinstance(choice, dict)
+        ]
+    return compact
