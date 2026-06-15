@@ -16,6 +16,7 @@ from llmwiki_engine.lite.models import (
     CandidateContext,
     CandidateContextHit,
     CandidateContexts,
+    CandidateMergePlan,
     CandidateMergeUnit,
     CandidatePage,
     CandidatePages,
@@ -33,17 +34,22 @@ from llmwiki_engine.lite.models import (
     WikiSnapshot,
 )
 from llmwiki_engine.lite.pipeline import (
+    _assert_candidate_pages_chinese,
     _assert_merge_plan_consumes_candidates,
+    _assert_merge_plan_chinese,
     _assert_source_digest_chinese,
     _canonical_final_markdown,
+    _normalize_candidate_pages,
     _normalize_final_pages,
+    _normalize_merge_plan,
     _page_generation_parallelism,
+    _step_candidate_merge,
     _validate_before_write,
     init_vault,
     PipelineError,
 )
 from llmwiki_engine.lite.profile import load_profile
-from llmwiki_engine.lite.providers import ProviderSpec, build_chat_payload
+from llmwiki_engine.lite.providers import ProviderCallResult, ProviderSpec, build_chat_payload
 
 
 def write_raw(vault: Path, name: str = "project_note.md") -> Path:
@@ -248,6 +254,93 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
         embeddings.build_candidate_contexts(candidate_pages, [], {}, config)
 
 
+def test_candidate_open_question_locator_resolves_to_chinese_body_question() -> None:
+    ref = SourceRef(raw_path="raw/managed_agents.md", raw_sha256="abc", locator="whole_file")
+    artifact = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-005",
+                candidate_unit_id="CM-005",
+                source_candidate_ids=["C-003"],
+                title="会话作为外部上下文",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Session_Context.md",
+                summary="会话日志是外部上下文对象。",
+                body_markdown=(
+                    "## 矛盾与未决问题\n\n"
+                    "- 未来模型需要怎样的上下文工程，harness 应如何演进以支持不可预见的上下文操作？【O-001】\n"
+                ),
+                open_questions=["O-001", "Claude-3 是否需要特殊上下文工程？"],
+                source_refs=[ref],
+                evidence_notes=["section"],
+                confidence=0.9,
+            )
+        ]
+    )
+
+    normalized = _normalize_candidate_pages(artifact)
+
+    assert normalized.pages[0].open_questions == [
+        "未来模型需要怎样的上下文工程，harness 应如何演进以支持不可预见的上下文操作？",
+        "Claude-3 是否需要特殊上下文工程？",
+    ]
+    assert normalized.pages[0].evidence_notes == ["来源定位：section"]
+    _assert_candidate_pages_chinese(normalized)
+
+
+def test_candidate_open_question_orphan_locator_is_dropped() -> None:
+    ref = SourceRef(raw_path="raw/managed_agents.md", raw_sha256="abc", locator="whole_file")
+    artifact = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["C-001"],
+                title="上下文工程",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Context_Engineering.md",
+                summary="上下文工程需要根据任务演进。",
+                body_markdown="## 摘要\n\n上下文工程需要根据任务演进。\n",
+                open_questions=["O-001"],
+                source_refs=[ref],
+                confidence=0.8,
+            )
+        ]
+    )
+
+    normalized = _normalize_candidate_pages(artifact)
+
+    assert normalized.pages[0].open_questions == []
+    _assert_candidate_pages_chinese(normalized)
+
+
+def test_merge_plan_candidate_path_index_allows_locator_values() -> None:
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    plan = MergePlan(
+        decisions=[
+            MergeDecision(
+                decision_id="",
+                candidate_page_id="CP-001",
+                action="create",
+                target_path="concepts/Concept_Context.md",
+                title="上下文工程",
+                page_type="concept",
+                content_scope="写入候选页中关于上下文工程的内容。",
+                candidate_path_index=["O-001", "摘要"],
+                reason="候选页包含新的上下文工程说明。",
+                source_refs=[ref],
+            )
+        ],
+        action_counts={},
+    )
+
+    normalized = _normalize_merge_plan(plan)
+
+    assert normalized.decisions[0].decision_id == "MD-001"
+    assert normalized.decisions[0].candidate_path_index == ["候选页定位：O-001", "摘要"]
+    _assert_merge_plan_chinese(normalized)
+
+
 def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     raw = write_raw(vault)
@@ -327,6 +420,123 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
     assert page_prompt.user_payload["candidate_unit"]["candidate_unit_id"] == "CM-001"
     assert page_prompt.cache_prefix_payload
     assert page_prompt.cache_prefix_payload["raw_text"]
+
+
+def test_candidate_merge_retries_unknown_source_candidate_ids(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path="raw/project_note.md",
+        raw_sha256="abc",
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["候选合并只能引用真实候选 ID。"],
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND-001",
+                kind="concept",
+                name="自动化入库",
+                suggested_page_title="自动化入库",
+                summary="自动化入库强调去掉人工审核节点。",
+                source_basis="原文说明流程不再人工审核。",
+                source_refs=[ref],
+            )
+        ],
+    )
+    invalid_plan = CandidateMergePlan(
+        units=[
+            CandidateMergeUnit(
+                candidate_unit_id="CM-999",
+                source_candidate_ids=["B-001"],
+                title="错误候选",
+                page_type="concept",
+                path_hint="concepts/Concept_Bad.md",
+                summary="这一轮错误引用了不存在的候选。",
+                merge_reason="模型误把说明性编号当成候选 ID。",
+                must_cover_points=["修正不存在的候选 ID。"],
+                source_refs=[ref],
+            )
+        ]
+    )
+    valid_plan = CandidateMergePlan(
+        units=[
+            CandidateMergeUnit(
+                candidate_unit_id="CM-999",
+                source_candidate_ids=["CAND-001"],
+                title="自动化入库",
+                page_type="concept",
+                path_hint="concepts/Concept_Auto_Ingest.md",
+                summary="这一轮使用真实候选 ID。",
+                merge_reason="只保留 source_digest 中存在的候选 ID。",
+                must_cover_points=["解释候选合并为什么不能编造 ID。"],
+                source_refs=[ref],
+            )
+        ]
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_plan if len(self.requests) == 1 else valid_plan
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "source_digest": digest,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_candidate_merge(tmp_path / "run", state)
+    plan = state["candidate_merge"]
+
+    assert isinstance(plan, CandidateMergePlan)
+    assert [unit.source_candidate_ids for unit in plan.units] == [["CAND-001"]]
+    assert len(registry.requests) == 2
+    assert registry.requests[1].user_payload["allowed_source_candidate_ids"] == ["CAND-001"]
+    assert "B-001" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 2
+    assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
 
 
 def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path) -> None:

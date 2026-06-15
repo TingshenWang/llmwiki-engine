@@ -51,6 +51,7 @@ COUNT_LABELS = {
     "artifact_count": "产物数",
     "model_calls": "模型调用",
     "repair_count": "修复数",
+    "semantic_retry_count": "语义重试数",
     "api_call_count": "API调用",
     "api_success_count": "API成功",
     "api_paused_count": "API暂停",

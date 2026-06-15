@@ -95,6 +95,33 @@ def candidate_merge_prompt(*, digest: SourceDigest, profile: Profile) -> PromptR
     )
 
 
+def candidate_merge_retry_prompt(
+    *,
+    digest: SourceDigest,
+    profile: Profile,
+    previous_plan: CandidateMergePlan,
+    validation_error: str,
+) -> PromptRequest:
+    request = candidate_merge_prompt(digest=digest, profile=profile)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    allowed_ids = [candidate.candidate_id for candidate in digest.candidates()]
+    payload.update(
+        {
+            "allowed_source_candidate_ids": allowed_ids,
+            "previous_invalid_output": previous_plan.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 candidate_merge 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "source_candidate_ids 只能使用 allowed_source_candidate_ids 中的值。",
+                "删除无法映射到 allowed_source_candidate_ids 的 unit，或合并到最接近的真实 candidate_id；不要编造新 ID。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
+
+
 def candidate_page_prompt(*, digest: SourceDigest, candidate_unit: CandidateMergeUnit, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> PromptRequest:
     return _request(
         step="candidate_pages",
