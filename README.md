@@ -38,21 +38,21 @@ records are pruned during cache sync.
 Download the macOS/Linux release bundle from GitHub:
 
 ```bash
-curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.0/llmwiki-engine-0.2.0-macos-linux.tar.gz
-curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.0/llmwiki-engine-0.2.0-macos-linux.tar.gz.sha256
+curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.1/llmwiki-engine-0.2.1-macos-linux.tar.gz
+curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.1/llmwiki-engine-0.2.1-macos-linux.tar.gz.sha256
 ```
 
 Verify the archive:
 
 ```bash
-shasum -a 256 -c llmwiki-engine-0.2.0-macos-linux.tar.gz.sha256
+shasum -a 256 -c llmwiki-engine-0.2.1-macos-linux.tar.gz.sha256
 ```
 
 Unpack and run the installer:
 
 ```bash
-tar -xzf llmwiki-engine-0.2.0-macos-linux.tar.gz
-cd llmwiki-engine-0.2.0-macos-linux
+tar -xzf llmwiki-engine-0.2.1-macos-linux.tar.gz
+cd llmwiki-engine-0.2.1-macos-linux
 ./install.sh
 ```
 

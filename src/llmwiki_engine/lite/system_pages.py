@@ -25,10 +25,6 @@ def initial_index_text() -> str:
     return render_index(entries=[], tension_rows=[], page_type_order=[])
 
 
-def initial_log_text() -> str:
-    return "# 日志\n\n" f"{SYSTEM_MARKER}\n\n" + markdown_table(["日期", "操作数", "来源"], []) + "\n"
-
-
 def markdown_table(headers: list[str], rows: list[list[object]]) -> str:
     lines = [
         "| " + " | ".join(_table_cell(header) for header in headers) + " |",
@@ -92,13 +88,6 @@ def render_index(
     )
     parts.extend(["## 矛盾与未决问题", "", markdown_table(["问题", "关联页面", "更新日期"], tension_table_rows)])
     return "\n".join(parts).rstrip() + "\n"
-
-
-def render_log_index(*, date: str, operation_id: str, raw_path: str, existing_text: str | None) -> str:
-    rows = _read_table_rows(existing_text or "")
-    date_link = obsidian_link(f"logs/{date}.md")
-    merged = _merge_log_index_row(rows, date_link=date_link, raw_path=raw_path)
-    return "# 日志\n\n" f"{SYSTEM_MARKER}\n\n" + markdown_table(["日期", "操作数", "来源"], merged) + f"\n\n最新 operation: `{operation_id}`\n"
 
 
 def render_daily_log(
@@ -301,25 +290,6 @@ def _looks_like_table_header(cells: list[str]) -> bool:
 
 def _looks_like_empty_row(cells: list[str]) -> bool:
     return bool(cells and cells[0].startswith("暂无"))
-
-
-def _merge_log_index_row(rows: list[list[str]], *, date_link: str, raw_path: str) -> list[list[str]]:
-    rendered_raw = f"`{raw_path}`"
-    for row in rows:
-        if not row or row[0] != date_link:
-            continue
-        while len(row) < 3:
-            row.append("")
-        try:
-            row[1] = str(int(row[1]) + 1)
-        except ValueError:
-            row[1] = "1"
-        sources = [item.strip() for item in row[2].split(",") if item.strip()]
-        if rendered_raw not in sources:
-            sources.append(rendered_raw)
-        row[2] = ", ".join(sources)
-        return rows
-    return [*rows, [date_link, "1", rendered_raw]]
 
 
 def _upsert_by_first_cell(rows: list[list[str]], new_row: list[str]) -> list[list[str]]:

@@ -137,8 +137,6 @@ def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
     _ensure_gitignore(vault)
     if not (vault / "wiki" / "index.md").exists():
         write_text(vault / "wiki" / "index.md", system_pages.initial_index_text())
-    if not (vault / "wiki" / "log.md").exists():
-        write_text(vault / "wiki" / "log.md", system_pages.initial_log_text())
     return vault
 
 
@@ -1478,7 +1476,6 @@ def _step_index_log_write(vault: Path, run_dir: Path, state: dict[str, object], 
     daily_target = f"logs/{log_date}.md"
     writes = {
         "index.md": _updated_index(vault, profile),
-        "log.md": _updated_log_index(vault, manifest.operation_id, binding),
         daily_target: _updated_daily_log(vault, log_date, manifest.operation_id, binding, merge_plan),
     }
     out_dir = run_dir / "index_log_write"
@@ -1923,12 +1920,6 @@ def _updated_index(vault: Path, profile: Profile) -> str:
         tension_rows=_index_tension_rows(vault, entries),
         page_type_order=profile.page_types.keys(),
     )
-
-
-def _updated_log_index(vault: Path, operation_id: str, binding: RawBinding) -> str:
-    log_path = vault / "wiki" / "log.md"
-    existing = read_text(log_path) if log_path.exists() else None
-    return system_pages.render_log_index(date=_operation_date(operation_id), operation_id=operation_id, raw_path=binding.raw_path, existing_text=existing)
 
 
 def _updated_daily_log(vault: Path, log_date: str, operation_id: str, binding: RawBinding, merge_plan: MergePlan) -> str:

@@ -26,6 +26,7 @@ from llmwiki_engine.lite.models import (
     FinalPages,
     MergeDecision,
     MergePlan,
+    OperationManifest,
     RawBinding,
     SourceDigest,
     SourceDigestCandidate,
@@ -44,6 +45,7 @@ from llmwiki_engine.lite.pipeline import (
     _normalize_merge_plan,
     _page_generation_parallelism,
     _step_candidate_merge,
+    _step_index_log_write,
     _validate_before_write,
     init_vault,
     PipelineError,
@@ -153,6 +155,49 @@ def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code != 0
     assert "必须使用真实模型 provider" in result.output
+
+
+def test_log_pages_are_date_sharded_without_global_log(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault)
+    raw_path = raw.relative_to(vault).as_posix()
+    assert not (vault / "wiki" / "log.md").exists()
+
+    binding = RawBinding(
+        raw_path=raw_path,
+        raw_sha256=sha256_file(raw),
+        size_bytes=raw.stat().st_size,
+        mtime_ns=raw.stat().st_mtime_ns,
+        bound_at="2026-06-16T00:00:00Z",
+    )
+    manifest = OperationManifest(
+        operation_id="ING-20260616T000000Z-log-test",
+        status="running",
+        created_at="2026-06-16T00:00:00Z",
+        updated_at="2026-06-16T00:00:00Z",
+        vault=vault.as_posix(),
+        raw_path=raw_path,
+        profile_name="default",
+        engine_version="test",
+    )
+    merge_plan = MergePlan(action_counts={"create": 2, "update": 1, "noop": 0}, decisions=[])
+
+    output = _step_index_log_write(
+        vault,
+        tmp_path / "run",
+        {"raw_binding": binding, "merge_plan": merge_plan, "profile": load_profile(vault)},
+        manifest,
+    )
+
+    assert output.counts["system_written_count"] == 2
+    assert output.counts["written_target_count"] == 2
+    assert (vault / "wiki" / "index.md").exists()
+    assert not (vault / "wiki" / "log.md").exists()
+    daily_log = vault / "wiki" / "logs" / "2026-06-16.md"
+    assert daily_log.exists()
+    assert "`ING-20260616T000000Z-log-test`" in daily_log.read_text(encoding="utf-8")
+    write_result = json.loads((tmp_path / "run" / "index_log_write" / "write_result.json").read_text(encoding="utf-8"))
+    assert write_result["written_targets"] == ["index.md", "logs/2026-06-16.md"]
 
 
 def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_path: Path, monkeypatch) -> None:
