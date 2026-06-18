@@ -26,7 +26,22 @@ class ProviderConfigError(ValueError):
 
 
 class ProviderCallError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        api_calls: list[dict[str, Any]] | None = None,
+        prompt_artifact: dict[str, Any] | None = None,
+        provider_result: dict[str, Any] | None = None,
+        sanitized_context: dict[str, Any] | None = None,
+        model_calls: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.api_calls = api_calls or []
+        self.prompt_artifact = prompt_artifact or {}
+        self.provider_result = provider_result or {}
+        self.sanitized_context = sanitized_context or {}
+        self.model_calls = model_calls
 
 
 class ProviderLiveCheckResult(BaseModel):
@@ -41,7 +56,7 @@ class ProviderSpec(BaseModel):
     spec: str = "unconfigured"
     endpoint: str | None = None
     api_key: str | None = None
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 180.0
     max_retries: int = 1
     retry_backoff_seconds: float = 1.0
     temperature: float = 0.0
@@ -190,45 +205,56 @@ class ProviderRegistry:
         calls_made = 0
         api_calls: list[dict[str, Any]] = []
         retry_reason: str | None = None
+        last_attempt_spec = spec
+
+        def post_once(client: httpx.Client, payload: dict[str, Any], attempt: int) -> tuple[httpx.Response, dict[str, Any], float]:
+            nonlocal calls_made
+            calls_made += 1
+            call_index = calls_made
+            started = time.perf_counter()
+            try:
+                response = client.post(spec.endpoint, headers=headers, json=payload)
+            except Exception as exc:  # noqa: BLE001 - record provider failures before retrying.
+                duration_ms = (time.perf_counter() - started) * 1000
+                api_calls.append(
+                    api_call_record(
+                        step=step,
+                        model=model,
+                        attempt=attempt,
+                        call_index=call_index,
+                        status="paused",
+                        duration_ms=duration_ms,
+                        error=_provider_exception_message(exc),
+                    )
+                )
+                raise
+            duration_ms = (time.perf_counter() - started) * 1000
+            response_record = api_call_record(
+                step=step,
+                model=model,
+                attempt=attempt,
+                call_index=call_index,
+                status="paused",
+                duration_ms=duration_ms,
+                response_status_code=response.status_code,
+            )
+            api_calls.append(response_record)
+            return response, response_record, duration_ms
+
         for attempt in range(spec.max_retries + 1):
             attempt_spec = _spec_for_retry_attempt(spec, attempt, retry_reason)
+            last_attempt_spec = attempt_spec
             payload = build_chat_payload(attempt_spec, request)
             current_retry_reason: str | None = None
             try:
                 with httpx.Client(timeout=spec.timeout_seconds) as client:
-                    started = time.perf_counter()
-                    response = client.post(spec.endpoint, headers=headers, json=payload)
-                    duration_ms = (time.perf_counter() - started) * 1000
-                    calls_made += 1
-                    response_record = api_call_record(
-                        step=step,
-                        model=model,
-                        attempt=attempt,
-                        call_index=calls_made,
-                        status="paused",
-                        duration_ms=duration_ms,
-                        response_status_code=response.status_code,
-                    )
-                    api_calls.append(response_record)
+                    response, response_record, duration_ms = post_once(client, payload, attempt)
                     fallback_used = False
                     if _should_fallback_to_json_object(response, attempt_spec):
                         response_record["error"] = "json_schema_response_format_fallback"
                         fallback_spec = attempt_spec.model_copy(update={"json_mode": "json_object"})
                         fallback_payload = build_chat_payload(fallback_spec, request)
-                        started = time.perf_counter()
-                        response = client.post(spec.endpoint, headers=headers, json=fallback_payload)
-                        duration_ms = (time.perf_counter() - started) * 1000
-                        calls_made += 1
-                        response_record = api_call_record(
-                            step=step,
-                            model=model,
-                            attempt=attempt,
-                            call_index=calls_made,
-                            status="paused",
-                            duration_ms=duration_ms,
-                            response_status_code=response.status_code,
-                        )
-                        api_calls.append(response_record)
+                        response, response_record, duration_ms = post_once(client, fallback_payload, attempt)
                         fallback_used = True
                 response.raise_for_status()
                 raw_response = response.json()
@@ -271,12 +297,27 @@ class ProviderRegistry:
                 )
             except Exception as exc:  # noqa: BLE001 - retry surface should preserve provider failure text.
                 if api_calls and api_calls[-1].get("status") != "success" and not api_calls[-1].get("error"):
-                    api_calls[-1]["error"] = str(exc)
+                    api_calls[-1]["error"] = _provider_exception_message(exc)
                 last_error = exc
-                retry_reason = current_retry_reason or "provider_or_schema_error"
+                retry_reason = current_retry_reason or _provider_retry_reason(exc)
                 if attempt < spec.max_retries:
                     time.sleep(spec.retry_backoff_seconds * (attempt + 1))
-        raise ProviderCallError(f"{step} provider 调用失败：{last_error}") from last_error
+        failure_context = last_attempt_spec.sanitized_context() | {"retry_count": spec.max_retries}
+        if retry_reason:
+            failure_context["retry_reason"] = retry_reason
+        failure_result = {
+            "provider": failure_context,
+            "api_calls": api_calls,
+            "error": _provider_exception_message(last_error) if last_error else "unknown provider error",
+        }
+        raise ProviderCallError(
+            f"{step} provider 调用失败：{last_error}",
+            api_calls=api_calls,
+            prompt_artifact=_prompt_artifact(request, last_attempt_spec),
+            provider_result=failure_result,
+            sanitized_context=failure_context,
+            model_calls=calls_made,
+        ) from last_error
 
     def _call_live_check(self, name: str, spec: ProviderSpec) -> ProviderCallResult:
         smoke_spec = spec.model_copy(
@@ -436,6 +477,26 @@ def _response_was_truncated(raw_response: dict[str, Any]) -> bool:
         if isinstance(choice, dict) and str(choice.get("finish_reason", "")).lower() in {"length", "max_tokens"}:
             return True
     return False
+
+
+def _provider_retry_reason(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "provider_timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return "provider_http_error"
+    if isinstance(exc, httpx.TransportError):
+        return "provider_transport_error"
+    return "provider_or_schema_error"
+
+
+def _provider_exception_message(exc: Exception | None) -> str:
+    if exc is None:
+        return ""
+    reason = _provider_retry_reason(exc)
+    message = str(exc).strip()
+    if message:
+        return f"{reason}: {message}"
+    return reason
 
 
 def _spec_for_retry_attempt(spec: ProviderSpec, attempt: int, retry_reason: str | None) -> ProviderSpec:

@@ -257,7 +257,7 @@ class MergeDecision(StrictModel):
     title: str
     page_type: str
     content_scope: str
-    candidate_path_index: list[str]
+    candidate_content_locators: list[str] = Field(default_factory=list)
     matched_existing_paths: list[str] = Field(default_factory=list)
     inspected_context_paths: list[str] = Field(default_factory=list)
     strongest_overlap: float = 0.0

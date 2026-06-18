@@ -73,6 +73,35 @@ def source_digest_prompt(*, raw_path: str, raw_sha256: str, raw_text: str, profi
     )
 
 
+def source_digest_retry_prompt(
+    *,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    profile: Profile,
+    previous_digest: SourceDigest,
+    validation_error: str,
+) -> PromptRequest:
+    request = source_digest_prompt(raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, profile=profile)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "previous_invalid_output": previous_digest.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 source_digest 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "所有 summary、key_takeaways、name、suggested_page_title、source_basis、weak_or_noise reason 等用户可读字段必须使用中文。",
+                "必要产品名、框架名、API 名可以保留英文专有名词，但解释性句子必须是中文。",
+                "source_raw_path 和 raw_sha256 必须保持与输入完全一致。",
+                "不要为了通过中文校验而删除有价值候选；应把英文说明改写成中文说明。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
+
+
 def candidate_merge_prompt(*, digest: SourceDigest, profile: Profile) -> PromptRequest:
     return _request(
         step="candidate_merge",
@@ -179,9 +208,9 @@ def merge_plan_prompt(*, candidate_pages: CandidatePages, candidate_contexts: Ca
                 "每个 candidate_page_id 必须至少产生一个 decision；同一个候选页可以拆成多个 decision。",
                 "如果候选页的一部分应更新 top-k 中某篇旧页，另一部分应新建页面，就输出一个 update decision 和一个 create decision。",
                 "每个 decision 必须填写全局唯一 decision_id，例如 MD-001。",
-                "每个 decision 必须填写 title、page_type、content_scope、candidate_path_index 和 source_refs。",
+                "每个 decision 必须填写 title、page_type、content_scope、candidate_content_locators 和 source_refs。",
                 "content_scope 用中文说明这个 decision 消费候选页中的哪一部分内容，避免拆分后重复或遗漏。",
-                "candidate_path_index 必须列出候选页中被此 decision 消费的章节、要点或证据定位。",
+                "candidate_content_locators 必须列出候选页中被此 decision 消费的章节、要点或证据定位。",
                 "新知识使用 create，匹配 top-k 旧页使用 update，已经覆盖才使用 noop。",
                 "update 的 target_path 必须来自同一 candidate_page_id 的 candidate_contexts.hits.path。",
                 "create 的 target_path 必须留在 profile 路由目录内。",
@@ -194,6 +223,39 @@ def merge_plan_prompt(*, candidate_pages: CandidatePages, candidate_contexts: Ca
             ],
         },
     )
+
+
+def merge_plan_retry_prompt(
+    *,
+    candidate_pages: CandidatePages,
+    candidate_contexts: CandidateContexts,
+    profile: Profile,
+    previous_plan: MergePlan,
+    validation_error: str,
+) -> PromptRequest:
+    request = merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=candidate_contexts, profile=profile)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    allowed_update_targets = {
+        item.candidate_page_id: [hit.path for hit in item.hits]
+        for item in candidate_contexts.items
+    }
+    payload.update(
+        {
+            "allowed_update_targets_by_candidate_page": allowed_update_targets,
+            "previous_invalid_output": previous_plan.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 merge_plan 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "update decision 的 target_path 必须来自同一个 candidate_page_id 的 allowed_update_targets_by_candidate_page。",
+                "update decision 必须填写 matched_existing_paths，并且至少包含本次 update 的 target_path。",
+                "如果候选页只有部分内容能更新旧页，其余新内容必须拆成 create decision，并用 candidate_content_locators 标明各自消费的候选内容。",
+                "不要为了通过校验而遗漏 candidate_page；每个 candidate_page_id 仍必须至少有一个 decision。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
 
 
 def composition_plan_prompt(
@@ -264,6 +326,35 @@ def final_page_prompt(
             ],
         },
     )
+
+
+def final_page_retry_prompt(
+    *,
+    composition_item: CompositionItem,
+    candidate_pages: CandidatePages,
+    snapshot: WikiSnapshot,
+    profile: Profile,
+    previous_pages: FinalPages,
+    validation_error: str,
+) -> PromptRequest:
+    request = final_page_prompt(composition_item=composition_item, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "previous_invalid_output": previous_pages.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 final_pages 输出没有通过系统校验；本轮必须只修正当前 composition_item，并返回完整 JSON。",
+                "仍然只能返回 1 页，final_page_id 和 target_path 必须匹配 expected values。",
+                "正文中不得包含 raw、sources、logs、index、Source_* 或 source page 的 wikilink、Markdown link、HTML href。",
+                "不要写 Related 或 相关页面章节；引擎会统一生成。",
+                "保留有来源支撑的中文正文和 source_refs，不要为了修复链接而删除核心信息。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
 
 
 def _candidate_page_cache_prefix(*, digest: SourceDigest, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> dict[str, Any]:
@@ -364,7 +455,7 @@ def _json_example(step: str) -> dict[str, Any]:
                     "title": "示例概念",
                     "page_type": "concept",
                     "content_scope": "写入候选页中关于示例概念定义和来源依据的全部内容。",
-                    "candidate_path_index": ["摘要", "核心内容"],
+                    "candidate_content_locators": ["摘要", "核心内容"],
                     "matched_existing_paths": [],
                     "inspected_context_paths": [],
                     "strongest_overlap": 0.0,

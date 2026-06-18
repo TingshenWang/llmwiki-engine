@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from threading import Lock
 from pathlib import Path
 
 import pytest
@@ -44,8 +45,12 @@ from llmwiki_engine.lite.pipeline import (
     _normalize_final_pages,
     _normalize_merge_plan,
     _page_generation_parallelism,
+    _repair_merge_plan_candidate_content_locators,
     _step_candidate_merge,
+    _step_final_pages,
     _step_index_log_write,
+    _step_merge_plan,
+    _step_source_digest,
     _validate_before_write,
     init_vault,
     PipelineError,
@@ -87,7 +92,7 @@ def make_decision(
         title=title,
         page_type="concept",
         content_scope=f"写入 {title} 对应的候选内容。",
-        candidate_path_index=["摘要", "核心内容"],
+        candidate_content_locators=["摘要", "核心内容"],
         matched_existing_paths=matched_existing_paths or [],
         reason="按候选内容生成合并决策。",
         source_refs=[ref],
@@ -139,6 +144,112 @@ def test_source_digest_allows_proper_noun_name_with_chinese_context() -> None:
     )
 
     _assert_source_digest_chinese(digest)
+
+
+def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault)
+    raw_rel = raw.relative_to(vault).as_posix()
+    raw_sha = sha256_file(raw)
+    binding = RawBinding(
+        raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        size_bytes=raw.stat().st_size,
+        mtime_ns=raw.stat().st_mtime_ns,
+        bound_at="2026-06-18T00:00:00Z",
+    )
+    ref = SourceRef(raw_path=raw_rel, raw_sha256=raw_sha, locator="whole_file")
+    invalid_digest = SourceDigest(
+        source_raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["候选项必须使用中文用户可读文本。"],
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND-001",
+                kind="concept",
+                name="自动化入库",
+                suggested_page_title="自动化入库",
+                summary="自动化入库强调去掉人工审核节点。",
+                source_basis="English source basis",
+                source_refs=[ref],
+            )
+        ],
+    )
+    valid_digest = invalid_digest.model_copy(
+        update={
+            "concepts": [
+                invalid_digest.concepts[0].model_copy(update={"source_basis": "原文说明自动化入库会去掉人工审核节点。"})
+            ]
+        }
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_digest if len(self.requests) == 1 else valid_digest
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "raw_abs": raw,
+        "raw_rel": raw_rel,
+        "raw_binding": binding,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_source_digest(tmp_path / "run", state)
+    digest = state["source_digest"]
+
+    assert isinstance(digest, SourceDigest)
+    assert digest.concepts[0].source_basis == "原文说明自动化入库会去掉人工审核节点。"
+    assert len(registry.requests) == 2
+    retry_payload = registry.requests[1].user_payload
+    assert "source_basis" in retry_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 2
+    assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
 
 
 def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:
@@ -359,7 +470,7 @@ def test_candidate_open_question_orphan_locator_is_dropped() -> None:
     _assert_candidate_pages_chinese(normalized)
 
 
-def test_merge_plan_candidate_path_index_allows_locator_values() -> None:
+def test_merge_plan_candidate_content_locators_allow_locator_values() -> None:
     ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
     plan = MergePlan(
         decisions=[
@@ -371,7 +482,7 @@ def test_merge_plan_candidate_path_index_allows_locator_values() -> None:
                 title="上下文工程",
                 page_type="concept",
                 content_scope="写入候选页中关于上下文工程的内容。",
-                candidate_path_index=["O-001", "摘要"],
+                candidate_content_locators=["O-001", "摘要"],
                 reason="候选页包含新的上下文工程说明。",
                 source_refs=[ref],
             )
@@ -382,8 +493,59 @@ def test_merge_plan_candidate_path_index_allows_locator_values() -> None:
     normalized = _normalize_merge_plan(plan)
 
     assert normalized.decisions[0].decision_id == "MD-001"
-    assert normalized.decisions[0].candidate_path_index == ["候选页定位：O-001", "摘要"]
+    assert normalized.decisions[0].candidate_content_locators == ["候选内容定位：O-001", "摘要"]
     _assert_merge_plan_chinese(normalized)
+
+
+def test_merge_plan_missing_candidate_content_locators_are_repaired_from_candidate_page() -> None:
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    decision = MergeDecision.model_validate(
+        {
+            "decision_id": "MD-001",
+            "candidate_page_id": "CP-001",
+            "action": "create",
+            "target_path": "concepts/Concept_Context.md",
+            "title": "上下文工程",
+            "page_type": "concept",
+            "content_scope": "写入候选页中关于上下文工程的内容。",
+            "reason": "候选页包含新的上下文工程说明。",
+            "source_refs": [ref.model_dump(mode="json")],
+        }
+    )
+    plan = MergePlan(decisions=[decision], action_counts={})
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-001"],
+                title="上下文工程",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Context.md",
+                summary="上下文工程负责组织模型可用信息。",
+                body_markdown="## 摘要\n\n上下文工程负责组织模型可用信息。\n",
+                source_refs=[ref],
+                confidence=0.8,
+            )
+        ]
+    )
+    contexts = CandidateContexts(
+        retrieval_backend="sentence_transformers",
+        model="Qwen/Qwen3-Embedding-0.6B",
+        input_version="test",
+        top_k=5,
+        knowledge_pool_size=0,
+        candidate_page_count=1,
+        candidate_pool_hash="pool",
+        items=[CandidateContext(candidate_page_id="CP-001", query="上下文工程", hits=[])],
+    )
+
+    repaired = _repair_merge_plan_candidate_content_locators(_normalize_merge_plan(plan), candidate_pages)
+
+    assert repaired.decisions[0].candidate_content_locators
+    assert "候选内容定位由引擎根据候选页自动补齐。" in repaired.decisions[0].warnings
+    _assert_merge_plan_chinese(repaired)
+    _assert_merge_plan_consumes_candidates(repaired, candidate_pages, contexts)
 
 
 def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_path: Path) -> None:
@@ -578,6 +740,288 @@ def test_candidate_merge_retries_unknown_source_candidate_ids(tmp_path: Path) ->
     assert len(registry.requests) == 2
     assert registry.requests[1].user_payload["allowed_source_candidate_ids"] == ["CAND-001"]
     assert "B-001" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 2
+    assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
+
+
+def test_candidate_merge_filters_deferred_candidate_after_retry(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    active = SourceDigestCandidate(
+        candidate_id="CAND-001",
+        kind="concept",
+        name="主动候选",
+        suggested_page_title="主动候选",
+        summary="主动候选应进入候选合并。",
+        source_basis="原文支持主动候选。",
+        source_refs=[ref],
+    )
+    deferred = SourceDigestCandidate(
+        candidate_id="CAND-004",
+        kind="concept",
+        name="延后候选",
+        suggested_page_title="延后候选",
+        summary="延后候选暂不进入本轮处理。",
+        source_basis="原文支持延后候选，但本轮暂不处理。",
+        source_refs=[ref],
+    )
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料包含主动候选和延后候选。",
+        key_takeaways=["延后候选不能进入 candidate_merge 的 source_candidate_ids。"],
+        concepts=[active],
+        budget_deferred_candidates=[deferred],
+    )
+    invalid_plan = CandidateMergePlan(
+        units=[
+            CandidateMergeUnit(
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-004"],
+                title="延后候选",
+                page_type="concept",
+                path_hint="concepts/Concept_Deferred.md",
+                summary="错误地处理延后候选。",
+                merge_reason="模型误把 deferred candidate 当成可处理候选。",
+                must_cover_points=["不应处理延后候选。"],
+                source_refs=[ref],
+            )
+        ]
+    )
+    mixed_retry_plan = CandidateMergePlan(
+        units=[
+            CandidateMergeUnit(
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-001", "CAND-004"],
+                title="主动候选",
+                page_type="concept",
+                path_hint="concepts/Concept_Active.md",
+                summary="重试后仍混入了延后候选。",
+                merge_reason="应该只保留主动候选。",
+                must_cover_points=["保留主动候选并移除延后候选。"],
+                source_refs=[ref],
+            )
+        ],
+        skipped_candidate_ids=["CAND-004"],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_plan if len(self.requests) == 1 else mixed_retry_plan
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "source_digest": digest,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_candidate_merge(tmp_path / "run", state)
+    plan = state["candidate_merge"]
+
+    assert isinstance(plan, CandidateMergePlan)
+    assert len(registry.requests) == 2
+    assert [unit.source_candidate_ids for unit in plan.units] == [["CAND-001"]]
+    assert plan.skipped_candidate_ids == ["CAND-004"]
+    assert "已从本轮合并中移除" in plan.warnings[0]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 2
+    assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
+
+
+def test_merge_plan_retries_semantic_validation(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-001"],
+                title="自动化入库",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Auto_Ingest.md",
+                summary="候选页包含可更新旧页的内容。",
+                body_markdown="## 摘要\n\n候选页包含可更新旧页的内容。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    contexts = CandidateContexts(
+        retrieval_backend="sentence_transformers",
+        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
+        input_version="test",
+        top_k=5,
+        knowledge_pool_size=1,
+        candidate_page_count=1,
+        candidate_pool_hash="hash",
+        items=[
+            CandidateContext(
+                candidate_page_id="CP-001",
+                query="自动化入库",
+                hits=[CandidateContextHit(path="concepts/Concept_Old.md", title="旧页", rank=1, score=0.9, reason="向量相近。")],
+            )
+        ],
+    )
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["候选合并后需要用召回结果判断更新或新建。"],
+    )
+    snapshot = WikiSnapshot(
+        wiki_root="wiki",
+        pool_hash="pool",
+        generated_at="2026-06-18T00:00:00Z",
+        entries=[
+            WikiKnowledgeEntry(
+                path="concepts/Concept_Old.md",
+                title="旧页",
+                page_type="concept",
+                sha256="old",
+                summary="旧页已有部分内容。",
+                text_excerpt="旧页已有部分内容。",
+            )
+        ],
+    )
+    invalid_plan = MergePlan(
+        action_counts={"create": 0, "update": 1, "noop": 0},
+        decisions=[
+            make_decision(
+                decision_id="MD-001",
+                candidate_page_id="CP-001",
+                action="update",
+                target_path="concepts/Concept_Old.md",
+                title="旧页",
+                ref=ref,
+                matched_existing_paths=[],
+            )
+        ],
+    )
+    valid_plan = MergePlan(
+        action_counts={"create": 0, "update": 1, "noop": 0},
+        decisions=[
+            make_decision(
+                decision_id="MD-001",
+                candidate_page_id="CP-001",
+                action="update",
+                target_path="concepts/Concept_Old.md",
+                title="旧页",
+                ref=ref,
+                matched_existing_paths=["concepts/Concept_Old.md"],
+            )
+        ],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_plan if len(self.requests) == 1 else valid_plan
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "candidate_pages": candidate_pages,
+        "source_digest": digest,
+        "wiki_snapshot": snapshot,
+        "candidate_contexts": contexts,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_merge_plan(tmp_path / "run", state)
+    plan = state["merge_plan"]
+
+    assert isinstance(plan, MergePlan)
+    assert plan.decisions[0].matched_existing_paths == ["concepts/Concept_Old.md"]
+    assert len(registry.requests) == 2
+    retry_payload = registry.requests[1].user_payload
+    assert retry_payload["allowed_update_targets_by_candidate_page"]["CP-001"] == ["concepts/Concept_Old.md"]
+    assert "matched_existing_paths" in retry_payload["validation_error"]
     assert output.counts["semantic_retry_count"] == 1
     assert output.counts["api_call_count"] == 2
     assert output.counts["api_success_count"] == 1
@@ -929,6 +1373,153 @@ def test_canonicalization_rejects_raw_source_and_system_graph_links(tmp_path: Pa
 
     with pytest.raises(PipelineError, match="raw/source/system 图谱链接"):
         _canonical_final_markdown(page, None, operation_id="OP-GRAPH")
+
+
+def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                candidate_unit_id="CM-001",
+                source_candidate_ids=["CAND-001"],
+                title="链接契约",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Link_Contract.md",
+                summary="候选页说明最终页不能链接 raw。",
+                body_markdown="## 摘要\n\n最终页不能链接 raw。",
+                source_refs=[ref],
+                confidence=0.9,
+            ),
+            CandidatePage(
+                candidate_page_id="CP-002",
+                candidate_unit_id="CM-002",
+                source_candidate_ids=["CAND-002"],
+                title="稳定写作",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Stable_Writing.md",
+                summary="候选页说明稳定写作。",
+                body_markdown="## 摘要\n\n稳定写作需要中文正文。",
+                source_refs=[ref],
+                confidence=0.9,
+            ),
+        ]
+    )
+    composition = CompositionPlan(
+        items=[
+            CompositionItem(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Link_Contract.md",
+                action="create",
+                merge_decision_ids=["MD-001"],
+                candidate_page_ids=["CP-001"],
+                section_order=["摘要"],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="生成中文知识页。",
+            ),
+            CompositionItem(
+                final_page_id="FP-002",
+                target_path="concepts/Concept_Stable_Writing.md",
+                action="create",
+                merge_decision_ids=["MD-002"],
+                candidate_page_ids=["CP-002"],
+                section_order=["摘要"],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="生成中文知识页。",
+            ),
+        ]
+    )
+    snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-18T00:00:00Z", entries=[])
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.lock = Lock()
+            self.requests: list[tuple[str, bool]] = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            final_page_id = request.user_payload["composition_item"]["final_page_id"]
+            target_path = request.user_payload["composition_item"]["target_path"]
+            is_retry = "validation_error" in request.user_payload
+            with self.lock:
+                self.requests.append((final_page_id, is_retry))
+                call_index = len(self.requests)
+            if final_page_id == "FP-001" and not is_retry:
+                markdown = "# 链接契约\n\n## 摘要\n\n这段错误地链接到 [raw](raw/project_note.md)。"
+            else:
+                title = "链接契约" if final_page_id == "FP-001" else "稳定写作"
+                markdown = f"# {title}\n\n## 摘要\n\n这是通过校验的中文最终页面。"
+            page = FinalPage(
+                final_page_id=final_page_id,
+                target_path=target_path,
+                action="create",
+                title="链接契约" if final_page_id == "FP-001" else "稳定写作",
+                page_type="concept",
+                markdown=markdown,
+                source_refs=[ref],
+            )
+            output = FinalPages(pages=[page])
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": call_index,
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "composition_plan": composition,
+        "candidate_pages": candidate_pages,
+        "wiki_snapshot": snapshot,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+        "operation_id": "ING-20260618T000000Z-test",
+    }
+
+    output = _step_final_pages(vault, tmp_path / "run", state)
+    final_pages = state["final_pages"]
+
+    assert isinstance(final_pages, FinalPages)
+    assert len(final_pages.pages) == 2
+    assert all("](raw/project_note.md)" not in page.markdown for page in final_pages.pages)
+    assert sorted(registry.requests) == [("FP-001", False), ("FP-001", True), ("FP-002", False)]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 3
+    assert output.counts["api_success_count"] == 2
+    assert output.counts["api_paused_count"] == 1
+    retry_prompt = tmp_path / "run" / "final_pages" / "model_calls" / "final_pages_FP-001_retry_1.prompt.json"
+    assert retry_prompt.exists()
 
 
 def test_canonicalization_strips_model_related_section(tmp_path: Path) -> None:
