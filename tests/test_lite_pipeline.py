@@ -47,6 +47,7 @@ from llmwiki_engine.lite.pipeline import (
     _page_generation_parallelism,
     _repair_merge_plan_candidate_content_locators,
     _step_candidate_merge,
+    _step_candidate_pages,
     _step_final_pages,
     _step_index_log_write,
     _step_merge_plan,
@@ -870,6 +871,165 @@ def test_candidate_merge_filters_deferred_candidate_after_retry(tmp_path: Path) 
     assert output.counts["semantic_retry_count"] == 1
     assert output.counts["api_call_count"] == 2
     assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
+
+
+def test_candidate_pages_retries_only_invalid_candidate_unit(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault)
+    raw_rel = raw.relative_to(vault).as_posix()
+    raw_sha = sha256_file(raw)
+    ref = SourceRef(raw_path=raw_rel, raw_sha256=raw_sha, locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["候选页生成应该按候选单元局部重试。"],
+        concepts=[
+            SourceDigestCandidate(
+                candidate_id="CAND-001",
+                kind="concept",
+                name="自动化入库",
+                suggested_page_title="自动化入库",
+                summary="自动化入库强调去掉人工审核节点。",
+                source_basis="原文说明流程不再人工审核。",
+                source_refs=[ref],
+            ),
+            SourceDigestCandidate(
+                candidate_id="CAND-002",
+                kind="concept",
+                name="向量缓存",
+                suggested_page_title="向量缓存",
+                summary="向量缓存用于下一轮候选召回。",
+                source_basis="原文说明写入后要刷新向量缓存。",
+                source_refs=[ref],
+            ),
+        ],
+    )
+    units = [
+        CandidateMergeUnit(
+            candidate_unit_id="CM-001",
+            source_candidate_ids=["CAND-001"],
+            title="自动化入库",
+            page_type="concept",
+            path_hint="concepts/Concept_Auto_Ingest.md",
+            summary="自动化入库强调去掉人工审核。",
+            merge_reason="原文描述了自动化入库流程。",
+            must_cover_points=["说明为什么不再人工审核。"],
+            source_refs=[ref],
+        ),
+        CandidateMergeUnit(
+            candidate_unit_id="CM-002",
+            source_candidate_ids=["CAND-002"],
+            title="向量缓存",
+            page_type="concept",
+            path_hint="concepts/Concept_Vector_Cache.md",
+            summary="向量缓存保存最终知识页的最新向量。",
+            merge_reason="原文描述了写入后刷新向量缓存。",
+            must_cover_points=["说明向量缓存服务下一轮召回。"],
+            source_refs=[ref],
+        ),
+    ]
+
+    def page(unit: CandidateMergeUnit, suffix: str = "") -> CandidatePage:
+        return CandidatePage(
+            candidate_page_id=f"MODEL-{unit.candidate_unit_id}{suffix}",
+            candidate_unit_id=unit.candidate_unit_id,
+            source_candidate_ids=unit.source_candidate_ids,
+            title=unit.title,
+            proposed_page_type=unit.page_type,
+            proposed_path_hint=unit.path_hint,
+            summary=unit.summary,
+            body_markdown=f"# {unit.title}\n\n## 摘要\n\n{unit.summary}\n\n## 核心内容\n\n这是一页中文候选知识页。",
+            source_refs=[ref],
+            evidence_notes=["来源定位：整篇材料。"],
+            confidence=0.8,
+        )
+
+    invalid_cm001 = CandidatePages(pages=[page(units[0], "-A"), page(units[0], "-B")])
+    valid_cm001 = CandidatePages(pages=[page(units[0])])
+    valid_cm002 = CandidatePages(pages=[page(units[1])])
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.lock = Lock()
+            self.calls_by_unit: dict[str, int] = {}
+            self.requests_by_unit: dict[str, list] = {}
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            unit_id = request.user_payload["candidate_unit"]["candidate_unit_id"]
+            with self.lock:
+                call_index = sum(self.calls_by_unit.values()) + 1
+                count = self.calls_by_unit.get(unit_id, 0) + 1
+                self.calls_by_unit[unit_id] = count
+                self.requests_by_unit.setdefault(unit_id, []).append(request)
+            output = invalid_cm001 if unit_id == "CM-001" and count == 1 else valid_cm001 if unit_id == "CM-001" else valid_cm002
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": call_index,
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "source_digest": digest,
+        "candidate_merge": CandidateMergePlan(units=units),
+        "raw_abs": raw,
+        "raw_rel": raw_rel,
+        "raw_binding": RawBinding(
+            raw_path=raw_rel,
+            raw_sha256=raw_sha,
+            size_bytes=raw.stat().st_size,
+            mtime_ns=raw.stat().st_mtime_ns,
+            bound_at="2026-06-18T00:00:00Z",
+        ),
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_candidate_pages(tmp_path / "run", state)
+    artifact = state["candidate_pages"]
+
+    assert isinstance(artifact, CandidatePages)
+    assert [page.candidate_unit_id for page in artifact.pages] == ["CM-001", "CM-002"]
+    assert registry.calls_by_unit == {"CM-001": 2, "CM-002": 1}
+    retry_payload = registry.requests_by_unit["CM-001"][1].user_payload
+    assert "必须且只能返回 1 页" in retry_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 3
+    assert output.counts["api_success_count"] == 2
     assert output.counts["api_paused_count"] == 1
 
 

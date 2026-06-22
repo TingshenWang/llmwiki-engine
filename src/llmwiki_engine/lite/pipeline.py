@@ -420,6 +420,75 @@ def _call_provider_artifacts_parallel(
     return outputs, [*artifacts, api_calls_path], model_calls, api_calls
 
 
+def _call_provider_artifacts_parallel_soft(
+    state: dict[str, object],
+    out_dir: Path,
+    step: str,
+    requests: list[tuple[str, BaseModel]],
+    output_model: type[BaseModel],
+    *,
+    artifact_suffix: str = "",
+    api_calls_filename: str = "token_usage_calls.json",
+) -> tuple[dict[str, BaseModel], list[Path], int, list[dict[str, object]], dict[str, str]]:
+    registry: ProviderRegistry = state["provider_registry"]  # type: ignore[assignment]
+    spec = registry.provider_for(step)
+    provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
+    provider_contexts[step] = {**spec.sanitized_context(), "parallel_request_count": len(requests)}
+    if not requests:
+        return {}, [], 0, [], {}
+
+    max_workers = _page_generation_parallelism(state, len(requests))
+    results_by_key: dict[str, BaseModel] = {}
+    artifacts_by_key: dict[str, list[Path]] = {}
+    model_calls_by_key: dict[str, int] = {}
+    api_calls_by_key: dict[str, list[dict[str, object]]] = {}
+    errors_by_key: dict[str, str] = {}
+    contexts = []
+    model_dir = out_dir / "model_calls"
+
+    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel | None, list[Path], dict[str, object], int, list[dict[str, object]], str | None]:
+        artifact_stem = f"{step}_{safe_filename(key)}{artifact_suffix}"
+        try:
+            result = registry.call_structured(step, request, output_model)
+        except ProviderCallError as exc:
+            artifacts = _write_provider_failure_artifacts(out_dir, artifact_stem, exc, key)
+            context = exc.sanitized_context or spec.sanitized_context()
+            return key, None, artifacts, context, exc.model_calls, tag_api_calls(exc.api_calls, key), str(exc)
+        except (ProviderConfigError, ValueError) as exc:
+            raise PipelineError(str(exc)) from exc
+        prompt_path = model_dir / f"{artifact_stem}.prompt.json"
+        result_path = model_dir / f"{artifact_stem}.provider_result.json"
+        write_json(prompt_path, result.prompt_artifact)
+        write_json(result_path, result.provider_result)
+        return key, result.output, [prompt_path, result_path], result.sanitized_context, result.model_calls, tag_api_calls(result.api_calls, key), None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(call_one, key, request) for key, request in requests]
+        for future in as_completed(futures):
+            key, output, artifacts, context, model_calls, api_calls, error = future.result()
+            if output is not None:
+                results_by_key[key] = output
+            if error:
+                errors_by_key[key] = error
+            artifacts_by_key[key] = artifacts
+            model_calls_by_key[key] = model_calls
+            api_calls_by_key[key] = api_calls
+            contexts.append(context)
+
+    provider_contexts[step] = {
+        **spec.sanitized_context(),
+        "parallel_request_count": len(requests),
+        "parallel_max_workers": max_workers,
+        "per_request_contexts": contexts,
+    }
+    artifacts = [path for key, _ in requests for path in artifacts_by_key.get(key, [])]
+    model_calls = sum(model_calls_by_key.get(key, 0) for key, _ in requests)
+    api_calls = [call for key, _ in requests for call in api_calls_by_key.get(key, [])]
+    api_calls_path = out_dir / api_calls_filename
+    write_json(api_calls_path, api_calls)
+    return results_by_key, [*artifacts, api_calls_path], model_calls, api_calls, errors_by_key
+
+
 def _write_provider_failure_artifacts(out_dir: Path, artifact_stem: str, exc: ProviderCallError, request_key: str) -> list[Path]:
     model_dir = out_dir / "model_calls"
     prompt_path = model_dir / f"{artifact_stem}.prompt.json"
@@ -739,6 +808,35 @@ def _merge_parallel_candidate_pages(outputs: list[BaseModel], units: list[Candid
             )
         )
     return CandidatePages(pages=pages, skipped_candidate_ids=_dedupe_list(skipped))
+
+
+def _candidate_pages_from_outputs(outputs: list[BaseModel], units: list[CandidateMergeUnit]) -> CandidatePages:
+    artifact = _merge_parallel_candidate_pages(outputs, units)
+    artifact = _normalize_candidate_pages(artifact)
+    _assert_unique([page.candidate_page_id for page in artifact.pages], "candidate_page_id")
+    _assert_candidate_pages_have_sources(artifact)
+    _assert_candidate_pages_chinese(artifact)
+    return artifact
+
+
+def _candidate_page_semantic_errors(
+    outputs_by_unit_id: dict[str, BaseModel],
+    units: list[CandidateMergeUnit],
+    provider_errors: dict[str, str] | None = None,
+) -> dict[str, str]:
+    errors: dict[str, str] = dict(provider_errors or {})
+    for unit in units:
+        if unit.candidate_unit_id in errors:
+            continue
+        output = outputs_by_unit_id.get(unit.candidate_unit_id)
+        if output is None:
+            errors[unit.candidate_unit_id] = f"{unit.candidate_unit_id} 缺少 provider 输出。"
+            continue
+        try:
+            _candidate_pages_from_outputs([output], [unit])
+        except PipelineError as exc:
+            errors[unit.candidate_unit_id] = str(exc)
+    return errors
 
 
 def _normalize_merge_plan(plan: MergePlan) -> MergePlan:
@@ -1333,32 +1431,75 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
     raw_text = read_text(raw_abs)
     out_dir = run_dir / "candidate_pages"
     units = candidate_merge.units
-    outputs, provider_artifacts, model_calls, api_calls = _call_provider_artifacts_parallel(
+    initial_requests = [
+        (
+            unit.candidate_unit_id,
+            prompts.candidate_page_prompt(
+                digest=digest,
+                candidate_unit=unit,
+                raw_path=raw_rel,
+                raw_sha256=binding.raw_sha256,
+                raw_text=raw_text,
+                profile=profile,
+            ),
+        )
+        for unit in units
+    ]
+    outputs_by_unit_id, provider_artifacts, model_calls, api_calls, provider_errors = _call_provider_artifacts_parallel_soft(
         state,
         out_dir,
         "candidate_pages",
-        [
-            (
-                unit.candidate_unit_id,
-                prompts.candidate_page_prompt(
-                    digest=digest,
-                    candidate_unit=unit,
-                    raw_path=raw_rel,
-                    raw_sha256=binding.raw_sha256,
-                    raw_text=raw_text,
-                    profile=profile,
-                ),
-            )
-            for unit in units
-        ],
+        initial_requests,
         CandidatePages,
     )
-    artifact = _merge_parallel_candidate_pages(outputs, units)
     parallel_request_count = len(units)
-    artifact = _normalize_candidate_pages(artifact)
-    _assert_unique([page.candidate_page_id for page in artifact.pages], "candidate_page_id")
-    _assert_candidate_pages_have_sources(artifact)
-    _assert_candidate_pages_chinese(artifact)
+    semantic_retry_count = 0
+    semantic_errors = _candidate_page_semantic_errors(outputs_by_unit_id, units, provider_errors)
+    if semantic_errors:
+        api_calls = _mark_request_semantic_retry_failed(api_calls, semantic_errors)
+        retry_units = [unit for unit in units if unit.candidate_unit_id in semantic_errors]
+        retry_requests = []
+        for unit in retry_units:
+            previous_output = outputs_by_unit_id.get(unit.candidate_unit_id)
+            previous_pages = previous_output if isinstance(previous_output, CandidatePages) else None
+            retry_requests.append(
+                (
+                    unit.candidate_unit_id,
+                    prompts.candidate_page_retry_prompt(
+                        digest=digest,
+                        candidate_unit=unit,
+                        raw_path=raw_rel,
+                        raw_sha256=binding.raw_sha256,
+                        raw_text=raw_text,
+                        profile=profile,
+                        previous_pages=previous_pages,
+                        validation_error=semantic_errors[unit.candidate_unit_id],
+                    ),
+                )
+            )
+        semantic_retry_count = len(retry_requests)
+        retry_outputs, retry_artifacts, retry_model_calls, retry_api_calls, retry_provider_errors = _call_provider_artifacts_parallel_soft(
+            state,
+            out_dir,
+            "candidate_pages",
+            retry_requests,
+            CandidatePages,
+            artifact_suffix="_retry_1",
+            api_calls_filename="token_usage_calls_retry_1.json",
+        )
+        provider_artifacts.extend(retry_artifacts)
+        model_calls += retry_model_calls
+        retry_errors = _candidate_page_semantic_errors(retry_outputs, retry_units, retry_provider_errors)
+        if retry_errors:
+            api_calls.extend(_mark_request_semantic_retry_failed(retry_api_calls, retry_errors))
+            raise PipelineError(f"candidate_pages 单候选页重试后仍未通过系统校验：{'; '.join(retry_errors.values())}")
+        api_calls.extend(retry_api_calls)
+        outputs_by_unit_id.update(retry_outputs)
+        combined_api_calls_path = out_dir / "token_usage_calls.json"
+        write_json(combined_api_calls_path, api_calls)
+        if combined_api_calls_path not in provider_artifacts:
+            provider_artifacts.append(combined_api_calls_path)
+    artifact = _candidate_pages_from_outputs([outputs_by_unit_id[unit.candidate_unit_id] for unit in units], units)
     state["candidate_pages"] = artifact
     json_path = out_dir / "candidate_pages.json"
     md_path = out_dir / "candidate_pages.md"
@@ -1374,6 +1515,7 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         "covered_digest_candidate_count": len({cid for page in artifact.pages for cid in page.source_candidate_ids}),
         "parallel_request_count": parallel_request_count if model_calls else 0,
         "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
+        **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
         **_token_usage_counts(api_calls),
     }
     return StepOutput([*artifacts, *provider_artifacts], counts, model_calls=model_calls, api_calls=api_calls)

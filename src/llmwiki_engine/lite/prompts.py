@@ -176,6 +176,43 @@ def candidate_page_prompt(*, digest: SourceDigest, candidate_unit: CandidateMerg
     )
 
 
+def candidate_page_retry_prompt(
+    *,
+    digest: SourceDigest,
+    candidate_unit: CandidateMergeUnit,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    profile: Profile,
+    previous_pages: CandidatePages | None,
+    validation_error: str,
+) -> PromptRequest:
+    request = candidate_page_prompt(
+        digest=digest,
+        candidate_unit=candidate_unit,
+        raw_path=raw_path,
+        raw_sha256=raw_sha256,
+        raw_text=raw_text,
+        profile=profile,
+    )
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "validation_error": validation_error,
+            "previous_invalid_output": previous_pages.model_dump(mode="json") if previous_pages is not None else None,
+            "instructions": [
+                *instructions,
+                "上一轮 candidate_pages 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "顶层必须是对象，必须包含 pages 数组和 skipped_candidate_ids 数组。",
+                "pages 数组必须且只能包含 1 个候选页。",
+                "该候选页必须对应 expected_candidate_unit_id，且必须包含中文 title、summary、body_markdown、evidence_notes 和 source_refs。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
+
+
 def candidate_pages_warmup_prompt(*, digest: SourceDigest, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> PromptRequest:
     return _request(
         step="candidate_pages_warmup",
