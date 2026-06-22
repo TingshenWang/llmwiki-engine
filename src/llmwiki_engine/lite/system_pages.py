@@ -9,7 +9,7 @@ from .models import WikiKnowledgeEntry
 
 
 SYSTEM_MARKER = "<!-- llmwiki:system-page:v3 -->"
-RELATED_LINK_LIMIT = 3
+RELATED_LINK_LIMIT = 1
 GRAPH_EXCLUDED_ROOTS = {"raw", "sources", "logs"}
 SYSTEM_WIKI_FILES = {"index.md", "log.md"}
 

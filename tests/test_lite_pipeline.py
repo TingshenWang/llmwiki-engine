@@ -51,6 +51,8 @@ from llmwiki_engine.lite.pipeline import (
     _step_final_pages,
     _step_index_log_write,
     _step_merge_plan,
+    _step_related_maintenance,
+    _step_related_refresh,
     _step_source_digest,
     _validate_before_write,
     init_vault,
@@ -1310,154 +1312,203 @@ def test_merge_plan_allows_split_decisions_but_update_must_use_top5() -> None:
         _assert_merge_plan_consumes_candidates(bad_plan, candidate_pages, contexts)
 
 
-def test_source_digest_related_candidates_resolve_to_sibling_pages() -> None:
+def test_related_refresh_keeps_one_related_and_excludes_body_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
-    first = SourceDigestCandidate(
-        candidate_id="CAND-001",
-        kind="concept",
-        name="First",
-        suggested_page_title="First",
-        summary="First summary.",
-        source_basis="First basis.",
-        source_refs=[ref],
-        related_candidates=["CAND-002"],
-    )
-    second = SourceDigestCandidate(
-        candidate_id="CAND-002",
-        kind="concept",
-        name="Second",
-        suggested_page_title="Second",
-        summary="Second summary.",
-        source_basis="Second basis.",
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_New.md",
+        action="create",
+        title="新页",
+        page_type="concept",
+        markdown="# 新页\n\n正文已经链接 [[concepts/Concept_Body|正文旧页]]，所以 Related 不能重复它。",
         source_refs=[ref],
     )
-    digest = SourceDigest(source_raw_path="raw/a.md", raw_sha256="abc", summary="summary", key_takeaways=["one"], concepts=[first, second])
-    candidate_pages = CandidatePages(
-        pages=[
-            CandidatePage(
-                candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
-                title="First",
-                proposed_page_type="concept",
-                proposed_path_hint="concepts/Concept_First.md",
-                summary="First summary.",
-                body_markdown="## Summary\n\nFirst.",
-                source_refs=[ref],
-                confidence=0.8,
-            ),
-            CandidatePage(
-                candidate_page_id="CP-002",
-                candidate_unit_id="CM-002",
-                source_candidate_ids=["CAND-002"],
-                title="Second",
-                proposed_page_type="concept",
-                proposed_path_hint="concepts/Concept_Second.md",
-                summary="Second summary.",
-                body_markdown="## Summary\n\nSecond.",
-                source_refs=[ref],
-                confidence=0.8,
-            ),
-        ]
-    )
-    plan = MergePlan(
-        action_counts={"create": 2, "update": 0, "noop": 0},
-        decisions=[
-            make_decision(decision_id="MD-001", candidate_page_id="CP-001", action="create", target_path="concepts/Concept_First.md", title="First", ref=ref),
-            make_decision(decision_id="MD-002", candidate_page_id="CP-002", action="create", target_path="concepts/Concept_Second.md", title="Second", ref=ref),
+    snapshot = WikiSnapshot(
+        wiki_root="wiki",
+        pool_hash="pool",
+        generated_at="2026-06-22T00:00:00Z",
+        entries=[
+            WikiKnowledgeEntry(path="concepts/Concept_Body.md", title="正文旧页", page_type="concept", sha256="body", summary="正文已链接。", text_excerpt="正文已链接。"),
+            WikiKnowledgeEntry(path="concepts/Concept_Related.md", title="相关旧页", page_type="concept", sha256="related", summary="应该成为 Related。", text_excerpt="应该成为 Related。"),
         ],
     )
-    contexts = CandidateContexts(
-        retrieval_backend="sentence_transformers",
-        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
-        input_version="test",
-        top_k=5,
-        knowledge_pool_size=0,
-        candidate_page_count=2,
-        candidate_pool_hash="hash",
-        items=[],
-    )
-    snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-11T00:00:00Z", entries=[])
+    state = {
+        "final_pages": FinalPages(pages=[page]),
+        "wiki_snapshot": snapshot,
+        "embedding_config": embeddings.EmbeddingConfig(dimensions=2),
+        "embedding_page_records": {
+            "concepts/Concept_Body.md": {"vector": [1.0, 0.0]},
+            "concepts/Concept_Related.md": {"vector": [0.9, 0.1]},
+        },
+        "config": {},
+    }
 
-    resolved, report = related_logic.finalize_merge_plan_related(plan, candidate_pages=candidate_pages, digest=digest, snapshot=snapshot, contexts=contexts)
+    def fake_embed_texts(texts, config, *, is_query):
+        assert is_query is False
+        return [[1.0, 0.0] for _ in texts]
 
-    assert resolved.decisions[0].related_pages[0].target_path == "concepts/Concept_Second.md"
-    assert resolved.decisions[0].related_pages[0].source == "source_digest"
-    assert any(item.decision == "kept" and item.target_path == "concepts/Concept_Second.md" for item in report.candidates)
+    monkeypatch.setattr("llmwiki_engine.lite.pipeline.embed_texts", fake_embed_texts)
+
+    output = _step_related_refresh(tmp_path / "run", state)
+    refreshed = state["final_pages"]
+    report = state["related_refresh_report"]
+
+    assert isinstance(refreshed, FinalPages)
+    assert "[[concepts/Concept_Related|相关旧页]]" in refreshed.pages[0].markdown
+    assert "全文向量相似度" not in refreshed.pages[0].markdown
+    assert output.counts["related_link_count"] == 1
+    assert any(item.target_path == "concepts/Concept_Body.md" and item.reject_reason == "already_body_link" for item in report.candidates)
+    assert any(item.target_path == "concepts/Concept_Related.md" and item.decision == "kept" for item in report.candidates)
 
 
-def test_top5_context_can_become_related_but_unknown_paths_are_filtered() -> None:
+def test_related_refresh_omits_related_below_threshold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
-    digest = SourceDigest(
-        source_raw_path="raw/a.md",
-        raw_sha256="abc",
-        summary="summary",
-        key_takeaways=["one"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="New",
-                suggested_page_title="New",
-                summary="New summary.",
-                source_basis="basis",
-                source_refs=[ref],
-            )
-        ],
-    )
-    candidate_pages = CandidatePages(
-        pages=[
-            CandidatePage(
-                candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
-                title="New",
-                proposed_page_type="concept",
-                proposed_path_hint="concepts/Concept_New.md",
-                summary="New summary.",
-                body_markdown="## Summary\n\nNew.",
-                source_refs=[ref],
-                confidence=0.8,
-            )
-        ]
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_New.md",
+        action="create",
+        title="新页",
+        page_type="concept",
+        markdown="# 新页\n\n正文没有足够相似的页面。",
+        source_refs=[ref],
     )
     old_entry = WikiKnowledgeEntry(
         path="concepts/Concept_Old.md",
-        title="Old",
+        title="旧页",
         page_type="concept",
         sha256="oldsha",
-        summary="Old summary.",
-        text_excerpt="Old page.",
+        summary="相似度不足。",
+        text_excerpt="相似度不足。",
     )
-    snapshot = WikiSnapshot(wiki_root="wiki", pool_hash="pool", generated_at="2026-06-11T00:00:00Z", entries=[old_entry])
-    contexts = CandidateContexts(
-        retrieval_backend="sentence_transformers",
-        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
-        input_version="test",
-        top_k=5,
-        knowledge_pool_size=1,
-        candidate_page_count=1,
-        candidate_pool_hash="hash",
-        items=[
-            CandidateContext(
-                candidate_page_id="CP-001",
-                query="New",
-                hits=[
-                    CandidateContextHit(path="concepts/Concept_Old.md", title="Old", rank=1, score=0.42, reason="related old page"),
-                    CandidateContextHit(path="concepts/Concept_Missing.md", title="Missing", rank=2, score=0.41, reason="missing"),
-                ],
-            )
-        ],
+    state = {
+        "final_pages": FinalPages(pages=[page]),
+        "wiki_snapshot": WikiSnapshot(wiki_root="wiki", pool_hash="pool", generated_at="2026-06-22T00:00:00Z", entries=[old_entry]),
+        "embedding_config": embeddings.EmbeddingConfig(dimensions=2),
+        "embedding_page_records": {"concepts/Concept_Old.md": {"vector": [0.6, 0.8]}},
+        "config": {},
+    }
+
+    monkeypatch.setattr("llmwiki_engine.lite.pipeline.embed_texts", lambda texts, config, *, is_query: [[1.0, 0.0] for _ in texts])
+
+    output = _step_related_refresh(tmp_path / "run", state)
+    refreshed = state["final_pages"]
+
+    assert isinstance(refreshed, FinalPages)
+    assert "## 相关页面" not in refreshed.pages[0].markdown
+    assert output.counts["related_link_count"] == 0
+
+
+def test_related_maintenance_replaces_old_related_when_new_page_is_stronger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    vault = init_vault(tmp_path / "vault")
+    wiki = vault / "wiki"
+    (wiki / "concepts").mkdir(parents=True, exist_ok=True)
+    old_path = wiki / "concepts/Concept_AI_PM职业路径与作品集策略.md"
+    weak_path = wiki / "concepts/Concept_AI产品经理类型.md"
+    new_path = wiki / "concepts/Concept_AI_PM职业路径规划与求职.md"
+    old_path.write_text(
+        "# AI PM职业路径与作品集策略\n\n"
+        "正文保持不变。\n\n"
+        "## 相关页面\n\n"
+        "- [[concepts/Concept_AI产品经理类型|AI产品经理类型]]\n",
+        encoding="utf-8",
     )
-    plan = MergePlan(
-        action_counts={"create": 1, "update": 0, "noop": 0},
-        decisions=[make_decision(decision_id="MD-001", candidate_page_id="CP-001", action="create", target_path="concepts/Concept_New.md", title="New", ref=ref)],
+    weak_path.write_text("# AI产品经理类型\n\n岗位类型分类。\n", encoding="utf-8")
+    new_path.write_text("# AI PM职业路径规划与求职\n\n求职路径规划与作品集策略。\n", encoding="utf-8")
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    final_page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_AI_PM职业路径规划与求职.md",
+        action="create",
+        title="AI PM职业路径规划与求职",
+        page_type="concept",
+        markdown=new_path.read_text(encoding="utf-8"),
+        source_refs=[ref],
+    )
+    state = {
+        "profile": load_profile(vault),
+        "final_pages": FinalPages(pages=[final_page]),
+        "embedding_config": embeddings.EmbeddingConfig(dimensions=2),
+        "embedding_page_records": {
+            "concepts/Concept_AI_PM职业路径与作品集策略.md": {"vector": [1.0, 0.0]},
+            "concepts/Concept_AI产品经理类型.md": {"vector": [0.75, 0.6614]},
+            "concepts/Concept_AI_PM职业路径规划与求职.md": {"vector": [0.95, 0.3122]},
+        },
+        "config": {"related": {"min_similarity": 0.72, "replacement_margin": 0.04}},
+        "write_set_items": [],
+        "written_targets": [final_page.target_path],
+        "embedding_refresh_metrics": {},
+    }
+
+    monkeypatch.setattr(
+        "llmwiki_engine.lite.pipeline.sync_page_embedding_cache",
+        lambda vault, entries, config: (state["embedding_page_records"], {"cache_hit": len(entries), "cache_refreshed": 0}),
     )
 
-    resolved, report = related_logic.finalize_merge_plan_related(plan, candidate_pages=candidate_pages, digest=digest, snapshot=snapshot, contexts=contexts)
+    output = _step_related_maintenance(vault, tmp_path / "run", state)
+    updated = old_path.read_text(encoding="utf-8")
+    report = json.loads((tmp_path / "run" / "related_maintenance" / "related_maintenance_report.json").read_text(encoding="utf-8"))
 
-    assert [ref.target_path for ref in resolved.decisions[0].related_pages] == ["concepts/Concept_Old.md"]
-    assert any(item.target_path == "concepts/Concept_Missing.md" and item.decision == "filtered" for item in report.candidates)
+    assert "[[concepts/Concept_AI_PM职业路径规划与求职|AI PM职业路径规划与求职]]" in updated
+    assert "全文向量相似度" not in updated
+    assert "正文保持不变。" in updated
+    assert output.counts["related_maintenance_replaced_count"] == 1
+    assert "concepts/Concept_AI_PM职业路径与作品集策略.md" in state["written_targets"]
+    assert report["checked_pages"][0]["action"] == "replace"
+
+
+def test_related_maintenance_keeps_existing_when_margin_is_too_small(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    vault = init_vault(tmp_path / "vault")
+    wiki = vault / "wiki"
+    (wiki / "concepts").mkdir(parents=True, exist_ok=True)
+    old_path = wiki / "concepts/Concept_Old.md"
+    weak_path = wiki / "concepts/Concept_Current.md"
+    new_path = wiki / "concepts/Concept_New.md"
+    original = (
+        "# 旧页\n\n"
+        "正文保持不变。\n\n"
+        "## 相关页面\n\n"
+        "- [[concepts/Concept_Current|当前相关]]\n"
+    )
+    old_path.write_text(original, encoding="utf-8")
+    weak_path.write_text("# 当前相关\n\n已有相关页面。\n", encoding="utf-8")
+    new_path.write_text("# 新页\n\n略强一点但没有明显更强。\n", encoding="utf-8")
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    final_page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_New.md",
+        action="create",
+        title="新页",
+        page_type="concept",
+        markdown=new_path.read_text(encoding="utf-8"),
+        source_refs=[ref],
+    )
+    state = {
+        "profile": load_profile(vault),
+        "final_pages": FinalPages(pages=[final_page]),
+        "embedding_config": embeddings.EmbeddingConfig(dimensions=2),
+        "embedding_page_records": {
+            "concepts/Concept_Old.md": {"vector": [1.0, 0.0]},
+            "concepts/Concept_Current.md": {"vector": [0.78, 0.6258]},
+            "concepts/Concept_New.md": {"vector": [0.80, 0.6]},
+        },
+        "config": {"related": {"min_similarity": 0.72, "replacement_margin": 0.04}},
+        "write_set_items": [],
+        "written_targets": [final_page.target_path],
+        "embedding_refresh_metrics": {},
+    }
+
+    monkeypatch.setattr(
+        "llmwiki_engine.lite.pipeline.sync_page_embedding_cache",
+        lambda vault, entries, config: (state["embedding_page_records"], {"cache_hit": len(entries), "cache_refreshed": 0}),
+    )
+
+    output = _step_related_maintenance(vault, tmp_path / "run", state)
+    report = json.loads((tmp_path / "run" / "related_maintenance" / "related_maintenance_report.json").read_text(encoding="utf-8"))
+
+    assert old_path.read_text(encoding="utf-8") == original
+    assert output.counts["related_maintenance_replaced_count"] == 0
+    old_row = next(item for item in report["checked_pages"] if item["path"] == "concepts/Concept_Old.md")
+    assert old_row["action"] == "keep_existing"
 
 
 def test_validation_rejects_model_related_sections_and_self_wikilinks(tmp_path: Path) -> None:
@@ -1532,7 +1583,7 @@ def test_canonicalization_rejects_raw_source_and_system_graph_links(tmp_path: Pa
     )
 
     with pytest.raises(PipelineError, match="raw/source/system 图谱链接"):
-        _canonical_final_markdown(page, None, operation_id="OP-GRAPH")
+        _canonical_final_markdown(page, operation_id="OP-GRAPH")
 
 
 def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path) -> None:
@@ -1697,10 +1748,32 @@ def test_canonicalization_strips_model_related_section(tmp_path: Path) -> None:
         source_refs=[ref],
     )
 
-    markdown = _canonical_final_markdown(page, None, operation_id="OP-RELATED")
+    markdown = _canonical_final_markdown(page, operation_id="OP-RELATED")
 
     assert "模型自己写的相关页面" not in markdown
     assert "## 相关页面" not in markdown
+
+
+def test_canonicalization_resolves_short_body_wikilinks_to_known_paths(tmp_path: Path) -> None:
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_New.md",
+        action="create",
+        title="新页",
+        page_type="concept",
+        markdown="# 新页\n\n正文链接到 [[Concept_智能体与工作流]]。",
+        source_refs=[ref],
+    )
+
+    markdown = _canonical_final_markdown(
+        page,
+        operation_id="OP-LINK",
+        known_paths={"concepts/Concept_New.md", "concepts/Concept_智能体与工作流.md"},
+        path_titles={"concepts/Concept_New.md": "新页", "concepts/Concept_智能体与工作流.md": "智能体与工作流"},
+    )
+
+    assert "[[concepts/Concept_智能体与工作流]]" in markdown
 
 
 def test_validation_rejects_source_ref_mismatch_and_unsafe_overwrite(tmp_path: Path) -> None:
@@ -1719,7 +1792,7 @@ def test_validation_rejects_source_ref_mismatch_and_unsafe_overwrite(tmp_path: P
         markdown="# Bad\n\nBody",
         source_refs=[ref],
     )
-    markdown = _canonical_final_markdown(page, None, operation_id="OP-MISMATCH")
+    markdown = _canonical_final_markdown(page, operation_id="OP-MISMATCH")
     page = page.model_copy(update={"markdown": markdown, "content_sha256": sha256_text(markdown)})
     binding = RawBinding(
         raw_path="raw/project_note.md",
@@ -1776,7 +1849,7 @@ def test_update_frontmatter_preserves_existing_provenance_and_aliases(tmp_path: 
         preimage_sha256="oldsha",
     )
 
-    markdown = _canonical_final_markdown(page.model_copy(update={"title": existing.title}), None, operation_id="OP-NEW", existing_entry=existing, model_title=page.title)
+    markdown = _canonical_final_markdown(page.model_copy(update={"title": existing.title}), operation_id="OP-NEW", existing_entry=existing, model_title=page.title)
     frontmatter = yaml.safe_load(markdown.split("---", 2)[1])
 
     assert frontmatter["title"] == "Existing Title"

@@ -9,17 +9,21 @@ The current Lite implementation is a fully automatic ingest pipeline:
 ```text
 raw_file
 -> source_digest
--> wiki_snapshot
+-> candidate_merge
+-> candidate_pages_warmup
 -> candidate_pages
+-> wiki_snapshot
 -> candidate_contexts
 -> merge_plan
 -> composition_plan
 -> final_pages
+-> related_refresh
 -> validation
 -> knowledge_write
 -> source_record_write
--> index_log_write
 -> embedding_cache_refresh
+-> related_maintenance
+-> index_log_write
 -> receipt
 ```
 
@@ -32,6 +36,17 @@ current-state page embedding cache. `candidate_contexts` then retrieves the
 top related old pages for each generated candidate page. The cache is
 path-current: the same wiki path has one latest vector record, and stale
 records are pruned during cache sync.
+
+Linking is intentionally conservative for Lite. Final page body links are
+model-written but capped at 0-2 Obsidian wikilinks, and must target existing
+knowledge pages. The `related_refresh` step then computes at most one
+non-duplicate `相关页面` link from embedding similarity. The default Related
+threshold is `0.72`; pages below that threshold get no Related link.
+After the latest embedding cache is written, `related_maintenance` checks old
+pages affected by the current write and rewrites only their `相关页面` section.
+Existing Related links are replaced only when the new candidate is at least
+`0.04` similarity points stronger by default, which keeps links from
+oscillating on small score changes.
 
 ## Install From GitHub Release
 

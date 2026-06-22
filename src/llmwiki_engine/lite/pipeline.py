@@ -21,7 +21,7 @@ from llmwiki_engine import __version__
 from . import prompts
 from . import related as related_logic
 from . import system_pages
-from .embeddings import EmbeddingConfig, build_candidate_contexts, load_embedding_config, sync_page_embedding_cache
+from .embeddings import EmbeddingConfig, build_candidate_contexts, cosine, embed_texts, load_embedding_config, sync_page_embedding_cache
 from .io import (
     append_jsonl,
     artifact_hash,
@@ -59,6 +59,7 @@ from .models import (
     RawBinding,
     Receipt,
     RepairItem,
+    RelatedCandidateReport,
     RelatedPageRef,
     SourceDigest,
     SourceDigestCandidate,
@@ -104,6 +105,10 @@ class StepOutput:
     api_calls: list[dict[str, object]] | None = None
 
 
+RELATED_MIN_SIMILARITY = 0.72
+RELATED_REPLACEMENT_MARGIN = 0.04
+
+
 def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
     vault = vault.expanduser().resolve()
     vault.mkdir(parents=True, exist_ok=True)
@@ -122,7 +127,7 @@ def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
             "cache_dir": ".llmwiki/cache/embeddings",
             "top_k_pages": 5,
             "dimensions": 1024,
-            "input_version": "page_card_v1",
+            "input_version": "page_card_v2",
             "max_page_chars": 6000,
             "max_query_chars": 4000,
             "batch_size": 8,
@@ -200,13 +205,15 @@ def run_ingest(
         ("wiki_snapshot", lambda: _step_wiki_snapshot(vault, run_dir, state)),
         ("candidate_contexts", lambda: _step_candidate_contexts(run_dir, state)),
         ("merge_plan", lambda: _step_merge_plan(run_dir, state)),
-        ("composition_plan", lambda: _step_composition_plan(vault, run_dir, state)),
+        ("composition_plan", lambda: _step_composition_plan(run_dir, state)),
         ("final_pages", lambda: _step_final_pages(vault, run_dir, state)),
+        ("related_refresh", lambda: _step_related_refresh(run_dir, state)),
         ("validation", lambda: _step_validation(vault, run_dir, state)),
         ("knowledge_write", lambda: _step_knowledge_write(vault, run_dir, state)),
         ("source_record_write", lambda: _step_source_record_write(vault, run_dir, state, manifest)),
-        ("index_log_write", lambda: _step_index_log_write(vault, run_dir, state, manifest)),
         ("embedding_cache_refresh", lambda: _step_embedding_cache_refresh(vault, run_dir, state)),
+        ("related_maintenance", lambda: _step_related_maintenance(vault, run_dir, state)),
+        ("index_log_write", lambda: _step_index_log_write(vault, run_dir, state, manifest)),
         ("receipt", lambda: _step_receipt(vault, run_dir, state, manifest)),
     ]
 
@@ -628,8 +635,6 @@ def _assert_merge_plan_chinese(plan: MergePlan) -> None:
         _require_chinese_text(f"{decision.candidate_page_id}.reason", decision.reason)
         for index, item in enumerate(decision.candidate_content_locators, start=1):
             _require_chinese_text(f"{decision.decision_id}.candidate_content_locators[{index}]", item)
-        for ref in decision.related_pages:
-            _require_chinese_text(f"{decision.candidate_page_id}.related_pages.reason", ref.reason)
         for index, item in enumerate(decision.warnings, start=1):
             _require_chinese_text(f"{decision.candidate_page_id}.warnings[{index}]", item)
 
@@ -640,8 +645,6 @@ def _assert_composition_plan_chinese(plan: CompositionPlan) -> None:
         for field_name in ["preserve_rules", "insert_rules", "delete_rules", "source_ref_rules", "warnings"]:
             for index, value in enumerate(getattr(item, field_name), start=1):
                 _require_chinese_text(f"{item.final_page_id}.{field_name}[{index}]", value)
-        for ref in item.related_pages:
-            _require_chinese_text(f"{item.final_page_id}.related_pages.reason", ref.reason)
 
 
 def _assert_final_pages_chinese(artifact: FinalPages) -> None:
@@ -850,7 +853,10 @@ def _normalize_merge_plan(plan: MergePlan) -> MergePlan:
         ]
         decisions.append(
             decision.model_copy(
-                update={"decision_id": decision_id, "candidate_content_locators": candidate_content_locators}
+                update={
+                    "decision_id": decision_id,
+                    "candidate_content_locators": candidate_content_locators,
+                }
             )
         )
     return plan.model_copy(update={"decisions": decisions, "action_counts": action_counts})
@@ -947,15 +953,18 @@ def _normalize_composition_plan(plan: CompositionPlan) -> CompositionPlan:
                 "insert_rules": _dedupe_list([*existing.insert_rules, *item.insert_rules]),
                 "delete_rules": _dedupe_list([*existing.delete_rules, *item.delete_rules]),
                 "source_ref_rules": _dedupe_list([*existing.source_ref_rules, *item.source_ref_rules]),
-                "related_pages": _merge_related_refs([*existing.related_pages, *item.related_pages], current_path=item.target_path),
-                "related_absence_reason": existing.related_absence_reason or item.related_absence_reason,
-                "related_unresolved": _dedupe_list([*existing.related_unresolved, *item.related_unresolved]),
                 "warnings": _dedupe_list([*existing.warnings, *item.warnings, "多个合并决策指向同一个目标页面，已合并写作规则。"]),
             }
         )
     normalized = []
     for index, item in enumerate(grouped.values(), start=1):
-        normalized.append(item.model_copy(update={"final_page_id": f"FP-{index:03d}"}))
+        normalized.append(
+            item.model_copy(
+                update={
+                    "final_page_id": f"FP-{index:03d}",
+                }
+            )
+        )
     return CompositionPlan(items=normalized)
 
 
@@ -1052,18 +1061,18 @@ def _normalize_final_pages(
     entries_by_path = {entry.path: entry for entry in snapshot.entries} if snapshot else {}
     known_paths = set(entries_by_path) | {page.target_path for page in pages.pages}
     path_titles = {entry.path: entry.title for entry in entries_by_path.values()}
+    for page in pages.pages:
+        path_titles[page.target_path] = page.title
     normalized = []
     for page in pages.pages:
         item = items_by_id.get(page.final_page_id) or items_by_target.get(page.target_path)
         existing_entry = entries_by_path.get(page.target_path)
         model_title = page.title
         final_title = existing_entry.title if existing_entry is not None and item is not None and item.action == "update" else page.title
-        path_titles[page.target_path] = final_title
         source_refs = _merge_source_refs(page.source_refs)
         updated_page = page.model_copy(update={"title": final_title, "source_refs": source_refs})
         markdown = _canonical_final_markdown(
             updated_page,
-            item,
             operation_id=operation_id,
             existing_entry=existing_entry,
             known_paths=known_paths,
@@ -1076,7 +1085,6 @@ def _normalize_final_pages(
 
 def _canonical_final_markdown(
     page: FinalPage,
-    item: CompositionItem | None,
     *,
     operation_id: str = "",
     existing_entry: WikiKnowledgeEntry | None = None,
@@ -1089,16 +1097,18 @@ def _canonical_final_markdown(
     link_errors = related_logic.precanonical_link_errors(markdown=body, target_path=page.target_path, title=page.title)
     if link_errors:
         raise PipelineError(f"最终页 {page.target_path} 不符合链接契约：{'; '.join(link_errors)}")
+    body = related_logic.canonicalize_body_wikilinks(body, known_paths=known_paths or set(), path_titles=path_titles or {})
+    link_issues = related_logic.final_markdown_link_issues(
+        markdown=body,
+        target_path=page.target_path,
+        title=model_title or page.title,
+        known_paths=known_paths,
+        path_titles=path_titles,
+    )
+    if link_issues:
+        raise PipelineError(f"最终页 {page.target_path} 不符合链接契约：{'; '.join(issue.message for issue in link_issues)}")
     if not body.startswith("# "):
         body = f"# {page.title}\n\n{body}" if body else f"# {page.title}\n"
-    if item is not None:
-        related = related_logic.render_related_section(
-            current_path=page.target_path,
-            related_pages=item.related_pages,
-            known_paths=known_paths or set(),
-            path_titles=path_titles,
-        )
-        body = _replace_section(body, {"Related", "相关页面"}, "相关页面", related)
     log_date = _operation_date(operation_id)
     source_refs = _merge_source_refs(page.source_refs)
     aliases = list(existing_entry.aliases if existing_entry else [])
@@ -1546,8 +1556,6 @@ def _step_candidate_contexts(run_dir: Path, state: dict[str, object]) -> StepOut
 
 def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
-    digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
-    snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     contexts: CandidateContexts = state["candidate_contexts"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "merge_plan"
@@ -1557,7 +1565,6 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     model_calls = 0
     semantic_retry_count = 0
     plan: MergePlan | None = None
-    related_report: related_logic.RelatedMergeReport | None = None
     last_semantic_error = ""
     for attempt in range(2):
         artifact_stem = "merge_plan" if attempt == 0 else f"merge_plan_retry_{attempt}"
@@ -1577,13 +1584,6 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
             candidate_plan = _normalize_merge_plan(plan_result)
             candidate_plan = _repair_merge_plan_candidate_content_locators(candidate_plan, candidate_pages)
             _assert_merge_plan_chinese(candidate_plan)
-            candidate_plan, candidate_related_report = related_logic.finalize_merge_plan_related(
-                candidate_plan,
-                candidate_pages=candidate_pages,
-                digest=digest,
-                snapshot=snapshot,
-                contexts=contexts,
-            )
             _assert_merge_plan_consumes_candidates(candidate_plan, candidate_pages, contexts)
         except PipelineError as exc:
             last_semantic_error = str(exc)
@@ -1601,27 +1601,19 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
             continue
         api_calls.extend(attempt_api_calls)
         plan = candidate_plan
-        related_report = candidate_related_report
         break
-    if plan is None or related_report is None:
+    if plan is None:
         raise PipelineError(f"merge_plan provider 重试后仍未通过系统语义校验：{last_semantic_error}")
     state["merge_plan"] = plan
-    state["related_merge_report"] = related_report
     json_path = out_dir / "merge_plan.json"
     md_path = out_dir / "merge_plan.md"
-    related_report_json = out_dir / "related_merge_report.json"
-    related_report_md = out_dir / "related_merge_report.md"
     write_json(json_path, plan)
     rendered = _render_merge_plan_md(plan)
     write_text(md_path, rendered)
-    write_json(related_report_json, related_report)
-    write_text(related_report_md, related_logic.render_related_report(related_report))
     return StepOutput(
-        [json_path, md_path, related_report_json, related_report_md, *provider_artifacts],
+        [json_path, md_path, *provider_artifacts],
         {
             **{f"{key}_count": value for key, value in plan.action_counts.items()},
-            "related_kept_count": sum(1 for item in related_report.candidates if item.decision == "kept"),
-            "related_filtered_count": sum(1 for item in related_report.candidates if item.decision != "kept"),
             **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
             **_token_usage_counts(api_calls),
         },
@@ -1630,10 +1622,9 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     )
 
 
-def _step_composition_plan(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     plan: MergePlan = state["merge_plan"]  # type: ignore[assignment]
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
-    snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "composition_plan"
     plan_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
@@ -1648,28 +1639,17 @@ def _step_composition_plan(vault: Path, run_dir: Path, state: dict[str, object])
     artifact = plan_result
     artifact = _normalize_composition_plan(artifact)
     _assert_composition_plan_chinese(artifact)
-    artifact, composition_related_report = related_logic.finalize_composition_related(artifact, snapshot=snapshot, vault=vault)
-    related_report = related_logic.merge_reports(
-        state.get("related_merge_report", related_logic.RelatedMergeReport()),  # type: ignore[arg-type]
-        composition_related_report,
-    )
     _assert_composition_covers_writes(artifact, plan)
     state["composition_plan"] = artifact
-    state["related_merge_report"] = related_report
     json_path = out_dir / "composition_plan.json"
     md_path = out_dir / "composition_plan.md"
-    related_report_json = out_dir / "related_merge_report.json"
-    related_report_md = out_dir / "related_merge_report.md"
     write_json(json_path, artifact)
     write_text(md_path, _render_composition_plan_md(artifact))
-    write_json(related_report_json, related_report)
-    write_text(related_report_md, related_logic.render_related_report(related_report))
     return StepOutput(
-        [json_path, md_path, related_report_json, related_report_md, *provider_artifacts],
+        [json_path, md_path, *provider_artifacts],
         {
             "final_target_count": len(artifact.items),
             "update_target_count": sum(1 for item in artifact.items if item.action == "update"),
-            "related_link_count": sum(len(item.related_pages) for item in artifact.items),
             **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,
@@ -1795,6 +1775,553 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     )
 
 
+def _step_related_refresh(run_dir: Path, state: dict[str, object]) -> StepOutput:
+    final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
+    snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
+    embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
+    page_records: dict[str, dict[str, object]] = state.get("embedding_page_records", {})  # type: ignore[assignment]
+    threshold = _related_similarity_threshold(state)
+    report = related_logic.RelatedMergeReport()
+    if not final_pages.pages:
+        return StepOutput([], {"related_link_count": 0, "related_threshold": threshold, "body_link_count": 0})
+
+    final_cards = [_final_page_embedding_card(page, embedding_config.max_page_chars) for page in final_pages.pages]
+    final_vectors = embed_texts(final_cards, embedding_config, is_query=False)
+    final_vector_by_path = {page.target_path: vector for page, vector in zip(final_pages.pages, final_vectors, strict=True)}
+    pool = _related_embedding_pool(
+        snapshot=snapshot,
+        page_records=page_records,
+        final_pages=final_pages,
+        final_vectors=final_vector_by_path,
+    )
+    known_paths = set(pool)
+    path_titles = {path: str(item["title"]) for path, item in pool.items()}
+    refreshed_pages: list[FinalPage] = []
+    related_link_count = 0
+    body_link_count = 0
+    for page in final_pages.pages:
+        body_links = set(related_logic.body_wikilink_targets(page.markdown))
+        body_link_count += len(body_links)
+        vector = final_vector_by_path[page.target_path]
+        selected = _select_calculated_related(
+            page=page,
+            vector=vector,
+            pool=pool,
+            body_links=body_links,
+            threshold=threshold,
+            report=report,
+        )
+        if selected:
+            related_link_count += 1
+        markdown = _apply_calculated_related_section(
+            page.markdown,
+            current_path=page.target_path,
+            related_page=selected,
+            known_paths=known_paths,
+            path_titles=path_titles,
+        )
+        refreshed_pages.append(page.model_copy(update={"markdown": markdown, "content_sha256": sha256_text(markdown)}))
+    artifact = final_pages.model_copy(update={"pages": refreshed_pages})
+    state["final_pages"] = artifact
+    state["related_refresh_report"] = report
+    out_dir = run_dir / "related_refresh"
+    json_path = out_dir / "final_pages.json"
+    report_json = out_dir / "related_refresh_report.json"
+    report_md = out_dir / "related_refresh_report.md"
+    write_json(json_path, artifact)
+    write_json(report_json, report)
+    write_text(report_md, related_logic.render_related_report(report))
+    page_artifacts = []
+    for page in artifact.pages:
+        page_path = out_dir / "pages" / page.target_path
+        write_text(page_path, page.markdown)
+        page_artifacts.append(page_path)
+    return StepOutput(
+        [json_path, report_json, report_md, *page_artifacts],
+        {
+            "related_link_count": related_link_count,
+            "related_kept_count": sum(1 for item in report.candidates if item.decision == "kept"),
+            "related_filtered_count": sum(1 for item in report.candidates if item.decision != "kept"),
+            "related_threshold": threshold,
+            "body_link_count": body_link_count,
+        },
+    )
+
+
+def _related_similarity_threshold(state: dict[str, object]) -> float:
+    config = state.get("config")
+    if isinstance(config, dict):
+        related = config.get("related")
+        if isinstance(related, dict):
+            raw = related.get("min_similarity")
+            if raw is not None:
+                try:
+                    return max(0.0, min(1.0, float(raw)))
+                except (TypeError, ValueError):
+                    pass
+    return RELATED_MIN_SIMILARITY
+
+
+def _related_replacement_margin(state: dict[str, object]) -> float:
+    config = state.get("config")
+    if isinstance(config, dict):
+        related = config.get("related")
+        if isinstance(related, dict):
+            raw = related.get("replacement_margin")
+            if raw is not None:
+                try:
+                    return max(0.0, min(1.0, float(raw)))
+                except (TypeError, ValueError):
+                    pass
+    return RELATED_REPLACEMENT_MARGIN
+
+
+def _step_related_maintenance(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+    profile: Profile = state["profile"]  # type: ignore[assignment]
+    final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
+    embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
+    page_records: dict[str, dict[str, object]] = state.get("embedding_page_records", {})  # type: ignore[assignment]
+    final_targets = {page.target_path for page in final_pages.pages}
+    out_dir = run_dir / "related_maintenance"
+    report_path = out_dir / "related_maintenance_report.json"
+    report_md_path = out_dir / "related_maintenance_report.md"
+    result_path = out_dir / "write_result.json"
+    items_path = out_dir / "write_items.json"
+    if not final_targets:
+        empty = {
+            "threshold": _related_similarity_threshold(state),
+            "replacement_margin": _related_replacement_margin(state),
+            "checked_pages": [],
+            "candidates": [],
+            "written_targets": [],
+        }
+        write_json(report_path, empty)
+        write_text(report_md_path, _render_related_maintenance_md(empty))
+        result = WriteResult(written_targets=[])
+        write_json(result_path, result)
+        write_json(items_path, [])
+        return StepOutput([report_path, report_md_path, result_path, items_path], {"related_maintenance_checked_count": 0, "related_maintenance_written_count": 0})
+
+    threshold = _related_similarity_threshold(state)
+    margin = _related_replacement_margin(state)
+    entries = _scan_wiki_entries(vault, profile)
+    pool = _related_pool_from_entries(entries=entries, page_records=page_records)
+    path_titles = {path: str(item["title"]) for path, item in pool.items()}
+    report = related_logic.RelatedMergeReport()
+    checked_pages: list[dict[str, object]] = []
+    writes: dict[str, str] = {}
+    write_items: list[WriteSetItem] = []
+    final_vectors = {path: pool[path]["vector"] for path in final_targets if path in pool}
+
+    for entry in entries:
+        if entry.path in final_targets:
+            continue
+        page_path = vault / "wiki" / entry.path
+        markdown = read_text(page_path)
+        current_targets = related_logic.related_section_targets(markdown)
+        current_target = current_targets[0] if current_targets else ""
+        vector = pool[entry.path]["vector"]
+        affected_reasons = _related_maintenance_reasons(
+            vector=vector,  # type: ignore[arg-type]
+            current_target=current_target,
+            final_targets=final_targets,
+            final_vectors=final_vectors,  # type: ignore[arg-type]
+            threshold=threshold,
+        )
+        if not affected_reasons:
+            continue
+        body_links = set(related_logic.body_wikilink_targets(markdown))
+        best = _best_related_candidate(
+            owner_id=f"MAINT-{len(checked_pages) + 1:03d}",
+            current_path=entry.path,
+            vector=vector,  # type: ignore[arg-type]
+            pool=pool,
+            body_links=body_links,
+            threshold=threshold,
+            report=report,
+        )
+        current_score = _related_score(vector, pool, current_target) if current_target else None  # type: ignore[arg-type]
+        action = "keep_existing"
+        reason = "现有 Related 足够稳定。"
+        selected: RelatedPageRef | None = None
+        candidate_path = ""
+        candidate_score: float | None = None
+        if best is None:
+            if current_target and (current_target not in pool or current_target in body_links):
+                action = "remove"
+                reason = "现有 Related 目标无效或与正文链接重复，且没有可替代候选。"
+            else:
+                action = "keep_no_candidate"
+                reason = "没有超过阈值的新候选。"
+        else:
+            candidate_score, candidate_path, candidate_item = best
+            if not current_target:
+                action = "add"
+                reason = "旧页面没有 Related，新增超过阈值的最相关页面。"
+                selected = _related_ref_from_candidate(candidate_path, candidate_item, candidate_score)
+            elif current_target == candidate_path:
+                action = "keep_existing"
+                reason = "当前 Related 仍是最相关页面。"
+            elif current_target not in pool or current_target in body_links or current_score is None:
+                action = "replace"
+                reason = "现有 Related 无效或与正文链接重复，替换为最相关页面。"
+                selected = _related_ref_from_candidate(candidate_path, candidate_item, candidate_score)
+            elif candidate_score >= current_score + margin:
+                action = "replace"
+                reason = f"新候选相似度比现有 Related 高至少 {margin:.2f}。"
+                selected = _related_ref_from_candidate(candidate_path, candidate_item, candidate_score)
+            else:
+                action = "keep_existing"
+                reason = f"新候选未比现有 Related 高出 {margin:.2f}，保持稳定。"
+
+        if action in {"add", "replace", "remove"}:
+            new_markdown = _apply_calculated_related_section(
+                markdown,
+                current_path=entry.path,
+                related_page=selected,
+                known_paths=set(pool),
+                path_titles=path_titles,
+            )
+            if new_markdown != markdown:
+                writes[entry.path] = new_markdown
+                pre_sha = sha256_file(page_path)
+                write_items.append(WriteSetItem(kind="knowledge", target_path=entry.path, content_sha256=sha256_text(new_markdown), preimage_sha256=pre_sha))
+                atomic_write_text(page_path, new_markdown)
+                page_artifact = out_dir / "pages" / entry.path
+                write_text(page_artifact, new_markdown)
+                diff_path = out_dir / "diffs" / f"{safe_filename(entry.path)}.diff"
+                diff = "\n".join(
+                    difflib.unified_diff(
+                        markdown.splitlines(),
+                        new_markdown.splitlines(),
+                        fromfile=f"a/wiki/{entry.path}",
+                        tofile=f"b/wiki/{entry.path}",
+                        lineterm="",
+                    )
+                )
+                write_text(diff_path, diff + ("\n" if diff else ""))
+            else:
+                action = "unchanged"
+                reason = "计算结果与当前页面一致。"
+
+        checked_pages.append(
+            {
+                "path": entry.path,
+                "title": entry.title,
+                "affected_reasons": affected_reasons,
+                "current_target": current_target,
+                "current_score": round(current_score, 4) if current_score is not None else None,
+                "candidate_target": candidate_path,
+                "candidate_score": round(candidate_score, 4) if candidate_score is not None else None,
+                "action": action,
+                "reason": reason,
+            }
+        )
+
+    if write_items:
+        state["write_set_items"] = [*state.get("write_set_items", []), *write_items]  # type: ignore[list-item]
+        state["written_targets"] = sorted({*state.get("written_targets", []), *writes.keys()})  # type: ignore[arg-type]
+        refreshed_entries = _scan_wiki_entries(vault, profile)
+        refreshed_records, cache_metrics = sync_page_embedding_cache(vault, refreshed_entries, embedding_config)
+        state["embedding_page_records"] = refreshed_records
+        embedding_metrics = dict(state.get("embedding_refresh_metrics", {}))
+        embedding_metrics["related_maintenance_cache_sync"] = cache_metrics
+        state["embedding_refresh_metrics"] = embedding_metrics
+
+    result = WriteResult(written_targets=sorted(writes))
+    report_payload = {
+        "threshold": threshold,
+        "replacement_margin": margin,
+        "checked_pages": checked_pages,
+        "candidates": report.candidates,
+        "written_targets": sorted(writes),
+    }
+    write_json(report_path, report_payload)
+    write_text(report_md_path, _render_related_maintenance_md(report_payload))
+    write_json(result_path, result)
+    write_json(items_path, write_items)
+    artifacts = [report_path, report_md_path, result_path, items_path]
+    artifacts.extend(out_dir / "pages" / target for target in sorted(writes))
+    artifacts.extend(out_dir / "diffs" / f"{safe_filename(target)}.diff" for target in sorted(writes))
+    return StepOutput(
+        artifacts,
+        {
+            "related_maintenance_checked_count": len(checked_pages),
+            "related_maintenance_written_count": len(writes),
+            "related_maintenance_added_count": sum(1 for item in checked_pages if item["action"] == "add"),
+            "related_maintenance_replaced_count": sum(1 for item in checked_pages if item["action"] == "replace"),
+            "related_maintenance_removed_count": sum(1 for item in checked_pages if item["action"] == "remove"),
+            "related_threshold": threshold,
+            "related_replacement_margin": margin,
+        },
+    )
+
+
+def _related_maintenance_reasons(
+    *,
+    vector: list[float],
+    current_target: str,
+    final_targets: set[str],
+    final_vectors: dict[str, list[float]],
+    threshold: float,
+) -> list[str]:
+    reasons: list[str] = []
+    if current_target in final_targets:
+        reasons.append("current_related_points_to_written_page")
+    best_written_score = 0.0
+    for final_vector in final_vectors.values():
+        best_written_score = max(best_written_score, cosine(vector, final_vector))
+    if best_written_score >= threshold:
+        reasons.append("similar_to_written_page")
+    return reasons
+
+
+def _related_pool_from_entries(
+    *,
+    entries: list[WikiKnowledgeEntry],
+    page_records: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    pool: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        record = page_records.get(entry.path)
+        vector = record.get("vector", []) if isinstance(record, dict) else []
+        if not isinstance(vector, list) or not vector:
+            raise PipelineError(f"相关页面维护必须使用最新 embedding cache，但页面缺少有效向量：{entry.path}")
+        pool[entry.path] = {
+            "path": entry.path,
+            "title": entry.title,
+            "page_type": entry.page_type,
+            "vector": vector,
+        }
+    return pool
+
+
+def _best_related_candidate(
+    *,
+    owner_id: str,
+    current_path: str,
+    vector: list[float],
+    pool: dict[str, dict[str, object]],
+    body_links: set[str],
+    threshold: float,
+    report: related_logic.RelatedMergeReport,
+) -> tuple[float, str, dict[str, object]] | None:
+    ranked: list[tuple[float, str, dict[str, object]]] = []
+    for path, item in pool.items():
+        if path == current_path:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=owner_id,
+                    current_path=current_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="filtered",
+                    reject_reason="self_link",
+                    reason="候选目标是当前页面自身。",
+                )
+            )
+            continue
+        score = round(cosine(vector, item["vector"]), 4)  # type: ignore[arg-type]
+        reason = f"全文向量相似度={score:.4f}；阈值={threshold:.2f}。"
+        if path in body_links:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=owner_id,
+                    current_path=current_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="filtered",
+                    reject_reason="already_body_link",
+                    reason=reason,
+                )
+            )
+            continue
+        if score < threshold:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=owner_id,
+                    current_path=current_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="filtered",
+                    reject_reason="below_similarity_threshold",
+                    reason=reason,
+                )
+            )
+            continue
+        ranked.append((score, path, item))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    if not ranked:
+        return None
+    score, path, item = ranked[0]
+    report.candidates.append(
+        RelatedCandidateReport(
+            owner_id=owner_id,
+            current_path=current_path,
+            target_path=path,
+            display_title=str(item["title"]),
+            source="embedding_similarity",
+            decision="kept",
+            reason=f"全文向量相似度={score:.4f}，是超过阈值的最相关非正文链接页面。",
+        )
+    )
+    for cutoff_score, cutoff_path, cutoff_item in ranked[1:]:
+        report.candidates.append(
+            RelatedCandidateReport(
+                owner_id=owner_id,
+                current_path=current_path,
+                target_path=cutoff_path,
+                display_title=str(cutoff_item["title"]),
+                source="embedding_similarity",
+                decision="cutoff",
+                reject_reason="single_related_limit",
+                reason=f"全文向量相似度={cutoff_score:.4f}，但 Related 只保留最相关 1 条。",
+            )
+        )
+    return score, path, item
+
+
+def _related_score(vector: list[float], pool: dict[str, dict[str, object]], target_path: str) -> float | None:
+    item = pool.get(target_path)
+    if not item:
+        return None
+    return cosine(vector, item["vector"])  # type: ignore[arg-type]
+
+
+def _related_ref_from_candidate(path: str, item: dict[str, object], score: float) -> RelatedPageRef:
+    return RelatedPageRef(
+        target_path=path,
+        display_title=str(item["title"]),
+        source="wiki_context",
+        reason=f"全文向量相似度={score:.4f}，是超过阈值的最相关非正文链接页面。",
+    )
+
+
+def _render_related_maintenance_md(report: dict[str, object]) -> str:
+    lines = [
+        "# 相关页面维护报告",
+        "",
+        f"- 阈值：{report.get('threshold')}",
+        f"- 替换分差：{report.get('replacement_margin')}",
+        f"- 写入页面数：{len(report.get('written_targets', [])) if isinstance(report.get('written_targets'), list) else 0}",
+        "",
+        "## 检查页面",
+    ]
+    checked = report.get("checked_pages")
+    if not isinstance(checked, list) or not checked:
+        lines.append("- 暂无需要维护的旧页面。")
+        return "\n".join(lines) + "\n"
+    for item in checked:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            "- "
+            f"`{item.get('path')}`：{item.get('action')}；"
+            f"当前=`{item.get('current_target') or '<none>'}`({item.get('current_score')})；"
+            f"候选=`{item.get('candidate_target') or '<none>'}`({item.get('candidate_score')})；"
+            f"{item.get('reason')}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _related_embedding_pool(
+    *,
+    snapshot: WikiSnapshot,
+    page_records: dict[str, dict[str, object]],
+    final_pages: FinalPages,
+    final_vectors: dict[str, list[float]],
+) -> dict[str, dict[str, object]]:
+    final_targets = {page.target_path for page in final_pages.pages}
+    pool: dict[str, dict[str, object]] = {}
+    for entry in snapshot.entries:
+        if entry.path in final_targets:
+            continue
+        record = page_records.get(entry.path)
+        vector = record.get("vector", []) if isinstance(record, dict) else []
+        if not isinstance(vector, list) or not vector:
+            raise PipelineError(f"相关页面计算必须使用 embedding cache，但页面缺少有效向量：{entry.path}")
+        pool[entry.path] = {
+            "path": entry.path,
+            "title": entry.title,
+            "page_type": entry.page_type,
+            "vector": vector,
+        }
+    for page in final_pages.pages:
+        pool[page.target_path] = {
+            "path": page.target_path,
+            "title": page.title,
+            "page_type": page.page_type,
+            "vector": final_vectors[page.target_path],
+        }
+    return pool
+
+
+def _select_calculated_related(
+    *,
+    page: FinalPage,
+    vector: list[float],
+    pool: dict[str, dict[str, object]],
+    body_links: set[str],
+    threshold: float,
+    report: related_logic.RelatedMergeReport,
+) -> RelatedPageRef | None:
+    best = _best_related_candidate(
+        owner_id=page.final_page_id,
+        current_path=page.target_path,
+        vector=vector,
+        pool=pool,
+        body_links=body_links,
+        threshold=threshold,
+        report=report,
+    )
+    if best is None:
+        return None
+    score, path, item = best
+    return _related_ref_from_candidate(path, item, score)
+
+
+def _apply_calculated_related_section(
+    markdown: str,
+    *,
+    current_path: str,
+    related_page: RelatedPageRef | None,
+    known_paths: set[str],
+    path_titles: dict[str, str],
+) -> str:
+    if related_page is None:
+        return _drop_sections(markdown, {"Related", "相关页面"}).rstrip() + "\n"
+    body = related_logic.render_related_section(
+        current_path=current_path,
+        related_pages=[related_page],
+        known_paths=known_paths,
+        path_titles=path_titles,
+    )
+    if not body.strip():
+        return _drop_sections(markdown, {"Related", "相关页面"}).rstrip() + "\n"
+    return _replace_section(markdown, {"Related", "相关页面"}, "相关页面", body).rstrip() + "\n"
+
+
+def _final_page_embedding_card(page: FinalPage, max_chars: int) -> str:
+    body = _drop_sections(strip_frontmatter(page.markdown), {"Related", "相关页面"})
+    values = [
+        f"title: {page.title}",
+        f"type: {page.page_type}",
+        f"path: {page.target_path}",
+        body,
+    ]
+    return _trim_text("\n\n".join(value for value in values if value.strip()), max_chars)
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    compact = re.sub(r"\n{3,}", "\n\n", text.strip())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars].rstrip()
+
+
 def _step_validation(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
     report = _validate_before_write(vault, state)
     out_dir = run_dir / "validation"
@@ -1902,7 +2429,8 @@ def _step_embedding_cache_refresh(vault: Path, run_dir: Path, state: dict[str, o
     profile: Profile = state["profile"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
     entries = _scan_wiki_entries(vault, profile)
-    _, metrics = sync_page_embedding_cache(vault, entries, embedding_config)
+    records, metrics = sync_page_embedding_cache(vault, entries, embedding_config)
+    state["embedding_page_records"] = records
     state["embedding_refresh_metrics"] = metrics
     out_dir = run_dir / "embedding_cache_refresh"
     report_path = out_dir / "embedding_cache_refresh.json"
@@ -2119,10 +2647,11 @@ def _validate_before_write(vault: Path, state: dict[str, object]) -> ValidationR
     raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
-    merge_plan: MergePlan | None = state.get("merge_plan") if isinstance(state.get("merge_plan"), MergePlan) else None  # type: ignore[assignment]
-    composition_plan: CompositionPlan | None = state.get("composition_plan") if isinstance(state.get("composition_plan"), CompositionPlan) else None  # type: ignore[assignment]
     snapshot: WikiSnapshot | None = state.get("wiki_snapshot") if isinstance(state.get("wiki_snapshot"), WikiSnapshot) else None  # type: ignore[assignment]
-    issues.extend(related_logic.validate_related_plan(merge_plan=merge_plan, composition_plan=composition_plan, snapshot=snapshot))
+    known_paths = {entry.path for entry in snapshot.entries} if snapshot else set()
+    path_titles = {entry.path: entry.title for entry in snapshot.entries} if snapshot else {}
+    known_paths.update(page.target_path for page in final_pages.pages)
+    path_titles.update({page.target_path: page.title for page in final_pages.pages})
     if sha256_file(raw_abs) != binding.raw_sha256:
         issues.append(ValidationIssue(severity="error", code="raw_hash_drift", message="raw 在 ingest 过程中发生变化。", path=binding.raw_path))
     targets = [page.target_path for page in final_pages.pages]
@@ -2146,7 +2675,15 @@ def _validate_before_write(vault: Path, state: dict[str, object]) -> ValidationR
             issues.append(ValidationIssue(severity="error", code="source_ref_mismatch", message="最终页面没有包含本次绑定的 raw source ref。", path=page.target_path))
         frontmatter_issues = _validate_final_markdown_frontmatter(page)
         issues.extend(frontmatter_issues)
-        issues.extend(related_logic.final_markdown_link_issues(markdown=page.markdown, target_path=page.target_path, title=page.title))
+        issues.extend(
+            related_logic.final_markdown_link_issues(
+                markdown=page.markdown,
+                target_path=page.target_path,
+                title=page.title,
+                known_paths=known_paths,
+                path_titles=path_titles,
+            )
+        )
         existing = vault / "wiki" / page.target_path
         if existing.exists():
             current_sha = sha256_file(existing)
@@ -2243,21 +2780,6 @@ def _merge_source_refs(refs: list[SourceRef]) -> list[SourceRef]:
             continue
         seen.add(key)
         merged.append(ref)
-    return merged
-
-
-def _merge_related_refs(refs: list[RelatedPageRef], *, current_path: str) -> list[RelatedPageRef]:
-    current = system_pages.normalize_related_path(current_path)
-    seen: set[str] = set()
-    merged: list[RelatedPageRef] = []
-    for ref in refs:
-        normalized = system_pages.normalize_related_path(ref.target_path)
-        if normalized is None or normalized == current or normalized in seen:
-            continue
-        seen.add(normalized)
-        merged.append(ref.model_copy(update={"target_path": normalized}))
-        if len(merged) >= system_pages.RELATED_LINK_LIMIT:
-            break
     return merged
 
 
@@ -2380,12 +2902,15 @@ def _important_artifact_hashes(run_dir: Path) -> dict[str, str]:
         "candidate_contexts": run_dir / "candidate_contexts" / "candidate_contexts.json",
         "merge_plan": run_dir / "merge_plan" / "merge_plan.json",
         "composition_plan": run_dir / "composition_plan" / "composition_plan.json",
-        "related_merge_report": run_dir / "composition_plan" / "related_merge_report.json",
         "final_pages": run_dir / "final_pages" / "final_pages.json",
+        "related_refresh": run_dir / "related_refresh" / "related_refresh_report.json",
+        "related_final_pages": run_dir / "related_refresh" / "final_pages.json",
         "knowledge_write_set": run_dir / "knowledge_write" / "write_set.json",
         "source_record_write": run_dir / "source_record_write" / "write_result.json",
-        "index_log_write": run_dir / "index_log_write" / "write_result.json",
         "embedding_cache_refresh": run_dir / "embedding_cache_refresh" / "embedding_cache_refresh.json",
+        "related_maintenance": run_dir / "related_maintenance" / "related_maintenance_report.json",
+        "related_maintenance_write": run_dir / "related_maintenance" / "write_result.json",
+        "index_log_write": run_dir / "index_log_write" / "write_result.json",
     }
     return {name: sha256_file(path) for name, path in paths.items() if path.exists()}
 
@@ -2460,11 +2985,6 @@ def _render_merge_plan_md(plan: MergePlan) -> str:
             lines.append(f"- 候选内容定位：{', '.join(decision.candidate_content_locators)}")
         lines.append(f"- 理由：{decision.reason}")
         lines.append(f"- 最强重合度：{decision.strongest_overlap}")
-        if decision.related_pages:
-            related = ", ".join(f"`{ref.target_path}`" for ref in decision.related_pages)
-            lines.append(f"- 相关页面：{related}")
-        elif decision.related_absence_reason:
-            lines.append(f"- 无相关页面原因：{decision.related_absence_reason}")
         lines.append("")
     return "\n".join(lines)
 
@@ -2476,11 +2996,6 @@ def _render_composition_plan_md(plan: CompositionPlan) -> str:
         lines.append(f"- 动作：{_action_label(item.action)}")
         lines.append(f"- 合并决策：{', '.join(item.merge_decision_ids)}")
         lines.append(f"- 章节顺序：{', '.join(item.section_order)}")
-        if item.related_pages:
-            related = ", ".join(f"`{ref.target_path}`" for ref in item.related_pages)
-            lines.append(f"- 相关页面：{related}")
-        elif item.related_absence_reason:
-            lines.append(f"- 无相关页面原因：{item.related_absence_reason}")
         lines.append("")
     return "\n".join(lines)
 

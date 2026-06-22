@@ -263,9 +263,6 @@ class MergeDecision(StrictModel):
     strongest_overlap: float = 0.0
     reason: str
     source_refs: list[SourceRef]
-    related_pages: list[RelatedPageRef] = Field(default_factory=list)
-    related_absence_reason: str = ""
-    related_unresolved: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -288,9 +285,6 @@ class CompositionItem(StrictModel):
     delete_rules: list[str] = Field(default_factory=list)
     source_ref_rules: list[str]
     readability_goal: str
-    related_pages: list[RelatedPageRef] = Field(default_factory=list)
-    related_absence_reason: str = ""
-    related_unresolved: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

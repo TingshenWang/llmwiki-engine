@@ -13,7 +13,7 @@ from .text import strip_frontmatter
 
 
 CACHE_SCHEMA_VERSION = "lite_page_embedding_cache.v1"
-INPUT_VERSION = "page_card_v1"
+INPUT_VERSION = "page_card_v2"
 DEFAULT_QWEN_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 
@@ -82,6 +82,10 @@ def sync_page_embedding_cache(
         if cached is not None:
             hits += 1
             hit_paths.append(entry.path)
+            if cached.get("content_sha256") != entry.sha256:
+                cached["content_sha256"] = entry.sha256
+                cached["updated_at"] = now_utc()
+                write_json(cache_path, cached)
             cached["cache_hit"] = True
             records[entry.path] = cached
             continue
@@ -230,7 +234,7 @@ def page_card(entry: WikiKnowledgeEntry, vault: Path, max_chars: int) -> str:
         f"type: {entry.page_type}",
         f"summary: {entry.summary}",
         f"path: {entry.path}",
-        strip_frontmatter(text),
+        strip_related_section(strip_frontmatter(text)),
     ]
     return trim_text("\n\n".join(value for value in values if value.strip()), max_chars)
 
@@ -309,8 +313,26 @@ def trim_text(text: str, max_chars: int) -> str:
 
 
 def excerpt_text(text: str, max_chars: int) -> tuple[str, bool]:
-    compact = trim_text(strip_frontmatter(text), max_chars)
-    return compact, len(strip_frontmatter(text).strip()) > len(compact)
+    body = strip_related_section(strip_frontmatter(text))
+    compact = trim_text(body, max_chars)
+    return compact, len(body.strip()) > len(compact)
+
+
+def strip_related_section(markdown: str) -> str:
+    wanted = {"related", "相关页面"}
+    lines = markdown.splitlines()
+    result: list[str] = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.startswith("## ") and stripped[3:].strip().lower() in wanted:
+            index += 1
+            while index < len(lines) and not lines[index].strip().startswith("## "):
+                index += 1
+            continue
+        result.append(lines[index])
+        index += 1
+    return "\n".join(result).strip()
 
 
 def _hit_reason(score: float) -> str:
@@ -343,7 +365,6 @@ def _read_valid_record(cache_path: Path, entry: WikiKnowledgeEntry, config: Embe
     checks = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "path": entry.path,
-        "content_sha256": entry.sha256,
         "input_sha256": input_sha,
         **embedding_contract(config),
     }

@@ -251,11 +251,7 @@ def merge_plan_prompt(*, candidate_pages: CandidatePages, candidate_contexts: Ca
                 "新知识使用 create，匹配 top-k 旧页使用 update，已经覆盖才使用 noop。",
                 "update 的 target_path 必须来自同一 candidate_page_id 的 candidate_contexts.hits.path。",
                 "create 的 target_path 必须留在 profile 路由目录内。",
-                "每个候选项选择 related_pages 前必须检查 top-k context hits。",
-                "related_pages 在这里决定，不在 final writing 决定。最多建议 2 个 related_pages；引擎可能保留旧链接，总上限 3 个。",
-                "相关页可以来自 source 内部 related_candidates、已检查旧 wiki context、或精确 title/alias 命中。",
-                "不要链接 source pages、log/index pages、未知路径或页面自身。",
-                "没有合适相关页时，设置 related_absence_reason，并保证理由字段使用中文。",
+                "不要在 merge_plan 中决定 Related；相关页面由后续计算步骤按 embedding 相似度生成。",
                 "重新计算 action_counts，确保它与 decisions 一致。",
             ],
         },
@@ -316,7 +312,7 @@ def composition_plan_prompt(
                 "candidate_page_ids 必须来自对应 merge decisions。",
                 "update target 必须保留有价值的旧内容。",
                 "每个 item 必须包含 source_ref_rules，且规则文本用中文。",
-                "把 merge decisions 中的 related_pages、related_absence_reason、related_unresolved 带入匹配的 composition item。",
+                "不要在 composition_plan 中决定 Related；相关页面由后续计算步骤按 embedding 相似度生成。",
             ],
         },
     )
@@ -333,6 +329,16 @@ def final_page_prompt(
     relevant_candidates = CandidatePages(pages=[page for page in candidate_pages.pages if page.candidate_page_id in candidate_ids])
     relevant_paths = {composition_item.target_path, *composition_item.existing_page_refs}
     relevant_entries = [entry for entry in snapshot.entries if entry.path in relevant_paths]
+    allowed_body_link_targets = [
+        {
+            "path": entry.path,
+            "title": entry.title,
+            "page_type": entry.page_type,
+            "summary": entry.summary,
+        }
+        for entry in snapshot.entries
+        if entry.path != composition_item.target_path
+    ]
     return _request(
         step="final_pages",
         model=FinalPages,
@@ -340,6 +346,7 @@ def final_page_prompt(
             "composition_item": composition_item.model_dump(mode="json"),
             "candidate_pages": relevant_candidates.model_dump(mode="json"),
             "wiki_snapshot_entries": [entry.model_dump(mode="json") for entry in relevant_entries],
+            "allowed_body_link_targets": allowed_body_link_targets,
             "profile": profile.model_dump(mode="json"),
             "parallel_generation_contract": {
                 "mode": "per_composition_item",
@@ -356,7 +363,9 @@ def final_page_prompt(
                 "引擎会替换最终 frontmatter；专注于中文正文和稳定的中文标题结构。",
                 "每个页面必须保留 source_refs。",
                 "update 页面必须保留有价值的旧笔记，并加入有来源支撑的新材料。",
-                "不要写 Related 或 相关页面章节；引擎会在 validation 之后渲染官方相关页面章节。",
+                "正文可以写 0-2 条 Obsidian wikilink，但只在阅读语境确实需要跳转理解时使用，不要为了凑数而链接。",
+                "正文 wikilink 必须从 allowed_body_link_targets.path 中选择，不能链接未知页面或本页面。",
+                "不要写 Related 或 相关页面章节；引擎会在 final_pages 之后按 embedding 相似度计算唯一 Related。",
                 "不要创建自链接。",
                 "content_sha256 可以为空；引擎会重新计算。",
                 "不要包含模型自我说明。",
@@ -385,6 +394,7 @@ def final_page_retry_prompt(
                 *instructions,
                 "上一轮 final_pages 输出没有通过系统校验；本轮必须只修正当前 composition_item，并返回完整 JSON。",
                 "仍然只能返回 1 页，final_page_id 和 target_path 必须匹配 expected values。",
+                "正文 Obsidian wikilink 最多 2 条，且必须来自 allowed_body_link_targets.path；也可以不写正文链接。",
                 "正文中不得包含 raw、sources、logs、index、Source_* 或 source page 的 wikilink、Markdown link、HTML href。",
                 "不要写 Related 或 相关页面章节；引擎会统一生成。",
                 "保留有来源支撑的中文正文和 source_refs，不要为了修复链接而删除核心信息。",
@@ -498,9 +508,6 @@ def _json_example(step: str) -> dict[str, Any]:
                     "strongest_overlap": 0.0,
                     "reason": "没有已有页面覆盖这个有来源支撑的概念。",
                     "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
-                    "related_pages": [],
-                    "related_absence_reason": "no_related_candidate_after_filter",
-                    "related_unresolved": [],
                     "warnings": [],
                 }
             ],
@@ -522,9 +529,6 @@ def _json_example(step: str) -> dict[str, Any]:
                     "delete_rules": [],
                     "source_ref_rules": ["保留 raw 来源引用。"],
                     "readability_goal": "生成可读的中文 wiki 笔记。",
-                    "related_pages": [],
-                    "related_absence_reason": "no_related_candidate_after_filter",
-                    "related_unresolved": [],
                     "warnings": [],
                 }
             ]

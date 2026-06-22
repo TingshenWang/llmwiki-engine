@@ -9,17 +9,21 @@
 ```text
 raw_file
 -> source_digest
--> wiki_snapshot
+-> candidate_merge
+-> candidate_pages_warmup
 -> candidate_pages
+-> wiki_snapshot
 -> candidate_contexts
 -> merge_plan
 -> composition_plan
 -> final_pages
+-> related_refresh
 -> validation
 -> knowledge_write
 -> source_record_write
--> index_log_write
 -> embedding_cache_refresh
+-> related_maintenance
+-> index_log_write
 -> receipt
 ```
 
@@ -29,6 +33,14 @@ raw_file
 `wiki_snapshot` 会冻结当前知识池，并同步当前状态的页面 embedding 缓存。
 `candidate_contexts` 会为每个候选页面召回 top 相关旧页面。缓存是 path-current
 语义：同一个 wiki 路径只保留最新向量记录，缓存同步时会清理陈旧记录。
+
+Lite 的链接策略刻意保持保守：最终页正文链接由模型写，但每篇只允许 0-2 条
+Obsidian wikilink，且必须指向已有知识页。`related_refresh` 再根据 embedding
+相似度计算最多 1 条不与正文重复的 `相关页面` 链接。默认 Related 阈值是
+`0.72`；低于阈值就不写 Related。`related_maintenance` 会在最新 embedding
+缓存写好后，检查受本次新增/更新页面影响的旧页面，只替换 `相关页面` 区块，
+不改正文；已有 Related 只有在新候选至少高出默认 `0.04` 相似度时才会替换，
+以避免轻微分数波动造成链接抖动。
 
 ## 从 GitHub Release 安装
 
