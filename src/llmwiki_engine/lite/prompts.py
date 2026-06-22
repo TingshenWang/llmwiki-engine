@@ -6,8 +6,6 @@ from pydantic import BaseModel
 
 from .models import (
     CandidateContexts,
-    CandidateMergePlan,
-    CandidateMergeUnit,
     CandidatePages,
     CandidatePagesWarmup,
     CompositionItem,
@@ -15,6 +13,7 @@ from .models import (
     FinalPages,
     MergePlan,
     SourceDigest,
+    SourcePageUnit,
     WikiSnapshot,
 )
 from .profile import Profile
@@ -63,11 +62,16 @@ def source_digest_prompt(*, raw_path: str, raw_sha256: str, raw_text: str, profi
                 *CHINESE_OUTPUT_RULES,
                 "source_raw_path 必须严格等于 raw_path。",
                 "raw_sha256 必须严格等于 raw_sha256。",
-                "提取值得写入 wiki 知识页的候选项。",
-                "每个候选项必须包含至少一个 source_ref，包含 raw_path、raw_sha256 和有用 locator。",
-                "如果 suggested_page_title 不确定，使用 name；不要让 name 为空。",
-                "related_candidates 只用于本 source 内部 candidate_id 关系，例如上下游、补充、反例、使用场景或方法依赖。",
-                "不要在 related_candidates 放 wiki 路径，也不要在本步骤判断 create/update/noop。",
+                "直接从 raw_text 规划本次应该生成哪些 page_units；每个 page_unit 表示后续要生成的一篇候选页。",
+                "在本步骤内完成去重、近义合并和页面类型确认；不要额外输出候选项再交给后续合并。",
+                "page_unit_id 使用 PU-001、PU-002 这样的稳定格式，不要编造 wiki 旧页路径。",
+                "page_type 必须来自 profile.page_types，且不能是 source。",
+                "path_hint 必须位于 page_type 对应目录内，且以 .md 结尾。",
+                "page_units 必须覆盖 raw_text 中所有值得进入知识库的有效内容；不要把重要信息漏掉。",
+                "must_cover_points 必须列出后续候选页必须覆盖的中文要点。",
+                "每个 page_unit 必须包含至少一个 source_ref，包含 raw_path、raw_sha256 和有用 locator。",
+                "不值得入库、噪声、重复或证据不足的内容放入 weak_or_noise_items，并用中文说明原因。",
+                "不要在本步骤读取或假设旧 wiki；不要判断 create/update/noop。",
             ],
         },
     )
@@ -92,83 +96,33 @@ def source_digest_retry_prompt(
             "instructions": [
                 *instructions,
                 "上一轮 source_digest 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
-                "所有 summary、key_takeaways、name、suggested_page_title、source_basis、weak_or_noise reason 等用户可读字段必须使用中文。",
+                "所有 summary、key_takeaways、title、content_scope、must_cover_points、weak_or_noise reason 等用户可读字段必须使用中文。",
                 "必要产品名、框架名、API 名可以保留英文专有名词，但解释性句子必须是中文。",
                 "source_raw_path 和 raw_sha256 必须保持与输入完全一致。",
-                "不要为了通过中文校验而删除有价值候选；应把英文说明改写成中文说明。",
+                "不要为了通过中文校验而删除有价值 page_unit；应把英文说明改写成中文说明。",
             ],
         }
     )
     return request.model_copy(update={"user_payload": payload})
 
 
-def candidate_merge_prompt(*, digest: SourceDigest, profile: Profile) -> PromptRequest:
-    return _request(
-        step="candidate_merge",
-        model=CandidateMergePlan,
-        payload={
-            "source_digest": digest.model_dump(mode="json"),
-            "profile": profile.model_dump(mode="json"),
-            "instructions": [
-                *CHINESE_OUTPUT_RULES,
-                "本步骤只做 source_digest 内部候选项的去重、近义合并和页面类型确认。",
-                "不要读取或假设旧 wiki；不要判断 create/update/noop。",
-                "每个 unit 表示后续要生成的一篇候选页。",
-                "source_candidate_ids 必须来自 source_digest 中已有 candidate_id，不能编造。",
-                "page_type 必须来自 profile.page_types，且不能是 source。",
-                "path_hint 必须位于 page_type 对应目录内，且以 .md 结尾。",
-                "must_cover_points 必须列出后续候选页必须覆盖的中文要点。",
-                "source_refs 必须合并对应 source candidates 的来源引用。",
-            ],
-        },
-    )
-
-
-def candidate_merge_retry_prompt(
-    *,
-    digest: SourceDigest,
-    profile: Profile,
-    previous_plan: CandidateMergePlan,
-    validation_error: str,
-) -> PromptRequest:
-    request = candidate_merge_prompt(digest=digest, profile=profile)
-    payload = dict(request.user_payload)
-    instructions = list(payload.get("instructions") or [])
-    allowed_ids = [candidate.candidate_id for candidate in digest.candidates()]
-    payload.update(
-        {
-            "allowed_source_candidate_ids": allowed_ids,
-            "previous_invalid_output": previous_plan.model_dump(mode="json"),
-            "validation_error": validation_error,
-            "instructions": [
-                *instructions,
-                "上一轮 candidate_merge 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
-                "source_candidate_ids 只能使用 allowed_source_candidate_ids 中的值。",
-                "删除无法映射到 allowed_source_candidate_ids 的 unit，或合并到最接近的真实 candidate_id；不要编造新 ID。",
-            ],
-        }
-    )
-    return request.model_copy(update={"user_payload": payload})
-
-
-def candidate_page_prompt(*, digest: SourceDigest, candidate_unit: CandidateMergeUnit, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> PromptRequest:
+def candidate_page_prompt(*, digest: SourceDigest, page_unit: SourcePageUnit, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> PromptRequest:
     return _request(
         step="candidate_pages",
         model=CandidatePages,
         cache_prefix_payload=_candidate_page_cache_prefix(digest=digest, raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, profile=profile),
         payload={
-            "candidate_unit": candidate_unit.model_dump(mode="json"),
+            "page_unit": page_unit.model_dump(mode="json"),
             "parallel_generation_contract": {
-                "mode": "per_candidate_unit",
-                "expected_candidate_unit_id": candidate_unit.candidate_unit_id,
+                "mode": "per_page_unit",
+                "expected_page_unit_id": page_unit.page_unit_id,
                 "expected_page_count": 1,
             },
             "instructions": [
                 "这是并发 candidate-page 生成请求组中的一个请求。",
-                "只为 candidate_unit 生成一个候选页面。",
+                "只为 page_unit 生成一个候选页面。",
                 "返回的 pages 数组必须只有一个 item。",
-                "page.candidate_unit_id 必须等于 expected_candidate_unit_id。",
-                "page.source_candidate_ids 必须等于或覆盖 candidate_unit.source_candidate_ids。",
+                "page.page_unit_id 必须等于 expected_page_unit_id。",
                 "必须对照 cache_prefix.raw_text 写正文。",
                 "必须使用 cache_prefix.source_digest、cache_prefix.profile 和 cache_prefix.instructions。",
             ],
@@ -179,7 +133,7 @@ def candidate_page_prompt(*, digest: SourceDigest, candidate_unit: CandidateMerg
 def candidate_page_retry_prompt(
     *,
     digest: SourceDigest,
-    candidate_unit: CandidateMergeUnit,
+    page_unit: SourcePageUnit,
     raw_path: str,
     raw_sha256: str,
     raw_text: str,
@@ -189,7 +143,7 @@ def candidate_page_retry_prompt(
 ) -> PromptRequest:
     request = candidate_page_prompt(
         digest=digest,
-        candidate_unit=candidate_unit,
+        page_unit=page_unit,
         raw_path=raw_path,
         raw_sha256=raw_sha256,
         raw_text=raw_text,
@@ -204,9 +158,9 @@ def candidate_page_retry_prompt(
             "instructions": [
                 *instructions,
                 "上一轮 candidate_pages 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
-                "顶层必须是对象，必须包含 pages 数组和 skipped_candidate_ids 数组。",
+                "顶层必须是对象，必须包含 pages 数组和 skipped_page_unit_ids 数组。",
                 "pages 数组必须且只能包含 1 个候选页。",
-                "该候选页必须对应 expected_candidate_unit_id，且必须包含中文 title、summary、body_markdown、evidence_notes 和 source_refs。",
+                "该候选页必须对应 expected_page_unit_id，且必须包含中文 title、summary、body_markdown、evidence_notes 和 source_refs。",
             ],
         }
     )
@@ -436,31 +390,25 @@ def _json_example(step: str) -> dict[str, Any]:
             "raw_sha256": "sha256",
             "summary": "这是一段来源材料的中文摘要。",
             "key_takeaways": ["一条有来源支撑的中文收获。"],
-            "entities": [],
-            "concepts": [
+            "page_units": [
                 {
-                    "candidate_id": "CAND-001",
-                    "kind": "concept",
-                    "name": "示例概念",
-                    "suggested_page_title": "示例概念",
+                    "page_unit_id": "PU-001",
+                    "title": "示例概念",
+                    "page_type": "concept",
+                    "path_hint": "concepts/Concept_Example_Concept.md",
                     "summary": "说明这个概念为什么值得写入 wiki。",
-                    "source_basis": "候选项对应的具体来源依据。",
+                    "content_scope": "覆盖 raw 中关于示例概念的定义、用途和来源依据。",
+                    "must_cover_points": ["说明示例概念的定义和来源依据。"],
                     "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
-                    "related_candidates": [],
                 }
             ],
-            "designs": [],
-            "comparisons": [],
-            "open_questions": [],
-            "budget_deferred_candidates": [],
             "weak_or_noise_items": [],
         },
         "candidate_pages": {
             "pages": [
                 {
                     "candidate_page_id": "CP-001",
-                    "candidate_unit_id": "CM-001",
-                    "source_candidate_ids": ["CAND-001"],
+                    "page_unit_id": "PU-001",
                     "title": "示例概念",
                     "proposed_page_type": "concept",
                     "proposed_path_hint": "concepts/Concept_Example_Concept.md",
@@ -472,26 +420,9 @@ def _json_example(step: str) -> dict[str, Any]:
                     "confidence": 0.7,
                 }
             ],
-            "skipped_candidate_ids": [],
+            "skipped_page_unit_ids": [],
         },
         "candidate_pages_warmup": {"status": "OK"},
-        "candidate_merge": {
-            "units": [
-                {
-                    "candidate_unit_id": "CM-001",
-                    "source_candidate_ids": ["CAND-001"],
-                    "title": "示例概念",
-                    "page_type": "concept",
-                    "path_hint": "concepts/Concept_Example_Concept.md",
-                    "summary": "把同义候选合并成一个待生成页面。",
-                    "merge_reason": "只有一个候选项，直接保留为一个页面单元。",
-                    "must_cover_points": ["说明示例概念的定义和来源依据。"],
-                    "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
-                }
-            ],
-            "skipped_candidate_ids": [],
-            "warnings": [],
-        },
         "merge_plan": {
             "decisions": [
                 {

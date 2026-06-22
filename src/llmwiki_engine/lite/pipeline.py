@@ -44,8 +44,6 @@ from .models import (
     ArtifactRef,
     CandidateContext,
     CandidateContexts,
-    CandidateMergePlan,
-    CandidateMergeUnit,
     CandidatePage,
     CandidatePages,
     CandidatePagesWarmup,
@@ -62,7 +60,7 @@ from .models import (
     RelatedCandidateReport,
     RelatedPageRef,
     SourceDigest,
-    SourceDigestCandidate,
+    SourcePageUnit,
     SourceRef,
     StepRecord,
     StructuredRepairReport,
@@ -199,7 +197,6 @@ def run_ingest(
     steps: list[tuple[str, Callable[[], StepOutput]]] = [
         ("raw_binding", lambda: _step_raw_binding(run_dir, state)),
         ("source_digest", lambda: _step_source_digest(run_dir, state)),
-        ("candidate_merge", lambda: _step_candidate_merge(run_dir, state)),
         ("candidate_pages_warmup", lambda: _step_candidate_pages_warmup(run_dir, state)),
         ("candidate_pages", lambda: _step_candidate_pages(run_dir, state)),
         ("wiki_snapshot", lambda: _step_wiki_snapshot(vault, run_dir, state)),
@@ -310,23 +307,35 @@ def scan_raw_candidates(vault: Path, *, include_processed: bool = False, limit: 
     return {"vault": vault.as_posix(), "count": len(items), "items": items}
 
 
-def normalize_source_digest(digest: SourceDigest) -> tuple[SourceDigest, StructuredRepairReport]:
+def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[SourceDigest, StructuredRepairReport]:
     repairs: list[RepairItem] = []
 
-    def fix(candidate: SourceDigestCandidate, path: str) -> SourceDigestCandidate:
-        if candidate.suggested_page_title.strip():
-            return candidate
-        replacement = candidate.name.strip() or safe_filename(candidate.candidate_id)
-        repairs.append(RepairItem(path=path, reason="suggested_page_title 为空，已使用候选名称补齐。", local_fix=True, model_called=False))
-        return candidate.model_copy(update={"suggested_page_title": replacement})
-
-    sections: dict[str, list[SourceDigestCandidate]] = {}
-    for section in ["entities", "concepts", "designs", "comparisons", "open_questions", "budget_deferred_candidates"]:
-        items = []
-        for index, candidate in enumerate(getattr(digest, section)):
-            items.append(fix(candidate, f"{section}[{index}].suggested_page_title"))
-        sections[section] = items
-    updated = digest.model_copy(update=sections)
+    page_units: list[SourcePageUnit] = []
+    for index, unit in enumerate(digest.page_units, start=1):
+        title = unit.title.strip()
+        if not title:
+            title = f"未命名页面单元 {index}"
+            repairs.append(RepairItem(path=f"page_units[{index - 1}].title", reason="title 为空，已使用默认标题补齐。", local_fix=True, model_called=False))
+        page_type = unit.page_type if unit.page_type in profile.page_types and unit.page_type != profile.source_page_type else profile.default_page_type
+        if page_type != unit.page_type:
+            repairs.append(RepairItem(path=f"page_units[{index - 1}].page_type", reason="page_type 不在 profile 中或指向 source 类型，已改为默认知识页类型。", local_fix=True, model_called=False))
+        path_hint = _normalize_path_hint(unit.path_hint, page_type, title, profile)
+        if path_hint != unit.path_hint:
+            repairs.append(RepairItem(path=f"page_units[{index - 1}].path_hint", reason="path_hint 越界或格式不正确，已按页面类型和标题重建。", local_fix=True, model_called=False))
+        must_cover_points = _dedupe_list([item.strip() for item in unit.must_cover_points if item.strip()]) or [unit.summary]
+        page_units.append(
+            unit.model_copy(
+                update={
+                    "page_unit_id": f"PU-{index:03d}",
+                    "title": title,
+                    "page_type": page_type,
+                    "path_hint": path_hint,
+                    "must_cover_points": must_cover_points,
+                    "source_refs": _merge_source_refs(unit.source_refs),
+                }
+            )
+        )
+    updated = digest.model_copy(update={"page_units": page_units})
     return updated, StructuredRepairReport(repairs=repairs, model_calls=0)
 
 
@@ -585,8 +594,8 @@ def _assert_unique(values: list[str], label: str) -> None:
 
 def _assert_candidate_pages_have_sources(artifact: CandidatePages) -> None:
     for page in artifact.pages:
-        if not page.candidate_unit_id.strip():
-            raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 candidate_unit_id。")
+        if not page.page_unit_id.strip():
+            raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 page_unit_id。")
         if not page.source_refs:
             raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 source_refs。")
         if not page.body_markdown.strip():
@@ -597,11 +606,12 @@ def _assert_source_digest_chinese(digest: SourceDigest) -> None:
     _require_chinese_text("source_digest.summary", digest.summary)
     for index, item in enumerate(digest.key_takeaways, start=1):
         _require_chinese_text(f"source_digest.key_takeaways[{index}]", item)
-    for candidate in digest.candidates():
-        _require_chinese_title(f"{candidate.candidate_id}.name", candidate.name, candidate.suggested_page_title, candidate.summary, candidate.source_basis)
-        _require_chinese_title(f"{candidate.candidate_id}.suggested_page_title", candidate.suggested_page_title, candidate.summary, candidate.source_basis)
-        _require_chinese_text(f"{candidate.candidate_id}.summary", candidate.summary)
-        _require_chinese_text(f"{candidate.candidate_id}.source_basis", candidate.source_basis)
+    for unit in digest.page_units:
+        _require_chinese_title(f"{unit.page_unit_id}.title", unit.title, unit.summary, unit.content_scope)
+        _require_chinese_text(f"{unit.page_unit_id}.summary", unit.summary)
+        _require_chinese_text(f"{unit.page_unit_id}.content_scope", unit.content_scope)
+        for index, item in enumerate(unit.must_cover_points, start=1):
+            _require_chinese_text(f"{unit.page_unit_id}.must_cover_points[{index}]", item)
     for index, item in enumerate(digest.weak_or_noise_items, start=1):
         _require_chinese_text(f"weak_or_noise_items[{index}].reason", item.reason)
 
@@ -615,17 +625,6 @@ def _assert_candidate_pages_chinese(artifact: CandidatePages) -> None:
             _require_chinese_text(f"{page.candidate_page_id}.open_questions[{index}]", item)
         for index, item in enumerate(page.evidence_notes, start=1):
             _require_chinese_text(f"{page.candidate_page_id}.evidence_notes[{index}]", item)
-
-
-def _assert_candidate_merge_chinese(plan: CandidateMergePlan) -> None:
-    for unit in plan.units:
-        _require_chinese_title(f"{unit.candidate_unit_id}.title", unit.title, unit.summary, unit.merge_reason)
-        _require_chinese_text(f"{unit.candidate_unit_id}.summary", unit.summary)
-        _require_chinese_text(f"{unit.candidate_unit_id}.merge_reason", unit.merge_reason)
-        for index, item in enumerate(unit.must_cover_points, start=1):
-            _require_chinese_text(f"{unit.candidate_unit_id}.must_cover_points[{index}]", item)
-    for index, item in enumerate(plan.warnings, start=1):
-        _require_chinese_text(f"candidate_merge.warnings[{index}]", item)
 
 
 def _assert_merge_plan_chinese(plan: MergePlan) -> None:
@@ -727,51 +726,6 @@ def _strip_locator_marker(text: str, marker: str | None = None) -> str:
     return stripped or text.strip()
 
 
-def _normalize_candidate_merge_plan(
-    plan: CandidateMergePlan,
-    digest: SourceDigest,
-    profile: Profile,
-    *,
-    repair_unknown_source_ids: bool = False,
-) -> CandidateMergePlan:
-    known_candidates = {candidate.candidate_id: candidate for candidate in digest.candidates()}
-    used_source_ids: list[str] = []
-    skipped_source_ids: list[str] = []
-    warnings = list(plan.warnings)
-    units: list[CandidateMergeUnit] = []
-    for index, unit in enumerate(plan.units, start=1):
-        source_ids = _dedupe_list(unit.source_candidate_ids)
-        if not source_ids:
-            raise PipelineError(f"候选合并单元 {unit.candidate_unit_id} 缺少 source_candidate_ids。")
-        unknown = [candidate_id for candidate_id in source_ids if candidate_id not in known_candidates]
-        if unknown and not repair_unknown_source_ids:
-            raise PipelineError(f"候选合并单元 {unit.candidate_unit_id} 引用了未知 source candidate：{', '.join(unknown)}")
-        if unknown:
-            source_ids = [candidate_id for candidate_id in source_ids if candidate_id in known_candidates]
-            skipped_source_ids.extend(unknown)
-            warnings.append(f"候选合并单元 {unit.candidate_unit_id} 引用了未进入本轮处理的候选 {', '.join(unknown)}，已从本轮合并中移除。")
-            if not source_ids:
-                continue
-        page_type = unit.page_type if unit.page_type in profile.page_types and unit.page_type != profile.source_page_type else profile.default_page_type
-        path_hint = _normalize_path_hint(unit.path_hint, page_type, unit.title, profile)
-        refs = _merge_source_refs([ref for candidate_id in source_ids for ref in known_candidates[candidate_id].source_refs] or unit.source_refs)
-        units.append(
-            unit.model_copy(
-                update={
-                    "candidate_unit_id": f"CM-{index:03d}",
-                    "source_candidate_ids": source_ids,
-                    "page_type": page_type,
-                    "path_hint": path_hint,
-                    "source_refs": refs,
-                    "must_cover_points": unit.must_cover_points or [unit.summary],
-                }
-            )
-        )
-        used_source_ids.extend(source_ids)
-    skipped = _dedupe_list([*plan.skipped_candidate_ids, *skipped_source_ids, *(candidate_id for candidate_id in known_candidates if candidate_id not in used_source_ids)])
-    return plan.model_copy(update={"units": units, "skipped_candidate_ids": skipped, "warnings": _dedupe_list(warnings)})
-
-
 def _normalize_path_hint(path_hint: str, page_type: str, title: str, profile: Profile) -> str:
     spec = profile.page_type(page_type)
     cleaned = path_hint.strip().replace("\\", "/").lstrip("/")
@@ -785,36 +739,34 @@ def _normalize_path_hint(path_hint: str, page_type: str, title: str, profile: Pr
     return f"{spec.directory}/{filename}.md"
 
 
-def _merge_parallel_candidate_pages(outputs: list[BaseModel], units: list[CandidateMergeUnit]) -> CandidatePages:
-    if len(outputs) != len(units):
-        raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但 candidate unit 数量是 {len(units)}。")
+def _merge_parallel_candidate_pages(outputs: list[BaseModel], page_units: list[SourcePageUnit]) -> CandidatePages:
+    if len(outputs) != len(page_units):
+        raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但 page_unit 数量是 {len(page_units)}。")
     pages: list[CandidatePage] = []
     skipped: list[str] = []
-    for index, (output, unit) in enumerate(zip(outputs, units, strict=True), start=1):
+    for index, (output, unit) in enumerate(zip(outputs, page_units, strict=True), start=1):
         if not isinstance(output, CandidatePages):
             raise PipelineError("候选页并发请求返回了无效 artifact。")
-        skipped.extend(output.skipped_candidate_ids)
+        skipped.extend(output.skipped_page_unit_ids)
         if len(output.pages) != 1:
-            raise PipelineError(f"{unit.candidate_unit_id} 的候选页请求必须且只能返回 1 页。")
+            raise PipelineError(f"{unit.page_unit_id} 的候选页请求必须且只能返回 1 页。")
         page = output.pages[0]
-        source_ids = _dedupe_list([*unit.source_candidate_ids, *page.source_candidate_ids])
         pages.append(
             page.model_copy(
                 update={
                     "candidate_page_id": f"CP-{index:03d}",
-                    "candidate_unit_id": unit.candidate_unit_id,
-                    "source_candidate_ids": source_ids,
+                    "page_unit_id": unit.page_unit_id,
                     "proposed_page_type": unit.page_type,
                     "proposed_path_hint": unit.path_hint,
                     "source_refs": _merge_source_refs([*unit.source_refs, *page.source_refs]),
                 }
             )
         )
-    return CandidatePages(pages=pages, skipped_candidate_ids=_dedupe_list(skipped))
+    return CandidatePages(pages=pages, skipped_page_unit_ids=_dedupe_list(skipped))
 
 
-def _candidate_pages_from_outputs(outputs: list[BaseModel], units: list[CandidateMergeUnit]) -> CandidatePages:
-    artifact = _merge_parallel_candidate_pages(outputs, units)
+def _candidate_pages_from_outputs(outputs: list[BaseModel], page_units: list[SourcePageUnit]) -> CandidatePages:
+    artifact = _merge_parallel_candidate_pages(outputs, page_units)
     artifact = _normalize_candidate_pages(artifact)
     _assert_unique([page.candidate_page_id for page in artifact.pages], "candidate_page_id")
     _assert_candidate_pages_have_sources(artifact)
@@ -823,22 +775,22 @@ def _candidate_pages_from_outputs(outputs: list[BaseModel], units: list[Candidat
 
 
 def _candidate_page_semantic_errors(
-    outputs_by_unit_id: dict[str, BaseModel],
-    units: list[CandidateMergeUnit],
+    outputs_by_page_unit_id: dict[str, BaseModel],
+    page_units: list[SourcePageUnit],
     provider_errors: dict[str, str] | None = None,
 ) -> dict[str, str]:
     errors: dict[str, str] = dict(provider_errors or {})
-    for unit in units:
-        if unit.candidate_unit_id in errors:
+    for unit in page_units:
+        if unit.page_unit_id in errors:
             continue
-        output = outputs_by_unit_id.get(unit.candidate_unit_id)
+        output = outputs_by_page_unit_id.get(unit.page_unit_id)
         if output is None:
-            errors[unit.candidate_unit_id] = f"{unit.candidate_unit_id} 缺少 provider 输出。"
+            errors[unit.page_unit_id] = f"{unit.page_unit_id} 缺少 provider 输出。"
             continue
         try:
             _candidate_pages_from_outputs([output], [unit])
         except PipelineError as exc:
-            errors[unit.candidate_unit_id] = str(exc)
+            errors[unit.page_unit_id] = str(exc)
     return errors
 
 
@@ -878,7 +830,7 @@ def _repair_merge_plan_candidate_content_locators(plan: MergePlan, candidate_pag
                 decision.content_scope,
                 f"候选页标题：{page.title}",
                 f"候选页摘要：{page.summary}",
-                "来源候选：" + "、".join(page.source_candidate_ids),
+                f"页面单元：{page.page_unit_id}",
             ]
         )
         candidate_content_locators = [_chinese_scaffold(item, "候选内容定位") for item in locators if item.strip()]
@@ -1240,9 +1192,9 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
             raise PipelineError("source_digest provider 返回了无效 artifact。")
         try:
             _assert_source_digest_binding(digest_result, raw_rel, binding.raw_sha256)
-            candidate_digest, candidate_repair_report = normalize_source_digest(digest_result)
+            candidate_digest, candidate_repair_report = normalize_source_digest(digest_result, profile)
             _assert_source_digest_chinese(candidate_digest)
-            _assert_unique([candidate.candidate_id for candidate in candidate_digest.candidates()], "source digest candidate_id")
+            _assert_unique([unit.page_unit_id for unit in candidate_digest.page_units], "source digest page_unit_id")
         except PipelineError as exc:
             last_semantic_error = str(exc)
             api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
@@ -1267,24 +1219,23 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     state["source_digest"] = digest
     json_path = out_dir / "source_digest.json"
     md_path = out_dir / "source_digest.md"
-    source_map_json = out_dir / "source_map.json"
-    source_map_md = out_dir / "source_map.md"
+    page_units_json = out_dir / "page_units.json"
+    page_units_md = out_dir / "page_units.md"
     repair_path = out_dir / "structured_repair_report.json"
     write_json(json_path, digest)
     write_text(md_path, _render_source_digest_md(digest))
-    source_map = {"source_raw_path": raw_rel, "candidate_ids": [item.candidate_id for item in digest.candidates()]}
-    write_json(source_map_json, source_map)
-    write_text(source_map_md, "\n".join(f"- {item.candidate_id}: {item.name}" for item in digest.candidates()) + "\n")
+    page_units = {"source_raw_path": raw_rel, "page_unit_ids": [item.page_unit_id for item in digest.page_units]}
+    write_json(page_units_json, page_units)
+    write_text(page_units_md, "\n".join(f"- {item.page_unit_id}: {item.title}" for item in digest.page_units) + "\n")
     write_json(repair_path, repair_report)
     counts = {
-        "candidate_count": len(digest.candidates()),
+        "page_unit_count": len(digest.page_units),
         "weak_noise_count": len(digest.weak_or_noise_items),
-        "deferred_count": len(digest.budget_deferred_candidates),
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
         **_token_usage_counts(api_calls),
     }
     return StepOutput(
-        [json_path, md_path, source_map_json, source_map_md, repair_path, *provider_artifacts],
+        [json_path, md_path, page_units_json, page_units_md, repair_path, *provider_artifacts],
         counts,
         model_calls=model_calls,
         repair_count=len(repair_report.repairs),
@@ -1292,86 +1243,15 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     )
 
 
-def _step_candidate_merge(run_dir: Path, state: dict[str, object]) -> StepOutput:
-    digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
-    profile: Profile = state["profile"]  # type: ignore[assignment]
-    out_dir = run_dir / "candidate_merge"
-    request = prompts.candidate_merge_prompt(digest=digest, profile=profile)
-    provider_artifacts: list[Path] = []
-    api_calls: list[dict[str, object]] = []
-    model_calls = 0
-    semantic_retry_count = 0
-    plan: CandidateMergePlan | None = None
-    last_semantic_error = ""
-    for attempt in range(2):
-        artifact_stem = "candidate_merge" if attempt == 0 else f"candidate_merge_retry_{attempt}"
-        plan_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
-            state,
-            out_dir,
-            "candidate_merge",
-            request,
-            CandidateMergePlan,
-            artifact_stem=artifact_stem,
-        )
-        provider_artifacts.extend(attempt_artifacts)
-        model_calls += attempt_model_calls
-        if not isinstance(plan_result, CandidateMergePlan):
-            raise PipelineError("candidate_merge provider 返回了无效 artifact。")
-        try:
-            candidate_plan = _normalize_candidate_merge_plan(plan_result, digest, profile, repair_unknown_source_ids=attempt >= 1)
-            _assert_unique([unit.candidate_unit_id for unit in candidate_plan.units], "candidate_unit_id")
-            _assert_candidate_merge_chinese(candidate_plan)
-        except PipelineError as exc:
-            last_semantic_error = str(exc)
-            if attempt >= 1:
-                api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
-                break
-            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
-            semantic_retry_count += 1
-            request = prompts.candidate_merge_retry_prompt(
-                digest=digest,
-                profile=profile,
-                previous_plan=plan_result,
-                validation_error=last_semantic_error,
-            )
-            continue
-        api_calls.extend(attempt_api_calls)
-        plan = candidate_plan
-        break
-    if plan is None:
-        raise PipelineError(f"candidate_merge provider 重试后仍未通过系统语义校验：{last_semantic_error}")
-    state["candidate_merge"] = plan
-    json_path = out_dir / "candidate_merge.json"
-    md_path = out_dir / "candidate_merge.md"
-    api_calls_path = out_dir / "token_usage_calls.json"
-    write_json(json_path, plan)
-    write_text(md_path, _render_candidate_merge_md(plan))
-    write_json(api_calls_path, api_calls)
-    counts: dict[str, int | float] = {
-        "candidate_unit_count": len(plan.units),
-        "skipped_candidate_count": len(plan.skipped_candidate_ids),
-        **_token_usage_counts(api_calls),
-    }
-    if semantic_retry_count:
-        counts["semantic_retry_count"] = semantic_retry_count
-    return StepOutput(
-        [json_path, md_path, api_calls_path, *provider_artifacts],
-        counts,
-        model_calls=model_calls,
-        api_calls=api_calls,
-    )
-
-
 def _step_candidate_pages_warmup(run_dir: Path, state: dict[str, object]) -> StepOutput:
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
-    candidate_merge: CandidateMergePlan = state["candidate_merge"]  # type: ignore[assignment]
     raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
     binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
     raw_rel: str = state["raw_rel"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "candidate_pages_warmup"
-    if not candidate_merge.units:
-        return StepOutput([], {"warmup_count": 0, "candidate_unit_count": 0})
+    if not digest.page_units:
+        return StepOutput([], {"warmup_count": 0, "page_unit_count": 0})
     raw_text = read_text(raw_abs)
     warmup_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
         state,
@@ -1389,7 +1269,7 @@ def _step_candidate_pages_warmup(run_dir: Path, state: dict[str, object]) -> Ste
         [json_path, *provider_artifacts],
         {
             "warmup_count": 1,
-            "candidate_unit_count": len(candidate_merge.units),
+            "page_unit_count": len(digest.page_units),
             **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,
@@ -1433,57 +1313,56 @@ def _step_wiki_snapshot(vault: Path, run_dir: Path, state: dict[str, object]) ->
 
 def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput:
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
-    candidate_merge: CandidateMergePlan = state["candidate_merge"]  # type: ignore[assignment]
     raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
     binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
     raw_rel: str = state["raw_rel"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     raw_text = read_text(raw_abs)
     out_dir = run_dir / "candidate_pages"
-    units = candidate_merge.units
+    page_units = digest.page_units
     initial_requests = [
         (
-            unit.candidate_unit_id,
+            unit.page_unit_id,
             prompts.candidate_page_prompt(
                 digest=digest,
-                candidate_unit=unit,
+                page_unit=unit,
                 raw_path=raw_rel,
                 raw_sha256=binding.raw_sha256,
                 raw_text=raw_text,
                 profile=profile,
             ),
         )
-        for unit in units
+        for unit in page_units
     ]
-    outputs_by_unit_id, provider_artifacts, model_calls, api_calls, provider_errors = _call_provider_artifacts_parallel_soft(
+    outputs_by_page_unit_id, provider_artifacts, model_calls, api_calls, provider_errors = _call_provider_artifacts_parallel_soft(
         state,
         out_dir,
         "candidate_pages",
         initial_requests,
         CandidatePages,
     )
-    parallel_request_count = len(units)
+    parallel_request_count = len(page_units)
     semantic_retry_count = 0
-    semantic_errors = _candidate_page_semantic_errors(outputs_by_unit_id, units, provider_errors)
+    semantic_errors = _candidate_page_semantic_errors(outputs_by_page_unit_id, page_units, provider_errors)
     if semantic_errors:
         api_calls = _mark_request_semantic_retry_failed(api_calls, semantic_errors)
-        retry_units = [unit for unit in units if unit.candidate_unit_id in semantic_errors]
+        retry_units = [unit for unit in page_units if unit.page_unit_id in semantic_errors]
         retry_requests = []
         for unit in retry_units:
-            previous_output = outputs_by_unit_id.get(unit.candidate_unit_id)
+            previous_output = outputs_by_page_unit_id.get(unit.page_unit_id)
             previous_pages = previous_output if isinstance(previous_output, CandidatePages) else None
             retry_requests.append(
                 (
-                    unit.candidate_unit_id,
+                    unit.page_unit_id,
                     prompts.candidate_page_retry_prompt(
                         digest=digest,
-                        candidate_unit=unit,
+                        page_unit=unit,
                         raw_path=raw_rel,
                         raw_sha256=binding.raw_sha256,
                         raw_text=raw_text,
                         profile=profile,
                         previous_pages=previous_pages,
-                        validation_error=semantic_errors[unit.candidate_unit_id],
+                        validation_error=semantic_errors[unit.page_unit_id],
                     ),
                 )
             )
@@ -1504,12 +1383,12 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
             api_calls.extend(_mark_request_semantic_retry_failed(retry_api_calls, retry_errors))
             raise PipelineError(f"candidate_pages 单候选页重试后仍未通过系统校验：{'; '.join(retry_errors.values())}")
         api_calls.extend(retry_api_calls)
-        outputs_by_unit_id.update(retry_outputs)
+        outputs_by_page_unit_id.update(retry_outputs)
         combined_api_calls_path = out_dir / "token_usage_calls.json"
         write_json(combined_api_calls_path, api_calls)
         if combined_api_calls_path not in provider_artifacts:
             provider_artifacts.append(combined_api_calls_path)
-    artifact = _candidate_pages_from_outputs([outputs_by_unit_id[unit.candidate_unit_id] for unit in units], units)
+    artifact = _candidate_pages_from_outputs([outputs_by_page_unit_id[unit.page_unit_id] for unit in page_units], page_units)
     state["candidate_pages"] = artifact
     json_path = out_dir / "candidate_pages.json"
     md_path = out_dir / "candidate_pages.md"
@@ -1522,7 +1401,7 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         artifacts.append(page_path)
     counts = {
         "candidate_page_count": len(artifact.pages),
-        "covered_digest_candidate_count": len({cid for page in artifact.pages for cid in page.source_candidate_ids}),
+        "covered_page_unit_count": len({page.page_unit_id for page in artifact.pages}),
         "parallel_request_count": parallel_request_count if model_calls else 0,
         "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
@@ -2895,7 +2774,6 @@ def _source_page_target(raw_path: str) -> str:
 def _important_artifact_hashes(run_dir: Path) -> dict[str, str]:
     paths = {
         "source_digest": run_dir / "source_digest" / "source_digest.json",
-        "candidate_merge": run_dir / "candidate_merge" / "candidate_merge.json",
         "candidate_pages_warmup": run_dir / "candidate_pages_warmup" / "candidate_pages_warmup.json",
         "wiki_snapshot": run_dir / "wiki_snapshot" / "wiki_snapshot.json",
         "candidate_pages": run_dir / "candidate_pages" / "candidate_pages.json",
@@ -2916,31 +2794,22 @@ def _important_artifact_hashes(run_dir: Path) -> dict[str, str]:
 
 
 def _render_source_digest_md(digest: SourceDigest) -> str:
-    lines = [f"# 来源消化：{Path(digest.source_raw_path).name}", "", digest.summary, "", "## 候选知识项"]
-    for candidate in digest.candidates():
-        lines.append(f"- `{candidate.candidate_id}` {candidate.kind}: {candidate.name} - {candidate.summary}")
-        if candidate.related_candidates:
-            lines.append(f"  - 相关候选：{', '.join(candidate.related_candidates)}")
-    return "\n".join(lines) + "\n"
-
-
-def _render_candidate_merge_md(plan: CandidateMergePlan) -> str:
-    lines = ["# 候选合并计划", ""]
-    for unit in plan.units:
-        lines.append(f"## {unit.candidate_unit_id}: {unit.title}")
+    lines = [f"# 来源消化：{Path(digest.source_raw_path).name}", "", digest.summary, "", "## 页面单元计划"]
+    for unit in digest.page_units:
+        lines.append(f"## {unit.page_unit_id}: {unit.title}")
         lines.append(f"- 类型：{unit.page_type}")
-        lines.append(f"- 来源候选：{', '.join(unit.source_candidate_ids)}")
         lines.append(f"- 路径提示：`{unit.path_hint}`")
-        lines.append(f"- 合并理由：{unit.merge_reason}")
+        lines.append(f"- 内容范围：{unit.content_scope}")
         if unit.must_cover_points:
             lines.append("- 必须覆盖：")
             lines.extend(f"  - {item}" for item in unit.must_cover_points)
         lines.append("")
-    if plan.skipped_candidate_ids:
-        lines.append("## 跳过候选")
-        lines.extend(f"- `{item}`" for item in plan.skipped_candidate_ids)
+    if digest.weak_or_noise_items:
+        lines.append("## 弱信息与噪声")
+        for item in digest.weak_or_noise_items:
+            lines.append(f"- {item.text}：{item.reason}")
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
 
 
 def _render_contexts_md(contexts: Iterable[CandidateContext]) -> str:
@@ -2960,7 +2829,7 @@ def _render_candidate_pages_md(artifact: CandidatePages) -> str:
     lines = ["# 候选知识页", ""]
     for page in artifact.pages:
         lines.append(f"## {page.candidate_page_id}: {page.title}")
-        lines.append(f"- 候选单元：`{page.candidate_unit_id}`")
+        lines.append(f"- 页面单元：`{page.page_unit_id}`")
         lines.append(f"- 类型：{page.proposed_page_type}")
         lines.append(f"- 路径提示：`{page.proposed_path_hint}`")
         lines.append("")

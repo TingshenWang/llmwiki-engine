@@ -9,7 +9,6 @@ The current Lite implementation is a fully automatic ingest pipeline:
 ```text
 raw_file
 -> source_digest
--> candidate_merge
 -> candidate_pages_warmup
 -> candidate_pages
 -> wiki_snapshot
@@ -30,6 +29,10 @@ raw_file
 There is no manual review, no manual apply, and no raw prepare step in this
 branch. The `raw/` file remains the durable evidence layer; generated wiki
 pages are a compiled navigation and understanding layer.
+
+`source_digest` directly plans the page units to generate from the raw file,
+including deduplication, near-duplicate merging, page type choice, and raw
+coverage boundaries.
 
 `wiki_snapshot` freezes the current knowledge pool and synchronizes the
 current-state page embedding cache. `candidate_contexts` then retrieves the
@@ -169,10 +172,11 @@ providers:
     max_tokens: 262144
 ```
 
-Supported model-backed step keys are `source_digest`, `candidate_pages`,
-`merge_plan`, `composition_plan`, and `final_pages`. Provider prompts and
-response schemas are written under each step's `model_calls/` directory; API
-keys are not written to artifacts or receipts.
+Supported model-backed step keys are `source_digest`,
+`candidate_pages_warmup`, `candidate_pages`, `merge_plan`,
+`composition_plan`, and `final_pages`. Provider prompts and response schemas
+are written under each step's `model_calls/` directory; API keys are not
+written to artifacts or receipts.
 
 If an older vault already has `.llmwiki/config.yaml` with `local:heuristic`,
 replace that file with the real provider config or delete it so the global

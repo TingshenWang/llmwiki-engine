@@ -9,7 +9,6 @@
 ```text
 raw_file
 -> source_digest
--> candidate_merge
 -> candidate_pages_warmup
 -> candidate_pages
 -> wiki_snapshot
@@ -29,6 +28,9 @@ raw_file
 
 这个分支没有人工 review、没有人工 apply，也没有 raw prepare 步骤。`raw/`
 文件始终保留为可追溯证据层；生成的 wiki 页面是编译后的导航和理解层。
+
+`source_digest` 会直接从 raw 文件规划本次要生成的页面单元，并在这一步完成去重、
+近义合并、页面类型选择和 raw 覆盖边界确认。
 
 `wiki_snapshot` 会冻结当前知识池，并同步当前状态的页面 embedding 缓存。
 `candidate_contexts` 会为每个候选页面召回 top 相关旧页面。缓存是 path-current
@@ -162,9 +164,10 @@ Lite 会对 DeepSeek 自动使用 `json_object` 模式，因为 DeepSeek 当前 
 文档使用的是 `response_format: {"type": "json_object"}`，不是 JSON Schema
 response format。
 
-支持模型调用的步骤 key 包括 `source_digest`、`candidate_pages`、`merge_plan`、
-`composition_plan` 和 `final_pages`。每个步骤的 prompt 和 response schema 会写入
-对应的 `model_calls/` 目录；API key 不会写入 artifact 或 receipt。
+支持模型调用的步骤 key 包括 `source_digest`、`candidate_pages_warmup`、
+`candidate_pages`、`merge_plan`、`composition_plan` 和 `final_pages`。每个步骤的
+prompt 和 response schema 会写入对应的 `model_calls/` 目录；API key 不会写入
+artifact 或 receipt。
 
 如果旧 vault 里已经有 `.llmwiki/config.yaml`，并且内容还是 `local:heuristic`，
 请直接把那份文件替换成真实 provider 配置，或删除它，让全局配置生效。

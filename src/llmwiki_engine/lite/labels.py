@@ -4,7 +4,6 @@ from __future__ import annotations
 STEP_LABELS = {
     "raw_binding": "绑定 raw",
     "source_digest": "来源消化",
-    "candidate_merge": "候选合并",
     "candidate_pages_warmup": "候选页缓存预热",
     "wiki_snapshot": "Wiki 快照",
     "candidate_pages": "候选知识页",
@@ -24,15 +23,13 @@ STEP_LABELS = {
 
 COUNT_LABELS = {
     "raw_size_bytes": "raw大小",
-    "candidate_count": "候选数",
-    "candidate_unit_count": "候选单元数",
+    "page_unit_count": "页面单元数",
     "warmup_count": "预热数",
-    "skipped_candidate_count": "跳过候选数",
+    "skipped_page_unit_count": "跳过页面单元数",
     "weak_noise_count": "弱/噪声数",
-    "deferred_count": "延后数",
     "knowledge_pool_size": "知识池",
     "candidate_page_count": "候选页数",
-    "covered_digest_candidate_count": "覆盖候选数",
+    "covered_page_unit_count": "覆盖页面单元数",
     "query_count": "查询数",
     "top_k": "TopK",
     "create_count": "新建数",

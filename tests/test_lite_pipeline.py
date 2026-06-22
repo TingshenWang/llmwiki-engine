@@ -17,8 +17,6 @@ from llmwiki_engine.lite.models import (
     CandidateContext,
     CandidateContextHit,
     CandidateContexts,
-    CandidateMergePlan,
-    CandidateMergeUnit,
     CandidatePage,
     CandidatePages,
     CompositionItem,
@@ -30,7 +28,7 @@ from llmwiki_engine.lite.models import (
     OperationManifest,
     RawBinding,
     SourceDigest,
-    SourceDigestCandidate,
+    SourcePageUnit,
     SourceRef,
     WikiKnowledgeEntry,
     WikiSnapshot,
@@ -46,7 +44,6 @@ from llmwiki_engine.lite.pipeline import (
     _normalize_merge_plan,
     _page_generation_parallelism,
     _repair_merge_plan_candidate_content_locators,
-    _step_candidate_merge,
     _step_candidate_pages,
     _step_final_pages,
     _step_index_log_write,
@@ -109,14 +106,15 @@ def test_source_digest_rejects_english_user_facing_text() -> None:
         raw_sha256="abc",
         summary="English summary",
         key_takeaways=["English takeaway"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="English Name",
-                suggested_page_title="English Title",
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="English Title",
+                page_type="concept",
+                path_hint="concepts/Concept_English.md",
                 summary="English candidate summary",
-                source_basis="English source basis",
+                content_scope="English content scope",
+                must_cover_points=["English point"],
                 source_refs=[ref],
             )
         ],
@@ -133,14 +131,15 @@ def test_source_digest_allows_proper_noun_name_with_chinese_context() -> None:
         raw_sha256="abc",
         summary="本文解释 RAG 的核心流程。",
         key_takeaways=["RAG 先检索，再增强 prompt，最后生成回答。"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="RAG",
-                suggested_page_title="RAG（检索增强生成）",
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="RAG（检索增强生成）",
+                page_type="concept",
+                path_hint="concepts/Concept_RAG.md",
                 summary="RAG 是检索增强生成流程。",
-                source_basis="表格说明了三个字母的含义。",
+                content_scope="覆盖 RAG 的定义和流程。",
+                must_cover_points=["说明 RAG 先检索，再增强 prompt。"],
                 source_refs=[ref],
             )
         ],
@@ -166,23 +165,24 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
         source_raw_path=raw_rel,
         raw_sha256=raw_sha,
         summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["候选项必须使用中文用户可读文本。"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="自动化入库",
-                suggested_page_title="自动化入库",
+        key_takeaways=["页面单元必须使用中文用户可读文本。"],
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="自动化入库",
+                page_type="concept",
+                path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化入库强调去掉人工审核节点。",
-                source_basis="English source basis",
+                content_scope="English content scope",
+                must_cover_points=["说明为什么去掉人工审核。"],
                 source_refs=[ref],
             )
         ],
     )
     valid_digest = invalid_digest.model_copy(
         update={
-            "concepts": [
-                invalid_digest.concepts[0].model_copy(update={"source_basis": "原文说明自动化入库会去掉人工审核节点。"})
+            "page_units": [
+                invalid_digest.page_units[0].model_copy(update={"content_scope": "覆盖原文中关于自动化入库去掉人工审核节点的内容。"})
             ]
         }
     )
@@ -245,10 +245,11 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
     digest = state["source_digest"]
 
     assert isinstance(digest, SourceDigest)
-    assert digest.concepts[0].source_basis == "原文说明自动化入库会去掉人工审核节点。"
+    assert digest.page_units[0].content_scope == "覆盖原文中关于自动化入库去掉人工审核节点的内容。"
     assert len(registry.requests) == 2
     retry_payload = registry.requests[1].user_payload
-    assert "source_basis" in retry_payload["validation_error"]
+    assert "content_scope" in retry_payload["validation_error"]
+    assert output.counts["page_unit_count"] == 1
     assert output.counts["semantic_retry_count"] == 1
     assert output.counts["api_call_count"] == 2
     assert output.counts["api_success_count"] == 1
@@ -366,8 +367,7 @@ def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_pa
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="Local Embedding Retrieval",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Local_Embedding_Retrieval.md",
@@ -395,8 +395,7 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="RAG 系统",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_RAG系统.md",
@@ -419,8 +418,7 @@ def test_candidate_open_question_locator_resolves_to_chinese_body_question() -> 
         pages=[
             CandidatePage(
                 candidate_page_id="CP-005",
-                candidate_unit_id="CM-005",
-                source_candidate_ids=["C-003"],
+                page_unit_id="PU-005",
                 title="会话作为外部上下文",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Session_Context.md",
@@ -453,8 +451,7 @@ def test_candidate_open_question_orphan_locator_is_dropped() -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["C-001"],
+                page_unit_id="PU-001",
                 title="上下文工程",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Context_Engineering.md",
@@ -520,8 +517,7 @@ def test_merge_plan_missing_candidate_content_locators_are_repaired_from_candida
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="上下文工程",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Context.md",
@@ -560,35 +556,34 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
         raw_sha256=sha256_file(raw),
         summary="这份材料说明自动化知识库入库流程。",
         key_takeaways=["候选页必须先忠于原文，再进行旧 wiki 召回。"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="自动化入库",
-                suggested_page_title="自动化入库",
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="自动化入库",
+                page_type="concept",
+                path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化入库强调去掉人工审核节点。",
-                source_basis="原文说明流程不再人工审核。",
+                content_scope="覆盖原文中关于自动化入库的流程说明。",
+                must_cover_points=["解释为什么候选页先忠于原文。"],
                 source_refs=[ref],
             )
         ],
     )
-    unit = CandidateMergeUnit(
-        candidate_unit_id="CM-001",
-        source_candidate_ids=["CAND-001"],
+    unit = SourcePageUnit(
+        page_unit_id="PU-001",
         title="自动化入库",
         page_type="concept",
         path_hint="concepts/Concept_Auto_Ingest.md",
         summary="合并后的候选页单元。",
-        merge_reason="只有一个同义候选，直接生成页面。",
+        content_scope="覆盖原文中关于自动化入库的流程说明。",
         must_cover_points=["解释为什么候选页先忠于原文。"],
         source_refs=[ref],
     )
     profile = load_profile(vault)
 
-    merge_prompt = prompts.candidate_merge_prompt(digest=digest, profile=profile)
     page_prompt = prompts.candidate_page_prompt(
         digest=digest,
-        candidate_unit=unit,
+        page_unit=unit,
         raw_path=ref.raw_path,
         raw_sha256=ref.raw_sha256,
         raw_text=raw.read_text(encoding="utf-8"),
@@ -598,8 +593,7 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -622,261 +616,15 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
     )
     merge_plan_prompt = prompts.merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=contexts, profile=profile)
 
-    assert merge_prompt.schema_name == "llmwiki_lite_candidate_merge"
-    assert "wiki_snapshot" not in merge_prompt.user_payload
     assert "wiki_snapshot_entries" not in page_prompt.user_payload
     assert "wiki_snapshot" not in merge_plan_prompt.user_payload
     assert "wiki_snapshot_entries" not in merge_plan_prompt.user_payload
-    assert page_prompt.user_payload["candidate_unit"]["candidate_unit_id"] == "CM-001"
+    assert page_prompt.user_payload["page_unit"]["page_unit_id"] == "PU-001"
     assert page_prompt.cache_prefix_payload
     assert page_prompt.cache_prefix_payload["raw_text"]
 
 
-def test_candidate_merge_retries_unknown_source_candidate_ids(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
-    digest = SourceDigest(
-        source_raw_path="raw/project_note.md",
-        raw_sha256="abc",
-        summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["候选合并只能引用真实候选 ID。"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="自动化入库",
-                suggested_page_title="自动化入库",
-                summary="自动化入库强调去掉人工审核节点。",
-                source_basis="原文说明流程不再人工审核。",
-                source_refs=[ref],
-            )
-        ],
-    )
-    invalid_plan = CandidateMergePlan(
-        units=[
-            CandidateMergeUnit(
-                candidate_unit_id="CM-999",
-                source_candidate_ids=["B-001"],
-                title="错误候选",
-                page_type="concept",
-                path_hint="concepts/Concept_Bad.md",
-                summary="这一轮错误引用了不存在的候选。",
-                merge_reason="模型误把说明性编号当成候选 ID。",
-                must_cover_points=["修正不存在的候选 ID。"],
-                source_refs=[ref],
-            )
-        ]
-    )
-    valid_plan = CandidateMergePlan(
-        units=[
-            CandidateMergeUnit(
-                candidate_unit_id="CM-999",
-                source_candidate_ids=["CAND-001"],
-                title="自动化入库",
-                page_type="concept",
-                path_hint="concepts/Concept_Auto_Ingest.md",
-                summary="这一轮使用真实候选 ID。",
-                merge_reason="只保留 source_digest 中存在的候选 ID。",
-                must_cover_points=["解释候选合并为什么不能编造 ID。"],
-                source_refs=[ref],
-            )
-        ]
-    )
-
-    class FakeRegistry:
-        def __init__(self) -> None:
-            self.spec = ProviderSpec(
-                spec="openai_compatible:deepseek-v4-flash",
-                endpoint="https://api.deepseek.com/v1/chat/completions",
-                api_key="test-key",
-            )
-            self.requests = []
-
-        def provider_for(self, step: str) -> ProviderSpec:
-            return self.spec
-
-        def call_structured(self, step: str, request, output_model):
-            self.requests.append(request)
-            output = invalid_plan if len(self.requests) == 1 else valid_plan
-            return ProviderCallResult(
-                output=output,
-                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
-                provider_result={"parsed": output.model_dump(mode="json")},
-                sanitized_context=self.spec.sanitized_context(),
-                api_calls=[
-                    {
-                        "step": step,
-                        "request_key": "",
-                        "model": "deepseek-v4-flash",
-                        "attempt": 0,
-                        "call_index": len(self.requests),
-                        "status": "success",
-                        "finish_reason": "stop",
-                        "duration_ms": 1.0,
-                        "response_status_code": 200,
-                        "error": "",
-                        "prompt_tokens": 10,
-                        "prompt_cache_hit_tokens": 0,
-                        "prompt_cache_miss_tokens": 10,
-                        "completion_tokens": 5,
-                        "reasoning_tokens": 0,
-                        "total_tokens": 15,
-                        "cache_hit_rate_percent": 0.0,
-                        "price_cny": 0.00002,
-                    }
-                ],
-            )
-
-    registry = FakeRegistry()
-    state = {
-        "source_digest": digest,
-        "profile": load_profile(vault),
-        "provider_registry": registry,
-        "provider_contexts": {},
-    }
-
-    output = _step_candidate_merge(tmp_path / "run", state)
-    plan = state["candidate_merge"]
-
-    assert isinstance(plan, CandidateMergePlan)
-    assert [unit.source_candidate_ids for unit in plan.units] == [["CAND-001"]]
-    assert len(registry.requests) == 2
-    assert registry.requests[1].user_payload["allowed_source_candidate_ids"] == ["CAND-001"]
-    assert "B-001" in registry.requests[1].user_payload["validation_error"]
-    assert output.counts["semantic_retry_count"] == 1
-    assert output.counts["api_call_count"] == 2
-    assert output.counts["api_success_count"] == 1
-    assert output.counts["api_paused_count"] == 1
-
-
-def test_candidate_merge_filters_deferred_candidate_after_retry(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
-    active = SourceDigestCandidate(
-        candidate_id="CAND-001",
-        kind="concept",
-        name="主动候选",
-        suggested_page_title="主动候选",
-        summary="主动候选应进入候选合并。",
-        source_basis="原文支持主动候选。",
-        source_refs=[ref],
-    )
-    deferred = SourceDigestCandidate(
-        candidate_id="CAND-004",
-        kind="concept",
-        name="延后候选",
-        suggested_page_title="延后候选",
-        summary="延后候选暂不进入本轮处理。",
-        source_basis="原文支持延后候选，但本轮暂不处理。",
-        source_refs=[ref],
-    )
-    digest = SourceDigest(
-        source_raw_path=ref.raw_path,
-        raw_sha256=ref.raw_sha256,
-        summary="这份材料包含主动候选和延后候选。",
-        key_takeaways=["延后候选不能进入 candidate_merge 的 source_candidate_ids。"],
-        concepts=[active],
-        budget_deferred_candidates=[deferred],
-    )
-    invalid_plan = CandidateMergePlan(
-        units=[
-            CandidateMergeUnit(
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-004"],
-                title="延后候选",
-                page_type="concept",
-                path_hint="concepts/Concept_Deferred.md",
-                summary="错误地处理延后候选。",
-                merge_reason="模型误把 deferred candidate 当成可处理候选。",
-                must_cover_points=["不应处理延后候选。"],
-                source_refs=[ref],
-            )
-        ]
-    )
-    mixed_retry_plan = CandidateMergePlan(
-        units=[
-            CandidateMergeUnit(
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001", "CAND-004"],
-                title="主动候选",
-                page_type="concept",
-                path_hint="concepts/Concept_Active.md",
-                summary="重试后仍混入了延后候选。",
-                merge_reason="应该只保留主动候选。",
-                must_cover_points=["保留主动候选并移除延后候选。"],
-                source_refs=[ref],
-            )
-        ],
-        skipped_candidate_ids=["CAND-004"],
-    )
-
-    class FakeRegistry:
-        def __init__(self) -> None:
-            self.spec = ProviderSpec(
-                spec="openai_compatible:deepseek-v4-flash",
-                endpoint="https://api.deepseek.com/v1/chat/completions",
-                api_key="test-key",
-            )
-            self.requests = []
-
-        def provider_for(self, step: str) -> ProviderSpec:
-            return self.spec
-
-        def call_structured(self, step: str, request, output_model):
-            self.requests.append(request)
-            output = invalid_plan if len(self.requests) == 1 else mixed_retry_plan
-            return ProviderCallResult(
-                output=output,
-                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
-                provider_result={"parsed": output.model_dump(mode="json")},
-                sanitized_context=self.spec.sanitized_context(),
-                api_calls=[
-                    {
-                        "step": step,
-                        "request_key": "",
-                        "model": "deepseek-v4-flash",
-                        "attempt": 0,
-                        "call_index": len(self.requests),
-                        "status": "success",
-                        "finish_reason": "stop",
-                        "duration_ms": 1.0,
-                        "response_status_code": 200,
-                        "error": "",
-                        "prompt_tokens": 10,
-                        "prompt_cache_hit_tokens": 0,
-                        "prompt_cache_miss_tokens": 10,
-                        "completion_tokens": 5,
-                        "reasoning_tokens": 0,
-                        "total_tokens": 15,
-                        "cache_hit_rate_percent": 0.0,
-                        "price_cny": 0.00002,
-                    }
-                ],
-            )
-
-    registry = FakeRegistry()
-    state = {
-        "source_digest": digest,
-        "profile": load_profile(vault),
-        "provider_registry": registry,
-        "provider_contexts": {},
-    }
-
-    output = _step_candidate_merge(tmp_path / "run", state)
-    plan = state["candidate_merge"]
-
-    assert isinstance(plan, CandidateMergePlan)
-    assert len(registry.requests) == 2
-    assert [unit.source_candidate_ids for unit in plan.units] == [["CAND-001"]]
-    assert plan.skipped_candidate_ids == ["CAND-004"]
-    assert "已从本轮合并中移除" in plan.warnings[0]
-    assert output.counts["semantic_retry_count"] == 1
-    assert output.counts["api_call_count"] == 2
-    assert output.counts["api_success_count"] == 1
-    assert output.counts["api_paused_count"] == 1
-
-
-def test_candidate_pages_retries_only_invalid_candidate_unit(tmp_path: Path) -> None:
+def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     raw = write_raw(vault)
     raw_rel = raw.relative_to(vault).as_posix()
@@ -886,58 +634,57 @@ def test_candidate_pages_retries_only_invalid_candidate_unit(tmp_path: Path) -> 
         source_raw_path=raw_rel,
         raw_sha256=raw_sha,
         summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["候选页生成应该按候选单元局部重试。"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="自动化入库",
-                suggested_page_title="自动化入库",
+        key_takeaways=["候选页生成应该按页面单元局部重试。"],
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="自动化入库",
+                page_type="concept",
+                path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化入库强调去掉人工审核节点。",
-                source_basis="原文说明流程不再人工审核。",
+                content_scope="覆盖原文中关于自动化入库的流程说明。",
+                must_cover_points=["说明为什么不再人工审核。"],
                 source_refs=[ref],
             ),
-            SourceDigestCandidate(
-                candidate_id="CAND-002",
-                kind="concept",
-                name="向量缓存",
-                suggested_page_title="向量缓存",
+            SourcePageUnit(
+                page_unit_id="PU-002",
+                title="向量缓存",
+                page_type="concept",
+                path_hint="concepts/Concept_Vector_Cache.md",
                 summary="向量缓存用于下一轮候选召回。",
-                source_basis="原文说明写入后要刷新向量缓存。",
+                content_scope="覆盖原文中关于写入后刷新向量缓存的说明。",
+                must_cover_points=["说明向量缓存服务下一轮召回。"],
                 source_refs=[ref],
             ),
         ],
     )
     units = [
-        CandidateMergeUnit(
-            candidate_unit_id="CM-001",
-            source_candidate_ids=["CAND-001"],
+        SourcePageUnit(
+            page_unit_id="PU-001",
             title="自动化入库",
             page_type="concept",
             path_hint="concepts/Concept_Auto_Ingest.md",
             summary="自动化入库强调去掉人工审核。",
-            merge_reason="原文描述了自动化入库流程。",
+            content_scope="覆盖原文中关于自动化入库的流程说明。",
             must_cover_points=["说明为什么不再人工审核。"],
             source_refs=[ref],
         ),
-        CandidateMergeUnit(
-            candidate_unit_id="CM-002",
-            source_candidate_ids=["CAND-002"],
+        SourcePageUnit(
+            page_unit_id="PU-002",
             title="向量缓存",
             page_type="concept",
             path_hint="concepts/Concept_Vector_Cache.md",
             summary="向量缓存保存最终知识页的最新向量。",
-            merge_reason="原文描述了写入后刷新向量缓存。",
+            content_scope="覆盖原文中关于写入后刷新向量缓存的说明。",
             must_cover_points=["说明向量缓存服务下一轮召回。"],
             source_refs=[ref],
         ),
     ]
 
-    def page(unit: CandidateMergeUnit, suffix: str = "") -> CandidatePage:
+    def page(unit: SourcePageUnit, suffix: str = "") -> CandidatePage:
         return CandidatePage(
-            candidate_page_id=f"MODEL-{unit.candidate_unit_id}{suffix}",
-            candidate_unit_id=unit.candidate_unit_id,
-            source_candidate_ids=unit.source_candidate_ids,
+            candidate_page_id=f"MODEL-{unit.page_unit_id}{suffix}",
+            page_unit_id=unit.page_unit_id,
             title=unit.title,
             proposed_page_type=unit.page_type,
             proposed_path_hint=unit.path_hint,
@@ -967,13 +714,13 @@ def test_candidate_pages_retries_only_invalid_candidate_unit(tmp_path: Path) -> 
             return self.spec
 
         def call_structured(self, step: str, request, output_model):
-            unit_id = request.user_payload["candidate_unit"]["candidate_unit_id"]
+            unit_id = request.user_payload["page_unit"]["page_unit_id"]
             with self.lock:
                 call_index = sum(self.calls_by_unit.values()) + 1
                 count = self.calls_by_unit.get(unit_id, 0) + 1
                 self.calls_by_unit[unit_id] = count
                 self.requests_by_unit.setdefault(unit_id, []).append(request)
-            output = invalid_cm001 if unit_id == "CM-001" and count == 1 else valid_cm001 if unit_id == "CM-001" else valid_cm002
+            output = invalid_cm001 if unit_id == "PU-001" and count == 1 else valid_cm001 if unit_id == "PU-001" else valid_cm002
             return ProviderCallResult(
                 output=output,
                 prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
@@ -1006,7 +753,6 @@ def test_candidate_pages_retries_only_invalid_candidate_unit(tmp_path: Path) -> 
     registry = FakeRegistry()
     state = {
         "source_digest": digest,
-        "candidate_merge": CandidateMergePlan(units=units),
         "raw_abs": raw,
         "raw_rel": raw_rel,
         "raw_binding": RawBinding(
@@ -1025,9 +771,10 @@ def test_candidate_pages_retries_only_invalid_candidate_unit(tmp_path: Path) -> 
     artifact = state["candidate_pages"]
 
     assert isinstance(artifact, CandidatePages)
-    assert [page.candidate_unit_id for page in artifact.pages] == ["CM-001", "CM-002"]
-    assert registry.calls_by_unit == {"CM-001": 2, "CM-002": 1}
-    retry_payload = registry.requests_by_unit["CM-001"][1].user_payload
+    assert [page.page_unit_id for page in artifact.pages] == ["PU-001", "PU-002"]
+    assert output.counts["covered_page_unit_count"] == 2
+    assert registry.calls_by_unit == {"PU-001": 2, "PU-002": 1}
+    retry_payload = registry.requests_by_unit["PU-001"][1].user_payload
     assert "必须且只能返回 1 页" in retry_payload["validation_error"]
     assert output.counts["semantic_retry_count"] == 1
     assert output.counts["api_call_count"] == 3
@@ -1042,8 +789,7 @@ def test_merge_plan_retries_semantic_validation(tmp_path: Path) -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -1201,26 +947,26 @@ def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path)
         raw_sha256=raw_sha,
         summary="这份材料说明自动化知识库入库流程。",
         key_takeaways=["候选页必须先忠于原文，再进行旧 wiki 召回。"],
-        concepts=[
-            SourceDigestCandidate(
-                candidate_id="CAND-001",
-                kind="concept",
-                name="自动化入库",
-                suggested_page_title="自动化入库",
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="自动化入库",
+                page_type="concept",
+                path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化入库强调去掉人工审核节点。",
-                source_basis="原文说明流程不再人工审核。",
+                content_scope="覆盖原文中关于自动化入库的流程说明。",
+                must_cover_points=["解释为什么候选页先忠于原文。"],
                 source_refs=[ref],
             )
         ],
     )
-    unit = CandidateMergeUnit(
-        candidate_unit_id="CM-001",
-        source_candidate_ids=["CAND-001"],
+    unit = SourcePageUnit(
+        page_unit_id="PU-001",
         title="自动化入库",
         page_type="concept",
         path_hint="concepts/Concept_Auto_Ingest.md",
         summary="合并后的候选页单元。",
-        merge_reason="只有一个同义候选，直接生成页面。",
+        content_scope="覆盖原文中关于自动化入库的流程说明。",
         must_cover_points=["解释为什么候选页先忠于原文。"],
         source_refs=[ref],
     )
@@ -1228,7 +974,7 @@ def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path)
     spec = ProviderSpec(spec="openai_compatible:deepseek-v4-flash", endpoint="https://api.deepseek.com/v1/chat/completions", api_key="test-key")
 
     warmup_prompt = prompts.candidate_pages_warmup_prompt(digest=digest, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
-    page_prompt = prompts.candidate_page_prompt(digest=digest, candidate_unit=unit, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
+    page_prompt = prompts.candidate_page_prompt(digest=digest, page_unit=unit, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
     warmup_payload = build_chat_payload(spec, warmup_prompt)
     page_payload = build_chat_payload(spec, page_prompt)
 
@@ -1242,8 +988,8 @@ def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path)
     warmup_suffix = json.loads(warmup_payload["messages"][2]["content"])
     assert shared_prefix["task"] == "candidate_pages"
     assert shared_prefix["raw_text"] == raw_text
-    assert "candidate_unit" not in shared_prefix
-    assert variable_suffix["input"]["candidate_unit"]["candidate_unit_id"] == "CM-001"
+    assert "page_unit" not in shared_prefix
+    assert variable_suffix["input"]["page_unit"]["page_unit_id"] == "PU-001"
     assert "raw_text" not in variable_suffix["input"]
     assert warmup_suffix["input"]["warmup"] is True
     assert warmup_suffix["json_output_example"] == {"status": "OK"}
@@ -1255,8 +1001,7 @@ def test_merge_plan_allows_split_decisions_but_update_must_use_top5() -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -1593,8 +1338,7 @@ def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="链接契约",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Link_Contract.md",
@@ -1605,8 +1349,7 @@ def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path
             ),
             CandidatePage(
                 candidate_page_id="CP-002",
-                candidate_unit_id="CM-002",
-                source_candidate_ids=["CAND-002"],
+                page_unit_id="PU-002",
                 title="稳定写作",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Stable_Writing.md",
@@ -1875,8 +1618,7 @@ def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> 
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                candidate_unit_id="CM-001",
-                source_candidate_ids=["CAND-001"],
+                page_unit_id="PU-001",
                 title="项目知识库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Project_Wiki.md",

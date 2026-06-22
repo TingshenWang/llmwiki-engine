@@ -63,17 +63,17 @@ class RawBinding(StrictModel):
     bound_at: str
 
 
-class SourceDigestCandidate(StrictModel):
-    candidate_id: str
-    kind: str
-    name: str
-    suggested_page_title: str
+class SourcePageUnit(StrictModel):
+    page_unit_id: str
+    title: str
+    page_type: str
+    path_hint: str
     summary: str
-    source_basis: str
+    content_scope: str
+    must_cover_points: list[str]
     source_refs: list[SourceRef]
-    related_candidates: list[str] = Field(default_factory=list)
 
-    @field_validator("candidate_id", "kind", "name", "summary", "source_basis")
+    @field_validator("page_unit_id", "title", "page_type", "path_hint", "summary", "content_scope")
     @classmethod
     def non_empty(cls, value: str) -> str:
         if not value.strip():
@@ -91,22 +91,8 @@ class SourceDigest(StrictModel):
     raw_sha256: str
     summary: str
     key_takeaways: list[str]
-    entities: list[SourceDigestCandidate] = Field(default_factory=list)
-    concepts: list[SourceDigestCandidate] = Field(default_factory=list)
-    designs: list[SourceDigestCandidate] = Field(default_factory=list)
-    comparisons: list[SourceDigestCandidate] = Field(default_factory=list)
-    open_questions: list[SourceDigestCandidate] = Field(default_factory=list)
-    budget_deferred_candidates: list[SourceDigestCandidate] = Field(default_factory=list)
+    page_units: list[SourcePageUnit] = Field(default_factory=list)
     weak_or_noise_items: list[WeakOrNoiseItem] = Field(default_factory=list)
-
-    def candidates(self) -> list[SourceDigestCandidate]:
-        return [
-            *self.entities,
-            *self.concepts,
-            *self.designs,
-            *self.comparisons,
-            *self.open_questions,
-        ]
 
 
 class RepairItem(StrictModel):
@@ -178,28 +164,9 @@ class WikiSnapshot(StrictModel):
     embedding_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
-class CandidateMergeUnit(StrictModel):
-    candidate_unit_id: str
-    source_candidate_ids: list[str]
-    title: str
-    page_type: str
-    path_hint: str
-    summary: str
-    merge_reason: str
-    must_cover_points: list[str]
-    source_refs: list[SourceRef]
-
-
-class CandidateMergePlan(StrictModel):
-    units: list[CandidateMergeUnit]
-    skipped_candidate_ids: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-
-
 class CandidatePage(StrictModel):
     candidate_page_id: str
-    candidate_unit_id: str
-    source_candidate_ids: list[str]
+    page_unit_id: str
     title: str
     proposed_page_type: str
     proposed_path_hint: str
@@ -213,7 +180,7 @@ class CandidatePage(StrictModel):
 
 class CandidatePages(StrictModel):
     pages: list[CandidatePage]
-    skipped_candidate_ids: list[str] = Field(default_factory=list)
+    skipped_page_unit_ids: list[str] = Field(default_factory=list)
 
 
 class CandidatePagesWarmup(StrictModel):

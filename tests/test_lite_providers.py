@@ -40,7 +40,7 @@ def test_openai_compatible_payload_uses_json_schema_and_sanitizes_key(tmp_path: 
     assert payload["model"] == "test-model"
     assert payload["response_format"]["type"] == "json_schema"
     assert payload["response_format"]["json_schema"]["name"] == "llmwiki_lite_source_digest"
-    assert "SourceDigestCandidate" in json.dumps(payload["response_format"]["json_schema"]["schema"])
+    assert "SourcePageUnit" in json.dumps(payload["response_format"]["json_schema"]["schema"])
     assert context["has_api_key"] is True
     assert "secret-value" not in json.dumps(context)
 
@@ -88,12 +88,7 @@ def test_openai_compatible_retries_truncated_response(tmp_path: Path, monkeypatc
         "raw_sha256": raw_sha,
         "summary": "A valid digest after retry.",
         "key_takeaways": ["Retry recovered from truncation."],
-        "entities": [],
-        "concepts": [],
-        "designs": [],
-        "comparisons": [],
-        "open_questions": [],
-        "budget_deferred_candidates": [],
+        "page_units": [],
         "weak_or_noise_items": [],
     }
     responses = [
@@ -189,12 +184,7 @@ def test_truncated_retry_caps_at_256k(tmp_path: Path, monkeypatch) -> None:
         "raw_sha256": raw_sha,
         "summary": "A valid digest after retry.",
         "key_takeaways": ["Retry recovered from truncation."],
-        "entities": [],
-        "concepts": [],
-        "designs": [],
-        "comparisons": [],
-        "open_questions": [],
-        "budget_deferred_candidates": [],
+        "page_units": [],
         "weak_or_noise_items": [],
     }
     responses = [
@@ -256,12 +246,7 @@ def test_openai_compatible_retries_timeout_and_records_paused_call(tmp_path: Pat
         "raw_sha256": raw_sha,
         "summary": "A valid digest after timeout retry.",
         "key_takeaways": ["Timeout recovered at the same step request."],
-        "entities": [],
-        "concepts": [],
-        "designs": [],
-        "comparisons": [],
-        "open_questions": [],
-        "budget_deferred_candidates": [],
+        "page_units": [],
         "weak_or_noise_items": [],
     }
     posted_payloads: list[dict[str, object]] = []

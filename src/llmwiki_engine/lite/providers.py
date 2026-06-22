@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .token_usage import api_call_record
 
 
-MODEL_BACKED_STEPS = ["source_digest", "candidate_merge", "candidate_pages_warmup", "candidate_pages", "merge_plan", "composition_plan", "final_pages"]
+MODEL_BACKED_STEPS = ["source_digest", "candidate_pages_warmup", "candidate_pages", "merge_plan", "composition_plan", "final_pages"]
 MAX_OUTPUT_TOKENS = 262144
 
 T = TypeVar("T", bound=BaseModel)
