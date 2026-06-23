@@ -72,6 +72,7 @@ class SourcePageUnit(StrictModel):
     content_scope: str
     must_cover_points: list[str]
     source_refs: list[SourceRef]
+    split_rationale: str = ""
 
     @field_validator("page_unit_id", "title", "page_type", "path_hint", "summary", "content_scope")
     @classmethod
@@ -93,6 +94,21 @@ class SourceDigest(StrictModel):
     key_takeaways: list[str]
     page_units: list[SourcePageUnit] = Field(default_factory=list)
     weak_or_noise_items: list[WeakOrNoiseItem] = Field(default_factory=list)
+
+
+class SourceGranularityStats(StrictModel):
+    raw_size_bytes: int
+    char_count: int
+    effective_char_count: int
+    paragraph_count: int
+    heading_count: int
+    code_block_count: int
+    markdown_link_count: int
+    navigation_noise_line_count: int
+    suggested_min_page_units: int
+    suggested_target_page_units: float
+    suggested_max_page_units: int
+    range_basis: str
 
 
 class RepairItem(StrictModel):

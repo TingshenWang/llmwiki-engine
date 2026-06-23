@@ -38,6 +38,7 @@ from llmwiki_engine.lite.pipeline import (
     _assert_merge_plan_consumes_candidates,
     _assert_merge_plan_chinese,
     _assert_source_digest_chinese,
+    _assert_source_digest_granularity,
     _canonical_final_markdown,
     _normalize_candidate_pages,
     _normalize_final_pages,
@@ -51,6 +52,7 @@ from llmwiki_engine.lite.pipeline import (
     _step_related_maintenance,
     _step_related_refresh,
     _step_source_digest,
+    _source_granularity_stats,
     _validate_before_write,
     init_vault,
     PipelineError,
@@ -254,6 +256,141 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
     assert output.counts["api_call_count"] == 2
     assert output.counts["api_success_count"] == 1
     assert output.counts["api_paused_count"] == 1
+
+
+def test_source_digest_retries_over_split_granularity(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault)
+    raw_rel = raw.relative_to(vault).as_posix()
+    raw_sha = sha256_file(raw)
+    binding = RawBinding(
+        raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        size_bytes=raw.stat().st_size,
+        mtime_ns=raw.stat().st_mtime_ns,
+        bound_at="2026-06-18T00:00:00Z",
+    )
+    ref = SourceRef(raw_path=raw_rel, raw_sha256=raw_sha, locator="whole_file")
+
+    def unit(index: int, title: str) -> SourcePageUnit:
+        return SourcePageUnit(
+            page_unit_id=f"PU-{index:03d}",
+            title=title,
+            page_type="concept",
+            path_hint=f"concepts/Concept_{index}.md",
+            summary=f"{title} 是自动化入库流程的一部分。",
+            content_scope=f"覆盖 {title} 的具体内容。",
+            must_cover_points=[f"说明 {title}。"],
+            source_refs=[ref],
+            split_rationale="这是上一轮错误拆分。",
+        )
+
+    invalid_digest = SourceDigest(
+        source_raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["短文应该合并为粗粒度页面。"],
+        page_units=[unit(1, "自动化入库"), unit(2, "去掉人工审核"), unit(3, "自动写入 Wiki")],
+    )
+    valid_digest = SourceDigest(
+        source_raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["短文应该合并为一篇粗粒度页面。"],
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="自动化知识库入库流程",
+                page_type="concept",
+                path_hint="concepts/Concept_Auto_Ingest.md",
+                summary="自动化知识库入库流程把人工审核、候选页生成和自动写入合并为可运行链路。",
+                content_scope="覆盖原文中自动化入库流程的核心设计。",
+                must_cover_points=["说明为什么不再人工审核。", "说明自动写入 wiki 的基本顺序。"],
+                source_refs=[ref],
+            )
+        ],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_digest if len(self.requests) == 1 else valid_digest
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "raw_abs": raw,
+        "raw_rel": raw_rel,
+        "raw_binding": binding,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_source_digest(tmp_path / "run", state)
+    digest = state["source_digest"]
+
+    assert isinstance(digest, SourceDigest)
+    assert len(digest.page_units) == 1
+    assert len(registry.requests) == 2
+    assert "page_unit_count 超出经验粒度区间" in registry.requests[1].user_payload["validation_error"]
+    assert "granularity_stats" in registry.requests[0].user_payload
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["granularity_suggested_max_page_units"] == 1
+    assert (tmp_path / "run" / "source_digest" / "granularity.json").exists()
+
+
+def test_source_digest_allows_zero_page_units_for_explicit_noise() -> None:
+    raw_text = "# 404\n\nNavigation\n\nSearch\n\nPage not found"
+    stats = _source_granularity_stats(raw_text, raw_size_bytes=len(raw_text.encode()))
+    digest = SourceDigest(
+        source_raw_path="raw/404.md",
+        raw_sha256="abc",
+        summary="原文是无法访问的错误页。",
+        key_takeaways=[],
+        page_units=[],
+        weak_or_noise_items=[{"text": "404 页面", "reason": "原始链接返回 404，页面只有导航菜单。"}],
+    )
+
+    _assert_source_digest_granularity(digest, stats)
 
 
 def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:

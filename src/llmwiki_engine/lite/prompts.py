@@ -13,6 +13,7 @@ from .models import (
     FinalPages,
     MergePlan,
     SourceDigest,
+    SourceGranularityStats,
     SourcePageUnit,
     WikiSnapshot,
 )
@@ -49,7 +50,14 @@ CANDIDATE_PAGE_SHARED_INSTRUCTIONS = [
 ]
 
 
-def source_digest_prompt(*, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> PromptRequest:
+def source_digest_prompt(
+    *,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    profile: Profile,
+    granularity_stats: SourceGranularityStats | None = None,
+) -> PromptRequest:
     return _request(
         step="source_digest",
         model=SourceDigest,
@@ -57,18 +65,23 @@ def source_digest_prompt(*, raw_path: str, raw_sha256: str, raw_text: str, profi
             "raw_path": raw_path,
             "raw_sha256": raw_sha256,
             "raw_text": raw_text,
+            **({"granularity_stats": granularity_stats.model_dump(mode="json")} if granularity_stats is not None else {}),
             "profile": profile.model_dump(mode="json"),
             "instructions": [
                 *CHINESE_OUTPUT_RULES,
                 "source_raw_path 必须严格等于 raw_path。",
                 "raw_sha256 必须严格等于 raw_sha256。",
-                "直接从 raw_text 规划本次应该生成哪些 page_units；每个 page_unit 表示后续要生成的一篇候选页。",
+                "直接从 raw_text 规划本次应该生成哪些 page_units；每个 page_unit 表示后续要生成的一篇可读 wiki 候选页，而不是一个零散知识点。",
+                "优先使用粗粒度页面：同一主体对象、同一读者任务、同一页面类型下的 what/why/how/example/version 应合并为同一 page_unit 的不同段落。",
+                "只有主体对象不同、读者任务不同、或页面类型明显不同，才拆成多个 page_units。",
+                "如果提供了 granularity_stats，page_unit 数量应落在 suggested_min_page_units 到 suggested_max_page_units 的经验区间附近；超出区间必须有强拆分理由。",
                 "在本步骤内完成去重、近义合并和页面类型确认；不要额外输出候选项再交给后续合并。",
                 "page_unit_id 使用 PU-001、PU-002 这样的稳定格式，不要编造 wiki 旧页路径。",
                 "page_type 必须来自 profile.page_types，且不能是 source。",
                 "path_hint 必须位于 page_type 对应目录内，且以 .md 结尾。",
                 "page_units 必须覆盖 raw_text 中所有值得进入知识库的有效内容；不要把重要信息漏掉。",
                 "must_cover_points 必须列出后续候选页必须覆盖的中文要点。",
+                "多个 page_units 时，每个 page_unit 的 split_rationale 必须用中文说明为什么它不能并入其他 page_unit；如果说不清，应合并。",
                 "每个 page_unit 必须包含至少一个 source_ref，包含 raw_path、raw_sha256 和有用 locator。",
                 "不值得入库、噪声、重复或证据不足的内容放入 weak_or_noise_items，并用中文说明原因。",
                 "不要在本步骤读取或假设旧 wiki；不要判断 create/update/noop。",
@@ -85,8 +98,9 @@ def source_digest_retry_prompt(
     profile: Profile,
     previous_digest: SourceDigest,
     validation_error: str,
+    granularity_stats: SourceGranularityStats | None = None,
 ) -> PromptRequest:
-    request = source_digest_prompt(raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, profile=profile)
+    request = source_digest_prompt(raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, profile=profile, granularity_stats=granularity_stats)
     payload = dict(request.user_payload)
     instructions = list(payload.get("instructions") or [])
     payload.update(
@@ -100,6 +114,8 @@ def source_digest_retry_prompt(
                 "必要产品名、框架名、API 名可以保留英文专有名词，但解释性句子必须是中文。",
                 "source_raw_path 和 raw_sha256 必须保持与输入完全一致。",
                 "不要为了通过中文校验而删除有价值 page_unit；应把英文说明改写成中文说明。",
+                "如果 validation_error 指出 page_unit 过多，请优先合并同主体、同读者任务、同页面类型的页面单元，而不是删掉有效内容。",
+                "如果 validation_error 指出 0 个 page_unit 但原文不是噪声，请生成至少一个粗粒度 page_unit。",
             ],
         }
     )

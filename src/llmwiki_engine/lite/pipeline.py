@@ -60,6 +60,7 @@ from .models import (
     RelatedCandidateReport,
     RelatedPageRef,
     SourceDigest,
+    SourceGranularityStats,
     SourcePageUnit,
     SourceRef,
     StepRecord,
@@ -337,6 +338,112 @@ def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[Sou
         )
     updated = digest.model_copy(update={"page_units": page_units})
     return updated, StructuredRepairReport(repairs=repairs, model_calls=0)
+
+
+def _source_granularity_stats(raw_text: str, *, raw_size_bytes: int) -> SourceGranularityStats:
+    text_without_frontmatter = strip_frontmatter(raw_text)
+    code_block_count = len(re.findall(r"```.*?```", text_without_frontmatter, flags=re.S))
+    text_without_code = re.sub(r"```.*?```", "\n", text_without_frontmatter, flags=re.S)
+    heading_count = len(re.findall(r"(?m)^\s{0,3}#{1,6}\s+\S", text_without_code))
+    markdown_link_count = len(re.findall(r"\[[^\]]+\]\([^)]+\)", text_without_code))
+    navigation_noise_line_count = sum(1 for line in text_without_code.splitlines() if _is_navigation_noise_line(line))
+    content_lines = [line for line in text_without_code.splitlines() if not _is_navigation_noise_line(line)]
+    content_text = "\n".join(content_lines)
+    paragraph_count = len([part for part in re.split(r"\n\s*\n", content_text) if part.strip()])
+    char_count = len(re.sub(r"\s+", "", text_without_frontmatter))
+    effective_char_count = len(re.sub(r"\s+", "", content_text))
+    target = _suggested_page_unit_target(effective_char_count)
+    suggested_min = max(1, int(target * 0.6))
+    suggested_max = max(suggested_min, int(target * 1.45 + 0.999))
+    if effective_char_count <= 1200:
+        suggested_max = 1
+    return SourceGranularityStats(
+        raw_size_bytes=raw_size_bytes,
+        char_count=char_count,
+        effective_char_count=effective_char_count,
+        paragraph_count=paragraph_count,
+        heading_count=heading_count,
+        code_block_count=code_block_count,
+        markdown_link_count=markdown_link_count,
+        navigation_noise_line_count=navigation_noise_line_count,
+        suggested_min_page_units=suggested_min,
+        suggested_target_page_units=round(target, 2),
+        suggested_max_page_units=suggested_max,
+        range_basis="初始经验公式：target = 1 + max(0, effective_char_count - 2500) / 5000；后续用真实回归数据拟合。",
+    )
+
+
+def _suggested_page_unit_target(effective_char_count: int) -> float:
+    return max(1.0, 1.0 + max(0, effective_char_count - 2500) / 5000.0)
+
+
+def _is_navigation_noise_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if len(stripped) <= 80 and re.search(r"\b(skip to|search|sign in|log in|navigation|menu|footer|header|breadcrumb)\b", lowered):
+        return True
+    if len(stripped) <= 120 and lowered.count("](") >= 2:
+        return True
+    if len(stripped) <= 120 and re.fullmatch(r"[-*+]\s*(\[.*?\]\(.*?\)\s*)+", stripped):
+        return True
+    return False
+
+
+def _assert_source_digest_granularity(digest: SourceDigest, stats: SourceGranularityStats) -> None:
+    page_unit_count = len(digest.page_units)
+    if page_unit_count == 0:
+        if stats.effective_char_count < 600 or _has_strong_noise_reason(digest):
+            return
+        raise PipelineError(
+            "source_digest page_unit_count=0，但 raw 看起来仍有可吸收内容；"
+            f"effective_char_count={stats.effective_char_count}。如果原文确实是噪声，请在 weak_or_noise_items 中写清楚原因。"
+        )
+    if page_unit_count > stats.suggested_max_page_units:
+        raise PipelineError(
+            "source_digest page_unit_count 超出经验粒度区间："
+            f"actual={page_unit_count}, suggested={stats.suggested_min_page_units}-{stats.suggested_max_page_units}, "
+            f"effective_char_count={stats.effective_char_count}。请合并同主体、同读者任务、同页面类型的 page_units。"
+        )
+    if page_unit_count > 1:
+        missing_rationale = [unit.page_unit_id for unit in digest.page_units if not unit.split_rationale.strip()]
+        if missing_rationale:
+            raise PipelineError(f"多个 page_units 时必须提供中文 split_rationale：{', '.join(missing_rationale)}")
+        _assert_source_digest_no_near_duplicate_units(digest)
+
+
+def _has_strong_noise_reason(digest: SourceDigest) -> bool:
+    text = " ".join(item.reason for item in digest.weak_or_noise_items).lower()
+    return bool(re.search(r"404|not found|无法访问|导航|菜单|噪声|重复|证据不足|空页面|错误页", text))
+
+
+def _assert_source_digest_no_near_duplicate_units(digest: SourceDigest) -> None:
+    units = digest.page_units
+    for left_index, left in enumerate(units):
+        for right in units[left_index + 1 :]:
+            if left.page_type != right.page_type:
+                continue
+            title_score = difflib.SequenceMatcher(None, _granularity_text_key(left.title), _granularity_text_key(right.title)).ratio()
+            scope_score = difflib.SequenceMatcher(None, _granularity_text_key(left.content_scope), _granularity_text_key(right.content_scope)).ratio()
+            path_same_subject = _path_subject_key(left.path_hint) and _path_subject_key(left.path_hint) == _path_subject_key(right.path_hint)
+            if title_score >= 0.82 or scope_score >= 0.76 or path_same_subject:
+                raise PipelineError(
+                    "source_digest 存在疑似过拆 page_units："
+                    f"{left.page_unit_id}({left.title}) 与 {right.page_unit_id}({right.title}) 过于相近；"
+                    "请合并为同一篇可读页面，除非主体对象、读者任务或页面类型明显不同。"
+                )
+
+
+def _granularity_text_key(text: str) -> str:
+    return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", text.lower()))
+
+
+def _path_subject_key(path: str) -> str:
+    stem = Path(path).stem.lower()
+    stem = re.sub(r"^(concept|design|entity|comparison|open_question|source)_", "", stem)
+    parts = [part for part in re.split(r"[_\-\s]+", stem) if part and part not in {"the", "and", "of", "for", "to", "a", "an"}]
+    return "_".join(parts[:3])
 
 
 def _call_provider_artifact(
@@ -1168,7 +1275,8 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     raw_text = read_text(raw_abs)
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "source_digest"
-    request = prompts.source_digest_prompt(raw_path=raw_rel, raw_sha256=binding.raw_sha256, raw_text=raw_text, profile=profile)
+    granularity_stats = _source_granularity_stats(raw_text, raw_size_bytes=binding.size_bytes)
+    request = prompts.source_digest_prompt(raw_path=raw_rel, raw_sha256=binding.raw_sha256, raw_text=raw_text, profile=profile, granularity_stats=granularity_stats)
     provider_artifacts: list[Path] = []
     api_calls: list[dict[str, object]] = []
     model_calls = 0
@@ -1195,6 +1303,7 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
             candidate_digest, candidate_repair_report = normalize_source_digest(digest_result, profile)
             _assert_source_digest_chinese(candidate_digest)
             _assert_unique([unit.page_unit_id for unit in candidate_digest.page_units], "source digest page_unit_id")
+            _assert_source_digest_granularity(candidate_digest, granularity_stats)
         except PipelineError as exc:
             last_semantic_error = str(exc)
             api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
@@ -1208,6 +1317,7 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
                 profile=profile,
                 previous_digest=digest_result,
                 validation_error=last_semantic_error,
+                granularity_stats=granularity_stats,
             )
             continue
         api_calls.extend(attempt_api_calls)
@@ -1221,21 +1331,27 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     md_path = out_dir / "source_digest.md"
     page_units_json = out_dir / "page_units.json"
     page_units_md = out_dir / "page_units.md"
+    granularity_path = out_dir / "granularity.json"
     repair_path = out_dir / "structured_repair_report.json"
     write_json(json_path, digest)
     write_text(md_path, _render_source_digest_md(digest))
     page_units = {"source_raw_path": raw_rel, "page_unit_ids": [item.page_unit_id for item in digest.page_units]}
     write_json(page_units_json, page_units)
     write_text(page_units_md, "\n".join(f"- {item.page_unit_id}: {item.title}" for item in digest.page_units) + "\n")
+    write_json(granularity_path, granularity_stats)
     write_json(repair_path, repair_report)
     counts = {
         "page_unit_count": len(digest.page_units),
         "weak_noise_count": len(digest.weak_or_noise_items),
+        "granularity_effective_chars": granularity_stats.effective_char_count,
+        "granularity_suggested_min_page_units": granularity_stats.suggested_min_page_units,
+        "granularity_suggested_target_page_units": granularity_stats.suggested_target_page_units,
+        "granularity_suggested_max_page_units": granularity_stats.suggested_max_page_units,
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
         **_token_usage_counts(api_calls),
     }
     return StepOutput(
-        [json_path, md_path, page_units_json, page_units_md, repair_path, *provider_artifacts],
+        [json_path, md_path, page_units_json, page_units_md, granularity_path, repair_path, *provider_artifacts],
         counts,
         model_calls=model_calls,
         repair_count=len(repair_report.repairs),
@@ -2800,6 +2916,8 @@ def _render_source_digest_md(digest: SourceDigest) -> str:
         lines.append(f"- 类型：{unit.page_type}")
         lines.append(f"- 路径提示：`{unit.path_hint}`")
         lines.append(f"- 内容范围：{unit.content_scope}")
+        if unit.split_rationale:
+            lines.append(f"- 拆分理由：{unit.split_rationale}")
         if unit.must_cover_points:
             lines.append("- 必须覆盖：")
             lines.extend(f"  - {item}" for item in unit.must_cover_points)
