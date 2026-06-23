@@ -758,6 +758,9 @@ def _assert_final_pages_chinese(artifact: FinalPages) -> None:
         body = strip_frontmatter(page.markdown)
         _require_chinese_title(f"{page.final_page_id}.title", page.title, body)
         _require_chinese_text(f"{page.final_page_id}.markdown", body)
+        for index, item in enumerate(page.preimage_coverage_report, start=1):
+            _require_chinese_text(f"{page.final_page_id}.preimage_coverage_report[{index}].final_anchor", item.final_anchor)
+            _require_chinese_text(f"{page.final_page_id}.preimage_coverage_report[{index}].evidence", item.evidence)
         for index, item in enumerate(page.warnings, start=1):
             _require_chinese_text(f"{page.final_page_id}.warnings[{index}]", item)
 
@@ -1084,6 +1087,7 @@ def _final_pages_from_outputs(
     )
     _assert_final_pages_cover_composition(artifact, composition)
     _assert_final_pages_chinese(artifact)
+    _assert_final_pages_preserve_preimage_coverage(artifact, composition, snapshot)
     return artifact
 
 
@@ -1236,6 +1240,119 @@ def _assert_final_pages_cover_composition(artifact: FinalPages, composition: Com
             raise PipelineError(f"最终页 {page.target_path} 缺少 source_refs。")
         if not page.markdown.strip():
             raise PipelineError(f"最终页 {page.target_path} markdown 为空。")
+
+
+def _assert_final_pages_preserve_preimage_coverage(artifact: FinalPages, composition: CompositionPlan, snapshot: WikiSnapshot) -> None:
+    items_by_target = {item.target_path: item for item in composition.items}
+    entries_by_path = {entry.path: entry for entry in snapshot.entries}
+    generic_anchors = {_granularity_text_key(item) for item in ["摘要", "核心内容", "矛盾与未决问题", "未决问题", "相关页面", "Related"]}
+    for page in artifact.pages:
+        item = items_by_target.get(page.target_path)
+        if item is None or item.action != "update":
+            continue
+        existing = entries_by_path.get(page.target_path)
+        if existing is None:
+            continue
+        requirements = prompts.preimage_coverage_requirements(existing)
+        if not requirements:
+            continue
+        report_by_id = {report.requirement_id: report for report in page.preimage_coverage_report}
+        required_ids = [str(requirement["requirement_id"]) for requirement in requirements]
+        missing = [requirement_id for requirement_id in required_ids if requirement_id not in report_by_id]
+        extra = sorted(set(report_by_id) - set(required_ids))
+        if missing:
+            raise PipelineError(f"最终页 {page.target_path} 缺少旧页覆盖报告：{', '.join(missing)}")
+        if extra:
+            raise PipelineError(f"最终页 {page.target_path} 覆盖报告包含未知 requirement_id：{', '.join(extra)}")
+        body_key = _granularity_text_key(strip_frontmatter(page.markdown))
+        for requirement in requirements:
+            requirement_id = str(requirement["requirement_id"])
+            report = report_by_id[requirement_id]
+            final_anchor_key = _granularity_text_key(report.final_anchor)
+            if not final_anchor_key or final_anchor_key in generic_anchors:
+                raise PipelineError(f"最终页 {page.target_path} 的 {requirement_id} final_anchor 过于泛化，必须指向具体旧知识所在小节。")
+            if final_anchor_key not in body_key:
+                raise PipelineError(f"最终页 {page.target_path} 的 {requirement_id} final_anchor 未出现在最终正文：{report.final_anchor}")
+
+
+def _final_preimage_coverage_report(artifact: FinalPages, composition: CompositionPlan, snapshot: WikiSnapshot) -> dict[str, object]:
+    items_by_target = {item.target_path: item for item in composition.items}
+    entries_by_path = {entry.path: entry for entry in snapshot.entries}
+    pages: list[dict[str, object]] = []
+    requirement_count = 0
+    reported_count = 0
+    for page in artifact.pages:
+        item = items_by_target.get(page.target_path)
+        if item is None or item.action != "update":
+            continue
+        existing = entries_by_path.get(page.target_path)
+        requirements = prompts.preimage_coverage_requirements(existing)
+        requirement_count += len(requirements)
+        reported_count += len(page.preimage_coverage_report)
+        report_by_id = {report.requirement_id: report for report in page.preimage_coverage_report}
+        requirement_rows: list[dict[str, object]] = []
+        for requirement in requirements:
+            requirement_id = str(requirement["requirement_id"])
+            report = report_by_id.get(requirement_id)
+            requirement_rows.append(
+                {
+                    **requirement,
+                    "reported": report is not None,
+                    "report": report.model_dump(mode="json") if report is not None else None,
+                }
+            )
+        pages.append(
+            {
+                "target_path": page.target_path,
+                "title": page.title,
+                "preimage_sha256": page.preimage_sha256,
+                "requirements": requirement_rows,
+            }
+        )
+    return {
+        "requirement_count": requirement_count,
+        "reported_count": reported_count,
+        "pages": pages,
+    }
+
+
+def _render_final_preimage_coverage_report_md(report: dict[str, object]) -> str:
+    lines = [
+        "# 旧页覆盖报告",
+        "",
+        f"- 要求数：{report.get('requirement_count', 0)}",
+        f"- 已报告数：{report.get('reported_count', 0)}",
+        "",
+    ]
+    pages = report.get("pages")
+    if not isinstance(pages, list) or not pages:
+        lines.append("暂无 update 页面需要保留旧页覆盖。")
+        return "\n".join(lines) + "\n"
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        lines.append(f"## `{page.get('target_path')}`")
+        lines.append("")
+        requirements = page.get("requirements")
+        if not isinstance(requirements, list) or not requirements:
+            lines.append("- 无旧页覆盖要求。")
+            lines.append("")
+            continue
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            report_item = requirement.get("report")
+            if isinstance(report_item, dict):
+                lines.append(
+                    "- "
+                    f"{requirement.get('requirement_id')}：{report_item.get('status')}；"
+                    f"锚点：{report_item.get('final_anchor')}；"
+                    f"{report_item.get('evidence')}"
+                )
+            else:
+                lines.append(f"- {requirement.get('requirement_id')}：未报告；{requirement.get('description')}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _dedupe_list(values: list[str]) -> list[str]:
@@ -1749,17 +1866,24 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
         diff_path = out_dir / "diffs" / f"{safe_filename(final.target_path)}.diff"
         write_text(diff_path, diff_text)
         artifacts.append(diff_path)
+    coverage_report = _final_preimage_coverage_report(artifact, composition, snapshot)
+    coverage_json_path = out_dir / "preimage_coverage_report.json"
+    coverage_md_path = out_dir / "preimage_coverage_report.md"
+    write_json(coverage_json_path, coverage_report)
+    write_text(coverage_md_path, _render_final_preimage_coverage_report_md(coverage_report))
     state["final_pages"] = artifact
     json_path = out_dir / "final_pages.json"
     manifest_path = out_dir / "final_page_manifest.json"
     write_json(json_path, artifact)
     write_json(manifest_path, [{"target_path": page.target_path, "sha256": page.content_sha256, "action": page.action} for page in artifact.pages])
-    artifacts.extend([json_path, manifest_path, *provider_artifacts])
+    artifacts.extend([json_path, manifest_path, coverage_json_path, coverage_md_path, *provider_artifacts])
     return StepOutput(
         artifacts,
         {
             "final_page_count": len(artifact.pages),
             "diff_count": len(artifact.pages),
+            "preimage_coverage_requirement_count": int(coverage_report["requirement_count"]),
+            "preimage_coverage_report_count": int(coverage_report["reported_count"]),
             "parallel_request_count": parallel_request_count if model_calls else 0,
             "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
             **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),

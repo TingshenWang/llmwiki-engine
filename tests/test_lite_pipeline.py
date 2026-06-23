@@ -26,6 +26,7 @@ from llmwiki_engine.lite.models import (
     MergeDecision,
     MergePlan,
     OperationManifest,
+    PreimageCoverageItem,
     RawBinding,
     SourceDigest,
     SourcePageUnit,
@@ -1611,6 +1612,186 @@ def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path
     assert output.counts["api_paused_count"] == 1
     retry_prompt = tmp_path / "run" / "final_pages" / "model_calls" / "final_pages_FP-001_retry_1.prompt.json"
     assert retry_prompt.exists()
+
+
+def test_final_pages_retry_update_that_drops_preimage_coverage(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    existing_path = vault / "wiki" / "concepts" / "Concept_Agents_SDK.md"
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_body = (
+        "# Agents SDK\n\n"
+        "## 摘要\n\nAgents SDK 用于构建生产级智能体应用。\n\n"
+        "### 使用案例\n\nCoinbase 和 Box 使用 Agents SDK 构建企业级智能体。\n\n"
+        "### 开源与社区愿景\n\nOpenAI 将 Agents SDK 作为开源框架持续发展。\n"
+    )
+    existing_path.write_text(existing_body, encoding="utf-8")
+    existing_sha = sha256_file(existing_path)
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                page_unit_id="PU-001",
+                title="Agents SDK Python 快速开始",
+                proposed_page_type="concept",
+                proposed_path_hint="concepts/Concept_Agents_SDK.md",
+                summary="补充 Python 安装和 Hello World。",
+                body_markdown="# Agents SDK Python 快速开始\n\n## 安装\n\n使用 pip install openai-agents。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    composition = CompositionPlan(
+        items=[
+            CompositionItem(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Agents_SDK.md",
+                action="update",
+                merge_decision_ids=["MD-001"],
+                candidate_page_ids=["CP-001"],
+                section_order=["摘要", "安装", "使用案例", "开源与社区愿景"],
+                preserve_rules=["保留旧页使用案例和开源愿景。"],
+                source_ref_rules=["追加本次 raw 来源引用。"],
+                readability_goal="在旧页基础上补充 Python 快速开始。",
+            )
+        ]
+    )
+    snapshot = WikiSnapshot(
+        wiki_root="wiki",
+        pool_hash="old",
+        generated_at="2026-06-18T00:00:00Z",
+        entries=[
+            WikiKnowledgeEntry(
+                path="concepts/Concept_Agents_SDK.md",
+                title="Agents SDK",
+                page_type="concept",
+                sha256=existing_sha,
+                summary="Agents SDK 用于构建生产级智能体应用，包含使用案例和开源社区愿景。",
+                created="2026-06-01",
+                source_raw_paths=["raw/old_agents_sdk.md"],
+                source_raw_hashes=["oldhash"],
+                source_prepared_hashes=["oldhash"],
+                source_operation_ids=["OLD-OP"],
+                updated="2026-06-01",
+                text_excerpt=existing_body,
+            )
+        ],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            is_retry = "validation_error" in request.user_payload
+            if not is_retry:
+                page = FinalPage(
+                    final_page_id="FP-001",
+                    target_path="concepts/Concept_Agents_SDK.md",
+                    action="update",
+                    title="Agents SDK",
+                    page_type="concept",
+                    markdown="# Agents SDK\n\n## 摘要\n\nAgents SDK 支持 Python 快速开始。\n\n## 安装\n\n使用 pip install openai-agents。",
+                    source_refs=[ref],
+                )
+            else:
+                page = FinalPage(
+                    final_page_id="FP-001",
+                    target_path="concepts/Concept_Agents_SDK.md",
+                    action="update",
+                    title="Agents SDK",
+                    page_type="concept",
+                    markdown=(
+                        "# Agents SDK\n\n"
+                        "## SDK 的定位\n\nAgents SDK 用于构建生产级智能体应用，也支持 Python 快速开始。\n\n"
+                        "## 安装\n\n使用 pip install openai-agents。\n\n"
+                        "## 使用案例\n\nCoinbase 和 Box 使用 Agents SDK 构建企业级智能体。\n\n"
+                        "## 开源与社区愿景\n\nOpenAI 将 Agents SDK 作为开源框架持续发展。"
+                    ),
+                    source_refs=[ref],
+                    preimage_coverage_report=[
+                        PreimageCoverageItem(
+                            requirement_id="OLD-SUMMARY",
+                            status="merged",
+                            final_anchor="SDK 的定位",
+                            evidence="旧页关于生产级智能体应用的定位已合并到 SDK 的定位。",
+                        ),
+                        PreimageCoverageItem(
+                            requirement_id="OLD-SECTION-001",
+                            status="preserved",
+                            final_anchor="使用案例",
+                            evidence="Coinbase 和 Box 的旧使用案例已保留在使用案例小节。",
+                        ),
+                        PreimageCoverageItem(
+                            requirement_id="OLD-SECTION-002",
+                            status="preserved",
+                            final_anchor="开源与社区愿景",
+                            evidence="旧页开源社区愿景已保留在同名小节。",
+                        ),
+                    ],
+                )
+            output = FinalPages(pages=[page])
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "composition_plan": composition,
+        "candidate_pages": candidate_pages,
+        "wiki_snapshot": snapshot,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+        "operation_id": "ING-20260618T000000Z-test",
+    }
+
+    output = _step_final_pages(vault, tmp_path / "run", state)
+    final_page = state["final_pages"].pages[0]
+
+    assert len(registry.requests) == 2
+    assert "缺少旧页覆盖报告" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["preimage_coverage_requirement_count"] == 3
+    assert output.counts["preimage_coverage_report_count"] == 3
+    assert "Coinbase" in final_page.markdown
+    assert "开源与社区愿景" in final_page.markdown
+    assert (tmp_path / "run" / "final_pages" / "preimage_coverage_report.json").exists()
 
 
 def test_canonicalization_strips_model_related_section(tmp_path: Path) -> None:

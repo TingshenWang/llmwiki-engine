@@ -55,6 +55,8 @@ COUNT_LABELS = {
     "final_page_count": "最终页数",
     "update_target_count": "更新目标数",
     "diff_count": "diff数",
+    "preimage_coverage_requirement_count": "旧页覆盖要求",
+    "preimage_coverage_report_count": "旧页覆盖报告",
     "parallel_request_count": "并发请求",
     "parallel_max_workers": "最大并发",
     "error_count": "错误数",

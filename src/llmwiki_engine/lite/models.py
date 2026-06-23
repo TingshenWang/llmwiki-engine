@@ -275,6 +275,20 @@ class CompositionPlan(StrictModel):
     items: list[CompositionItem]
 
 
+class PreimageCoverageItem(StrictModel):
+    requirement_id: str
+    status: Literal["preserved", "merged"]
+    final_anchor: str
+    evidence: str
+
+    @field_validator("requirement_id", "final_anchor", "evidence")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
 class FinalPage(StrictModel):
     final_page_id: str
     target_path: str
@@ -285,6 +299,7 @@ class FinalPage(StrictModel):
     markdown: str
     source_refs: list[SourceRef]
     preimage_sha256: str | None = None
+    preimage_coverage_report: list[PreimageCoverageItem] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

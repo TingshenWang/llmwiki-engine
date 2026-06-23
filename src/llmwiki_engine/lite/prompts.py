@@ -15,6 +15,7 @@ from .models import (
     SourceDigest,
     SourceGranularityStats,
     SourcePageUnit,
+    WikiKnowledgeEntry,
     WikiSnapshot,
 )
 from .profile import Profile
@@ -299,6 +300,8 @@ def final_page_prompt(
     relevant_candidates = CandidatePages(pages=[page for page in candidate_pages.pages if page.candidate_page_id in candidate_ids])
     relevant_paths = {composition_item.target_path, *composition_item.existing_page_refs}
     relevant_entries = [entry for entry in snapshot.entries if entry.path in relevant_paths]
+    target_entry = next((entry for entry in snapshot.entries if entry.path == composition_item.target_path), None)
+    preimage_requirements = preimage_coverage_requirements(target_entry) if composition_item.action == "update" else []
     allowed_body_link_targets = [
         {
             "path": entry.path,
@@ -316,6 +319,7 @@ def final_page_prompt(
             "composition_item": composition_item.model_dump(mode="json"),
             "candidate_pages": relevant_candidates.model_dump(mode="json"),
             "wiki_snapshot_entries": [entry.model_dump(mode="json") for entry in relevant_entries],
+            "preimage_coverage_requirements": preimage_requirements,
             "allowed_body_link_targets": allowed_body_link_targets,
             "profile": profile.model_dump(mode="json"),
             "parallel_generation_contract": {
@@ -333,6 +337,10 @@ def final_page_prompt(
                 "引擎会替换最终 frontmatter；专注于中文正文和稳定的中文标题结构。",
                 "每个页面必须保留 source_refs。",
                 "update 页面必须保留有价值的旧笔记，并加入有来源支撑的新材料。",
+                "update 页面禁止只围绕本次 candidate 重写旧页；必须把 preimage_coverage_requirements 中每条旧页覆盖要求保留或合并进最终正文。",
+                "update 页面必须填写 preimage_coverage_report；每个 requirement_id 必须逐条出现一次，status 只能是 preserved 或 merged。",
+                "preimage_coverage_report.final_anchor 必须是最终正文中真实存在的具体中文小节或锚点，不能只写“摘要”“核心内容”“矛盾与未决问题”等泛化位置。",
+                "preimage_coverage_report.evidence 必须用中文说明旧页内容被保留或合并到了哪里。",
                 "正文可以写 0-2 条 Obsidian wikilink，但只在阅读语境确实需要跳转理解时使用，不要为了凑数而链接。",
                 "正文 wikilink 必须从 allowed_body_link_targets.path 中选择，不能链接未知页面或本页面。",
                 "不要写 Related 或 相关页面章节；引擎会在 final_pages 之后按 embedding 相似度计算唯一 Related。",
@@ -368,10 +376,74 @@ def final_page_retry_prompt(
                 "正文中不得包含 raw、sources、logs、index、Source_* 或 source page 的 wikilink、Markdown link、HTML href。",
                 "不要写 Related 或 相关页面章节；引擎会统一生成。",
                 "保留有来源支撑的中文正文和 source_refs，不要为了修复链接而删除核心信息。",
+                "如果 validation_error 指出旧页覆盖丢失，必须把对应旧页小节或主题补回最终正文，并更新 preimage_coverage_report。",
             ],
         }
     )
     return request.model_copy(update={"user_payload": payload})
+
+
+def preimage_coverage_requirements(entry: WikiKnowledgeEntry | None) -> list[dict[str, object]]:
+    if entry is None:
+        return []
+    requirements: list[dict[str, object]] = []
+    if entry.summary.strip():
+        requirements.append(
+            {
+                "requirement_id": "OLD-SUMMARY",
+                "kind": "summary",
+                "description": f"旧页摘要覆盖必须保留或合并：{entry.summary.strip()}",
+                "source_raw_paths": entry.source_raw_paths,
+            }
+        )
+    for index, heading in enumerate(_coverage_headings(entry.text_excerpt, entry.title), start=1):
+        requirements.append(
+            {
+                "requirement_id": f"OLD-SECTION-{index:03d}",
+                "kind": "section",
+                "description": f"旧页小节或主题必须保留或合并：{heading}",
+                "anchor": heading,
+                "source_raw_paths": entry.source_raw_paths,
+            }
+        )
+    if not requirements:
+        requirements.append(
+            {
+                "requirement_id": "OLD-BODY",
+                "kind": "body",
+                "description": f"旧页 `{entry.path}` 的正文已有知识必须保留或合并，不得被本次 update 清空。",
+                "source_raw_paths": entry.source_raw_paths,
+            }
+        )
+    return requirements
+
+
+def _coverage_headings(markdown: str, title: str) -> list[str]:
+    generic = {"摘要", "核心内容", "矛盾与未决问题", "未决问题", "相关页面", "related"}
+    headings: list[str] = []
+    title_key = _coverage_key(title)
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        level, _, raw_heading = stripped.partition(" ")
+        if not raw_heading or len(level) > 3:
+            continue
+        heading = raw_heading.strip()
+        key = _coverage_key(heading)
+        if not key or key == title_key or heading.lower() in generic:
+            continue
+        if heading not in headings:
+            headings.append(heading)
+        if len(headings) >= 8:
+            break
+    return headings
+
+
+def _coverage_key(text: str) -> str:
+    import re
+
+    return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", text.lower()))
 
 
 def _candidate_page_cache_prefix(*, digest: SourceDigest, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> dict[str, Any]:
