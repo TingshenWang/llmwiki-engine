@@ -1739,19 +1739,50 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "composition_plan"
-    plan_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
-        state,
-        out_dir,
-        "composition_plan",
-        prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile),
-        CompositionPlan,
-    )
-    if not isinstance(plan_result, CompositionPlan):
-        raise PipelineError("composition_plan provider 返回了无效 artifact。")
-    artifact = plan_result
-    artifact = _normalize_composition_plan(artifact)
-    _assert_composition_plan_chinese(artifact)
-    _assert_composition_covers_writes(artifact, plan)
+    request = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile)
+    provider_artifacts: list[Path] = []
+    api_calls: list[dict[str, object]] = []
+    model_calls = 0
+    semantic_retry_count = 0
+    artifact: CompositionPlan | None = None
+    last_semantic_error = ""
+    for attempt in range(2):
+        artifact_stem = "composition_plan" if attempt == 0 else f"composition_plan_retry_{attempt}"
+        plan_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+            state,
+            out_dir,
+            "composition_plan",
+            request,
+            CompositionPlan,
+            artifact_stem=artifact_stem,
+        )
+        provider_artifacts.extend(attempt_artifacts)
+        model_calls += attempt_model_calls
+        if not isinstance(plan_result, CompositionPlan):
+            raise PipelineError("composition_plan provider 返回了无效 artifact。")
+        try:
+            candidate_plan = _normalize_composition_plan(plan_result)
+            _assert_composition_plan_chinese(candidate_plan)
+            _assert_composition_covers_writes(candidate_plan, plan)
+        except PipelineError as exc:
+            last_semantic_error = str(exc)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.composition_plan_retry_prompt(
+                merge_plan=plan,
+                candidate_pages=candidate_pages,
+                profile=profile,
+                previous_plan=plan_result,
+                validation_error=last_semantic_error,
+            )
+            continue
+        api_calls.extend(attempt_api_calls)
+        artifact = candidate_plan
+        break
+    if artifact is None:
+        raise PipelineError(f"composition_plan provider 重试后仍未通过系统语义校验：{last_semantic_error}")
     state["composition_plan"] = artifact
     json_path = out_dir / "composition_plan.json"
     md_path = out_dir / "composition_plan.md"
@@ -1762,6 +1793,7 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
         {
             "final_target_count": len(artifact.items),
             "update_target_count": sum(1 for item in artifact.items if item.action == "update"),
+            **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
             **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,

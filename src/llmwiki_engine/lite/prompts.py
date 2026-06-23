@@ -268,16 +268,19 @@ def composition_plan_prompt(
     candidate_pages: CandidatePages,
     profile: Profile,
 ) -> PromptRequest:
+    writable_targets = sorted({decision.target_path for decision in merge_plan.decisions if decision.action != "noop" and decision.target_path})
     return _request(
         step="composition_plan",
         model=CompositionPlan,
         payload={
             "merge_plan": merge_plan.model_dump(mode="json"),
             "candidate_pages": candidate_pages.model_dump(mode="json"),
+            "expected_writable_targets": writable_targets,
             "profile": profile.model_dump(mode="json"),
             "instructions": [
                 *CHINESE_OUTPUT_RULES,
                 "每个可写 create/update decision 必须进入一个 composition item；同一 target_path 的多个 decision 可以合并为一个 item。",
+                "composition item 的 target_path 必须逐字使用 expected_writable_targets 中的路径，禁止翻译、改写、重命名或重新生成路径。",
                 "不要为 noop decisions 创建 composition item。",
                 "merge_decision_ids 必须覆盖进入该 item 的 merge decision。",
                 "candidate_page_ids 必须来自对应 merge decisions。",
@@ -287,6 +290,33 @@ def composition_plan_prompt(
             ],
         },
     )
+
+
+def composition_plan_retry_prompt(
+    *,
+    merge_plan: MergePlan,
+    candidate_pages: CandidatePages,
+    profile: Profile,
+    previous_plan: CompositionPlan,
+    validation_error: str,
+) -> PromptRequest:
+    request = composition_plan_prompt(merge_plan=merge_plan, candidate_pages=candidate_pages, profile=profile)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "previous_invalid_output": previous_plan.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 composition_plan 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "不要改变 merge_plan 已决定的 target_path；只能从 expected_writable_targets 逐字复制。",
+                "如果 validation_error 中出现 expected/actual，以 expected 为准重建 composition items。",
+                "仍然必须覆盖所有可写 merge_decision_ids，不得遗漏任何 create/update decision。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
 
 
 def final_page_prompt(

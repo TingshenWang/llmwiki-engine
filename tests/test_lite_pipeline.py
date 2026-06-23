@@ -47,6 +47,7 @@ from llmwiki_engine.lite.pipeline import (
     _page_generation_parallelism,
     _repair_merge_plan_candidate_content_locators,
     _step_candidate_pages,
+    _step_composition_plan,
     _step_final_pages,
     _step_index_log_write,
     _step_merge_plan,
@@ -1927,6 +1928,120 @@ def test_page_generation_parallelism_defaults_to_request_count_and_supports_limi
     assert _page_generation_parallelism({}, 16) == 16
     assert _page_generation_parallelism({"config": {"page_generation": {}}}, 23) == 23
     assert _page_generation_parallelism({"config": {"page_generation": {"max_parallel_requests": 7}}}, 23) == 7
+
+
+def test_composition_plan_retries_target_path_drift(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/react.md", raw_sha256="abc", locator="whole_file")
+    expected_path = "concepts/Concept_ReAct_推理与行动协同的语言模型范式.md"
+    wrong_path = "concepts/Concept_ReAct_Synergizing_Reasoning_and_Acting_in_Language_Models.md"
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                page_unit_id="PU-001",
+                title="ReAct 推理与行动协同",
+                proposed_page_type="concept",
+                proposed_path_hint=expected_path,
+                summary="ReAct 将推理轨迹与环境行动交织起来。",
+                body_markdown="# ReAct 推理与行动协同\n\nReAct 将推理轨迹与环境行动交织起来。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    merge_plan = MergePlan(
+        action_counts={"create": 1, "update": 0, "noop": 0},
+        decisions=[
+            make_decision(
+                decision_id="MD-001",
+                candidate_page_id="CP-001",
+                action="create",
+                target_path=expected_path,
+                title="ReAct 推理与行动协同",
+                ref=ref,
+            )
+        ],
+    )
+
+    def composition_item(target_path: str) -> CompositionItem:
+        return CompositionItem(
+            final_page_id="FP-001",
+            target_path=target_path,
+            action="create",
+            merge_decision_ids=["MD-001"],
+            candidate_page_ids=["CP-001"],
+            section_order=["摘要", "核心机制"],
+            source_ref_rules=["保留本次 raw 的来源引用。"],
+            readability_goal="整理成一篇中文概念页。",
+        )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            target_path = expected_path if "validation_error" in request.user_payload else wrong_path
+            output = CompositionPlan(items=[composition_item(target_path)])
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "merge_plan": merge_plan,
+        "candidate_pages": candidate_pages,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_composition_plan(tmp_path / "run", state)
+    artifact = state["composition_plan"]
+
+    assert isinstance(artifact, CompositionPlan)
+    assert artifact.items[0].target_path == expected_path
+    assert len(registry.requests) == 2
+    assert registry.requests[0].user_payload["expected_writable_targets"] == [expected_path]
+    assert "必须覆盖所有可写合并目标" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 2
+    assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
 
 
 def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> None:
