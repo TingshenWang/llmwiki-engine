@@ -940,6 +940,8 @@ def _looks_like_technical_token(token: str) -> bool:
         return True
     if normalized.isupper() and len(normalized) > 1:
         return True
+    if normalized[:1].isupper() and len(normalized) > 2:
+        return True
     if re.search(r"[a-z][A-Z]", normalized):
         return True
     return False

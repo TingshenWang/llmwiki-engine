@@ -604,6 +604,22 @@ def test_coverage_judge_allows_technical_evidence_fragments() -> None:
     _assert_coverage_judge_chinese(judge)
 
 
+def test_coverage_judge_allows_product_name_evidence_fragments() -> None:
+    judge = CoverageJudge(
+        claim_results=[
+            ClaimCoverageItem(
+                claim_id="C-001",
+                status="covered",
+                covered_by=["concepts/Concept_Model_Context_Protocol.md#预构建集成"],
+                evidence="Google Drive、Slack、GitHub、Git、Postgres、Puppeteer",
+                reason="最终页面列出了这些预构建集成，因此覆盖该知识点。",
+            )
+        ]
+    )
+
+    _assert_coverage_judge_chinese(judge)
+
+
 def test_coverage_judge_rejects_english_explanatory_evidence() -> None:
     judge = CoverageJudge(
         claim_results=[
