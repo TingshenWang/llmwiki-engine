@@ -9,6 +9,8 @@ OperationStatus = Literal["created", "running", "failed", "written", "source_rec
 StepStatus = Literal["running", "completed", "failed"]
 MergeAction = Literal["create", "update", "noop"]
 RelatedSource = Literal["source_digest", "wiki_context"]
+ClaimKind = str
+CoverageStatus = Literal["covered", "partial", "missing", "contradicted"]
 
 
 class StrictModel(BaseModel):
@@ -70,7 +72,7 @@ class SourcePageUnit(StrictModel):
     path_hint: str
     summary: str
     content_scope: str
-    must_cover_points: list[str]
+    claim_ids: list[str]
     source_refs: list[SourceRef]
     split_rationale: str = ""
 
@@ -87,13 +89,69 @@ class WeakOrNoiseItem(StrictModel):
     reason: str
 
 
+class SourceClaim(StrictModel):
+    claim_id: str
+    text: str
+    kind: ClaimKind = "fact"
+    importance: int = Field(ge=1, le=5)
+    concept_terms: list[str] = Field(default_factory=list)
+    raw_locator: str
+    source_refs: list[SourceRef]
+
+    @field_validator("claim_id", "text", "raw_locator")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
 class SourceDigest(StrictModel):
     source_raw_path: str
     raw_sha256: str
     summary: str
     key_takeaways: list[str]
+    claims: list[SourceClaim] = Field(default_factory=list)
     page_units: list[SourcePageUnit] = Field(default_factory=list)
     weak_or_noise_items: list[WeakOrNoiseItem] = Field(default_factory=list)
+
+
+class ClaimCoverageItem(StrictModel):
+    claim_id: str
+    status: CoverageStatus
+    covered_by: list[str] = Field(default_factory=list)
+    evidence: str
+    reason: str
+
+    @field_validator("claim_id", "evidence", "reason")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class CoverageJudge(StrictModel):
+    claim_results: list[ClaimCoverageItem] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ClaimRepairPatch(StrictModel):
+    claim_id: str
+    replacement_claim: SourceClaim
+    reason: str
+
+    @field_validator("claim_id", "reason")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class ClaimRepairResult(StrictModel):
+    patches: list[ClaimRepairPatch] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class SourceGranularityStats(StrictModel):

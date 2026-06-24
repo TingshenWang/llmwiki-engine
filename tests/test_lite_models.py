@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from llmwiki_engine.lite.models import RelatedPageRef, SourceDigest, SourcePageUnit, SourceRef
+from llmwiki_engine.lite.models import RelatedPageRef, SourceClaim, SourceDigest, SourcePageUnit, SourceRef
 from llmwiki_engine.lite.pipeline import normalize_source_digest
 from llmwiki_engine.lite.profile import PROJECT_BASIC, Profile
 
@@ -25,6 +25,17 @@ def test_normalize_source_digest_rewrites_page_unit_path_without_model_repair() 
         raw_sha256="abc",
         summary="summary",
         key_takeaways=["one"],
+        claims=[
+            SourceClaim(
+                claim_id="TEMP-CLAIM",
+                text="知识引擎是需要进入 wiki 的核心概念。",
+                kind="concept",
+                importance=4,
+                concept_terms=["知识引擎"],
+                raw_locator="whole_file",
+                source_refs=[ref],
+            )
+        ],
         page_units=[
             SourcePageUnit(
                 page_unit_id="TEMP",
@@ -33,7 +44,7 @@ def test_normalize_source_digest_rewrites_page_unit_path_without_model_repair() 
                 path_hint="../bad.md",
                 summary="summary",
                 content_scope="scope",
-                must_cover_points=[],
+                claim_ids=["TEMP-CLAIM"],
                 source_refs=[ref],
             )
         ],
@@ -42,9 +53,10 @@ def test_normalize_source_digest_rewrites_page_unit_path_without_model_repair() 
     normalized, report = normalize_source_digest(digest, Profile.model_validate(PROJECT_BASIC))
 
     assert normalized.page_units[0].page_unit_id == "PU-001"
+    assert normalized.claims[0].claim_id == "C-001"
     assert normalized.page_units[0].page_type == "concept"
     assert normalized.page_units[0].path_hint == "concepts/Concept_Knowledge_Engine.md"
-    assert normalized.page_units[0].must_cover_points == ["summary"]
+    assert normalized.page_units[0].claim_ids == ["C-001"]
     assert report.model_calls == 0
     assert report.repairs[0].local_fix is True
     assert report.repairs[0].model_called is False
