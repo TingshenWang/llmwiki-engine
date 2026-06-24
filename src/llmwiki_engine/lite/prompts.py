@@ -411,7 +411,7 @@ def final_page_retry_prompt(
         instructions.extend(
             [
                 "这是 coverage_judge 后的覆盖修复请求。",
-                "必须优先补齐 coverage_repair_claims 中 status 为 partial、missing 或 contradicted 的知识点。",
+                "必须优先补齐 coverage_repair_claims 中 status/judge_status 为 partial、missing 或 contradicted 的知识点。",
                 "每条 coverage_repair_claims.claim.text 都必须在最终正文中有明确中文落点；不要只写泛化总结。",
                 "如果 claim 包含数字、限制条件、例子、机制或对象，修复后必须保留这些关键信息。",
                 "不要删除已经正确覆盖的内容；只做必要补充和局部改写。",

@@ -644,9 +644,12 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
         source_raw_path=ref.raw_path,
         raw_sha256=ref.raw_sha256,
         summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["自动化入库会自动写入 wiki。"],
-        claims=[make_claim(ref, text="自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。")],
-        page_units=[make_source_unit(ref)],
+        key_takeaways=["自动化入库会自动写入 wiki，并保留 raw 用于追溯。"],
+        claims=[
+            make_claim(ref, "C-001", "自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。"),
+            make_claim(ref, "C-002", "自动化入库会保留 raw 文件用于追溯原始信息。"),
+        ],
+        page_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
     )
     candidate_pages = CandidatePages(
         pages=[
@@ -657,7 +660,7 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化入库去掉人工审核。",
-                body_markdown="## 摘要\n\n自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。",
+                body_markdown="## 摘要\n\n自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki，同时保留 raw 文件用于追溯。",
                 source_refs=[ref],
                 confidence=0.9,
             )
@@ -697,7 +700,32 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
                 status="missing",
                 evidence="最终页面没有写出自动写入 wiki。",
                 reason="缺少覆盖校验通过后自动写入 wiki 的信息。",
+            ),
+            ClaimCoverageItem(
+                claim_id="C-002",
+                status="covered",
+                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
+                evidence="最终页面体现 raw 可用于追溯。",
+                reason="raw 追溯信息已覆盖。",
             )
+        ]
+    )
+    newly_exposed_judge = CoverageJudge(
+        claim_results=[
+            ClaimCoverageItem(
+                claim_id="C-001",
+                status="covered",
+                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
+                evidence="最终页面写明覆盖校验通过后自动写入 wiki。",
+                reason="正文补齐了缺失的 claim。",
+            ),
+            ClaimCoverageItem(
+                claim_id="C-002",
+                status="partial",
+                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
+                evidence="最终页面只泛化提到 raw，没有明确保留 raw 文件用于追溯原始信息。",
+                reason="raw 追溯信息不够具体。",
+            ),
         ]
     )
     covered_judge = CoverageJudge(
@@ -708,6 +736,13 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
                 covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
                 evidence="最终页面写明覆盖校验通过后自动写入 wiki。",
                 reason="正文补齐了缺失的 claim。",
+            ),
+            ClaimCoverageItem(
+                claim_id="C-002",
+                status="covered",
+                covered_by=["concepts/Concept_Auto_Ingest.md#追溯"],
+                evidence="最终页面写明保留 raw 文件用于追溯原始信息。",
+                reason="raw 追溯信息已完整覆盖。",
             )
         ]
     )
@@ -720,6 +755,19 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
                 title="自动化入库",
                 page_type="concept",
                 markdown="# 自动化入库\n\n## 摘要\n\n自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。\n",
+                source_refs=[ref],
+            )
+        ]
+    )
+    second_repaired_pages = FinalPages(
+        pages=[
+            FinalPage(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Auto_Ingest.md",
+                action="create",
+                title="自动化入库",
+                page_type="concept",
+                markdown="# 自动化入库\n\n## 摘要\n\n自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。\n\n## 追溯\n\n自动化入库会保留 raw 文件用于追溯原始信息。\n",
                 source_refs=[ref],
             )
         ]
@@ -741,11 +789,10 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
         def call_structured(self, step: str, request, output_model):
             if output_model is CoverageJudge:
                 self.coverage_calls += 1
-                output = missing_judge if self.coverage_calls == 1 else covered_judge
+                output = [missing_judge, newly_exposed_judge, covered_judge][self.coverage_calls - 1]
             else:
                 self.repair_requests.append(request)
-                assert request.user_payload["coverage_repair_claims"][0]["claim"]["claim_id"] == "C-001"
-                output = repaired_pages
+                output = repaired_pages if len(self.repair_requests) == 1 else second_repaired_pages
             return ProviderCallResult(
                 output=output,
                 prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
@@ -790,13 +837,19 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
 
     output = _step_coverage_judge(tmp_path / "run", state)
 
-    assert output.counts["coverage_repair_count"] == 1
-    assert output.counts["coverage_repair_final_page_count"] == 1
+    assert output.counts["coverage_repair_count"] == 2
+    assert output.counts["coverage_repair_final_page_count"] == 2
     assert output.counts["raw_claim_coverage_percent"] == 100.0
-    assert registry.coverage_calls == 2
-    assert len(registry.repair_requests) == 1
+    assert registry.coverage_calls == 3
+    assert len(registry.repair_requests) == 2
+    assert registry.repair_requests[0].user_payload["coverage_repair_claims"][0]["claim"]["claim_id"] == "C-001"
+    assert registry.repair_requests[0].user_payload["coverage_repair_claims"][0]["status"] == "missing"
+    assert registry.repair_requests[1].user_payload["coverage_repair_claims"][0]["claim"]["claim_id"] == "C-002"
+    assert registry.repair_requests[1].user_payload["coverage_repair_claims"][0]["status"] == "partial"
     assert "自动写入 wiki" in state["final_pages"].pages[0].markdown
+    assert "保留 raw 文件用于追溯原始信息" in state["final_pages"].pages[0].markdown
     assert (tmp_path / "run" / "coverage_judge" / "coverage_repair_final_pages" / "repaired_final_pages.json").exists()
+    assert (tmp_path / "run" / "coverage_judge" / "coverage_repair_final_pages_round_2" / "repaired_final_pages.json").exists()
 
 
 def test_coverage_judge_repairs_claim_defect_without_touching_other_claims(tmp_path: Path) -> None:

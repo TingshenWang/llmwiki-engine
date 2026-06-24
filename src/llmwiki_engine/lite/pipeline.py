@@ -2105,10 +2105,7 @@ def _step_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepOutput:
     out_dir = run_dir / "coverage_judge"
     if not digest.claims:
         report = _coverage_judge_report(CoverageJudge(), digest)
-        report_path = out_dir / "coverage_judge_report.json"
-        md_path = out_dir / "coverage_judge_report.md"
-        write_json(report_path, report)
-        write_text(md_path, _render_coverage_judge_report_md(report))
+        report_path, md_path = _write_coverage_judge_report(out_dir, "coverage_judge_report", report)
         state["coverage_judge"] = CoverageJudge()
         state["coverage_report"] = report
         return StepOutput([report_path, md_path], _coverage_judge_counts(report))
@@ -2125,10 +2122,8 @@ def _step_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepOutput:
     repaired_final_page_count = 0
     failures = _coverage_threshold_failures(report)
     if failures:
-        initial_json_path = out_dir / "coverage_judge_report_initial.json"
-        initial_md_path = out_dir / "coverage_judge_report_initial.md"
-        write_json(initial_json_path, report)
-        write_text(initial_md_path, _render_coverage_judge_report_md(report))
+        initial_failures = failures
+        initial_json_path, initial_md_path = _write_coverage_judge_report(out_dir, "coverage_judge_report_initial", report)
         provider_artifacts.extend([initial_json_path, initial_md_path])
         claim_repair = _repair_claims_for_coverage(run_dir, state, report)
         if claim_repair is not None:
@@ -2145,10 +2140,7 @@ def _step_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepOutput:
                     "initial_failures": failures,
                     "downstream_restart_step": "candidate_pages_warmup",
                 }
-                report_path = out_dir / "coverage_judge_report.json"
-                md_path = out_dir / "coverage_judge_report.md"
-                write_json(report_path, report)
-                write_text(md_path, _render_coverage_judge_report_md(report))
+                _write_coverage_judge_report(out_dir, "coverage_judge_report", report)
                 return StepOutput(
                     provider_artifacts,
                     {
@@ -2162,10 +2154,26 @@ def _step_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepOutput:
                     repair_count=len(claim_repair.repaired_claim_ids),
                     api_calls=api_calls,
                 )
-        repair = _repair_final_pages_for_coverage(run_dir, state, report)
-        if repair is not None:
-            coverage_repair_count = 1
-            repaired_final_page_count = repair.repaired_final_page_count
+        max_coverage_repair_rounds = 3
+        for round_index in range(1, max_coverage_repair_rounds + 1):
+            repair = _repair_final_pages_for_coverage(run_dir, state, report, round_index=round_index)
+            if repair is None:
+                if coverage_repair_count:
+                    report["repair"] = {
+                        "attempted": True,
+                        "rounds": coverage_repair_count,
+                        "max_rounds": max_coverage_repair_rounds,
+                        "repaired_final_page_count": repaired_final_page_count,
+                        "initial_failures": initial_failures,
+                        "remaining_failures": failures,
+                        "stopped_reason": "没有找到可修复的最终页面。",
+                    }
+                else:
+                    report["repair"] = {"attempted": False, "reason": "没有找到可修复的最终页面。"}
+                _write_coverage_judge_report(out_dir, "coverage_judge_report", report)
+                break
+            coverage_repair_count += 1
+            repaired_final_page_count += repair.repaired_final_page_count
             final_pages = repair.final_pages
             state["final_pages"] = final_pages
             provider_artifacts.extend(repair.artifacts)
@@ -2176,28 +2184,25 @@ def _step_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepOutput:
                 state,
                 digest,
                 final_pages,
-                artifact_stem="coverage_judge_after_repair",
+                artifact_stem="coverage_judge_after_repair" if round_index == 1 else f"coverage_judge_after_repair_{round_index}",
                 report_stem="coverage_judge_report",
             )
             provider_artifacts.extend(second_artifacts)
             model_calls += second_model_calls
             api_calls.extend(second_api_calls)
             semantic_retry_count += second_semantic_retry_count
+            failures = _coverage_threshold_failures(report)
             report["repair"] = {
                 "attempted": True,
+                "rounds": coverage_repair_count,
+                "max_rounds": max_coverage_repair_rounds,
                 "repaired_final_page_count": repaired_final_page_count,
-                "initial_failures": failures,
+                "initial_failures": initial_failures,
+                "remaining_failures": failures,
             }
-            report_path = out_dir / "coverage_judge_report.json"
-            md_path = out_dir / "coverage_judge_report.md"
-            write_json(report_path, report)
-            write_text(md_path, _render_coverage_judge_report_md(report))
-        else:
-            report["repair"] = {"attempted": False, "reason": "没有找到可修复的最终页面。"}
-            report_path = out_dir / "coverage_judge_report.json"
-            md_path = out_dir / "coverage_judge_report.md"
-            write_json(report_path, report)
-            write_text(md_path, _render_coverage_judge_report_md(report))
+            _write_coverage_judge_report(out_dir, "coverage_judge_report", report)
+            if not failures:
+                break
     state["coverage_judge"] = judge
     state["coverage_report"] = report
     _assert_coverage_judge_thresholds(report)
@@ -2268,11 +2273,16 @@ def _run_coverage_judge_once(
     if judge is None:
         raise PipelineError(f"coverage_judge provider 重试后仍未通过系统语义校验：{last_semantic_error}")
     report = _coverage_judge_report(judge, digest)
-    report_path = out_dir / f"{report_stem}.json"
-    md_path = out_dir / f"{report_stem}.md"
+    report_path, md_path = _write_coverage_judge_report(out_dir, report_stem, report)
+    return judge, report, [report_path, md_path, *provider_artifacts], model_calls, api_calls, semantic_retry_count
+
+
+def _write_coverage_judge_report(out_dir: Path, stem: str, report: dict[str, object]) -> tuple[Path, Path]:
+    report_path = out_dir / f"{stem}.json"
+    md_path = out_dir / f"{stem}.md"
     write_json(report_path, report)
     write_text(md_path, _render_coverage_judge_report_md(report))
-    return judge, report, [report_path, md_path, *provider_artifacts], model_calls, api_calls, semantic_retry_count
+    return report_path, md_path
 
 
 def _repair_claims_for_coverage(run_dir: Path, state: dict[str, object], report: dict[str, object]) -> ClaimRepairOutput | None:
@@ -2404,7 +2414,13 @@ def _apply_claim_repair_result(
     return repaired
 
 
-def _repair_final_pages_for_coverage(run_dir: Path, state: dict[str, object], report: dict[str, object]) -> CoverageRepairOutput | None:
+def _repair_final_pages_for_coverage(
+    run_dir: Path,
+    state: dict[str, object],
+    report: dict[str, object],
+    *,
+    round_index: int = 1,
+) -> CoverageRepairOutput | None:
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
     composition: CompositionPlan = state["composition_plan"]  # type: ignore[assignment]
@@ -2419,7 +2435,8 @@ def _repair_final_pages_for_coverage(run_dir: Path, state: dict[str, object], re
     if not targets:
         return None
 
-    out_dir = run_dir / "coverage_judge" / "coverage_repair_final_pages"
+    out_dir_name = "coverage_repair_final_pages" if round_index == 1 else f"coverage_repair_final_pages_round_{round_index}"
+    out_dir = run_dir / "coverage_judge" / out_dir_name
     final_by_id = {page.final_page_id: page for page in final_pages.pages}
     item_by_id = {item.final_page_id: item for item in composition.items}
     retry_items = [item_by_id[final_page_id] for final_page_id in targets if final_page_id in item_by_id and final_page_id in final_by_id]
@@ -2449,8 +2466,8 @@ def _repair_final_pages_for_coverage(run_dir: Path, state: dict[str, object], re
         "coverage_judge",
         retry_requests,
         FinalPages,
-        artifact_suffix="_coverage_repair_1",
-        api_calls_filename="token_usage_calls_coverage_repair_1.json",
+        artifact_suffix=f"_coverage_repair_{round_index}",
+        api_calls_filename=f"token_usage_calls_coverage_repair_{round_index}.json",
     )
     outputs_by_id = {item.final_page_id: output for item, output in zip(retry_items, retry_outputs, strict=True)}
     retry_errors = _final_page_semantic_errors(outputs_by_id, CompositionPlan(items=retry_items), snapshot, operation_id=operation_id)
@@ -2502,6 +2519,7 @@ def _coverage_problem_claims(report: dict[str, object], digest: SourceDigest) ->
         problems.append(
             {
                 "claim": claim.model_dump(mode="json"),
+                "status": item.get("status"),
                 "judge_status": item.get("status"),
                 "judge_evidence": item.get("evidence"),
                 "judge_reason": item.get("reason"),
