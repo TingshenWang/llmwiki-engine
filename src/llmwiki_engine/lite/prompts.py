@@ -91,6 +91,7 @@ def source_digest_prompt(
                 "每个 claim_id 必须且只能归入一个 page_unit；如果一个 claim 完全无法归属，不要静默忽略，应调整 page_units。",
                 "多个 page_units 时，每个 page_unit 的 split_rationale 必须用中文说明为什么它不能并入其他 page_unit；如果说不清，应合并。",
                 "每个 page_unit 必须包含至少一个 source_ref，包含 raw_path、raw_sha256 和有用 locator。",
+                "如果 raw_text 明显是 404、Page not found、不可访问、空页面、导航页或只有网站菜单，不要把“页面失效”写成 event/知识页；claims 和 page_units 必须为空，只在 weak_or_noise_items 说明原因。",
                 "不值得入库、噪声、重复或证据不足的内容放入 weak_or_noise_items，并用中文说明原因。",
                 "不要在本步骤读取或假设旧 wiki；不要判断 create/update/noop。",
             ],
@@ -124,6 +125,7 @@ def source_digest_retry_prompt(
                 "不要为了通过中文校验而删除有价值 page_unit；应把英文说明改写成中文说明。",
                 "如果 validation_error 指出 page_unit 过多，请优先合并同主体、同读者任务、同页面类型的页面单元，而不是删掉有效内容。",
                 "如果 validation_error 指出 0 个 page_unit 但原文不是噪声，请生成至少一个粗粒度 page_unit。",
+                "如果 validation_error 指出 raw 只能记录来源，请清空 claims 和 page_units，只保留 weak_or_noise_items 说明 404、不可访问、空页面或导航噪声原因。",
             ],
         }
     )
@@ -228,6 +230,9 @@ def merge_plan_prompt(*, candidate_pages: CandidatePages, candidate_contexts: Ca
                 "content_scope 用中文说明这个 decision 消费候选页中的哪一部分内容，避免拆分后重复或遗漏。",
                 "candidate_content_locators 必须列出候选页中被此 decision 消费的章节、要点或证据定位。",
                 "新知识使用 create，匹配 top-k 旧页使用 update，已经覆盖才使用 noop。",
+                "当某个 candidate_page 的 top1 旧页 score >= 0.80 时，默认必须至少输出一个 update decision 指向该 top1 旧页；如果只有部分内容重叠，可以同时输出 update 和 create。",
+                "当 top1 score >= 0.80 且你认为旧页已完整覆盖候选内容时，输出 noop decision 并用 target_path 或 matched_existing_paths 指向该 top1 旧页；禁止只输出 create。",
+                "create decision 仍必须填写 inspected_context_paths 和 strongest_overlap，并在 reason 中说明为什么不能更新已检查旧页。",
                 "update 的 target_path 必须来自同一 candidate_page_id 的 candidate_contexts.hits.path。",
                 "create 的 target_path 必须留在 profile 路由目录内。",
                 "不要在 merge_plan 中决定 Related；相关页面由后续计算步骤按 embedding 相似度生成。",

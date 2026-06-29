@@ -306,6 +306,181 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
     assert output.counts["api_paused_count"] == 1
 
 
+def test_source_digest_retries_source_only_error_page(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = vault / "raw" / "voice_agents_quickstart.md"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_text(
+        "---\n"
+        "title: \"voice_agents_quickstart\"\n"
+        "source_url: \"https://cookbook.openai.com/examples/agents_sdk/voice_agents_quickstart\"\n"
+        "---\n\n"
+        "# voice_agents_quickstart\n\n"
+        "Title: Page not found\n\n"
+        "URL Source: https://cookbook.openai.com/examples/agents_sdk/voice_agents_quickstart\n\n"
+        "Warning: Target URL returned error 404: Not Found\n\n"
+        "Markdown Content:\n"
+        "# Page not found\n\n"
+        "[Home](https://cookbook.openai.com/)\n"
+        "[API](https://cookbook.openai.com/api)\n"
+        "[Docs](https://cookbook.openai.com/api/docs)\n",
+        encoding="utf-8",
+    )
+    raw_rel = raw.relative_to(vault).as_posix()
+    raw_sha = sha256_file(raw)
+    binding = RawBinding(
+        raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        size_bytes=raw.stat().st_size,
+        mtime_ns=raw.stat().st_mtime_ns,
+        bound_at="2026-06-18T00:00:00Z",
+    )
+    ref = SourceRef(raw_path=raw_rel, raw_sha256=raw_sha, locator="whole_file")
+    invalid_digest = SourceDigest(
+        source_raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        summary="原始页面返回 404，没有语音代理快速入门内容。",
+        key_takeaways=["页面失效不能提供语音代理教程。"],
+        claims=[
+            make_claim(
+                ref,
+                text="OpenAI Cookbook 的 voice_agents_quickstart 页面返回 404。",
+                importance=3,
+            )
+        ],
+        page_units=[
+            SourcePageUnit(
+                page_unit_id="PU-001",
+                title="voice_agents_quickstart 页面失效事件",
+                page_type="event",
+                path_hint="events/Event_voice_agents_quickstart_404.md",
+                summary="记录 voice_agents_quickstart 页面返回 404。",
+                content_scope="覆盖 raw 中关于该页面失效的唯一事实。",
+                claim_ids=["C-001"],
+                source_refs=[ref],
+            )
+        ],
+        weak_or_noise_items=[{"text": "导航菜单", "reason": "页面只有导航菜单和 Page not found 提示。"}],
+    )
+    valid_digest = SourceDigest(
+        source_raw_path=raw_rel,
+        raw_sha256=raw_sha,
+        summary="原始页面返回 404，没有可入库知识。",
+        key_takeaways=[],
+        claims=[],
+        page_units=[],
+        weak_or_noise_items=[{"text": "404 页面", "reason": "原始链接返回 404，页面只有导航菜单和错误提示，不应写入知识页。"}],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_digest if len(self.requests) == 1 else valid_digest
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "raw_abs": raw,
+        "raw_rel": raw_rel,
+        "raw_binding": binding,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_source_digest(tmp_path / "run", state)
+    digest = state["source_digest"]
+
+    assert isinstance(digest, SourceDigest)
+    assert digest.claims == []
+    assert digest.page_units == []
+    assert len(registry.requests) == 2
+    assert "只能记录来源" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["page_unit_count"] == 0
+    assert output.counts["semantic_retry_count"] == 1
+
+
+def test_empty_candidate_flow_skips_merge_and_composition_providers(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+
+    class NoProviderRegistry:
+        def provider_for(self, step: str) -> ProviderSpec:
+            raise AssertionError(f"不应调用 provider：{step}")
+
+        def call_structured(self, step: str, request, output_model):
+            raise AssertionError(f"不应调用 provider：{step}")
+
+    state = {
+        "candidate_pages": CandidatePages(pages=[]),
+        "candidate_contexts": CandidateContexts(
+            retrieval_backend="sentence_transformers",
+            model="Qwen/Qwen3-Embedding-0.6B",
+            input_version="page_card_v2",
+            top_k=5,
+            knowledge_pool_size=0,
+            candidate_page_count=0,
+            candidate_pool_hash="empty",
+            items=[],
+        ),
+        "profile": load_profile(vault),
+        "provider_registry": NoProviderRegistry(),
+        "provider_contexts": {},
+    }
+
+    merge_output = _step_merge_plan(tmp_path / "run", state)
+    composition_output = _step_composition_plan(tmp_path / "run", state)
+
+    merge_plan = state["merge_plan"]
+    composition_plan = state["composition_plan"]
+    assert isinstance(merge_plan, MergePlan)
+    assert isinstance(composition_plan, CompositionPlan)
+    assert merge_plan.decisions == []
+    assert merge_plan.action_counts == {"create": 0, "update": 0, "noop": 0}
+    assert composition_plan.items == []
+    assert merge_output.model_calls == 0
+    assert composition_output.model_calls == 0
+    assert merge_output.counts["api_call_count"] == 0
+    assert composition_output.counts["api_call_count"] == 0
+
+
 def test_source_digest_rejects_duplicate_claim_assignment() -> None:
     ref = SourceRef(raw_path="raw/example.md", raw_sha256="sha", locator="whole_file")
     digest = SourceDigest(
@@ -1640,6 +1815,140 @@ def test_merge_plan_retries_semantic_validation(tmp_path: Path) -> None:
     assert output.counts["api_call_count"] == 2
     assert output.counts["api_success_count"] == 1
     assert output.counts["api_paused_count"] == 1
+
+
+def test_merge_plan_retries_high_overlap_create_only(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                page_unit_id="PU-001",
+                title="OpenAI Agents SDK 概览",
+                proposed_page_type="overview",
+                proposed_path_hint="overviews/Overview_OpenAI_Agents_SDK.md",
+                summary="候选页与旧的 Agents SDK 概览高度重叠。",
+                body_markdown="## 摘要\n\n候选页与旧的 Agents SDK 概览高度重叠，但补充了新工具链信息。",
+                source_refs=[ref],
+                confidence=0.9,
+            )
+        ]
+    )
+    contexts = CandidateContexts(
+        retrieval_backend="sentence_transformers",
+        model=embeddings.DEFAULT_QWEN_EMBEDDING_MODEL,
+        input_version="test",
+        top_k=5,
+        knowledge_pool_size=1,
+        candidate_page_count=1,
+        candidate_pool_hash="hash",
+        items=[
+            CandidateContext(
+                candidate_page_id="CP-001",
+                query="OpenAI Agents SDK 概览",
+                hits=[
+                    CandidateContextHit(
+                        path="overviews/Overview_OpenAI_Agents_SDK.md",
+                        title="OpenAI Agents SDK 概览",
+                        rank=1,
+                        score=0.86,
+                        reason="候选页与旧页高度相近。",
+                    )
+                ],
+            )
+        ],
+    )
+    invalid_plan = MergePlan(
+        action_counts={"create": 1, "update": 0, "noop": 0},
+        decisions=[
+            make_decision(
+                decision_id="MD-001",
+                candidate_page_id="CP-001",
+                action="create",
+                target_path="overviews/Overview_OpenAI_Agents_SDK_New.md",
+                title="OpenAI Agents SDK 新概览",
+                ref=ref,
+            )
+        ],
+    )
+    valid_plan = MergePlan(
+        action_counts={"create": 0, "update": 1, "noop": 0},
+        decisions=[
+            make_decision(
+                decision_id="MD-001",
+                candidate_page_id="CP-001",
+                action="update",
+                target_path="overviews/Overview_OpenAI_Agents_SDK.md",
+                title="OpenAI Agents SDK 概览",
+                ref=ref,
+                matched_existing_paths=["overviews/Overview_OpenAI_Agents_SDK.md"],
+            )
+        ],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            output = invalid_plan if len(self.requests) == 1 else valid_plan
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "candidate_pages": candidate_pages,
+        "candidate_contexts": contexts,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_merge_plan(tmp_path / "run", state)
+    plan = state["merge_plan"]
+
+    assert isinstance(plan, MergePlan)
+    assert plan.decisions[0].action == "update"
+    assert plan.decisions[0].target_path == "overviews/Overview_OpenAI_Agents_SDK.md"
+    assert len(registry.requests) == 2
+    assert "不能只 create" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
 
 
 def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path) -> None:

@@ -128,6 +128,7 @@ class ClaimRepairOutput:
 
 RELATED_MIN_SIMILARITY = 0.72
 RELATED_REPLACEMENT_MARGIN = 0.04
+MERGE_PLAN_STRONG_OVERLAP_UPDATE_THRESHOLD = 0.80
 COVERAGE_MIN_RAW_CLAIM_PERCENT = 85.0
 COVERAGE_MIN_CORE_CLAIM_PERCENT = 95.0
 COVERAGE_MIN_CONCEPT_PERCENT = 95.0
@@ -446,6 +447,29 @@ def _is_navigation_noise_line(line: str) -> bool:
     if len(stripped) <= 120 and re.fullmatch(r"[-*+]\s*(\[.*?\]\(.*?\)\s*)+", stripped):
         return True
     return False
+
+
+def _raw_requires_source_only(raw_text: str) -> bool:
+    text = strip_frontmatter(raw_text)
+    if re.search(r"(?im)^\s*warning:\s*target url returned error\s+(?:401|403|404|410)\b", text):
+        return True
+    if re.search(r"(?im)^\s*title:\s*[\"']?(?:page not found|not found|404|403 forbidden|access denied)[\"']?\s*$", text):
+        if re.search(r"(?im)^\s*#\s*(?:page not found|not found|404|403 forbidden|access denied)\s*$", text):
+            return True
+    if re.search(r"(?im)^\s*(?:url source|source url):.*$", text) and re.search(r"(?im)^\s*#\s*(?:page not found|not found)\s*$", text):
+        return True
+    return False
+
+
+def _assert_source_digest_source_only_boundary(digest: SourceDigest, raw_text: str) -> None:
+    if not _raw_requires_source_only(raw_text):
+        return
+    if digest.claims or digest.page_units:
+        raise PipelineError(
+            "source_digest 检测到 raw 是 404、不可访问或导航噪声页；"
+            "这类材料只能记录来源，claims 和 page_units 必须为空，"
+            "不要生成事件页或知识页。请把原因写入 weak_or_noise_items。"
+        )
 
 
 def _assert_source_digest_granularity(digest: SourceDigest, stats: SourceGranularityStats) -> None:
@@ -1149,6 +1173,33 @@ def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: Can
                 raise PipelineError(f"更新决策 {decision.decision_id} 的 target_path 不在该候选页 TopK 召回结果中。")
             if not decision.matched_existing_paths:
                 raise PipelineError(f"更新决策 {decision.decision_id} 缺少 matched_existing_paths。")
+    _assert_merge_plan_handles_strong_overlap(plan, contexts)
+
+
+def _assert_merge_plan_handles_strong_overlap(plan: MergePlan, contexts: CandidateContexts) -> None:
+    decisions_by_candidate: dict[str, list[MergeDecision]] = {}
+    for decision in plan.decisions:
+        decisions_by_candidate.setdefault(decision.candidate_page_id, []).append(decision)
+    for item in contexts.items:
+        if not item.hits:
+            continue
+        top_hit = max(item.hits, key=lambda hit: hit.score)
+        if top_hit.score < MERGE_PLAN_STRONG_OVERLAP_UPDATE_THRESHOLD:
+            continue
+        decisions = decisions_by_candidate.get(item.candidate_page_id, [])
+        handled = any(
+            decision.action in {"update", "noop"}
+            and (decision.target_path == top_hit.path or top_hit.path in decision.matched_existing_paths)
+            for decision in decisions
+        )
+        if handled:
+            continue
+        raise PipelineError(
+            f"merge_plan 候选页 {item.candidate_page_id} 的 Top1 旧页 {top_hit.path} "
+            f"相似度 {top_hit.score:.4f} >= {MERGE_PLAN_STRONG_OVERLAP_UPDATE_THRESHOLD:.2f}，"
+            "不能只 create；必须至少输出 update/noop decision 消费或确认该旧页，"
+            "如有独立新增内容再另行 create。"
+        )
 
 
 def _assert_composition_covers_writes(artifact: CompositionPlan, plan: MergePlan) -> None:
@@ -1589,6 +1640,7 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
             candidate_digest, candidate_repair_report = normalize_source_digest(digest_result, profile)
             _assert_source_digest_chinese(candidate_digest)
             _assert_unique([unit.page_unit_id for unit in candidate_digest.page_units], "source digest page_unit_id")
+            _assert_source_digest_source_only_boundary(candidate_digest, raw_text)
             _assert_source_digest_granularity(candidate_digest, granularity_stats)
         except PipelineError as exc:
             last_semantic_error = str(exc)
@@ -1844,6 +1896,17 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     contexts: CandidateContexts = state["candidate_contexts"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "merge_plan"
+    if not candidate_pages.pages:
+        plan = MergePlan(decisions=[], action_counts={"create": 0, "update": 0, "noop": 0})
+        state["merge_plan"] = plan
+        json_path = out_dir / "merge_plan.json"
+        md_path = out_dir / "merge_plan.md"
+        write_json(json_path, plan)
+        write_text(md_path, _render_merge_plan_md(plan))
+        return StepOutput(
+            [json_path, md_path],
+            {**{f"{key}_count": value for key, value in plan.action_counts.items()}, **_token_usage_counts([])},
+        )
     request = prompts.merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=contexts, profile=profile)
     provider_artifacts: list[Path] = []
     api_calls: list[dict[str, object]] = []
@@ -1912,6 +1975,21 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "composition_plan"
+    if not any(decision.action in {"create", "update"} for decision in plan.decisions):
+        artifact = CompositionPlan(items=[])
+        state["composition_plan"] = artifact
+        json_path = out_dir / "composition_plan.json"
+        md_path = out_dir / "composition_plan.md"
+        write_json(json_path, artifact)
+        write_text(md_path, _render_composition_plan_md(artifact))
+        return StepOutput(
+            [json_path, md_path],
+            {
+                "final_target_count": 0,
+                "update_target_count": 0,
+                **_token_usage_counts([]),
+            },
+        )
     request = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile)
     provider_artifacts: list[Path] = []
     api_calls: list[dict[str, object]] = []
