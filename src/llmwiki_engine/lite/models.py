@@ -13,6 +13,10 @@ ClaimKind = str
 CoverageStatus = Literal["covered", "partial", "missing", "contradicted"]
 ContentRole = Literal["主干", "附属", "工具性"]
 AbsorptionDecision = Literal["独立成页", "并入主干", "降级为段落"]
+PageStateNodeKind = Literal["主干", "附属", "工具性"]
+PageStateNodeStatus = Literal["活跃", "已摘要", "已废弃"]
+PageStateClaimStatus = Literal["活跃", "已摘要", "已废弃", "已拒绝"]
+PageStateCoveragePolicy = Literal["必须保留", "可摘要", "低价值"]
 
 
 class StrictModel(BaseModel):
@@ -140,6 +144,95 @@ class ClaimCoverageItem(StrictModel):
 class CoverageJudge(StrictModel):
     claim_results: list[ClaimCoverageItem] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class PageStateClaim(StrictModel):
+    state_claim_id: str
+    source_claim_id: str
+    text: str
+    kind: ClaimKind = "fact"
+    importance: int = Field(ge=1, le=5)
+    concept_terms: list[str] = Field(default_factory=list)
+    node_id: str
+    source_content_unit_id: str
+    source_operation_id: str
+    source_refs: list[SourceRef]
+    status: PageStateClaimStatus = "活跃"
+    coverage_policy: PageStateCoveragePolicy = "可摘要"
+    current_anchor: str = ""
+
+    @field_validator("state_claim_id", "source_claim_id", "text", "node_id", "source_content_unit_id", "source_operation_id")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class PageStateNode(StrictModel):
+    node_id: str
+    title: str
+    kind: PageStateNodeKind
+    section_hint: str
+    parent_node_id: str | None = None
+    source_content_unit_ids: list[str] = Field(default_factory=list)
+    claim_ids: list[str] = Field(default_factory=list)
+    status: PageStateNodeStatus = "活跃"
+
+    @field_validator("node_id", "title", "section_hint")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class PageState(StrictModel):
+    version: Literal["page-state-v1"] = "page-state-v1"
+    page_path: str
+    title: str
+    page_type: str
+    page_sha256: str
+    updated_at: str
+    source_raw_paths: list[str] = Field(default_factory=list)
+    source_operation_ids: list[str] = Field(default_factory=list)
+    nodes: list[PageStateNode] = Field(default_factory=list)
+    claims: list[PageStateClaim] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("page_path", "title", "page_type", "page_sha256", "updated_at")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class PageUpdatePlanItem(StrictModel):
+    final_page_id: str
+    target_path: str
+    action: MergeAction
+    state_path: str
+    state_exists: bool
+    previous_claim_count: int = 0
+    previous_active_claim_count: int = 0
+    previous_active_claims: list[PageStateClaim] = Field(default_factory=list)
+    incoming_content_units: list[SourceContentUnit] = Field(default_factory=list)
+    incoming_claims: list[SourceClaim] = Field(default_factory=list)
+    candidate_page_ids: list[str] = Field(default_factory=list)
+    merge_decision_ids: list[str] = Field(default_factory=list)
+    guidance: list[str] = Field(default_factory=list)
+
+    @field_validator("final_page_id", "target_path", "state_path")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class PageUpdatePlan(StrictModel):
+    items: list[PageUpdatePlanItem] = Field(default_factory=list)
 
 
 class ClaimRepairPatch(StrictModel):

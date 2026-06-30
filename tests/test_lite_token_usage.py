@@ -26,6 +26,24 @@ def test_extract_deepseek_usage_and_price_cny() -> None:
     assert price_cny("deepseek-v4-pro", usage) == 0.00301
 
 
+def test_sensenova_usage_uses_deepseek_flash_pricing_alias() -> None:
+    raw_response = {
+        "usage": {
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 250},
+            "completion_tokens": 200,
+            "total_tokens": 1200,
+        }
+    }
+
+    usage = extract_token_usage(raw_response)
+
+    assert usage["prompt_cache_hit_tokens"] == 250
+    assert usage["prompt_cache_miss_tokens"] == 750
+    assert price_cny("sensenova-6.7-flash-lite", usage) == price_cny("deepseek-v4-flash", usage)
+    assert price_cny("sensenova-6.7-flash-lite", usage) == 0.001155
+
+
 def test_summarize_api_calls_uses_cache_hit_rate_and_total_price() -> None:
     summary = summarize_api_calls(
         [

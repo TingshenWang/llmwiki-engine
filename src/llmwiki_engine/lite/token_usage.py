@@ -19,6 +19,7 @@ DEEPSEEK_RMB_PRICING_PER_1M = {
 DEEPSEEK_RMB_PRICING_ALIASES = {
     "deepseek-chat": "deepseek-v4-flash",
     "deepseek-reasoner": "deepseek-v4-flash",
+    "sensenova-6.7-flash-lite": "deepseek-v4-flash",
 }
 
 TOKEN_USAGE_KEYS = [
@@ -40,6 +41,9 @@ def extract_token_usage(raw_response: dict[str, Any] | None) -> dict[str, int]:
     result = _empty_usage()
     for key in ["prompt_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "completion_tokens", "total_tokens"]:
         result[key] = _safe_int(usage.get(key))
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict) and not result["prompt_cache_hit_tokens"]:
+        result["prompt_cache_hit_tokens"] = _safe_int(prompt_details.get("cached_tokens"))
     completion_details = usage.get("completion_tokens_details")
     if isinstance(completion_details, dict):
         result["reasoning_tokens"] = _safe_int(completion_details.get("reasoning_tokens"))

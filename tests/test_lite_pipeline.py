@@ -12,7 +12,7 @@ from llmwiki_engine.cli import app
 from llmwiki_engine.lite import embeddings
 from llmwiki_engine.lite import prompts
 from llmwiki_engine.lite import related as related_logic
-from llmwiki_engine.lite.io import sha256_file, sha256_text
+from llmwiki_engine.lite.io import read_json, sha256_file, sha256_text, write_json
 from llmwiki_engine.lite.models import (
     ArtifactRef,
     CandidateContext,
@@ -30,6 +30,10 @@ from llmwiki_engine.lite.models import (
     MergeDecision,
     MergePlan,
     OperationManifest,
+    PageState,
+    PageStateClaim,
+    PageStateNode,
+    PageUpdatePlan,
     PreimageCoverageItem,
     RawBinding,
     SourceDigest,
@@ -49,6 +53,7 @@ from llmwiki_engine.lite.pipeline import (
     _assert_source_digest_chinese,
     _assert_source_digest_granularity,
     _assert_coverage_judge_thresholds,
+    _build_page_update_plan,
     _canonical_final_markdown,
     _coverage_judge_report,
     _normalize_candidate_pages,
@@ -62,6 +67,7 @@ from llmwiki_engine.lite.pipeline import (
     _step_final_pages,
     _step_index_log_write,
     _step_merge_plan,
+    _step_page_state_write,
     _step_related_maintenance,
     _step_related_refresh,
     _step_source_digest,
@@ -2224,6 +2230,157 @@ def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path)
     assert "raw_text" not in variable_suffix["input"]
     assert warmup_suffix["input"]["warmup"] is True
     assert warmup_suffix["json_output_example"] == {"status": "OK"}
+
+
+def test_page_state_guides_update_and_is_refreshed_after_write(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    init_vault(vault)
+    target_path = "concepts/Concept_Auto_Ingest.md"
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    old_state = PageState(
+        page_path=target_path,
+        title="自动化入库",
+        page_type="concept",
+        page_sha256="old-sha",
+        updated_at="2026-06-30T00:00:00Z",
+        source_raw_paths=["raw/old.md"],
+        source_operation_ids=["ING-OLD"],
+        nodes=[
+            PageStateNode(
+                node_id="ING-OLD:CU-001",
+                title="自动化入库",
+                kind="主干",
+                section_hint="核心内容",
+                source_content_unit_ids=["CU-001"],
+                claim_ids=["ING-OLD:C-001"],
+            )
+        ],
+        claims=[
+            PageStateClaim(
+                state_claim_id="ING-OLD:C-001",
+                source_claim_id="C-001",
+                text="自动化入库需要保留 raw 以便追溯。",
+                importance=5,
+                node_id="ING-OLD:CU-001",
+                source_content_unit_id="CU-001",
+                source_operation_id="ING-OLD",
+                source_refs=[ref],
+                coverage_policy="必须保留",
+                current_anchor="核心内容",
+            )
+        ],
+    )
+    write_json(vault / ".llmwiki" / "page_state" / f"{target_path}.json", old_state)
+
+    new_claim = make_claim(ref, claim_id="C-002", text="自动化入库可以通过 page_state 防止旧内容被无声删除。", importance=4)
+    branch_claim = make_claim(ref, claim_id="C-003", text="低价值实现细节应降级为段落，不应该撑开新页面。", importance=2)
+    digest = SourceDigest(
+        source_raw_path="raw/project_note.md",
+        raw_sha256="abc",
+        summary="本文补充自动化入库的页面状态维护方式。",
+        key_takeaways=["page_state 用于防止 update 丢失旧内容。"],
+        claims=[new_claim, branch_claim],
+        content_units=[
+            make_source_unit(ref, claim_ids=["C-002"], content_scope="补充 page_state 防丢逻辑。"),
+            make_source_unit(
+                ref,
+                content_unit_id="CU-002",
+                title="低价值实现细节",
+                claim_ids=["C-003"],
+                content_scope="把低价值实现细节压缩进主干段落。",
+                content_role="附属",
+                absorption_decision="降级为段落",
+                anchor_unit_id="CU-001",
+                section_hint="实现边界",
+                absorption_reason="这是主干知识的补充说明，不适合独立成页。",
+            ),
+        ],
+    )
+    candidate_pages = CandidatePages(
+        pages=[
+            CandidatePage(
+                candidate_page_id="CP-001",
+                content_unit_id="CU-001",
+                title="自动化入库",
+                proposed_page_type="concept",
+                proposed_path_hint=target_path,
+                summary="补充 page_state 防丢逻辑。",
+                body_markdown="## 核心内容\n\npage_state 用于防止 update 丢失旧内容。\n",
+                source_refs=[ref],
+                confidence=0.8,
+            )
+        ]
+    )
+    composition = CompositionPlan(
+        items=[
+            CompositionItem(
+                final_page_id="FP-001",
+                target_path=target_path,
+                action="update",
+                merge_decision_ids=["MD-001"],
+                candidate_page_ids=["CP-001"],
+                section_order=["摘要", "核心内容"],
+                preserve_rules=[],
+                insert_rules=["补充 page_state 防丢逻辑。"],
+                delete_rules=[],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="更新自动化入库页面。",
+            )
+        ]
+    )
+
+    plan = _build_page_update_plan(vault, composition, candidate_pages, digest, operation_id="ING-NEW")
+    item = plan.items[0]
+    assert item.state_exists is True
+    assert item.previous_active_claim_count == 1
+    assert item.previous_active_claims[0].state_claim_id == "ING-OLD:C-001"
+    assert [unit.content_unit_id for unit in item.incoming_content_units] == ["CU-001", "CU-002"]
+    assert [claim.claim_id for claim in item.incoming_claims] == ["C-002", "C-003"]
+    prompt = prompts.final_page_prompt(
+        composition_item=composition.items[0],
+        candidate_pages=candidate_pages,
+        snapshot=WikiSnapshot(
+            wiki_root="wiki",
+            pool_hash="pool",
+            generated_at="2026-06-30T00:00:00Z",
+            entries=[
+                WikiKnowledgeEntry(
+                    path=target_path,
+                    title="自动化入库",
+                    page_type="concept",
+                    sha256="old-sha",
+                    summary="自动化入库需要保留 raw。",
+                    text_excerpt="# 自动化入库\n\n## 核心内容\n\n自动化入库需要保留 raw 以便追溯。\n",
+                )
+            ],
+        ),
+        profile=load_profile(vault),
+        page_update_plan_item=item,
+    )
+    assert prompt.user_payload["preimage_coverage_requirements"] == []
+    assert prompt.user_payload["page_update_plan"]["previous_active_claim_count"] == 1
+
+    final_page = FinalPage(
+        final_page_id="FP-001",
+        target_path=target_path,
+        action="update",
+        title="自动化入库",
+        page_type="concept",
+        markdown="# 自动化入库\n\n## 核心内容\n\n自动化入库需要保留 raw，也可以通过 page_state 防止旧内容被无声删除。\n",
+        source_refs=[ref],
+    )
+    output = _step_page_state_write(
+        vault,
+        tmp_path / "run",
+        {"final_pages": FinalPages(pages=[final_page]), "page_update_plan": plan, "operation_id": "ING-NEW"},
+    )
+    assert output.counts["page_state_written_count"] == 1
+    refreshed = PageState.model_validate(read_json(vault / ".llmwiki" / "page_state" / f"{target_path}.json"))
+    assert [claim.state_claim_id for claim in refreshed.claims] == ["ING-OLD:C-001", "ING-NEW:C-002", "ING-NEW:C-003"]
+    assert {node.node_id for node in refreshed.nodes} == {"ING-OLD:CU-001", "ING-NEW:CU-001", "ING-NEW:CU-002"}
+    branch_state_claim = next(claim for claim in refreshed.claims if claim.state_claim_id == "ING-NEW:C-003")
+    assert branch_state_claim.coverage_policy == "低价值"
+    assert refreshed.source_operation_ids == ["ING-OLD", "ING-NEW"]
 
 
 def test_merge_plan_allows_split_decisions_but_update_must_use_top5() -> None:

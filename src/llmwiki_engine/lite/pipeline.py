@@ -58,6 +58,11 @@ from .models import (
     MergeDecision,
     MergePlan,
     OperationManifest,
+    PageState,
+    PageStateClaim,
+    PageStateNode,
+    PageUpdatePlan,
+    PageUpdatePlanItem,
     RawBinding,
     Receipt,
     RepairItem,
@@ -144,7 +149,7 @@ COVERAGE_MIN_CONCEPT_PERCENT = 95.0
 def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
     vault = vault.expanduser().resolve()
     vault.mkdir(parents=True, exist_ok=True)
-    for directory in ["raw", "wiki", ".llmwiki/runs/ingest", ".llmwiki/applied", ".llmwiki/profiles"]:
+    for directory in ["raw", "wiki", ".llmwiki/runs/ingest", ".llmwiki/applied", ".llmwiki/profiles", ".llmwiki/page_state"]:
         (vault / directory).mkdir(parents=True, exist_ok=True)
     (vault / "wiki" / "logs").mkdir(parents=True, exist_ok=True)
     profile = load_profile(vault, profile_name)
@@ -237,11 +242,13 @@ def run_ingest(
         ("candidate_contexts", lambda: _step_candidate_contexts(run_dir, state)),
         ("merge_plan", lambda: _step_merge_plan(run_dir, state)),
         ("composition_plan", lambda: _step_composition_plan(run_dir, state)),
+        ("page_update_plan", lambda: _step_page_update_plan(vault, run_dir, state)),
         ("final_pages", lambda: _step_final_pages(vault, run_dir, state)),
         ("coverage_judge", lambda: _step_coverage_judge(run_dir, state)),
         ("related_refresh", lambda: _step_related_refresh(run_dir, state)),
         ("validation", lambda: _step_validation(vault, run_dir, state)),
         ("knowledge_write", lambda: _step_knowledge_write(vault, run_dir, state)),
+        ("page_state_write", lambda: _step_page_state_write(vault, run_dir, state)),
         ("source_record_write", lambda: _step_source_record_write(vault, run_dir, state, manifest)),
         ("embedding_cache_refresh", lambda: _step_embedding_cache_refresh(vault, run_dir, state)),
         ("related_maintenance", lambda: _step_related_maintenance(vault, run_dir, state)),
@@ -580,6 +587,7 @@ def _clear_downstream_state_after_claim_repair(state: dict[str, object]) -> None
         "candidate_contexts",
         "merge_plan",
         "composition_plan",
+        "page_update_plan",
         "final_pages",
         "coverage_judge",
         "coverage_report",
@@ -1390,6 +1398,7 @@ def _final_pages_from_outputs(
     snapshot: WikiSnapshot,
     *,
     operation_id: str,
+    page_update_plan: PageUpdatePlan | None = None,
 ) -> FinalPages:
     artifact = _hydrate_provider_final_pages(_merge_parallel_final_pages(outputs, composition), composition, snapshot)
     artifact = _normalize_final_pages(
@@ -1400,7 +1409,7 @@ def _final_pages_from_outputs(
     )
     _assert_final_pages_cover_composition(artifact, composition)
     _assert_final_pages_chinese(artifact)
-    _assert_final_pages_preserve_preimage_coverage(artifact, composition, snapshot)
+    _assert_final_pages_preserve_preimage_coverage(artifact, composition, snapshot, page_update_plan=page_update_plan)
     return artifact
 
 
@@ -1410,6 +1419,7 @@ def _final_page_semantic_errors(
     snapshot: WikiSnapshot,
     *,
     operation_id: str,
+    page_update_plan: PageUpdatePlan | None = None,
 ) -> dict[str, str]:
     errors: dict[str, str] = {}
     for item in composition.items:
@@ -1418,8 +1428,9 @@ def _final_page_semantic_errors(
             errors[item.final_page_id] = f"{item.final_page_id} 缺少 provider 输出。"
             continue
         single_composition = CompositionPlan(items=[item])
+        single_update_plan = _single_page_update_plan(page_update_plan, item.final_page_id)
         try:
-            _final_pages_from_outputs([output], single_composition, snapshot, operation_id=operation_id)
+            _final_pages_from_outputs([output], single_composition, snapshot, operation_id=operation_id, page_update_plan=single_update_plan)
         except PipelineError as exc:
             errors[item.final_page_id] = str(exc)
     return errors
@@ -1555,13 +1566,23 @@ def _assert_final_pages_cover_composition(artifact: FinalPages, composition: Com
             raise PipelineError(f"最终页 {page.target_path} markdown 为空。")
 
 
-def _assert_final_pages_preserve_preimage_coverage(artifact: FinalPages, composition: CompositionPlan, snapshot: WikiSnapshot) -> None:
+def _assert_final_pages_preserve_preimage_coverage(
+    artifact: FinalPages,
+    composition: CompositionPlan,
+    snapshot: WikiSnapshot,
+    *,
+    page_update_plan: PageUpdatePlan | None = None,
+) -> None:
     items_by_target = {item.target_path: item for item in composition.items}
     entries_by_path = {entry.path: entry for entry in snapshot.entries}
+    update_plan_by_target = {item.target_path: item for item in (page_update_plan.items if page_update_plan else [])}
     generic_anchors = {_granularity_text_key(item) for item in prompts.GENERIC_PREIMAGE_ANCHORS}
     for page in artifact.pages:
         item = items_by_target.get(page.target_path)
         if item is None or item.action != "update":
+            continue
+        update_plan_item = update_plan_by_target.get(page.target_path)
+        if update_plan_item is not None and update_plan_item.previous_active_claims:
             continue
         existing = entries_by_path.get(page.target_path)
         if existing is None:
@@ -1588,15 +1609,25 @@ def _assert_final_pages_preserve_preimage_coverage(artifact: FinalPages, composi
                 raise PipelineError(f"最终页 {page.target_path} 的 {requirement_id} final_anchor 未出现在最终正文：{report.final_anchor}")
 
 
-def _final_preimage_coverage_report(artifact: FinalPages, composition: CompositionPlan, snapshot: WikiSnapshot) -> dict[str, object]:
+def _final_preimage_coverage_report(
+    artifact: FinalPages,
+    composition: CompositionPlan,
+    snapshot: WikiSnapshot,
+    *,
+    page_update_plan: PageUpdatePlan | None = None,
+) -> dict[str, object]:
     items_by_target = {item.target_path: item for item in composition.items}
     entries_by_path = {entry.path: entry for entry in snapshot.entries}
+    update_plan_by_target = {item.target_path: item for item in (page_update_plan.items if page_update_plan else [])}
     pages: list[dict[str, object]] = []
     requirement_count = 0
     reported_count = 0
     for page in artifact.pages:
         item = items_by_target.get(page.target_path)
         if item is None or item.action != "update":
+            continue
+        update_plan_item = update_plan_by_target.get(page.target_path)
+        if update_plan_item is not None and update_plan_item.previous_active_claims:
             continue
         existing = entries_by_path.get(page.target_path)
         requirements = prompts.preimage_coverage_requirements(existing)
@@ -2177,18 +2208,166 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
     )
 
 
+def _page_state_root(vault: Path) -> Path:
+    return vault / ".llmwiki" / "page_state"
+
+
+def _page_state_path(vault: Path, target_path: str) -> Path:
+    root = _page_state_root(vault)
+    return ensure_under(root / f"{target_path}.json", root, label="page state target")
+
+
+def _page_state_artifact_path(run_dir: Path, target_path: str) -> Path:
+    return run_dir / "page_state_write" / "page_states" / f"{target_path}.json"
+
+
+def _load_page_state(vault: Path, target_path: str) -> PageState | None:
+    path = _page_state_path(vault, target_path)
+    if not path.exists():
+        return None
+    try:
+        return PageState.model_validate(read_json(path))
+    except Exception as exc:  # noqa: BLE001 - corrupted state must stop the ingest.
+        raise PipelineError(f"page_state 读取失败：{relative_posix(path, vault)}：{exc}") from exc
+
+
+def _single_page_update_plan(plan: PageUpdatePlan | None, final_page_id: str) -> PageUpdatePlan | None:
+    if plan is None:
+        return None
+    items = [item for item in plan.items if item.final_page_id == final_page_id]
+    return PageUpdatePlan(items=items) if items else None
+
+
+def _build_page_update_plan(
+    vault: Path,
+    composition: CompositionPlan,
+    candidate_pages: CandidatePages,
+    digest: SourceDigest,
+    *,
+    operation_id: str,
+) -> PageUpdatePlan:
+    claims_by_id = {claim.claim_id: claim for claim in digest.claims}
+    units_by_id = {unit.content_unit_id: unit for unit in digest.content_units}
+    candidates_by_id = {page.candidate_page_id: page for page in candidate_pages.pages}
+    items: list[PageUpdatePlanItem] = []
+    for item in composition.items:
+        state = _load_page_state(vault, item.target_path)
+        candidate_units: list[SourceContentUnit] = []
+        for candidate_id in item.candidate_page_ids:
+            candidate = candidates_by_id.get(candidate_id)
+            if candidate is None:
+                continue
+            anchor = units_by_id.get(candidate.content_unit_id)
+            if anchor is None:
+                continue
+            attached = [unit for unit in digest.content_units if unit.anchor_unit_id == anchor.content_unit_id]
+            candidate_units.extend([anchor, *[unit for unit in attached if unit.content_unit_id != anchor.content_unit_id]])
+        incoming_units = _dedupe_content_units(candidate_units)
+        incoming_claim_ids = _dedupe_list([claim_id for unit in incoming_units for claim_id in unit.claim_ids])
+        incoming_claims = [claims_by_id[claim_id] for claim_id in incoming_claim_ids if claim_id in claims_by_id]
+        previous_active_claims = [
+            claim
+            for claim in (state.claims if state else [])
+            if claim.status == "活跃" and claim.coverage_policy != "低价值"
+        ]
+        guidance = _page_update_guidance(item, state, previous_active_claims, incoming_units)
+        items.append(
+            PageUpdatePlanItem(
+                final_page_id=item.final_page_id,
+                target_path=item.target_path,
+                action=item.action,
+                state_path=relative_posix(_page_state_path(vault, item.target_path), vault),
+                state_exists=state is not None,
+                previous_claim_count=len(state.claims) if state else 0,
+                previous_active_claim_count=len(previous_active_claims),
+                previous_active_claims=previous_active_claims,
+                incoming_content_units=incoming_units,
+                incoming_claims=incoming_claims,
+                candidate_page_ids=item.candidate_page_ids,
+                merge_decision_ids=item.merge_decision_ids,
+                guidance=guidance,
+            )
+        )
+    return PageUpdatePlan(items=items)
+
+
+def _dedupe_content_units(units: list[SourceContentUnit]) -> list[SourceContentUnit]:
+    seen: set[str] = set()
+    result: list[SourceContentUnit] = []
+    for unit in units:
+        if unit.content_unit_id in seen:
+            continue
+        seen.add(unit.content_unit_id)
+        result.append(unit)
+    return result
+
+
+def _page_update_guidance(
+    item: CompositionItem,
+    state: PageState | None,
+    previous_active_claims: list[PageStateClaim],
+    incoming_units: list[SourceContentUnit],
+) -> list[str]:
+    guidance = [
+        "旧页面 Markdown 是旧内容语境；不要从旧知识点重新生成旧内容。",
+        "新 candidate page 是本次增量表达；按 incoming_content_units 的主干/附属/工具性归属补入。",
+        "page_state 是结构责任账本；用于防止处于“活跃”状态的旧知识在更新中无声消失。",
+    ]
+    if item.action == "create":
+        guidance.append("这是新建页面：用本次 source_digest 的主干和分支初始化 page_state。")
+    elif state is None:
+        guidance.append("这是没有 page_state 的旧页首次更新：本轮仍使用旧页面小节兜底保护，写入成功后创建 page_state。")
+    elif previous_active_claims:
+        guidance.append("这是已有 page_state 的更新：必须保留或摘要合并旧活跃知识点承担的旧知识责任。")
+    if any(unit.absorption_decision == "降级为段落" for unit in incoming_units):
+        guidance.append("本次包含降级为段落的内容：只在合适小节压缩吸收，不要抬成独立主题。")
+    return guidance
+
+
+def _step_page_update_plan(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+    composition: CompositionPlan = state["composition_plan"]  # type: ignore[assignment]
+    candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
+    digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
+    operation_id = str(state.get("operation_id", ""))
+    out_dir = run_dir / "page_update_plan"
+    artifact = _build_page_update_plan(vault, composition, candidate_pages, digest, operation_id=operation_id)
+    state["page_update_plan"] = artifact
+    json_path = out_dir / "page_update_plan.json"
+    md_path = out_dir / "page_update_plan.md"
+    write_json(json_path, artifact)
+    write_text(md_path, _render_page_update_plan_md(artifact))
+    previous_active_claim_count = sum(len(item.previous_active_claims) for item in artifact.items)
+    incoming_claim_count = sum(len(item.incoming_claims) for item in artifact.items)
+    return StepOutput(
+        [json_path, md_path],
+        {
+            "page_update_plan_count": len(artifact.items),
+            "previous_active_claim_count": previous_active_claim_count,
+            "incoming_claim_count": incoming_claim_count,
+        },
+    )
+
+
 def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
     composition: CompositionPlan = state["composition_plan"]  # type: ignore[assignment]
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
+    page_update_items_by_id = {item.final_page_id: item for item in page_update_plan.items}
     artifacts: list[Path] = []
     out_dir = run_dir / "final_pages"
     operation_id = str(state.get("operation_id", ""))
     initial_requests = [
         (
             item.final_page_id,
-            prompts.final_page_prompt(composition_item=item, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile),
+            prompts.final_page_prompt(
+                composition_item=item,
+                candidate_pages=candidate_pages,
+                snapshot=snapshot,
+                profile=profile,
+                page_update_plan_item=page_update_items_by_id.get(item.final_page_id),
+            ),
         )
         for item in composition.items
     ]
@@ -2202,7 +2381,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     parallel_request_count = len(composition.items)
     outputs_by_id = {item.final_page_id: output for item, output in zip(composition.items, outputs, strict=True)}
     semantic_retry_count = 0
-    semantic_errors = _final_page_semantic_errors(outputs_by_id, composition, snapshot, operation_id=operation_id)
+    semantic_errors = _final_page_semantic_errors(outputs_by_id, composition, snapshot, operation_id=operation_id, page_update_plan=page_update_plan)
     if semantic_errors:
         api_calls = _mark_request_semantic_retry_failed(api_calls, semantic_errors)
         semantic_retry_count = len(semantic_errors)
@@ -2222,6 +2401,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
                         profile=profile,
                         previous_pages=previous_output,
                         validation_error=semantic_errors[item.final_page_id],
+                        page_update_plan_item=page_update_items_by_id.get(item.final_page_id),
                     ),
                 )
             )
@@ -2243,6 +2423,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
             CompositionPlan(items=retry_items),
             snapshot,
             operation_id=operation_id,
+            page_update_plan=PageUpdatePlan(items=[page_update_items_by_id[item.final_page_id] for item in retry_items if item.final_page_id in page_update_items_by_id]),
         )
         if retry_errors:
             api_calls.extend(_mark_request_semantic_retry_failed(retry_api_calls, retry_errors))
@@ -2257,6 +2438,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
         composition,
         snapshot,
         operation_id=operation_id,
+        page_update_plan=page_update_plan,
     )
     for final in artifact.pages:
         page_path = out_dir / "pages" / final.target_path
@@ -2274,7 +2456,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
         diff_path = out_dir / "diffs" / f"{safe_filename(final.target_path)}.diff"
         write_text(diff_path, diff_text)
         artifacts.append(diff_path)
-    coverage_report = _final_preimage_coverage_report(artifact, composition, snapshot)
+    coverage_report = _final_preimage_coverage_report(artifact, composition, snapshot, page_update_plan=page_update_plan)
     coverage_json_path = out_dir / "preimage_coverage_report.json"
     coverage_md_path = out_dir / "preimage_coverage_report.md"
     write_json(coverage_json_path, coverage_report)
@@ -2630,6 +2812,8 @@ def _repair_final_pages_for_coverage(
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
+    page_update_items_by_id = {item.final_page_id: item for item in page_update_plan.items}
     operation_id = str(state.get("operation_id", ""))
     targets = _coverage_repair_targets(report, digest, composition, candidate_pages)
     if not targets and final_pages.pages:
@@ -2659,6 +2843,7 @@ def _repair_final_pages_for_coverage(
                     profile=profile,
                     previous_pages=FinalPages(pages=[previous_page]),
                     validation_error=_coverage_repair_validation_error(repair_claims),
+                    page_update_plan_item=page_update_items_by_id.get(item.final_page_id),
                     coverage_repair_claims=repair_claims,
                 ),
             )
@@ -2673,7 +2858,13 @@ def _repair_final_pages_for_coverage(
         api_calls_filename=f"token_usage_calls_coverage_repair_{round_index}.json",
     )
     outputs_by_id = {item.final_page_id: output for item, output in zip(retry_items, retry_outputs, strict=True)}
-    retry_errors = _final_page_semantic_errors(outputs_by_id, CompositionPlan(items=retry_items), snapshot, operation_id=operation_id)
+    retry_errors = _final_page_semantic_errors(
+        outputs_by_id,
+        CompositionPlan(items=retry_items),
+        snapshot,
+        operation_id=operation_id,
+        page_update_plan=PageUpdatePlan(items=[page_update_items_by_id[item.final_page_id] for item in retry_items if item.final_page_id in page_update_items_by_id]),
+    )
     if retry_errors:
         retry_api_calls = _mark_request_semantic_retry_failed(retry_api_calls, retry_errors)
         write_json(out_dir / "coverage_repair_errors.json", retry_errors)
@@ -2686,6 +2877,7 @@ def _repair_final_pages_for_coverage(
         composition,
         snapshot,
         operation_id=operation_id,
+        page_update_plan=page_update_plan,
     )
     repaired_path = out_dir / "repaired_final_pages.json"
     manifest_path = out_dir / "repaired_final_page_manifest.json"
@@ -3558,6 +3750,178 @@ def _step_knowledge_write(vault: Path, run_dir: Path, state: dict[str, object]) 
     )
 
 
+def _step_page_state_write(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
+    final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
+    page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
+    operation_id = str(state.get("operation_id", ""))
+    plan_by_target = {item.target_path: item for item in page_update_plan.items}
+    out_dir = run_dir / "page_state_write"
+    written_targets: list[str] = []
+    artifacts: list[Path] = []
+    manifest_rows: list[dict[str, object]] = []
+    for page in final_pages.pages:
+        item = plan_by_target.get(page.target_path)
+        if item is None:
+            continue
+        previous = _load_page_state(vault, page.target_path)
+        updated = _updated_page_state(page, item, previous, operation_id=operation_id)
+        state_path = _page_state_path(vault, page.target_path)
+        atomic_write_text(state_path, json.dumps(updated.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        artifact_path = _page_state_artifact_path(run_dir, page.target_path)
+        write_json(artifact_path, updated)
+        artifacts.append(artifact_path)
+        target_rel = relative_posix(state_path, vault)
+        written_targets.append(target_rel)
+        manifest_rows.append({"target_path": page.target_path, "state_path": target_rel, "claim_count": len(updated.claims), "node_count": len(updated.nodes)})
+    result = WriteResult(written_targets=sorted(written_targets))
+    result_path = out_dir / "write_result.json"
+    manifest_path = out_dir / "page_state_manifest.json"
+    write_json(result_path, result)
+    write_json(manifest_path, manifest_rows)
+    return StepOutput(
+        [result_path, manifest_path, *artifacts],
+        {
+            "page_state_written_count": len(written_targets),
+            "claim_count": sum(int(row["claim_count"]) for row in manifest_rows),
+        },
+    )
+
+
+def _updated_page_state(
+    page: FinalPage,
+    plan_item: PageUpdatePlanItem,
+    previous: PageState | None,
+    *,
+    operation_id: str,
+) -> PageState:
+    previous_nodes = list(previous.nodes if previous else [])
+    previous_claims = list(previous.claims if previous else [])
+    existing_claim_ids = {claim.state_claim_id for claim in previous_claims}
+    nodes_by_id = {node.node_id: node for node in previous_nodes}
+    new_nodes: list[PageStateNode] = []
+    new_claims: list[PageStateClaim] = []
+    claim_by_id = {claim.claim_id: claim for claim in plan_item.incoming_claims}
+    markdown_headings = _page_state_headings(page.markdown)
+    for unit in plan_item.incoming_content_units:
+        node_id = _page_state_node_id(operation_id, unit.content_unit_id)
+        parent_node_id = None
+        if unit.anchor_unit_id and unit.anchor_unit_id != unit.content_unit_id:
+            parent_node_id = _page_state_node_id(operation_id, unit.anchor_unit_id)
+            if parent_node_id not in nodes_by_id and all(node.node_id != parent_node_id for node in new_nodes):
+                parent_node_id = _find_previous_node_id_for_title(previous_nodes, unit.title)
+        state_claim_ids = [
+            _page_state_claim_id(operation_id, claim_id)
+            for claim_id in unit.claim_ids
+            if claim_id in claim_by_id
+        ]
+        if node_id not in nodes_by_id:
+            new_nodes.append(
+                PageStateNode(
+                    node_id=node_id,
+                    title=unit.title,
+                    kind=_page_state_node_kind(unit),
+                    section_hint=unit.section_hint,
+                    parent_node_id=parent_node_id,
+                    source_content_unit_ids=[unit.content_unit_id],
+                    claim_ids=state_claim_ids,
+                )
+            )
+        for claim_id in unit.claim_ids:
+            claim = claim_by_id.get(claim_id)
+            if claim is None:
+                continue
+            state_claim_id = _page_state_claim_id(operation_id, claim.claim_id)
+            if state_claim_id in existing_claim_ids:
+                continue
+            new_claims.append(
+                PageStateClaim(
+                    state_claim_id=state_claim_id,
+                    source_claim_id=claim.claim_id,
+                    text=claim.text,
+                    kind=claim.kind,
+                    importance=claim.importance,
+                    concept_terms=claim.concept_terms,
+                    node_id=node_id,
+                    source_content_unit_id=unit.content_unit_id,
+                    source_operation_id=operation_id,
+                    source_refs=claim.source_refs,
+                    coverage_policy=_page_state_coverage_policy(unit, claim),
+                    current_anchor=_best_page_state_anchor(markdown_headings, unit),
+                )
+            )
+    source_raw_paths = _dedupe_list([*(previous.source_raw_paths if previous else []), *(ref.raw_path for ref in page.source_refs)])
+    source_operation_ids = _dedupe_list([*(previous.source_operation_ids if previous else []), *([operation_id] if operation_id else [])])
+    warnings = list(previous.warnings if previous else [])
+    return PageState(
+        page_path=page.target_path,
+        title=page.title,
+        page_type=page.page_type,
+        page_sha256=page.content_sha256 or sha256_text(page.markdown),
+        updated_at=now_utc(),
+        source_raw_paths=source_raw_paths,
+        source_operation_ids=source_operation_ids,
+        nodes=[*previous_nodes, *new_nodes],
+        claims=[*previous_claims, *new_claims],
+        warnings=_dedupe_list(warnings),
+    )
+
+
+def _page_state_node_id(operation_id: str, content_unit_id: str) -> str:
+    return f"{operation_id}:{content_unit_id}"
+
+
+def _page_state_claim_id(operation_id: str, claim_id: str) -> str:
+    return f"{operation_id}:{claim_id}"
+
+
+def _page_state_node_kind(unit: SourceContentUnit) -> Literal["主干", "附属", "工具性"]:
+    return unit.content_role
+
+
+def _page_state_coverage_policy(unit: SourceContentUnit, claim: SourceClaim) -> Literal["必须保留", "可摘要", "低价值"]:
+    if unit.absorption_decision == "降级为段落" and claim.importance <= 2:
+        return "低价值"
+    if unit.content_role == "主干" or claim.importance >= 4:
+        return "必须保留"
+    return "可摘要"
+
+
+def _page_state_headings(markdown: str) -> list[str]:
+    headings: list[str] = []
+    for line in strip_frontmatter(markdown).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        level, _, raw_heading = stripped.partition(" ")
+        if not raw_heading or len(level) > 3:
+            continue
+        heading = raw_heading.strip()
+        if heading and heading not in headings:
+            headings.append(heading)
+    return headings
+
+
+def _best_page_state_anchor(headings: list[str], unit: SourceContentUnit) -> str:
+    candidates = [unit.section_hint, unit.title]
+    for candidate in candidates:
+        candidate_key = _granularity_text_key(candidate)
+        if not candidate_key:
+            continue
+        for heading in headings:
+            heading_key = _granularity_text_key(heading)
+            if heading_key and (candidate_key in heading_key or heading_key in candidate_key):
+                return heading
+    return headings[0] if headings else unit.section_hint
+
+
+def _find_previous_node_id_for_title(nodes: list[PageStateNode], title: str) -> str | None:
+    title_key = _granularity_text_key(title)
+    for node in nodes:
+        if _granularity_text_key(node.title) == title_key:
+            return node.node_id
+    return None
+
+
 def _step_source_record_write(vault: Path, run_dir: Path, state: dict[str, object], manifest: OperationManifest) -> StepOutput:
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
     digest: SourceDigest = state["source_digest"]  # type: ignore[assignment]
@@ -4092,12 +4456,14 @@ def _important_artifact_hashes(run_dir: Path) -> dict[str, str]:
         "candidate_contexts": run_dir / "candidate_contexts" / "candidate_contexts.json",
         "merge_plan": run_dir / "merge_plan" / "merge_plan.json",
         "composition_plan": run_dir / "composition_plan" / "composition_plan.json",
+        "page_update_plan": run_dir / "page_update_plan" / "page_update_plan.json",
         "final_pages": run_dir / "final_pages" / "final_pages.json",
         "coverage_judge": run_dir / "coverage_judge" / "coverage_judge_report.json",
         "coverage_repaired_final_pages": run_dir / "coverage_judge" / "coverage_repair_final_pages" / "repaired_final_pages.json",
         "related_refresh": run_dir / "related_refresh" / "related_refresh_report.json",
         "related_final_pages": run_dir / "related_refresh" / "final_pages.json",
         "knowledge_write_set": run_dir / "knowledge_write" / "write_set.json",
+        "page_state_write": run_dir / "page_state_write" / "write_result.json",
         "source_record_write": run_dir / "source_record_write" / "write_result.json",
         "embedding_cache_refresh": run_dir / "embedding_cache_refresh" / "embedding_cache_refresh.json",
         "related_maintenance": run_dir / "related_maintenance" / "related_maintenance_report.json",
@@ -4179,6 +4545,31 @@ def _render_merge_plan_md(plan: MergePlan) -> str:
             lines.append(f"- 候选内容定位：{', '.join(decision.candidate_content_locators)}")
         lines.append(f"- 理由：{decision.reason}")
         lines.append(f"- 最强重合度：{decision.strongest_overlap}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _render_page_update_plan_md(plan: PageUpdatePlan) -> str:
+    lines = ["# 页面状态计划", ""]
+    if not plan.items:
+        lines.append("- 暂无需要写入的页面。")
+        return "\n".join(lines) + "\n"
+    for item in plan.items:
+        lines.append(f"## {item.final_page_id}: `{item.target_path}`")
+        lines.append(f"- 动作：{_action_label(item.action)}")
+        lines.append(f"- 状态文件：`{item.state_path}`")
+        lines.append(f"- 已有状态：{'是' if item.state_exists else '否'}")
+        lines.append(f"- 旧活跃知识点：{item.previous_active_claim_count}")
+        lines.append(f"- 新增内容单元：{len(item.incoming_content_units)}")
+        lines.append(f"- 新增知识点：{len(item.incoming_claims)}")
+        if item.guidance:
+            lines.append("- 更新指引：")
+            for guide in item.guidance:
+                lines.append(f"  - {guide}")
+        if item.incoming_content_units:
+            lines.append("- 本次内容单元：")
+            for unit in item.incoming_content_units:
+                lines.append(f"  - {unit.content_unit_id}（{unit.content_role}/{unit.absorption_decision}）：{unit.title}")
         lines.append("")
     return "\n".join(lines)
 

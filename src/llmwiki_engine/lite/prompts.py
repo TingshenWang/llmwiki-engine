@@ -14,6 +14,7 @@ from .models import (
     CoverageJudge,
     FinalPages,
     MergePlan,
+    PageUpdatePlanItem,
     SourceDigest,
     SourceGranularityStats,
     SourceContentUnit,
@@ -357,13 +358,15 @@ def final_page_prompt(
     candidate_pages: CandidatePages,
     snapshot: WikiSnapshot,
     profile: Profile,
+    page_update_plan_item: PageUpdatePlanItem | None = None,
 ) -> PromptRequest:
     candidate_ids = set(composition_item.candidate_page_ids)
     relevant_candidates = CandidatePages(pages=[page for page in candidate_pages.pages if page.candidate_page_id in candidate_ids])
     relevant_paths = {composition_item.target_path, *composition_item.existing_page_refs}
     relevant_entries = [entry for entry in snapshot.entries if entry.path in relevant_paths]
     target_entry = next((entry for entry in snapshot.entries if entry.path == composition_item.target_path), None)
-    preimage_requirements = preimage_coverage_requirements(target_entry) if composition_item.action == "update" else []
+    has_page_state_claims = bool(page_update_plan_item and page_update_plan_item.previous_active_claims)
+    preimage_requirements = [] if has_page_state_claims else preimage_coverage_requirements(target_entry) if composition_item.action == "update" else []
     allowed_body_link_targets = [
         {
             "path": entry.path,
@@ -381,6 +384,7 @@ def final_page_prompt(
             "composition_item": composition_item.model_dump(mode="json"),
             "candidate_pages": relevant_candidates.model_dump(mode="json"),
             "wiki_snapshot_entries": [entry.model_dump(mode="json") for entry in relevant_entries],
+            "page_update_plan": page_update_plan_item.model_dump(mode="json") if page_update_plan_item is not None else None,
             "preimage_coverage_requirements": preimage_requirements,
             "allowed_body_link_targets": allowed_body_link_targets,
             "profile": profile.model_dump(mode="json"),
@@ -399,8 +403,11 @@ def final_page_prompt(
                 "引擎会替换最终 frontmatter；专注于中文正文和稳定的中文标题结构。",
                 "每个页面必须保留 source_refs。",
                 "update 页面必须保留有价值的旧笔记，并加入有来源支撑的新材料。",
-                "update 页面禁止只围绕本次 candidate 重写旧页；必须把 preimage_coverage_requirements 中每条旧页覆盖要求保留或合并进最终正文。",
-                "update 页面必须填写 preimage_coverage_report；每个 requirement_id 必须逐条出现一次，status 只能是 preserved 或 merged。",
+                "page_update_plan 是页面维护状态计划；旧页面 Markdown 才是旧内容语境，page_update_plan 只用于说明结构责任、旧活跃知识点和新增内容应该如何补入。",
+                "如果 page_update_plan.previous_active_claims 非空，它们取代 preimage_coverage_requirements；不要从旧知识点重新生成旧内容，而要以旧页面正文为语境，确保这些处于“活跃”状态的旧知识没有无声消失。",
+                "如果 page_update_plan.incoming_content_units 非空，应按其 content_role、absorption_decision、anchor_unit_id 和 section_hint 把新 candidate 内容补入对应主干或分支，不要直接覆盖旧页。",
+                "如果 preimage_coverage_requirements 非空，说明本页还没有 page_state，必须把其中每条旧页覆盖要求保留或合并进最终正文。",
+                "只有 preimage_coverage_requirements 非空时才需要填写 preimage_coverage_report；每个 requirement_id 必须逐条出现一次，status 只能是 preserved 或 merged。若 preimage_coverage_requirements 为空，preimage_coverage_report 可以为空数组。",
                 "preimage_coverage_report.final_anchor 必须是最终正文中真实存在的具体中文小节或锚点，不能只写“摘要”“核心内容”“矛盾与未决问题”等泛化位置。",
                 "preimage_coverage_report.final_anchor 必须是读者可见的中文标题文本；不要填写 HTML anchor id、英文 slug、#锚点 或隐藏标记。",
                 "OLD-SUMMARY 也不能把 final_anchor 写成“摘要”；如果旧页摘要被合入摘要，必须在正文中保留或新建一个更具体的中文小节承接该旧知识，并把 final_anchor 指向这个具体小节。",
@@ -425,9 +432,16 @@ def final_page_retry_prompt(
     profile: Profile,
     previous_pages: FinalPages,
     validation_error: str,
+    page_update_plan_item: PageUpdatePlanItem | None = None,
     coverage_repair_claims: list[dict[str, object]] | None = None,
 ) -> PromptRequest:
-    request = final_page_prompt(composition_item=composition_item, candidate_pages=candidate_pages, snapshot=snapshot, profile=profile)
+    request = final_page_prompt(
+        composition_item=composition_item,
+        candidate_pages=candidate_pages,
+        snapshot=snapshot,
+        profile=profile,
+        page_update_plan_item=page_update_plan_item,
+    )
     payload = dict(request.user_payload)
     instructions = list(payload.get("instructions") or [])
     if coverage_repair_claims:
