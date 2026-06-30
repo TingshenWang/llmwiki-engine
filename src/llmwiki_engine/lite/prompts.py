@@ -16,7 +16,7 @@ from .models import (
     MergePlan,
     SourceDigest,
     SourceGranularityStats,
-    SourcePageUnit,
+    SourceContentUnit,
     WikiKnowledgeEntry,
     WikiSnapshot,
 )
@@ -79,19 +79,24 @@ def source_digest_prompt(
                 "先从 raw_text 抽取 claims；claim 是有效知识原子，不是页面。",
                 "每个有效 claim 必须包含 claim_id、中文 text、kind、importance、concept_terms、raw_locator 和 source_refs。",
                 "claim_id 使用 C-001、C-002 这样的稳定格式；importance 取 1-5，5 表示核心知识，1 表示边缘但仍值得保留的信息。",
-                "再把 claims 聚合成 page_units；每个 page_unit 表示后续要生成的一篇可读 wiki 候选页，而不是一个零散知识点。",
-                "优先使用粗粒度页面：同一主体对象、同一读者任务、同一页面类型下的 what/why/how/example/version 应合并为同一 page_unit 的不同段落。",
-                "只有主体对象不同、读者任务不同、或页面类型明显不同，才拆成多个 page_units。",
-                "如果提供了 granularity_stats，page_unit 数量应落在 suggested_min_page_units 到 suggested_max_page_units 的经验区间附近；超出区间必须有强拆分理由。",
-                "在本步骤内完成去重、近义合并和页面类型确认；不要额外输出候选项再交给后续合并。",
-                "page_unit_id 使用 PU-001、PU-002 这样的稳定格式，不要编造 wiki 旧页路径。",
-                "page_type 必须来自 profile.page_types，且不能是 source。",
+                "再把 claims 聚合成 content_units；content_unit 是有效内容单元，不一定独立成页。",
+                "每个 content_unit 必须包含 content_unit_id、title、content_role、absorption_decision、anchor_unit_id、section_hint、page_type、path_hint、summary、absorption_reason、content_scope、claim_ids、source_refs。",
+                "content_unit_id 使用 CU-001、CU-002 这样的稳定格式，不要编造 wiki 旧页路径。",
+                "content_role 只能是：主干、附属、工具性。",
+                "absorption_decision 只能是：独立成页、并入主干、降级为段落。",
+                "所有有效 content_unit 必须有 anchor_unit_id；主干的 anchor_unit_id 必须指向自己，附属/工具性内容的 anchor_unit_id 必须指向一个真实存在的主干 content_unit。",
+                "只有 content_role=主干 且 absorption_decision=独立成页 的 content_unit 会生成候选页；附属和工具性内容会随 anchor 主干一起吸收。",
+                "如果 raw 中只有安装、价格、API 生命周期、experimental 单点、单 claim 比较、论文 benchmark 数字等附属/工具性内容，也必须先规划一个可承载它的主干对象，再把这些内容挂到该 anchor 下。",
+                "优先使用稳定主干对象：概念、框架、协议、架构、机制、方法论、长期可维护能力。",
+                "默认不要让单工具、安装指南、价格、API 生命周期、experimental 特性、单一比较、论文实验数字独立成页；它们通常应并入主干或降级为段落。",
+                "如果提供了 granularity_stats，主干候选页数量应落在 suggested_min_candidate_pages 到 suggested_max_candidate_pages 的经验区间附近；超出区间必须减少主干 anchor 数量。",
+                "在本步骤内完成去重、近义合并、主干/附属/工具性判断和归属确认；不要额外输出候选项再交给后续合并。",
+                "page_type 必须来自 profile.page_types，且不能是 source；附属/工具性 content_unit 的 page_type/path_hint 应与其 anchor 主干保持一致。",
                 "path_hint 必须位于 page_type 对应目录内，且以 .md 结尾。",
-                "page_units 必须通过 claim_ids 覆盖 raw_text 中所有值得进入知识库的有效 claims；不要把重要信息漏掉。",
-                "每个 claim_id 必须且只能归入一个 page_unit；如果一个 claim 完全无法归属，不要静默忽略，应调整 page_units。",
-                "多个 page_units 时，每个 page_unit 的 split_rationale 必须用中文说明为什么它不能并入其他 page_unit；如果说不清，应合并。",
-                "每个 page_unit 必须包含至少一个 source_ref，包含 raw_path、raw_sha256 和有用 locator。",
-                "如果 raw_text 明显是 404、Page not found、不可访问、空页面、导航页或只有网站菜单，不要把“页面失效”写成 event/知识页；claims 和 page_units 必须为空，只在 weak_or_noise_items 说明原因。",
+                "content_units 必须通过 claim_ids 覆盖 raw_text 中所有值得进入知识库的有效 claims；不要把重要信息漏掉。",
+                "每个 claim_id 必须且只能归入一个 content_unit；如果一个 claim 完全无法归属，不要静默忽略，应调整 content_units。",
+                "每个 content_unit 必须包含至少一个 source_ref，包含 raw_path、raw_sha256 和有用 locator。",
+                "如果 raw_text 明显是 404、Page not found、不可访问、空页面、导航页或只有网站菜单，不要把“页面失效”写成 event/知识页；claims 和 content_units 必须为空，只在 weak_or_noise_items 说明原因。",
                 "不值得入库、噪声、重复或证据不足的内容放入 weak_or_noise_items，并用中文说明原因。",
                 "不要在本步骤读取或假设旧 wiki；不要判断 create/update/noop。",
             ],
@@ -122,35 +127,47 @@ def source_digest_retry_prompt(
                 "所有 summary、key_takeaways、claim text、title、content_scope、weak_or_noise reason 等用户可读字段必须使用中文。",
                 "必要产品名、框架名、API 名可以保留英文专有名词，但解释性句子必须是中文。",
                 "source_raw_path 和 raw_sha256 必须保持与输入完全一致。",
-                "不要为了通过中文校验而删除有价值 page_unit；应把英文说明改写成中文说明。",
-                "如果 validation_error 指出 page_unit 过多，请优先合并同主体、同读者任务、同页面类型的页面单元，而不是删掉有效内容。",
-                "如果 validation_error 指出 0 个 page_unit 但原文不是噪声，请生成至少一个粗粒度 page_unit。",
-                "如果 validation_error 指出 raw 只能记录来源，请清空 claims 和 page_units，只保留 weak_or_noise_items 说明 404、不可访问、空页面或导航噪声原因。",
+                "不要为了通过中文校验而删除有价值 content_unit；应把英文说明改写成中文说明。",
+                "如果 validation_error 指出主干候选页过多，请减少 content_role=主干 的数量，把附属或工具性内容挂到已有 anchor。",
+                "如果 validation_error 指出 0 个候选页但原文不是噪声，请生成至少一个主干 content_unit，并让 anchor_unit_id 指向自己。",
+                "如果 validation_error 指出 raw 只能记录来源，请清空 claims 和 content_units，只保留 weak_or_noise_items 说明 404、不可访问、空页面或导航噪声原因。",
             ],
         }
     )
     return request.model_copy(update={"user_payload": payload})
 
 
-def candidate_page_prompt(*, digest: SourceDigest, page_unit: SourcePageUnit, raw_path: str, raw_sha256: str, raw_text: str, profile: Profile) -> PromptRequest:
+def candidate_page_prompt(
+    *,
+    digest: SourceDigest,
+    anchor_unit: SourceContentUnit,
+    attached_units: list[SourceContentUnit],
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    profile: Profile,
+) -> PromptRequest:
     return _request(
         step="candidate_pages",
         model=CandidatePages,
         cache_prefix_payload=_candidate_page_cache_prefix(digest=digest, raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, profile=profile),
         payload={
-            "page_unit": page_unit.model_dump(mode="json"),
+            "anchor_content_unit": anchor_unit.model_dump(mode="json"),
+            "attached_content_units": [unit.model_dump(mode="json") for unit in attached_units],
             "parallel_generation_contract": {
-                "mode": "per_page_unit",
-                "expected_page_unit_id": page_unit.page_unit_id,
+                "mode": "per_anchor_content_unit",
+                "expected_content_unit_id": anchor_unit.content_unit_id,
                 "expected_page_count": 1,
             },
             "instructions": [
                 "这是并发 candidate-page 生成请求组中的一个请求。",
-                "只为 page_unit 生成一个候选页面。",
+                "只为 anchor_content_unit 生成一个候选页面。",
                 "返回的 pages 数组必须只有一个 item。",
-                "page.page_unit_id 必须等于 expected_page_unit_id。",
+                "page.content_unit_id 必须等于 expected_content_unit_id。",
                 "必须对照 cache_prefix.raw_text 写正文。",
-                "必须覆盖 page_unit.claim_ids 对应的 source_digest.claims，不要只复述 page_unit.summary。",
+                "必须覆盖 anchor_content_unit 和 attached_content_units 中所有 claim_ids 对应的 source_digest.claims，不要只复述 summary。",
+                "attached_content_units 中 absorption_decision=并入主干 的内容应写入主干页相应小节；absorption_decision=降级为段落 的内容应按 section_hint 压缩为段落或备注。",
+                "不得把 attached_content_units 写成单独候选页。",
                 "必须使用 cache_prefix.source_digest、cache_prefix.profile 和 cache_prefix.instructions。",
             ],
         },
@@ -160,7 +177,8 @@ def candidate_page_prompt(*, digest: SourceDigest, page_unit: SourcePageUnit, ra
 def candidate_page_retry_prompt(
     *,
     digest: SourceDigest,
-    page_unit: SourcePageUnit,
+    anchor_unit: SourceContentUnit,
+    attached_units: list[SourceContentUnit],
     raw_path: str,
     raw_sha256: str,
     raw_text: str,
@@ -170,7 +188,8 @@ def candidate_page_retry_prompt(
 ) -> PromptRequest:
     request = candidate_page_prompt(
         digest=digest,
-        page_unit=page_unit,
+        anchor_unit=anchor_unit,
+        attached_units=attached_units,
         raw_path=raw_path,
         raw_sha256=raw_sha256,
         raw_text=raw_text,
@@ -185,9 +204,9 @@ def candidate_page_retry_prompt(
             "instructions": [
                 *instructions,
                 "上一轮 candidate_pages 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
-                "顶层必须是对象，必须包含 pages 数组和 skipped_page_unit_ids 数组。",
+                "顶层必须是对象，必须包含 pages 数组和 skipped_content_unit_ids 数组。",
                 "pages 数组必须且只能包含 1 个候选页。",
-                "该候选页必须对应 expected_page_unit_id，且必须包含中文 title、summary、body_markdown、evidence_notes 和 source_refs。",
+                "该候选页必须对应 expected_content_unit_id，且必须包含中文 title、summary、body_markdown、evidence_notes 和 source_refs。",
             ],
         }
     )
@@ -451,7 +470,7 @@ def coverage_judge_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> P
             "source_raw_path": digest.source_raw_path,
             "raw_sha256": digest.raw_sha256,
             "claims": [claim.model_dump(mode="json") for claim in digest.claims],
-            "page_units": [unit.model_dump(mode="json") for unit in digest.page_units],
+            "content_units": [unit.model_dump(mode="json") for unit in digest.content_units],
             "final_pages": [
                 {
                     "final_page_id": page.final_page_id,
@@ -474,6 +493,7 @@ def coverage_judge_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> P
                 "contradicted：最终页面与 claim 含义冲突。",
                 "covered_by 写 target_path#中文小节；如果缺失或冲突可为空数组。",
                 "evidence 必须引用最终页面中的中文表达；reason 必须中文说明判断理由。",
+                "evidence 和 reason 都不能为空；即使 status 是 missing、partial 或 contradicted，也必须写明最终页面没有覆盖、部分覆盖或冲突的具体依据。",
                 "不要因为 source_refs 或 frontmatter 包含 raw 路径就判 covered；必须看正文内容。",
             ],
         },
@@ -498,6 +518,7 @@ def coverage_judge_retry_prompt(
                 *instructions,
                 "上一轮 coverage_judge 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
                 "claim_results 的 claim_id 集合必须与输入 claims 完全一致。",
+                "每条 claim_results 的 evidence 和 reason 都不能为空。",
                 "所有 evidence、reason、warnings 等用户可读字段必须使用中文。",
             ],
         }
@@ -655,13 +676,18 @@ def _json_example(step: str) -> dict[str, Any]:
                     "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
                 }
             ],
-            "page_units": [
+            "content_units": [
                 {
-                    "page_unit_id": "PU-001",
+                    "content_unit_id": "CU-001",
                     "title": "示例概念",
+                    "content_role": "主干",
+                    "absorption_decision": "独立成页",
+                    "anchor_unit_id": "CU-001",
+                    "section_hint": "核心概念",
                     "page_type": "concept",
                     "path_hint": "concepts/Concept_Example_Concept.md",
                     "summary": "说明这个概念为什么值得写入 wiki。",
+                    "absorption_reason": "该内容是 raw 的主要知识对象，适合作为长期维护的知识页。",
                     "content_scope": "覆盖 raw 中关于示例概念的定义、用途和来源依据。",
                     "claim_ids": ["C-001"],
                     "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
@@ -673,7 +699,7 @@ def _json_example(step: str) -> dict[str, Any]:
             "pages": [
                 {
                     "candidate_page_id": "CP-001",
-                    "page_unit_id": "PU-001",
+                    "content_unit_id": "CU-001",
                     "title": "示例概念",
                     "proposed_page_type": "concept",
                     "proposed_path_hint": "concepts/Concept_Example_Concept.md",
@@ -685,7 +711,7 @@ def _json_example(step: str) -> dict[str, Any]:
                     "confidence": 0.7,
                 }
             ],
-            "skipped_page_unit_ids": [],
+            "skipped_content_unit_ids": [],
         },
         "candidate_pages_warmup": {"status": "OK"},
         "merge_plan": {

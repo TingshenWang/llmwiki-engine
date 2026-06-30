@@ -14,6 +14,7 @@ from llmwiki_engine.lite import prompts
 from llmwiki_engine.lite import related as related_logic
 from llmwiki_engine.lite.io import sha256_file, sha256_text
 from llmwiki_engine.lite.models import (
+    ArtifactRef,
     CandidateContext,
     CandidateContextHit,
     CandidateContexts,
@@ -33,12 +34,14 @@ from llmwiki_engine.lite.models import (
     RawBinding,
     SourceDigest,
     SourceClaim,
-    SourcePageUnit,
+    SourceContentUnit,
     SourceRef,
+    StepRecord,
     WikiKnowledgeEntry,
     WikiSnapshot,
 )
 from llmwiki_engine.lite.pipeline import (
+    _archive_manifest_steps_for_restart,
     _assert_candidate_pages_chinese,
     _assert_coverage_judge_chinese,
     _assert_merge_plan_consumes_candidates,
@@ -101,23 +104,31 @@ def make_claim(ref: SourceRef, claim_id: str = "C-001", text: str = "说明自�
 def make_source_unit(
     ref: SourceRef,
     *,
-    page_unit_id: str = "PU-001",
+    content_unit_id: str = "CU-001",
     title: str = "自动化入库",
     path_hint: str = "concepts/Concept_Auto_Ingest.md",
     claim_ids: list[str] | None = None,
     content_scope: str = "覆盖自动化入库的核心内容。",
-    split_rationale: str = "",
-) -> SourcePageUnit:
-    return SourcePageUnit(
-        page_unit_id=page_unit_id,
+    content_role: str = "主干",
+    absorption_decision: str = "独立成页",
+    anchor_unit_id: str | None = None,
+    section_hint: str = "核心内容",
+    absorption_reason: str = "这是原文中的主干知识对象，适合独立成页。",
+) -> SourceContentUnit:
+    return SourceContentUnit(
+        content_unit_id=content_unit_id,
         title=title,
+        content_role=content_role,  # type: ignore[arg-type]
+        absorption_decision=absorption_decision,  # type: ignore[arg-type]
+        anchor_unit_id=anchor_unit_id or content_unit_id,
+        section_hint=section_hint,
         page_type="concept",
         path_hint=path_hint,
         summary=f"{title} 是有来源支撑的知识点。",
+        absorption_reason=absorption_reason,
         content_scope=content_scope,
         claim_ids=claim_ids or ["C-001"],
         source_refs=[ref],
-        split_rationale=split_rationale,
     )
 
 
@@ -154,13 +165,18 @@ def test_source_digest_rejects_english_user_facing_text() -> None:
         summary="English summary",
         key_takeaways=["English takeaway"],
         claims=[make_claim(ref, text="English claim")],
-        page_units=[
-            SourcePageUnit(
-                page_unit_id="PU-001",
+        content_units=[
+            SourceContentUnit(
+                content_unit_id="CU-001",
                 title="English Title",
+                content_role="主干",
+                absorption_decision="独立成页",
+                anchor_unit_id="CU-001",
+                section_hint="English section",
                 page_type="concept",
                 path_hint="concepts/Concept_English.md",
                 summary="English candidate summary",
+                absorption_reason="English reason",
                 content_scope="English content scope",
                 claim_ids=["C-001"],
                 source_refs=[ref],
@@ -180,13 +196,18 @@ def test_source_digest_allows_proper_noun_name_with_chinese_context() -> None:
         summary="本文解释 RAG 的核心流程。",
         key_takeaways=["RAG 先检索，再增强 prompt，最后生成回答。"],
         claims=[make_claim(ref, text="RAG 先检索，再增强 prompt，最后生成回答。")],
-        page_units=[
-            SourcePageUnit(
-                page_unit_id="PU-001",
+        content_units=[
+            SourceContentUnit(
+                content_unit_id="CU-001",
                 title="RAG（检索增强生成）",
+                content_role="主干",
+                absorption_decision="独立成页",
+                anchor_unit_id="CU-001",
+                section_hint="核心流程",
                 page_type="concept",
                 path_hint="concepts/Concept_RAG.md",
                 summary="RAG 是检索增强生成流程。",
+                absorption_reason="这是原文主干概念，适合独立成页。",
                 content_scope="覆盖 RAG 的定义和流程。",
                 claim_ids=["C-001"],
                 source_refs=[ref],
@@ -214,15 +235,20 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
         source_raw_path=raw_rel,
         raw_sha256=raw_sha,
         summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["页面单元必须使用中文用户可读文本。"],
+        key_takeaways=["内容单元必须使用中文用户可读文本。"],
         claims=[make_claim(ref, text="自动化入库会去掉人工审核节点。")],
-        page_units=[
-            SourcePageUnit(
-                page_unit_id="PU-001",
+        content_units=[
+            SourceContentUnit(
+                content_unit_id="CU-001",
                 title="自动化入库",
+                content_role="主干",
+                absorption_decision="独立成页",
+                anchor_unit_id="CU-001",
+                section_hint="核心流程",
                 page_type="concept",
                 path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化入库强调去掉人工审核节点。",
+                absorption_reason="这是原文主干概念，适合独立成页。",
                 content_scope="English content scope",
                 claim_ids=["C-001"],
                 source_refs=[ref],
@@ -231,8 +257,8 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
     )
     valid_digest = invalid_digest.model_copy(
         update={
-            "page_units": [
-                invalid_digest.page_units[0].model_copy(update={"content_scope": "覆盖原文中关于自动化入库去掉人工审核节点的内容。"})
+            "content_units": [
+                invalid_digest.content_units[0].model_copy(update={"content_scope": "覆盖原文中关于自动化入库去掉人工审核节点的内容。"})
             ]
         }
     )
@@ -295,11 +321,11 @@ def test_source_digest_retries_chinese_semantic_validation(tmp_path: Path) -> No
     digest = state["source_digest"]
 
     assert isinstance(digest, SourceDigest)
-    assert digest.page_units[0].content_scope == "覆盖原文中关于自动化入库去掉人工审核节点的内容。"
+    assert digest.content_units[0].content_scope == "覆盖原文中关于自动化入库去掉人工审核节点的内容。"
     assert len(registry.requests) == 2
     retry_payload = registry.requests[1].user_payload
     assert "content_scope" in retry_payload["validation_error"]
-    assert output.counts["page_unit_count"] == 1
+    assert output.counts["content_unit_count"] == 1
     assert output.counts["semantic_retry_count"] == 1
     assert output.counts["api_call_count"] == 2
     assert output.counts["api_success_count"] == 1
@@ -348,13 +374,18 @@ def test_source_digest_retries_source_only_error_page(tmp_path: Path) -> None:
                 importance=3,
             )
         ],
-        page_units=[
-            SourcePageUnit(
-                page_unit_id="PU-001",
+        content_units=[
+            SourceContentUnit(
+                content_unit_id="CU-001",
                 title="voice_agents_quickstart 页面失效事件",
+                content_role="主干",
+                absorption_decision="独立成页",
+                anchor_unit_id="CU-001",
+                section_hint="页面失效",
                 page_type="event",
                 path_hint="events/Event_voice_agents_quickstart_404.md",
                 summary="记录 voice_agents_quickstart 页面返回 404。",
+                absorption_reason="这是错误示例，source-only 校验应拦截它。",
                 content_scope="覆盖 raw 中关于该页面失效的唯一事实。",
                 claim_ids=["C-001"],
                 source_refs=[ref],
@@ -368,7 +399,7 @@ def test_source_digest_retries_source_only_error_page(tmp_path: Path) -> None:
         summary="原始页面返回 404，没有可入库知识。",
         key_takeaways=[],
         claims=[],
-        page_units=[],
+        content_units=[],
         weak_or_noise_items=[{"text": "404 页面", "reason": "原始链接返回 404，页面只有导航菜单和错误提示，不应写入知识页。"}],
     )
 
@@ -431,10 +462,10 @@ def test_source_digest_retries_source_only_error_page(tmp_path: Path) -> None:
 
     assert isinstance(digest, SourceDigest)
     assert digest.claims == []
-    assert digest.page_units == []
+    assert digest.content_units == []
     assert len(registry.requests) == 2
     assert "只能记录来源" in registry.requests[1].user_payload["validation_error"]
-    assert output.counts["page_unit_count"] == 0
+    assert output.counts["content_unit_count"] == 0
     assert output.counts["semantic_retry_count"] == 1
 
 
@@ -487,14 +518,14 @@ def test_source_digest_rejects_duplicate_claim_assignment() -> None:
         source_raw_path="raw/example.md",
         raw_sha256="sha",
         summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["每个知识点只能被一个页面单元消费。"],
+        key_takeaways=["每个知识点只能被一个内容单元消费。"],
         claims=[
             make_claim(ref, "C-001", "说明自动化入库流程。"),
             make_claim(ref, "C-002", "说明覆盖审查机制。"),
         ],
-        page_units=[
-            make_source_unit(ref, page_unit_id="PU-001", claim_ids=["C-001"], split_rationale="这是第一个页面单元。"),
-            make_source_unit(ref, page_unit_id="PU-002", claim_ids=["C-001", "C-002"], split_rationale="这是第二个页面单元。"),
+        content_units=[
+            make_source_unit(ref, content_unit_id="CU-001", claim_ids=["C-001"]),
+            make_source_unit(ref, content_unit_id="CU-002", claim_ids=["C-001", "C-002"]),
         ],
     )
     stats = _source_granularity_stats("这是一段足够进入知识库的中文内容。" * 500, raw_size_bytes=10000)
@@ -517,17 +548,21 @@ def test_source_digest_retries_over_split_granularity(tmp_path: Path) -> None:
     )
     ref = SourceRef(raw_path=raw_rel, raw_sha256=raw_sha, locator="whole_file")
 
-    def unit(index: int, title: str) -> SourcePageUnit:
-        return SourcePageUnit(
-            page_unit_id=f"PU-{index:03d}",
+    def unit(index: int, title: str) -> SourceContentUnit:
+        return SourceContentUnit(
+            content_unit_id=f"CU-{index:03d}",
             title=title,
+            content_role="主干",
+            absorption_decision="独立成页",
+            anchor_unit_id=f"CU-{index:03d}",
+            section_hint="核心内容",
             page_type="concept",
             path_hint=f"concepts/Concept_{index}.md",
             summary=f"{title} 是自动化入库流程的一部分。",
+            absorption_reason="这是用于触发粒度校验的过细主干规划。",
             content_scope=f"覆盖 {title} 的具体内容。",
             claim_ids=[f"C-{index:03d}"],
             source_refs=[ref],
-            split_rationale="这是上一轮错误拆分。",
         )
 
     invalid_digest = SourceDigest(
@@ -540,7 +575,7 @@ def test_source_digest_retries_over_split_granularity(tmp_path: Path) -> None:
             make_claim(ref, "C-002", "说明去掉人工审核。"),
             make_claim(ref, "C-003", "说明自动写入 Wiki。"),
         ],
-        page_units=[unit(1, "自动化入库"), unit(2, "去掉人工审核"), unit(3, "自动写入 Wiki")],
+        content_units=[unit(1, "自动化入库"), unit(2, "去掉人工审核"), unit(3, "自动写入 Wiki")],
     )
     valid_digest = SourceDigest(
         source_raw_path=raw_rel,
@@ -551,13 +586,18 @@ def test_source_digest_retries_over_split_granularity(tmp_path: Path) -> None:
             make_claim(ref, "C-001", "说明为什么不再人工审核。"),
             make_claim(ref, "C-002", "说明自动写入 wiki 的基本顺序。"),
         ],
-        page_units=[
-            SourcePageUnit(
-                page_unit_id="PU-001",
+        content_units=[
+            SourceContentUnit(
+                content_unit_id="CU-001",
                 title="自动化知识库入库流程",
+                content_role="主干",
+                absorption_decision="独立成页",
+                anchor_unit_id="CU-001",
+                section_hint="核心流程",
                 page_type="concept",
                 path_hint="concepts/Concept_Auto_Ingest.md",
                 summary="自动化知识库入库流程把人工审核、候选页生成和自动写入合并为可运行链路。",
+                absorption_reason="这是合并后的主干流程页，适合独立成页。",
                 content_scope="覆盖原文中自动化入库流程的核心设计。",
                 claim_ids=["C-001", "C-002"],
                 source_refs=[ref],
@@ -623,16 +663,16 @@ def test_source_digest_retries_over_split_granularity(tmp_path: Path) -> None:
     digest = state["source_digest"]
 
     assert isinstance(digest, SourceDigest)
-    assert len(digest.page_units) == 1
+    assert len(digest.content_units) == 1
     assert len(registry.requests) == 2
-    assert "page_unit_count 超出经验粒度区间" in registry.requests[1].user_payload["validation_error"]
+    assert "candidate_page_count 超出经验粒度区间" in registry.requests[1].user_payload["validation_error"]
     assert "granularity_stats" in registry.requests[0].user_payload
     assert output.counts["semantic_retry_count"] == 1
-    assert output.counts["granularity_suggested_max_page_units"] == 1
+    assert output.counts["granularity_suggested_max_candidate_pages"] == 1
     assert (tmp_path / "run" / "source_digest" / "granularity.json").exists()
 
 
-def test_source_digest_allows_zero_page_units_for_explicit_noise() -> None:
+def test_source_digest_allows_zero_content_units_for_explicit_noise() -> None:
     raw_text = "# 404\n\nNavigation\n\nSearch\n\nPage not found"
     stats = _source_granularity_stats(raw_text, raw_size_bytes=len(raw_text.encode()))
     digest = SourceDigest(
@@ -640,7 +680,7 @@ def test_source_digest_allows_zero_page_units_for_explicit_noise() -> None:
         raw_sha256="abc",
         summary="原文是无法访问的错误页。",
         key_takeaways=[],
-        page_units=[],
+        content_units=[],
         weak_or_noise_items=[{"text": "404 页面", "reason": "原始链接返回 404，页面只有导航菜单。"}],
     )
 
@@ -655,7 +695,7 @@ def test_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
         summary="这份材料说明自动化知识库入库流程。",
         key_takeaways=["自动化入库去掉人工审核。"],
         claims=[make_claim(ref, text="自动化入库去掉人工审核并自动写入 wiki。")],
-        page_units=[make_source_unit(ref)],
+        content_units=[make_source_unit(ref)],
     )
     final_pages = FinalPages(
         pages=[
@@ -733,6 +773,110 @@ def test_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
     assert (tmp_path / "run" / "coverage_judge" / "coverage_judge_report.json").exists()
 
 
+def test_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明自动化知识库入库流程。",
+        key_takeaways=["自动化入库去掉人工审核。"],
+        claims=[make_claim(ref, text="自动化入库去掉人工审核并自动写入 wiki。")],
+        content_units=[make_source_unit(ref)],
+    )
+    final_pages = FinalPages(
+        pages=[
+            FinalPage(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Auto_Ingest.md",
+                action="create",
+                title="自动化入库",
+                page_type="concept",
+                markdown="# 自动化入库\n\n## 摘要\n\n自动化入库去掉人工审核，并自动写入 wiki。\n",
+                source_refs=[ref],
+            )
+        ]
+    )
+    invalid_judge = CoverageJudge(
+        claim_results=[
+            ClaimCoverageItem(
+                claim_id="C-001",
+                status="covered",
+                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
+                evidence="",
+                reason="判断理由有中文，但证据为空。",
+            )
+        ]
+    )
+    valid_judge = CoverageJudge(
+        claim_results=[
+            ClaimCoverageItem(
+                claim_id="C-001",
+                status="covered",
+                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
+                evidence="最终页面写明自动化入库去掉人工审核，并自动写入 wiki。",
+                reason="正文明确覆盖了 claim 的事实含义。",
+            )
+        ]
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            self.requests.append(request)
+            call_index = len(self.requests)
+            output = invalid_judge if call_index == 1 else valid_judge
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": call_index,
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {"source_digest": digest, "final_pages": final_pages, "provider_registry": registry, "provider_contexts": {}}
+
+    output = _step_coverage_judge(tmp_path / "run", state)
+
+    assert len(registry.requests) == 2
+    assert "evidence 不能为空" in registry.requests[1].user_payload["validation_error"]
+    assert output.counts["semantic_retry_count"] == 1
+    assert output.counts["api_call_count"] == 2
+    assert output.counts["api_success_count"] == 1
+    assert output.counts["api_paused_count"] == 1
+
+
 def test_coverage_judge_threshold_fails_when_core_claim_missing() -> None:
     ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
     digest = SourceDigest(
@@ -741,7 +885,7 @@ def test_coverage_judge_threshold_fails_when_core_claim_missing() -> None:
         summary="这份材料说明自动化知识库入库流程。",
         key_takeaways=["自动化入库去掉人工审核。"],
         claims=[make_claim(ref, text="自动化入库去掉人工审核并自动写入 wiki。")],
-        page_units=[make_source_unit(ref)],
+        content_units=[make_source_unit(ref)],
     )
     judge = CoverageJudge(
         claim_results=[
@@ -824,13 +968,13 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
             make_claim(ref, "C-001", "自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。"),
             make_claim(ref, "C-002", "自动化入库会保留 raw 文件用于追溯原始信息。"),
         ],
-        page_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
+        content_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
     )
     candidate_pages = CandidatePages(
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -1045,7 +1189,7 @@ def test_coverage_judge_repairs_claim_defect_without_touching_other_claims(tmp_p
         summary="这份材料说明 Guardrails 的类型。",
         key_takeaways=["Guardrails 包括输入、输出和工具三种类型。"],
         claims=[unchanged_claim, wrong_claim],
-        page_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
+        content_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
     )
     final_pages = FinalPages(
         pages=[
@@ -1174,6 +1318,85 @@ def test_coverage_judge_repairs_claim_defect_without_touching_other_claims(tmp_p
     assert (tmp_path / "run" / "coverage_judge" / "claim_repair" / "repaired_source_digest.json").exists()
 
 
+def test_claim_repair_restart_archives_stale_artifacts(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    artifact_paths = [
+        "candidate_pages_warmup/candidate_pages_warmup.json",
+        "candidate_pages/candidate_pages.json",
+        "coverage_judge/coverage_judge_report.json",
+    ]
+    for path in artifact_paths:
+        target = run_dir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"old:{path}", encoding="utf-8")
+
+    manifest = OperationManifest(
+        operation_id="ING-test",
+        status="running",
+        created_at="2026-06-29T00:00:00Z",
+        updated_at="2026-06-29T00:00:00Z",
+        vault=tmp_path.as_posix(),
+        raw_path="raw/a.md",
+        profile_name="default",
+        engine_version="test",
+        steps=[
+            StepRecord(name="raw_binding", status="completed"),
+            StepRecord(
+                name="candidate_pages_warmup",
+                status="completed",
+                artifacts=[
+                    ArtifactRef(
+                        path="candidate_pages_warmup/candidate_pages_warmup.json",
+                        sha256=sha256_file(run_dir / "candidate_pages_warmup/candidate_pages_warmup.json"),
+                        size_bytes=(run_dir / "candidate_pages_warmup/candidate_pages_warmup.json").stat().st_size,
+                    )
+                ],
+                model_calls=1,
+            ),
+            StepRecord(
+                name="candidate_pages",
+                status="completed",
+                artifacts=[
+                    ArtifactRef(
+                        path="candidate_pages/candidate_pages.json",
+                        sha256=sha256_file(run_dir / "candidate_pages/candidate_pages.json"),
+                        size_bytes=(run_dir / "candidate_pages/candidate_pages.json").stat().st_size,
+                    )
+                ],
+                model_calls=1,
+            ),
+            StepRecord(
+                name="coverage_judge",
+                status="completed",
+                artifacts=[
+                    ArtifactRef(
+                        path="coverage_judge/coverage_judge_report.json",
+                        sha256=sha256_file(run_dir / "coverage_judge/coverage_judge_report.json"),
+                        size_bytes=(run_dir / "coverage_judge/coverage_judge_report.json").stat().st_size,
+                    )
+                ],
+                model_calls=2,
+                repair_count=1,
+            ),
+        ],
+    )
+
+    archived_count = _archive_manifest_steps_for_restart(run_dir, manifest, "candidate_pages_warmup", "claim_repair_restart")
+
+    assert archived_count == 3
+    assert manifest.steps[0].artifacts == []
+    archived_refs = [artifact for step in manifest.steps[1:] for artifact in step.artifacts]
+    assert all(ref.path.startswith("restarts/claim_repair_restart_1/") for ref in archived_refs)
+    for path in artifact_paths:
+        (run_dir / path).write_text(f"new:{path}", encoding="utf-8")
+    for ref in archived_refs:
+        current_sha = sha256_file(run_dir / ref.path)
+        assert current_sha == ref.sha256
+    assert sum(step.model_calls for step in manifest.steps) == 4
+    assert sum(step.repair_count for step in manifest.steps) == 1
+
+
 def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -1285,7 +1508,7 @@ def test_sentence_transformers_embedding_backend_uses_qwen_cache_contract(tmp_pa
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="Local Embedding Retrieval",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Local_Embedding_Retrieval.md",
@@ -1313,7 +1536,7 @@ def test_candidate_contexts_rejects_non_embedding_backend(tmp_path: Path) -> Non
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="RAG 系统",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_RAG系统.md",
@@ -1336,7 +1559,7 @@ def test_candidate_open_question_locator_resolves_to_chinese_body_question() -> 
         pages=[
             CandidatePage(
                 candidate_page_id="CP-005",
-                page_unit_id="PU-005",
+                content_unit_id="CU-005",
                 title="会话作为外部上下文",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Session_Context.md",
@@ -1369,7 +1592,7 @@ def test_candidate_open_question_orphan_locator_is_dropped() -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="上下文工程",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Context_Engineering.md",
@@ -1435,7 +1658,7 @@ def test_merge_plan_missing_candidate_content_locators_are_repaired_from_candida
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="上下文工程",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Context.md",
@@ -1475,14 +1698,15 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
         summary="这份材料说明自动化知识库入库流程。",
         key_takeaways=["候选页必须先忠于原文，再进行旧 wiki 召回。"],
         claims=[make_claim(ref, text="候选页必须先忠于原文，再进行旧 wiki 召回。")],
-        page_units=[make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。")],
+        content_units=[make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。")],
     )
     unit = make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。")
     profile = load_profile(vault)
 
     page_prompt = prompts.candidate_page_prompt(
         digest=digest,
-        page_unit=unit,
+        anchor_unit=unit,
+        attached_units=[unit],
         raw_path=ref.raw_path,
         raw_sha256=ref.raw_sha256,
         raw_text=raw.read_text(encoding="utf-8"),
@@ -1492,7 +1716,7 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -1518,12 +1742,13 @@ def test_candidate_prompts_do_not_receive_wiki_snapshot_before_embedding(tmp_pat
     assert "wiki_snapshot_entries" not in page_prompt.user_payload
     assert "wiki_snapshot" not in merge_plan_prompt.user_payload
     assert "wiki_snapshot_entries" not in merge_plan_prompt.user_payload
-    assert page_prompt.user_payload["page_unit"]["page_unit_id"] == "PU-001"
+    assert page_prompt.user_payload["anchor_content_unit"]["content_unit_id"] == "CU-001"
+    assert page_prompt.user_payload["attached_content_units"][0]["content_unit_id"] == "CU-001"
     assert page_prompt.cache_prefix_payload
     assert page_prompt.cache_prefix_payload["raw_text"]
 
 
-def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
+def test_candidate_pages_retries_only_invalid_content_unit(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     raw = write_raw(vault)
     raw_rel = raw.relative_to(vault).as_posix()
@@ -1533,16 +1758,16 @@ def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
         source_raw_path=raw_rel,
         raw_sha256=raw_sha,
         summary="这份材料说明自动化知识库入库流程。",
-        key_takeaways=["候选页生成应该按页面单元局部重试。"],
+        key_takeaways=["候选页生成应该按内容单元局部重试。"],
         claims=[
             make_claim(ref, "C-001", "说明为什么不再人工审核。"),
             make_claim(ref, "C-002", "说明向量缓存服务下一轮召回。"),
         ],
-        page_units=[
+        content_units=[
             make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。"),
             make_source_unit(
                 ref,
-                page_unit_id="PU-002",
+                content_unit_id="CU-002",
                 title="向量缓存",
                 path_hint="concepts/Concept_Vector_Cache.md",
                 content_scope="覆盖原文中关于写入后刷新向量缓存的说明。",
@@ -1554,7 +1779,7 @@ def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
         make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。"),
         make_source_unit(
             ref,
-            page_unit_id="PU-002",
+            content_unit_id="CU-002",
             title="向量缓存",
             path_hint="concepts/Concept_Vector_Cache.md",
             content_scope="覆盖原文中关于写入后刷新向量缓存的说明。",
@@ -1562,10 +1787,10 @@ def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
         ),
     ]
 
-    def page(unit: SourcePageUnit, suffix: str = "") -> CandidatePage:
+    def page(unit: SourceContentUnit, suffix: str = "") -> CandidatePage:
         return CandidatePage(
-            candidate_page_id=f"MODEL-{unit.page_unit_id}{suffix}",
-            page_unit_id=unit.page_unit_id,
+            candidate_page_id=f"MODEL-{unit.content_unit_id}{suffix}",
+            content_unit_id=unit.content_unit_id,
             title=unit.title,
             proposed_page_type=unit.page_type,
             proposed_path_hint=unit.path_hint,
@@ -1595,13 +1820,13 @@ def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
             return self.spec
 
         def call_structured(self, step: str, request, output_model):
-            unit_id = request.user_payload["page_unit"]["page_unit_id"]
+            unit_id = request.user_payload["anchor_content_unit"]["content_unit_id"]
             with self.lock:
                 call_index = sum(self.calls_by_unit.values()) + 1
                 count = self.calls_by_unit.get(unit_id, 0) + 1
                 self.calls_by_unit[unit_id] = count
                 self.requests_by_unit.setdefault(unit_id, []).append(request)
-            output = invalid_cm001 if unit_id == "PU-001" and count == 1 else valid_cm001 if unit_id == "PU-001" else valid_cm002
+            output = invalid_cm001 if unit_id == "CU-001" and count == 1 else valid_cm001 if unit_id == "CU-001" else valid_cm002
             return ProviderCallResult(
                 output=output,
                 prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
@@ -1652,10 +1877,10 @@ def test_candidate_pages_retries_only_invalid_page_unit(tmp_path: Path) -> None:
     artifact = state["candidate_pages"]
 
     assert isinstance(artifact, CandidatePages)
-    assert [page.page_unit_id for page in artifact.pages] == ["PU-001", "PU-002"]
-    assert output.counts["covered_page_unit_count"] == 2
-    assert registry.calls_by_unit == {"PU-001": 2, "PU-002": 1}
-    retry_payload = registry.requests_by_unit["PU-001"][1].user_payload
+    assert [page.content_unit_id for page in artifact.pages] == ["CU-001", "CU-002"]
+    assert output.counts["covered_content_unit_count"] == 2
+    assert registry.calls_by_unit == {"CU-001": 2, "CU-002": 1}
+    retry_payload = registry.requests_by_unit["CU-001"][1].user_payload
     assert "必须且只能返回 1 页" in retry_payload["validation_error"]
     assert output.counts["semantic_retry_count"] == 1
     assert output.counts["api_call_count"] == 3
@@ -1670,7 +1895,7 @@ def test_merge_plan_retries_semantic_validation(tmp_path: Path) -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -1824,7 +2049,7 @@ def test_merge_plan_retries_high_overlap_create_only(tmp_path: Path) -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="OpenAI Agents SDK 概览",
                 proposed_page_type="overview",
                 proposed_path_hint="overviews/Overview_OpenAI_Agents_SDK.md",
@@ -1963,14 +2188,22 @@ def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path)
         summary="这份材料说明自动化知识库入库流程。",
         key_takeaways=["候选页必须先忠于原文，再进行旧 wiki 召回。"],
         claims=[make_claim(ref, text="候选页必须先忠于原文，再进行旧 wiki 召回。")],
-        page_units=[make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。")],
+        content_units=[make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。")],
     )
     unit = make_source_unit(ref, content_scope="覆盖原文中关于自动化入库的流程说明。")
     profile = load_profile(vault)
     spec = ProviderSpec(spec="openai_compatible:deepseek-v4-flash", endpoint="https://api.deepseek.com/v1/chat/completions", api_key="test-key")
 
     warmup_prompt = prompts.candidate_pages_warmup_prompt(digest=digest, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
-    page_prompt = prompts.candidate_page_prompt(digest=digest, page_unit=unit, raw_path=ref.raw_path, raw_sha256=raw_sha, raw_text=raw_text, profile=profile)
+    page_prompt = prompts.candidate_page_prompt(
+        digest=digest,
+        anchor_unit=unit,
+        attached_units=[unit],
+        raw_path=ref.raw_path,
+        raw_sha256=raw_sha,
+        raw_text=raw_text,
+        profile=profile,
+    )
     warmup_payload = build_chat_payload(spec, warmup_prompt)
     page_payload = build_chat_payload(spec, page_prompt)
 
@@ -1984,8 +2217,10 @@ def test_candidate_page_warmup_and_generation_share_cache_prefix(tmp_path: Path)
     warmup_suffix = json.loads(warmup_payload["messages"][2]["content"])
     assert shared_prefix["task"] == "candidate_pages"
     assert shared_prefix["raw_text"] == raw_text
-    assert "page_unit" not in shared_prefix
-    assert variable_suffix["input"]["page_unit"]["page_unit_id"] == "PU-001"
+    assert "anchor_content_unit" not in shared_prefix
+    assert "attached_content_units" not in shared_prefix
+    assert variable_suffix["input"]["anchor_content_unit"]["content_unit_id"] == "CU-001"
+    assert variable_suffix["input"]["attached_content_units"][0]["content_unit_id"] == "CU-001"
     assert "raw_text" not in variable_suffix["input"]
     assert warmup_suffix["input"]["warmup"] is True
     assert warmup_suffix["json_output_example"] == {"status": "OK"}
@@ -1997,7 +2232,7 @@ def test_merge_plan_allows_split_decisions_but_update_must_use_top5() -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="自动化入库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Auto_Ingest.md",
@@ -2334,7 +2569,7 @@ def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="链接契约",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Link_Contract.md",
@@ -2345,7 +2580,7 @@ def test_final_pages_retries_only_failed_page_semantic_validation(tmp_path: Path
             ),
             CandidatePage(
                 candidate_page_id="CP-002",
-                page_unit_id="PU-002",
+                content_unit_id="CU-002",
                 title="稳定写作",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Stable_Writing.md",
@@ -2489,7 +2724,7 @@ def test_final_pages_retry_update_that_drops_preimage_coverage(tmp_path: Path) -
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="Agents SDK Python 快速开始",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Agents_SDK.md",
@@ -2809,7 +3044,7 @@ def test_composition_plan_retries_target_path_drift(tmp_path: Path) -> None:
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="ReAct 推理与行动协同",
                 proposed_page_type="concept",
                 proposed_path_hint=expected_path,
@@ -2921,7 +3156,7 @@ def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> 
         pages=[
             CandidatePage(
                 candidate_page_id="CP-001",
-                page_unit_id="PU-001",
+                content_unit_id="CU-001",
                 title="项目知识库",
                 proposed_page_type="concept",
                 proposed_path_hint="concepts/Concept_Project_Wiki.md",

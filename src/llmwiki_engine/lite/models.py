@@ -11,6 +11,8 @@ MergeAction = Literal["create", "update", "noop"]
 RelatedSource = Literal["source_digest", "wiki_context"]
 ClaimKind = str
 CoverageStatus = Literal["covered", "partial", "missing", "contradicted"]
+ContentRole = Literal["主干", "附属", "工具性"]
+AbsorptionDecision = Literal["独立成页", "并入主干", "降级为段落"]
 
 
 class StrictModel(BaseModel):
@@ -65,18 +67,22 @@ class RawBinding(StrictModel):
     bound_at: str
 
 
-class SourcePageUnit(StrictModel):
-    page_unit_id: str
+class SourceContentUnit(StrictModel):
+    content_unit_id: str
     title: str
+    content_role: ContentRole
+    absorption_decision: AbsorptionDecision
+    anchor_unit_id: str
+    section_hint: str
     page_type: str
     path_hint: str
     summary: str
+    absorption_reason: str
     content_scope: str
     claim_ids: list[str]
     source_refs: list[SourceRef]
-    split_rationale: str = ""
 
-    @field_validator("page_unit_id", "title", "page_type", "path_hint", "summary", "content_scope")
+    @field_validator("content_unit_id", "title", "anchor_unit_id", "section_hint", "page_type", "path_hint", "summary", "absorption_reason", "content_scope")
     @classmethod
     def non_empty(cls, value: str) -> str:
         if not value.strip():
@@ -112,7 +118,7 @@ class SourceDigest(StrictModel):
     summary: str
     key_takeaways: list[str]
     claims: list[SourceClaim] = Field(default_factory=list)
-    page_units: list[SourcePageUnit] = Field(default_factory=list)
+    content_units: list[SourceContentUnit] = Field(default_factory=list)
     weak_or_noise_items: list[WeakOrNoiseItem] = Field(default_factory=list)
 
 
@@ -123,7 +129,7 @@ class ClaimCoverageItem(StrictModel):
     evidence: str
     reason: str
 
-    @field_validator("claim_id", "evidence", "reason")
+    @field_validator("claim_id")
     @classmethod
     def non_empty(cls, value: str) -> str:
         if not value.strip():
@@ -163,9 +169,9 @@ class SourceGranularityStats(StrictModel):
     code_block_count: int
     markdown_link_count: int
     navigation_noise_line_count: int
-    suggested_min_page_units: int
-    suggested_target_page_units: float
-    suggested_max_page_units: int
+    suggested_min_candidate_pages: int
+    suggested_target_candidate_pages: float
+    suggested_max_candidate_pages: int
     range_basis: str
 
 
@@ -240,7 +246,7 @@ class WikiSnapshot(StrictModel):
 
 class CandidatePage(StrictModel):
     candidate_page_id: str
-    page_unit_id: str
+    content_unit_id: str
     title: str
     proposed_page_type: str
     proposed_path_hint: str
@@ -254,7 +260,7 @@ class CandidatePage(StrictModel):
 
 class CandidatePages(StrictModel):
     pages: list[CandidatePage]
-    skipped_page_unit_ids: list[str] = Field(default_factory=list)
+    skipped_content_unit_ids: list[str] = Field(default_factory=list)
 
 
 class CandidatePagesWarmup(StrictModel):

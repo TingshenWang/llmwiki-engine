@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import shutil
 import subprocess
 import time
 from collections import Counter
@@ -65,7 +66,7 @@ from .models import (
     SourceDigest,
     SourceGranularityStats,
     SourceClaim,
-    SourcePageUnit,
+    SourceContentUnit,
     SourceRef,
     StepRecord,
     StructuredRepairReport,
@@ -124,6 +125,12 @@ class ClaimRepairOutput:
     model_calls: int
     api_calls: list[dict[str, object]]
     repaired_claim_ids: list[str]
+
+
+@dataclass(frozen=True)
+class CandidateContentGroup:
+    anchor: SourceContentUnit
+    members: list[SourceContentUnit]
 
 
 RELATED_MIN_SIMILARITY = 0.72
@@ -251,9 +258,15 @@ def run_ingest(
             name, fn = steps[index]
             _run_step(run_dir, manifest, name, fn, progress_console, emit_progress=emit_progress)
             if name == "coverage_judge" and state.pop("claim_repair_applied", False):
+                archived_count = _archive_manifest_steps_for_restart(run_dir, manifest, "candidate_pages_warmup", "claim_repair_restart")
                 _clear_downstream_state_after_claim_repair(state)
                 index = step_index["candidate_pages_warmup"]
-                _write_event(run_dir, "claim_repair_downstream_restart", {"restart_step": "candidate_pages_warmup"})
+                _write_manifest(run_dir, manifest)
+                _write_event(
+                    run_dir,
+                    "claim_repair_downstream_restart",
+                    {"restart_step": "candidate_pages_warmup", "archived_artifact_count": archived_count},
+                )
                 if emit_progress:
                     progress_console.print("[cyan]重跑[/] claim 修复后重新生成候选页到覆盖审查")
                 continue
@@ -369,24 +382,34 @@ def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[Sou
             )
         )
 
-    page_units: list[SourcePageUnit] = []
-    for index, unit in enumerate(digest.page_units, start=1):
+    content_unit_id_map = {unit.content_unit_id: f"CU-{index:03d}" for index, unit in enumerate(digest.content_units, start=1)}
+    content_units: list[SourceContentUnit] = []
+    for index, unit in enumerate(digest.content_units, start=1):
         title = unit.title.strip()
         if not title:
-            title = f"未命名页面单元 {index}"
-            repairs.append(RepairItem(path=f"page_units[{index - 1}].title", reason="title 为空，已使用默认标题补齐。", local_fix=True, model_called=False))
+            title = f"未命名内容单元 {index}"
+            repairs.append(RepairItem(path=f"content_units[{index - 1}].title", reason="title 为空，已使用默认标题补齐。", local_fix=True, model_called=False))
         page_type = unit.page_type if unit.page_type in profile.page_types and unit.page_type != profile.source_page_type else profile.default_page_type
         if page_type != unit.page_type:
-            repairs.append(RepairItem(path=f"page_units[{index - 1}].page_type", reason="page_type 不在 profile 中或指向 source 类型，已改为默认知识页类型。", local_fix=True, model_called=False))
+            repairs.append(RepairItem(path=f"content_units[{index - 1}].page_type", reason="page_type 不在 profile 中或指向 source 类型，已改为默认知识页类型。", local_fix=True, model_called=False))
         path_hint = _normalize_path_hint(unit.path_hint, page_type, title, profile)
         if path_hint != unit.path_hint:
-            repairs.append(RepairItem(path=f"page_units[{index - 1}].path_hint", reason="path_hint 越界或格式不正确，已按页面类型和标题重建。", local_fix=True, model_called=False))
+            repairs.append(RepairItem(path=f"content_units[{index - 1}].path_hint", reason="path_hint 越界或格式不正确，已按页面类型和标题重建。", local_fix=True, model_called=False))
         claim_ids = _dedupe_list([claim_id_map.get(item.strip(), item.strip()) for item in unit.claim_ids if item.strip()])
-        page_units.append(
+        normalized_id = content_unit_id_map[unit.content_unit_id]
+        anchor_unit_id = content_unit_id_map.get(unit.anchor_unit_id.strip(), unit.anchor_unit_id.strip() or normalized_id)
+        if anchor_unit_id != unit.anchor_unit_id:
+            repairs.append(RepairItem(path=f"content_units[{index - 1}].anchor_unit_id", reason="anchor_unit_id 已随 content_unit_id 归一化。", local_fix=True, model_called=False))
+        content_units.append(
             unit.model_copy(
                 update={
-                    "page_unit_id": f"PU-{index:03d}",
+                    "content_unit_id": normalized_id,
                     "title": title,
+                    "anchor_unit_id": anchor_unit_id,
+                    "section_hint": unit.section_hint.strip(),
+                    "summary": unit.summary.strip(),
+                    "absorption_reason": unit.absorption_reason.strip(),
+                    "content_scope": unit.content_scope.strip(),
                     "page_type": page_type,
                     "path_hint": path_hint,
                     "claim_ids": claim_ids,
@@ -394,7 +417,7 @@ def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[Sou
                 }
             )
         )
-    updated = digest.model_copy(update={"claims": claims, "page_units": page_units})
+    updated = digest.model_copy(update={"claims": claims, "content_units": content_units})
     return updated, StructuredRepairReport(repairs=repairs, model_calls=0)
 
 
@@ -410,7 +433,7 @@ def _source_granularity_stats(raw_text: str, *, raw_size_bytes: int) -> SourceGr
     paragraph_count = len([part for part in re.split(r"\n\s*\n", content_text) if part.strip()])
     char_count = len(re.sub(r"\s+", "", text_without_frontmatter))
     effective_char_count = len(re.sub(r"\s+", "", content_text))
-    target = _suggested_page_unit_target(effective_char_count)
+    target = _suggested_candidate_page_target(effective_char_count)
     suggested_min = max(1, int(target * 0.6))
     suggested_max = max(suggested_min, int(target * 1.45 + 0.999))
     if effective_char_count <= 1200:
@@ -424,14 +447,14 @@ def _source_granularity_stats(raw_text: str, *, raw_size_bytes: int) -> SourceGr
         code_block_count=code_block_count,
         markdown_link_count=markdown_link_count,
         navigation_noise_line_count=navigation_noise_line_count,
-        suggested_min_page_units=suggested_min,
-        suggested_target_page_units=round(target, 2),
-        suggested_max_page_units=suggested_max,
+        suggested_min_candidate_pages=suggested_min,
+        suggested_target_candidate_pages=round(target, 2),
+        suggested_max_candidate_pages=suggested_max,
         range_basis="初始经验公式：target = 1 + max(0, effective_char_count - 2500) / 5000；后续用真实回归数据拟合。",
     )
 
 
-def _suggested_page_unit_target(effective_char_count: int) -> float:
+def _suggested_candidate_page_target(effective_char_count: int) -> float:
     return max(1.0, 1.0 + max(0, effective_char_count - 2500) / 5000.0)
 
 
@@ -464,56 +487,83 @@ def _raw_requires_source_only(raw_text: str) -> bool:
 def _assert_source_digest_source_only_boundary(digest: SourceDigest, raw_text: str) -> None:
     if not _raw_requires_source_only(raw_text):
         return
-    if digest.claims or digest.page_units:
+    if digest.claims or digest.content_units:
         raise PipelineError(
             "source_digest 检测到 raw 是 404、不可访问或导航噪声页；"
-            "这类材料只能记录来源，claims 和 page_units 必须为空，"
+            "这类材料只能记录来源，claims 和 content_units 必须为空，"
             "不要生成事件页或知识页。请把原因写入 weak_or_noise_items。"
         )
 
 
 def _assert_source_digest_granularity(digest: SourceDigest, stats: SourceGranularityStats) -> None:
-    page_unit_count = len(digest.page_units)
-    if page_unit_count == 0:
+    candidate_page_count = len(_candidate_content_groups(digest))
+    if candidate_page_count == 0:
         if not digest.claims and (stats.effective_char_count < 600 or _has_strong_noise_reason(digest)):
             return
         raise PipelineError(
-            "source_digest page_unit_count=0，但 raw 看起来仍有可吸收内容；"
+            "source_digest candidate_page_count=0，但 raw 看起来仍有可吸收内容；"
             f"effective_char_count={stats.effective_char_count}。如果原文确实是噪声，请在 weak_or_noise_items 中写清楚原因。"
         )
-    if page_unit_count > stats.suggested_max_page_units:
+    if candidate_page_count > stats.suggested_max_candidate_pages:
         raise PipelineError(
-            "source_digest page_unit_count 超出经验粒度区间："
-            f"actual={page_unit_count}, suggested={stats.suggested_min_page_units}-{stats.suggested_max_page_units}, "
-            f"effective_char_count={stats.effective_char_count}。请合并同主体、同读者任务、同页面类型的 page_units。"
+            "source_digest candidate_page_count 超出经验粒度区间："
+            f"actual={candidate_page_count}, suggested={stats.suggested_min_candidate_pages}-{stats.suggested_max_candidate_pages}, "
+            f"effective_char_count={stats.effective_char_count}。请减少主干 anchor 数量，把附属或工具性内容挂到已有主干对象。"
         )
-    if page_unit_count > 1:
-        missing_rationale = [unit.page_unit_id for unit in digest.page_units if not unit.split_rationale.strip()]
-        if missing_rationale:
-            raise PipelineError(f"多个 page_units 时必须提供中文 split_rationale：{', '.join(missing_rationale)}")
     _assert_source_digest_claim_plan(digest)
 
 
 def _assert_source_digest_claim_plan(digest: SourceDigest) -> None:
     claim_ids = [claim.claim_id for claim in digest.claims]
     _assert_unique(claim_ids, "source digest claim_id")
+    unit_ids = [unit.content_unit_id for unit in digest.content_units]
+    _assert_unique(unit_ids, "source digest content_unit_id")
     known = set(claim_ids)
-    if digest.page_units and not known:
-        raise PipelineError("source_digest 生成了 page_units，但没有生成 claims；每个知识页必须由有效 claim 支撑。")
+    if digest.content_units and not known:
+        raise PipelineError("source_digest 生成了 content_units，但没有生成 claims；每个知识页必须由有效 claim 支撑。")
+    units_by_id = {unit.content_unit_id: unit for unit in digest.content_units}
+    anchors = [unit for unit in digest.content_units if unit.content_role == "主干"]
+    if digest.content_units and not anchors:
+        raise PipelineError("source_digest 必须至少规划一个主干 content_unit，附属或工具性内容不能无主干吸收。")
     assigned: list[str] = []
-    for unit in digest.page_units:
+    for unit in digest.content_units:
+        anchor = units_by_id.get(unit.anchor_unit_id)
+        if anchor is None:
+            raise PipelineError(f"{unit.content_unit_id} anchor_unit_id 指向不存在的 content_unit：{unit.anchor_unit_id}")
+        if anchor.content_role != "主干":
+            raise PipelineError(f"{unit.content_unit_id} anchor_unit_id 必须指向主干 content_unit：{unit.anchor_unit_id}")
+        if unit.content_role == "主干":
+            if unit.anchor_unit_id != unit.content_unit_id:
+                raise PipelineError(f"{unit.content_unit_id} 是主干，anchor_unit_id 必须指向自己。")
+            if unit.absorption_decision != "独立成页":
+                raise PipelineError(f"{unit.content_unit_id} 是主干，absorption_decision 必须是 独立成页。")
+        else:
+            if unit.anchor_unit_id == unit.content_unit_id:
+                raise PipelineError(f"{unit.content_unit_id} 不是主干，anchor_unit_id 不能指向自己。")
+            if unit.absorption_decision == "独立成页":
+                raise PipelineError(f"{unit.content_unit_id} 不是主干，不能独立成页。")
         if not unit.claim_ids:
-            raise PipelineError(f"{unit.page_unit_id} 缺少 claim_ids；每个 page_unit 必须消费至少一个有效 claim。")
+            raise PipelineError(f"{unit.content_unit_id} 缺少 claim_ids；每个 content_unit 必须消费至少一个有效 claim。")
         unknown = [claim_id for claim_id in unit.claim_ids if claim_id not in known]
         if unknown:
-            raise PipelineError(f"{unit.page_unit_id} 引用了不存在的 claim_ids：{', '.join(unknown)}")
+            raise PipelineError(f"{unit.content_unit_id} 引用了不存在的 claim_ids：{', '.join(unknown)}")
         assigned.extend(unit.claim_ids)
     duplicate_assignments = [claim_id for claim_id, count in Counter(assigned).items() if count > 1]
     if duplicate_assignments:
-        raise PipelineError(f"source_digest 存在被多个 page_unit 重复消费的 claims：{', '.join(sorted(duplicate_assignments))}")
+        raise PipelineError(f"source_digest 存在被多个 content_unit 重复消费的 claims：{', '.join(sorted(duplicate_assignments))}")
     unassigned = sorted(known - set(assigned))
     if unassigned:
-        raise PipelineError(f"source_digest 存在未分配到 page_unit 的有效 claims：{', '.join(unassigned)}")
+        raise PipelineError(f"source_digest 存在未分配到 content_unit 的有效 claims：{', '.join(unassigned)}")
+
+
+def _candidate_content_groups(digest: SourceDigest) -> list[CandidateContentGroup]:
+    groups: list[CandidateContentGroup] = []
+    for anchor in digest.content_units:
+        if anchor.content_role != "主干":
+            continue
+        members = [unit for unit in digest.content_units if unit.anchor_unit_id == anchor.content_unit_id]
+        groups.append(CandidateContentGroup(anchor=anchor, members=members or [anchor]))
+    return groups
 
 
 def _has_strong_noise_reason(digest: SourceDigest) -> bool:
@@ -535,6 +585,42 @@ def _clear_downstream_state_after_claim_repair(state: dict[str, object]) -> None
         "coverage_report",
     ]:
         state.pop(key, None)
+
+
+def _archive_manifest_steps_for_restart(
+    run_dir: Path,
+    manifest: OperationManifest,
+    restart_step: str,
+    reason: str,
+) -> int:
+    start_index = next((index for index, step in enumerate(manifest.steps) if step.name == restart_step), None)
+    if start_index is None:
+        return 0
+
+    archive_index = 1
+    archive_root = run_dir / "restarts" / f"{reason}_{archive_index}"
+    while archive_root.exists():
+        archive_index += 1
+        archive_root = run_dir / "restarts" / f"{reason}_{archive_index}"
+
+    copied_paths: dict[str, str] = {}
+    copied_count = 0
+    for step in manifest.steps[start_index:]:
+        for artifact in step.artifacts:
+            if artifact.path in copied_paths:
+                artifact.path = copied_paths[artifact.path]
+                continue
+            source = run_dir / artifact.path
+            if not source.exists():
+                raise PipelineError(f"重跑归档失败，artifact 不存在：{artifact.path}")
+            target = archive_root / artifact.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            archived_path = relative_posix(target, run_dir)
+            artifact.path = archived_path
+            copied_paths[source.relative_to(run_dir).as_posix()] = archived_path
+            copied_count += 1
+    return copied_count
 
 
 def _granularity_text_key(text: str) -> str:
@@ -796,8 +882,8 @@ def _assert_unique(values: list[str], label: str) -> None:
 
 def _assert_candidate_pages_have_sources(artifact: CandidatePages) -> None:
     for page in artifact.pages:
-        if not page.page_unit_id.strip():
-            raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 page_unit_id。")
+        if not page.content_unit_id.strip():
+            raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 content_unit_id。")
         if not page.source_refs:
             raise PipelineError(f"候选页 {page.candidate_page_id} 缺少 source_refs。")
         if not page.body_markdown.strip():
@@ -812,10 +898,12 @@ def _assert_source_digest_chinese(digest: SourceDigest) -> None:
         _require_chinese_text(f"{claim.claim_id}.text", claim.text)
         for index, item in enumerate(claim.concept_terms, start=1):
             _require_chinese_title(f"{claim.claim_id}.concept_terms[{index}]", item, claim.text)
-    for unit in digest.page_units:
-        _require_chinese_title(f"{unit.page_unit_id}.title", unit.title, unit.summary, unit.content_scope)
-        _require_chinese_text(f"{unit.page_unit_id}.summary", unit.summary)
-        _require_chinese_text(f"{unit.page_unit_id}.content_scope", unit.content_scope)
+    for unit in digest.content_units:
+        _require_chinese_title(f"{unit.content_unit_id}.title", unit.title, unit.summary, unit.content_scope)
+        _require_chinese_text(f"{unit.content_unit_id}.summary", unit.summary)
+        _require_chinese_text(f"{unit.content_unit_id}.content_scope", unit.content_scope)
+        _require_chinese_text(f"{unit.content_unit_id}.section_hint", unit.section_hint)
+        _require_chinese_text(f"{unit.content_unit_id}.absorption_reason", unit.absorption_reason)
     for index, item in enumerate(digest.weak_or_noise_items, start=1):
         _require_chinese_text(f"weak_or_noise_items[{index}].reason", item.reason)
 
@@ -1041,34 +1129,39 @@ def _normalize_path_hint(path_hint: str, page_type: str, title: str, profile: Pr
     return f"{spec.directory}/{filename}.md"
 
 
-def _merge_parallel_candidate_pages(outputs: list[BaseModel], page_units: list[SourcePageUnit]) -> CandidatePages:
-    if len(outputs) != len(page_units):
-        raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但 page_unit 数量是 {len(page_units)}。")
+def _merge_parallel_candidate_pages(outputs: list[BaseModel], groups: list[CandidateContentGroup]) -> CandidatePages:
+    if len(outputs) != len(groups):
+        raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但主干内容组数量是 {len(groups)}。")
     pages: list[CandidatePage] = []
     skipped: list[str] = []
-    for index, (output, unit) in enumerate(zip(outputs, page_units, strict=True), start=1):
+    for index, (output, group) in enumerate(zip(outputs, groups, strict=True), start=1):
         if not isinstance(output, CandidatePages):
             raise PipelineError("候选页并发请求返回了无效 artifact。")
-        skipped.extend(output.skipped_page_unit_ids)
+        skipped.extend(output.skipped_content_unit_ids)
         if len(output.pages) != 1:
-            raise PipelineError(f"{unit.page_unit_id} 的候选页请求必须且只能返回 1 页。")
+            raise PipelineError(f"{group.anchor.content_unit_id} 的候选页请求必须且只能返回 1 页。")
         page = output.pages[0]
+        if page.content_unit_id != group.anchor.content_unit_id:
+            raise PipelineError(
+                f"{group.anchor.content_unit_id} 的候选页 content_unit_id 不一致：{page.content_unit_id}"
+            )
+        group_source_refs = [ref for unit in group.members for ref in unit.source_refs]
         pages.append(
             page.model_copy(
                 update={
                     "candidate_page_id": f"CP-{index:03d}",
-                    "page_unit_id": unit.page_unit_id,
-                    "proposed_page_type": unit.page_type,
-                    "proposed_path_hint": unit.path_hint,
-                    "source_refs": _merge_source_refs([*unit.source_refs, *page.source_refs]),
+                    "content_unit_id": group.anchor.content_unit_id,
+                    "proposed_page_type": group.anchor.page_type,
+                    "proposed_path_hint": group.anchor.path_hint,
+                    "source_refs": _merge_source_refs([*group_source_refs, *page.source_refs]),
                 }
             )
         )
-    return CandidatePages(pages=pages, skipped_page_unit_ids=_dedupe_list(skipped))
+    return CandidatePages(pages=pages, skipped_content_unit_ids=_dedupe_list(skipped))
 
 
-def _candidate_pages_from_outputs(outputs: list[BaseModel], page_units: list[SourcePageUnit]) -> CandidatePages:
-    artifact = _merge_parallel_candidate_pages(outputs, page_units)
+def _candidate_pages_from_outputs(outputs: list[BaseModel], groups: list[CandidateContentGroup]) -> CandidatePages:
+    artifact = _merge_parallel_candidate_pages(outputs, groups)
     artifact = _normalize_candidate_pages(artifact)
     _assert_unique([page.candidate_page_id for page in artifact.pages], "candidate_page_id")
     _assert_candidate_pages_have_sources(artifact)
@@ -1077,22 +1170,23 @@ def _candidate_pages_from_outputs(outputs: list[BaseModel], page_units: list[Sou
 
 
 def _candidate_page_semantic_errors(
-    outputs_by_page_unit_id: dict[str, BaseModel],
-    page_units: list[SourcePageUnit],
+    outputs_by_content_unit_id: dict[str, BaseModel],
+    groups: list[CandidateContentGroup],
     provider_errors: dict[str, str] | None = None,
 ) -> dict[str, str]:
     errors: dict[str, str] = dict(provider_errors or {})
-    for unit in page_units:
-        if unit.page_unit_id in errors:
+    for group in groups:
+        anchor_id = group.anchor.content_unit_id
+        if anchor_id in errors:
             continue
-        output = outputs_by_page_unit_id.get(unit.page_unit_id)
+        output = outputs_by_content_unit_id.get(anchor_id)
         if output is None:
-            errors[unit.page_unit_id] = f"{unit.page_unit_id} 缺少 provider 输出。"
+            errors[anchor_id] = f"{anchor_id} 缺少 provider 输出。"
             continue
         try:
-            _candidate_pages_from_outputs([output], [unit])
+            _candidate_pages_from_outputs([output], [group])
         except PipelineError as exc:
-            errors[unit.page_unit_id] = str(exc)
+            errors[anchor_id] = str(exc)
     return errors
 
 
@@ -1132,7 +1226,7 @@ def _repair_merge_plan_candidate_content_locators(plan: MergePlan, candidate_pag
                 decision.content_scope,
                 f"候选页标题：{page.title}",
                 f"候选页摘要：{page.summary}",
-                f"页面单元：{page.page_unit_id}",
+                f"内容单元：{page.content_unit_id}",
             ]
         )
         candidate_content_locators = [_chinese_scaffold(item, "候选内容定位") for item in locators if item.strip()]
@@ -1639,7 +1733,7 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
             _assert_source_digest_binding(digest_result, raw_rel, binding.raw_sha256)
             candidate_digest, candidate_repair_report = normalize_source_digest(digest_result, profile)
             _assert_source_digest_chinese(candidate_digest)
-            _assert_unique([unit.page_unit_id for unit in candidate_digest.page_units], "source digest page_unit_id")
+            _assert_unique([unit.content_unit_id for unit in candidate_digest.content_units], "source digest content_unit_id")
             _assert_source_digest_source_only_boundary(candidate_digest, raw_text)
             _assert_source_digest_granularity(candidate_digest, granularity_stats)
         except PipelineError as exc:
@@ -1667,33 +1761,43 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     state["source_digest"] = digest
     json_path = out_dir / "source_digest.json"
     md_path = out_dir / "source_digest.md"
-    page_units_json = out_dir / "page_units.json"
-    page_units_md = out_dir / "page_units.md"
+    content_units_json = out_dir / "content_units.json"
+    content_units_md = out_dir / "content_units.md"
     granularity_path = out_dir / "granularity.json"
     repair_path = out_dir / "structured_repair_report.json"
     write_json(json_path, digest)
     write_text(md_path, _render_source_digest_md(digest))
-    page_units = {
+    content_units = {
         "source_raw_path": raw_rel,
-        "page_units": [{"page_unit_id": item.page_unit_id, "claim_ids": item.claim_ids} for item in digest.page_units],
+        "content_units": [
+            {
+                "content_unit_id": item.content_unit_id,
+                "content_role": item.content_role,
+                "absorption_decision": item.absorption_decision,
+                "anchor_unit_id": item.anchor_unit_id,
+                "claim_ids": item.claim_ids,
+            }
+            for item in digest.content_units
+        ],
     }
-    write_json(page_units_json, page_units)
-    write_text(page_units_md, "\n".join(f"- {item.page_unit_id}: {item.title}" for item in digest.page_units) + "\n")
+    write_json(content_units_json, content_units)
+    write_text(content_units_md, "\n".join(f"- {item.content_unit_id}: {item.title}" for item in digest.content_units) + "\n")
     write_json(granularity_path, granularity_stats)
     write_json(repair_path, repair_report)
     counts = {
         "claim_count": len(digest.claims),
-        "page_unit_count": len(digest.page_units),
+        "content_unit_count": len(digest.content_units),
+        "candidate_page_count": len(_candidate_content_groups(digest)),
         "weak_noise_count": len(digest.weak_or_noise_items),
         "granularity_effective_chars": granularity_stats.effective_char_count,
-        "granularity_suggested_min_page_units": granularity_stats.suggested_min_page_units,
-        "granularity_suggested_target_page_units": granularity_stats.suggested_target_page_units,
-        "granularity_suggested_max_page_units": granularity_stats.suggested_max_page_units,
+        "granularity_suggested_min_candidate_pages": granularity_stats.suggested_min_candidate_pages,
+        "granularity_suggested_target_candidate_pages": granularity_stats.suggested_target_candidate_pages,
+        "granularity_suggested_max_candidate_pages": granularity_stats.suggested_max_candidate_pages,
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
         **_token_usage_counts(api_calls),
     }
     return StepOutput(
-        [json_path, md_path, page_units_json, page_units_md, granularity_path, repair_path, *provider_artifacts],
+        [json_path, md_path, content_units_json, content_units_md, granularity_path, repair_path, *provider_artifacts],
         counts,
         model_calls=model_calls,
         repair_count=len(repair_report.repairs),
@@ -1708,8 +1812,9 @@ def _step_candidate_pages_warmup(run_dir: Path, state: dict[str, object]) -> Ste
     raw_rel: str = state["raw_rel"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
     out_dir = run_dir / "candidate_pages_warmup"
-    if not digest.page_units:
-        return StepOutput([], {"warmup_count": 0, "page_unit_count": 0})
+    candidate_groups = _candidate_content_groups(digest)
+    if not candidate_groups:
+        return StepOutput([], {"warmup_count": 0, "candidate_page_count": 0})
     raw_text = read_text(raw_abs)
     warmup_result, provider_artifacts, model_calls, api_calls = _call_provider_artifact(
         state,
@@ -1727,7 +1832,8 @@ def _step_candidate_pages_warmup(run_dir: Path, state: dict[str, object]) -> Ste
         [json_path, *provider_artifacts],
         {
             "warmup_count": 1,
-            "page_unit_count": len(digest.page_units),
+            "content_unit_count": len(digest.content_units),
+            "candidate_page_count": len(candidate_groups),
             **_token_usage_counts(api_calls),
         },
         model_calls=model_calls,
@@ -1777,50 +1883,69 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
     profile: Profile = state["profile"]  # type: ignore[assignment]
     raw_text = read_text(raw_abs)
     out_dir = run_dir / "candidate_pages"
-    page_units = digest.page_units
+    candidate_groups = _candidate_content_groups(digest)
+    if not candidate_groups:
+        artifact = CandidatePages(pages=[], skipped_content_unit_ids=[])
+        state["candidate_pages"] = artifact
+        json_path = out_dir / "candidate_pages.json"
+        md_path = out_dir / "candidate_pages.md"
+        write_json(json_path, artifact)
+        write_text(md_path, _render_candidate_pages_md(artifact))
+        return StepOutput(
+            [json_path, md_path],
+            {
+                "candidate_page_count": 0,
+                "covered_content_unit_count": 0,
+                "parallel_request_count": 0,
+                "parallel_max_workers": 0,
+            },
+        )
     initial_requests = [
         (
-            unit.page_unit_id,
+            group.anchor.content_unit_id,
             prompts.candidate_page_prompt(
                 digest=digest,
-                page_unit=unit,
+                anchor_unit=group.anchor,
+                attached_units=group.members,
                 raw_path=raw_rel,
                 raw_sha256=binding.raw_sha256,
                 raw_text=raw_text,
                 profile=profile,
             ),
         )
-        for unit in page_units
+        for group in candidate_groups
     ]
-    outputs_by_page_unit_id, provider_artifacts, model_calls, api_calls, provider_errors = _call_provider_artifacts_parallel_soft(
+    outputs_by_content_unit_id, provider_artifacts, model_calls, api_calls, provider_errors = _call_provider_artifacts_parallel_soft(
         state,
         out_dir,
         "candidate_pages",
         initial_requests,
         CandidatePages,
     )
-    parallel_request_count = len(page_units)
+    parallel_request_count = len(candidate_groups)
     semantic_retry_count = 0
-    semantic_errors = _candidate_page_semantic_errors(outputs_by_page_unit_id, page_units, provider_errors)
+    semantic_errors = _candidate_page_semantic_errors(outputs_by_content_unit_id, candidate_groups, provider_errors)
     if semantic_errors:
         api_calls = _mark_request_semantic_retry_failed(api_calls, semantic_errors)
-        retry_units = [unit for unit in page_units if unit.page_unit_id in semantic_errors]
+        retry_groups = [group for group in candidate_groups if group.anchor.content_unit_id in semantic_errors]
         retry_requests = []
-        for unit in retry_units:
-            previous_output = outputs_by_page_unit_id.get(unit.page_unit_id)
+        for group in retry_groups:
+            anchor_id = group.anchor.content_unit_id
+            previous_output = outputs_by_content_unit_id.get(anchor_id)
             previous_pages = previous_output if isinstance(previous_output, CandidatePages) else None
             retry_requests.append(
                 (
-                    unit.page_unit_id,
+                    anchor_id,
                     prompts.candidate_page_retry_prompt(
                         digest=digest,
-                        page_unit=unit,
+                        anchor_unit=group.anchor,
+                        attached_units=group.members,
                         raw_path=raw_rel,
                         raw_sha256=binding.raw_sha256,
                         raw_text=raw_text,
                         profile=profile,
                         previous_pages=previous_pages,
-                        validation_error=semantic_errors[unit.page_unit_id],
+                        validation_error=semantic_errors[anchor_id],
                     ),
                 )
             )
@@ -1836,17 +1961,17 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         )
         provider_artifacts.extend(retry_artifacts)
         model_calls += retry_model_calls
-        retry_errors = _candidate_page_semantic_errors(retry_outputs, retry_units, retry_provider_errors)
+        retry_errors = _candidate_page_semantic_errors(retry_outputs, retry_groups, retry_provider_errors)
         if retry_errors:
             api_calls.extend(_mark_request_semantic_retry_failed(retry_api_calls, retry_errors))
             raise PipelineError(f"candidate_pages 单候选页重试后仍未通过系统校验：{'; '.join(retry_errors.values())}")
         api_calls.extend(retry_api_calls)
-        outputs_by_page_unit_id.update(retry_outputs)
+        outputs_by_content_unit_id.update(retry_outputs)
         combined_api_calls_path = out_dir / "token_usage_calls.json"
         write_json(combined_api_calls_path, api_calls)
         if combined_api_calls_path not in provider_artifacts:
             provider_artifacts.append(combined_api_calls_path)
-    artifact = _candidate_pages_from_outputs([outputs_by_page_unit_id[unit.page_unit_id] for unit in page_units], page_units)
+    artifact = _candidate_pages_from_outputs([outputs_by_content_unit_id[group.anchor.content_unit_id] for group in candidate_groups], candidate_groups)
     state["candidate_pages"] = artifact
     json_path = out_dir / "candidate_pages.json"
     md_path = out_dir / "candidate_pages.md"
@@ -1859,7 +1984,7 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         artifacts.append(page_path)
     counts = {
         "candidate_page_count": len(artifact.pages),
-        "covered_page_unit_count": len({page.page_unit_id for page in artifact.pages}),
+        "covered_content_unit_count": len({page.content_unit_id for page in artifact.pages}),
         "parallel_request_count": parallel_request_count if model_calls else 0,
         "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
@@ -2487,7 +2612,7 @@ def _apply_claim_repair_result(
     )
     _assert_source_digest_binding(repaired, raw_rel, raw_sha256)
     _assert_source_digest_chinese(repaired)
-    _assert_unique([unit.page_unit_id for unit in repaired.page_units], "source digest page_unit_id")
+    _assert_unique([unit.content_unit_id for unit in repaired.content_units], "source digest content_unit_id")
     _assert_source_digest_granularity(repaired, stats)
     return repaired
 
@@ -2617,12 +2742,12 @@ def _coverage_repair_targets(
     if not problems:
         return {}
     claim_to_units: dict[str, list[str]] = {}
-    for unit in digest.page_units:
+    for unit in digest.content_units:
         for claim_id in unit.claim_ids:
-            claim_to_units.setdefault(claim_id, []).append(unit.page_unit_id)
+            claim_to_units.setdefault(claim_id, []).append(unit.content_unit_id)
     unit_to_candidates: dict[str, list[str]] = {}
     for page in candidate_pages.pages:
-        unit_to_candidates.setdefault(page.page_unit_id, []).append(page.candidate_page_id)
+        unit_to_candidates.setdefault(page.content_unit_id, []).append(page.candidate_page_id)
     candidate_to_final: dict[str, list[str]] = {}
     for item in composition.items:
         for candidate_page_id in item.candidate_page_ids:
@@ -2656,6 +2781,10 @@ def _coverage_repair_validation_error(repair_claims: list[dict[str, object]]) ->
 
 def _assert_coverage_judge_chinese(judge: CoverageJudge) -> None:
     for index, item in enumerate(judge.claim_results, start=1):
+        if not item.evidence.strip():
+            raise PipelineError(f"coverage_judge.claim_results[{index}].evidence 不能为空。")
+        if not item.reason.strip():
+            raise PipelineError(f"coverage_judge.claim_results[{index}].reason 不能为空。")
         _require_chinese_or_technical_fragment(f"coverage_judge.claim_results[{index}].evidence", item.evidence)
         _require_chinese_text(f"coverage_judge.claim_results[{index}].reason", item.reason)
     for index, warning in enumerate(judge.warnings, start=1):
@@ -3987,15 +4116,18 @@ def _render_source_digest_md(digest: SourceDigest) -> str:
         lines.append(f"  - 定位：{claim.raw_locator}")
     if digest.claims:
         lines.append("")
-    lines.append("## 页面单元计划")
-    for unit in digest.page_units:
-        lines.append(f"## {unit.page_unit_id}: {unit.title}")
+    lines.append("## 内容单元与候选页规划")
+    for unit in digest.content_units:
+        lines.append(f"## {unit.content_unit_id}: {unit.title}")
+        lines.append(f"- 内容角色：{unit.content_role}")
+        lines.append(f"- 吸收决策：{unit.absorption_decision}")
+        lines.append(f"- 主干锚点：{unit.anchor_unit_id}")
+        lines.append(f"- 建议小节：{unit.section_hint}")
         lines.append(f"- 类型：{unit.page_type}")
         lines.append(f"- 路径提示：`{unit.path_hint}`")
         lines.append(f"- 内容范围：{unit.content_scope}")
+        lines.append(f"- 吸收理由：{unit.absorption_reason}")
         lines.append(f"- 消费知识点：{', '.join(unit.claim_ids)}")
-        if unit.split_rationale:
-            lines.append(f"- 拆分理由：{unit.split_rationale}")
         lines.append("")
     if digest.weak_or_noise_items:
         lines.append("## 弱信息与噪声")
@@ -4022,7 +4154,7 @@ def _render_candidate_pages_md(artifact: CandidatePages) -> str:
     lines = ["# 候选知识页", ""]
     for page in artifact.pages:
         lines.append(f"## {page.candidate_page_id}: {page.title}")
-        lines.append(f"- 页面单元：`{page.page_unit_id}`")
+        lines.append(f"- 内容单元：`{page.content_unit_id}`")
         lines.append(f"- 类型：{page.proposed_page_type}")
         lines.append(f"- 路径提示：`{page.proposed_path_hint}`")
         lines.append("")
