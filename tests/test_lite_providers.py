@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -294,6 +295,70 @@ def test_openai_compatible_retries_timeout_and_records_paused_call(tmp_path: Pat
     assert result.api_calls[0]["status"] == "paused"
     assert result.api_calls[0]["error"].startswith("provider_timeout")
     assert result.api_calls[0]["response_status_code"] == 0
+    assert result.api_calls[1]["status"] == "success"
+
+
+def test_openai_compatible_wall_timeout_retries_slow_post(tmp_path: Path, monkeypatch) -> None:
+    vault = init_vault(tmp_path / "vault")
+    profile = load_profile(vault)
+    raw_sha = "abc123"
+    request = source_digest_prompt(raw_path="raw/a.md", raw_sha256=raw_sha, raw_text="# A\n\nBody", profile=profile)
+    spec = ProviderSpec(
+        spec="openai_compatible:test-model",
+        endpoint="https://example.test/v1/chat/completions",
+        api_key="test-key",
+        timeout_seconds=0.01,
+        max_retries=1,
+        retry_backoff_seconds=0,
+    )
+    valid_digest = {
+        "source_raw_path": "raw/a.md",
+        "raw_sha256": raw_sha,
+        "summary": "A valid digest after wall timeout retry.",
+        "key_takeaways": ["Wall timeout recovered at the same step request."],
+        "content_units": [],
+        "weak_or_noise_items": [],
+    }
+    posted_payloads: list[dict[str, object]] = []
+
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "DummyClient":
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:
+            return False
+
+        def post(self, *args, **kwargs) -> DummyResponse:
+            posted_payloads.append(kwargs["json"])
+            if len(posted_payloads) == 1:
+                time.sleep(0.05)
+            return DummyResponse({"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(valid_digest)}}]})
+
+    monkeypatch.setattr("llmwiki_engine.lite.providers.httpx.Client", DummyClient)
+
+    result = ProviderRegistry({"source_digest": spec}).call_structured("source_digest", request, SourceDigest)
+
+    assert result.model_calls == 2
+    assert result.output.summary == "A valid digest after wall timeout retry."
+    assert result.provider_result["provider"]["retry_reason"] == "provider_timeout"
+    assert result.api_calls[0]["status"] == "paused"
+    assert "exceeded timeout_seconds=0.01" in result.api_calls[0]["error"]
     assert result.api_calls[1]["status"] == "success"
 
 

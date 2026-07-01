@@ -21,10 +21,12 @@ from llmwiki_engine.lite.models import (
     CandidatePage,
     CandidatePages,
     ClaimCoverageItem,
-    ClaimRepairResult,
     CompositionItem,
     CompositionPlan,
     CoverageJudge,
+    DigestCoverageRepair,
+    DigestCoverageJudge,
+    FinalCoverageRepair,
     FinalPage,
     FinalPages,
     MergeDecision,
@@ -45,17 +47,19 @@ from llmwiki_engine.lite.models import (
     WikiSnapshot,
 )
 from llmwiki_engine.lite.pipeline import (
-    _archive_manifest_steps_for_restart,
     _assert_candidate_pages_chinese,
-    _assert_coverage_judge_chinese,
+    _assert_digest_coverage_complete,
+    _assert_digest_coverage_judge_valid,
+    _assert_final_coverage_judge_chinese,
     _assert_merge_plan_consumes_candidates,
     _assert_merge_plan_chinese,
     _assert_source_digest_chinese,
     _assert_source_digest_granularity,
-    _assert_coverage_judge_thresholds,
+    _assert_final_coverage_judge_thresholds,
     _build_page_update_plan,
     _canonical_final_markdown,
-    _coverage_judge_report,
+    _digest_coverage_report,
+    _final_coverage_report,
     _normalize_candidate_pages,
     _normalize_final_pages,
     _normalize_merge_plan,
@@ -63,7 +67,8 @@ from llmwiki_engine.lite.pipeline import (
     _repair_merge_plan_candidate_content_locators,
     _step_candidate_pages,
     _step_composition_plan,
-    _step_coverage_judge,
+    _step_digest_coverage_judge,
+    _step_final_coverage_judge,
     _step_final_pages,
     _step_index_log_write,
     _step_merge_plan,
@@ -693,7 +698,239 @@ def test_source_digest_allows_zero_content_units_for_explicit_noise() -> None:
     _assert_source_digest_granularity(digest, stats)
 
 
-def test_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
+def test_digest_coverage_judge_repairs_incomplete_source_digest(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = vault / "raw" / "project_note.md"
+    raw.write_text(
+        "# 项目笔记\n\n"
+        "自动化入库会在覆盖校验通过后自动写入 wiki。"
+        "系统必须保留 raw 文件，方便人类追溯原始信息。\n",
+        encoding="utf-8",
+    )
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256=sha256_file(raw), locator="whole_file")
+    initial_digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明自动化入库流程。",
+        key_takeaways=["自动化入库会自动写入 wiki。"],
+        claims=[make_claim(ref, "C-001", "自动化入库会在覆盖校验通过后自动写入 wiki。")],
+        content_units=[make_source_unit(ref, claim_ids=["C-001"])],
+    )
+    repaired_digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明自动化入库和 raw 追溯。",
+        key_takeaways=["自动化入库会自动写入 wiki。", "raw 文件用于追溯原始信息。"],
+        claims=[
+            make_claim(ref, "C-001", "自动化入库会在覆盖校验通过后自动写入 wiki。"),
+            make_claim(ref, "C-002", "系统必须保留 raw 文件，方便人类追溯原始信息。"),
+        ],
+        content_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
+    )
+    covered_judge = DigestCoverageJudge(
+        coverage_items=[
+            {
+                "item_id": "RI-001",
+                "text": "自动化入库会在覆盖校验通过后自动写入 wiki。",
+                "importance": 4,
+                "status": "covered",
+                "covered_by_claim_ids": ["C-001"],
+                "covered_by_content_unit_ids": ["CU-001"],
+                "raw_locator": "whole_file",
+                "evidence": "digest 已记录自动写入 wiki。",
+                "reason": "claim 和 content_unit 覆盖了该信息。",
+            },
+            {
+                "item_id": "RI-002",
+                "text": "系统必须保留 raw 文件，方便人类追溯原始信息。",
+                "importance": 4,
+                "status": "covered",
+                "covered_by_claim_ids": ["C-002"],
+                "covered_by_content_unit_ids": ["CU-001"],
+                "raw_locator": "whole_file",
+                "evidence": "digest 已补充 raw 追溯要求。",
+                "reason": "新增 claim 覆盖了 raw 保留与追溯。",
+            },
+        ]
+    )
+    coverage_repair = DigestCoverageRepair(
+        coverage_items=covered_judge.coverage_items,
+        repaired_source_digest=repaired_digest,
+        repair_actions=[
+            {
+                "item_id": "RI-002",
+                "action": "added_claim",
+                "claim_ids": ["C-002"],
+                "content_unit_ids": ["CU-001"],
+                "reason": "补充 raw 保留与追溯的知识点。",
+            }
+        ],
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.coverage_repair_calls = 0
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            if output_model is DigestCoverageRepair:
+                self.coverage_repair_calls += 1
+                output = coverage_repair
+            else:
+                raise AssertionError(output_model)
+            return ProviderCallResult(
+                output=output,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": output.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": self.coverage_repair_calls,
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "raw_abs": raw,
+        "raw_rel": ref.raw_path,
+        "raw_binding": RawBinding(
+            raw_path=ref.raw_path,
+            raw_sha256=ref.raw_sha256,
+            size_bytes=raw.stat().st_size,
+            mtime_ns=raw.stat().st_mtime_ns,
+            bound_at="2026-06-30T00:00:00Z",
+        ),
+        "source_granularity_stats": _source_granularity_stats(raw.read_text(encoding="utf-8"), raw_size_bytes=raw.stat().st_size),
+        "source_digest": initial_digest,
+        "profile": load_profile(vault),
+        "provider_registry": registry,
+        "provider_contexts": {},
+    }
+
+    output = _step_digest_coverage_judge(tmp_path / "run", state)
+
+    assert registry.coverage_repair_calls == 1
+    assert state["source_digest"].claims[1].claim_id == "C-002"
+    assert output.counts["digest_repair_count"] == 1
+    assert output.counts["digest_repair_action_count"] == 1
+    assert output.counts["digest_verify_count"] == 0
+    assert output.counts["digest_raw_coverage_percent"] == 100.0
+    assert (tmp_path / "run" / "digest_coverage_judge" / "digest_coverage_report.json").exists()
+    assert (tmp_path / "run" / "digest_coverage_judge" / "repaired_source_digest.json").exists()
+
+
+def test_digest_coverage_complete_rejects_low_importance_gap() -> None:
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明自动化入库流程。",
+        key_takeaways=["自动化入库会自动写入 wiki。"],
+        claims=[make_claim(ref, "C-001"), make_claim(ref, "C-002")],
+        content_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
+    )
+    judge = DigestCoverageJudge(
+        coverage_items=[
+            {
+                "item_id": "RI-001",
+                "text": "自动化入库会自动写入 wiki。",
+                "importance": 5,
+                "status": "covered",
+                "covered_by_claim_ids": ["C-001"],
+                "covered_by_content_unit_ids": ["CU-001"],
+                "raw_locator": "whole_file",
+                "evidence": "digest 已覆盖自动写入 wiki。",
+                "reason": "核心信息已覆盖。",
+            },
+            {
+                "item_id": "RI-002",
+                "text": "系统会展示一个低价值工具演示。",
+                "importance": 1,
+                "status": "missing",
+                "covered_by_claim_ids": [],
+                "covered_by_content_unit_ids": [],
+                "raw_locator": "whole_file",
+                "evidence": "digest 没有提到工具演示。",
+                "reason": "这是低重要度缺口，应进入报告但不应在覆盖率达标时阻断。",
+            },
+            {
+                "item_id": "RI-003",
+                "text": "raw 文件用于追溯原始信息。",
+                "importance": 5,
+                "status": "covered",
+                "covered_by_claim_ids": ["C-002"],
+                "covered_by_content_unit_ids": ["CU-001"],
+                "raw_locator": "whole_file",
+                "evidence": "digest 已覆盖 raw 追溯。",
+                "reason": "核心信息已覆盖。",
+            },
+        ]
+    )
+
+    report = _digest_coverage_report(judge, digest)
+
+    assert report["digest_raw_coverage_percent"] == 90.91
+    with pytest.raises(PipelineError, match="修复后仍存在未完整覆盖"):
+        _assert_digest_coverage_complete(report)
+
+
+def test_digest_coverage_allows_raw_english_evidence() -> None:
+    ref = SourceRef(raw_path="raw/paper.md", raw_sha256="abc", locator="results")
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明 ReAct 的实验设置。",
+        key_takeaways=["ReAct 同时使用推理轨迹和文本动作。"],
+        claims=[make_claim(ref, "C-001", "ReAct 在 HotpotQA 中使用 6-shot 设置评估。")],
+        content_units=[make_source_unit(ref, claim_ids=["C-001"])],
+    )
+    judge = DigestCoverageJudge(
+        coverage_items=[
+            {
+                "item_id": "RI-001",
+                "text": "ReAct 在 HotpotQA 中使用 6-shot 设置评估。",
+                "importance": 4,
+                "status": "covered",
+                "covered_by_claim_ids": ["C-001"],
+                "covered_by_content_unit_ids": ["CU-001"],
+                "raw_locator": "results",
+                "evidence": "HotpotQA (6-shot): ReAct exact match 27.4.",
+                "reason": "英文是 raw 原文短证据，中文字段已经说明覆盖判断。",
+            }
+        ]
+    )
+
+    raw_text = "HotpotQA (6-shot): ReAct exact match 27.4."
+    stats = _source_granularity_stats(raw_text, raw_size_bytes=len(raw_text.encode("utf-8")))
+    _assert_digest_coverage_judge_valid(judge, digest, raw_text, stats)
+
+
+def test_final_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
     ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
     digest = SourceDigest(
         source_raw_path=ref.raw_path,
@@ -727,6 +964,21 @@ def test_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
             )
         ]
     )
+    repair = FinalCoverageRepair(claim_results=judge.claim_results, repaired_final_pages=final_pages, repair_actions=[])
+    composition = CompositionPlan(
+        items=[
+            CompositionItem(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Auto_Ingest.md",
+                action="create",
+                merge_decision_ids=["MD-001"],
+                candidate_page_ids=["CP-001"],
+                section_order=["摘要"],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="生成可读的中文 wiki 笔记。",
+            )
+        ]
+    )
 
     class FakeRegistry:
         def __init__(self) -> None:
@@ -741,9 +993,9 @@ def test_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
 
         def call_structured(self, step: str, request, output_model):
             return ProviderCallResult(
-                output=judge,
+                output=repair,
                 prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
-                provider_result={"parsed": judge.model_dump(mode="json")},
+                provider_result={"parsed": repair.model_dump(mode="json")},
                 sanitized_context=self.spec.sanitized_context(),
                 api_calls=[
                     {
@@ -769,17 +1021,25 @@ def test_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
                 ],
             )
 
-    state = {"source_digest": digest, "final_pages": final_pages, "provider_registry": FakeRegistry(), "provider_contexts": {}}
+    state = {
+        "source_digest": digest,
+        "final_pages": final_pages,
+        "composition_plan": composition,
+        "wiki_snapshot": WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-23T00:00:00Z", entries=[]),
+        "provider_registry": FakeRegistry(),
+        "provider_contexts": {},
+        "operation_id": "ING-test",
+    }
 
-    output = _step_coverage_judge(tmp_path / "run", state)
+    output = _step_final_coverage_judge(tmp_path / "run", state)
 
     assert output.counts["claim_count"] == 1
     assert output.counts["raw_claim_coverage_percent"] == 100.0
     assert output.counts["core_claim_coverage_percent"] == 100.0
-    assert (tmp_path / "run" / "coverage_judge" / "coverage_judge_report.json").exists()
+    assert (tmp_path / "run" / "final_coverage_judge" / "final_coverage_report.json").exists()
 
 
-def test_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
+def test_final_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
     ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
     digest = SourceDigest(
         source_raw_path=ref.raw_path,
@@ -824,6 +1084,22 @@ def test_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
             )
         ]
     )
+    invalid_repair = FinalCoverageRepair(claim_results=invalid_judge.claim_results, repaired_final_pages=final_pages, repair_actions=[])
+    valid_repair = FinalCoverageRepair(claim_results=valid_judge.claim_results, repaired_final_pages=final_pages, repair_actions=[])
+    composition = CompositionPlan(
+        items=[
+            CompositionItem(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Auto_Ingest.md",
+                action="create",
+                merge_decision_ids=["MD-001"],
+                candidate_page_ids=["CP-001"],
+                section_order=["摘要"],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="生成可读的中文 wiki 笔记。",
+            )
+        ]
+    )
 
     class FakeRegistry:
         def __init__(self) -> None:
@@ -840,7 +1116,7 @@ def test_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
         def call_structured(self, step: str, request, output_model):
             self.requests.append(request)
             call_index = len(self.requests)
-            output = invalid_judge if call_index == 1 else valid_judge
+            output = invalid_repair if call_index == 1 else valid_repair
             return ProviderCallResult(
                 output=output,
                 prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
@@ -871,9 +1147,17 @@ def test_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
             )
 
     registry = FakeRegistry()
-    state = {"source_digest": digest, "final_pages": final_pages, "provider_registry": registry, "provider_contexts": {}}
+    state = {
+        "source_digest": digest,
+        "final_pages": final_pages,
+        "composition_plan": composition,
+        "wiki_snapshot": WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-23T00:00:00Z", entries=[]),
+        "provider_registry": registry,
+        "provider_contexts": {},
+        "operation_id": "ING-test",
+    }
 
-    output = _step_coverage_judge(tmp_path / "run", state)
+    output = _step_final_coverage_judge(tmp_path / "run", state)
 
     assert len(registry.requests) == 2
     assert "evidence 不能为空" in registry.requests[1].user_payload["validation_error"]
@@ -883,7 +1167,7 @@ def test_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
     assert output.counts["api_paused_count"] == 1
 
 
-def test_coverage_judge_threshold_fails_when_core_claim_missing() -> None:
+def test_final_coverage_judge_threshold_fails_when_core_claim_missing() -> None:
     ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
     digest = SourceDigest(
         source_raw_path=ref.raw_path,
@@ -903,13 +1187,13 @@ def test_coverage_judge_threshold_fails_when_core_claim_missing() -> None:
             )
         ]
     )
-    report = _coverage_judge_report(judge, digest)
+    report = _final_coverage_report(judge, digest)
 
-    with pytest.raises(PipelineError, match="coverage_judge 未通过"):
-        _assert_coverage_judge_thresholds(report)
+    with pytest.raises(PipelineError, match="final_coverage_judge 未通过"):
+        _assert_final_coverage_judge_thresholds(report)
 
 
-def test_coverage_judge_allows_technical_evidence_fragments() -> None:
+def test_final_coverage_judge_allows_technical_evidence_fragments() -> None:
     judge = CoverageJudge(
         claim_results=[
             ClaimCoverageItem(
@@ -926,10 +1210,10 @@ def test_coverage_judge_allows_technical_evidence_fragments() -> None:
         ]
     )
 
-    _assert_coverage_judge_chinese(judge)
+    _assert_final_coverage_judge_chinese(judge)
 
 
-def test_coverage_judge_allows_product_name_evidence_fragments() -> None:
+def test_final_coverage_judge_allows_product_name_evidence_fragments() -> None:
     judge = CoverageJudge(
         claim_results=[
             ClaimCoverageItem(
@@ -942,10 +1226,10 @@ def test_coverage_judge_allows_product_name_evidence_fragments() -> None:
         ]
     )
 
-    _assert_coverage_judge_chinese(judge)
+    _assert_final_coverage_judge_chinese(judge)
 
 
-def test_coverage_judge_rejects_english_explanatory_evidence() -> None:
+def test_final_coverage_judge_rejects_english_explanatory_evidence() -> None:
     judge = CoverageJudge(
         claim_results=[
             ClaimCoverageItem(
@@ -959,10 +1243,10 @@ def test_coverage_judge_rejects_english_explanatory_evidence() -> None:
     )
 
     with pytest.raises(PipelineError, match="必须使用中文用户可读文本"):
-        _assert_coverage_judge_chinese(judge)
+        _assert_final_coverage_judge_chinese(judge)
 
 
-def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_path: Path) -> None:
+def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
     digest = SourceDigest(
@@ -1097,6 +1381,24 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
             )
         ]
     )
+    final_repair = FinalCoverageRepair(
+        claim_results=covered_judge.claim_results,
+        repaired_final_pages=second_repaired_pages,
+        repair_actions=[
+            {
+                "claim_id": "C-001",
+                "action": "updated_content",
+                "final_page_ids": ["FP-001"],
+                "reason": "补齐覆盖校验通过后自动写入 wiki 的信息。",
+            },
+            {
+                "claim_id": "C-002",
+                "action": "added_content",
+                "final_page_ids": ["FP-001"],
+                "reason": "补齐保留 raw 文件用于追溯原始信息的表述。",
+            },
+        ],
+    )
 
     class FakeRegistry:
         def __init__(self) -> None:
@@ -1105,19 +1407,17 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
                 endpoint="https://api.deepseek.com/v1/chat/completions",
                 api_key="test-key",
             )
-            self.coverage_calls = 0
-            self.repair_requests = []
+            self.coverage_repair_calls = 0
 
         def provider_for(self, step: str) -> ProviderSpec:
             return self.spec
 
         def call_structured(self, step: str, request, output_model):
-            if output_model is CoverageJudge:
-                self.coverage_calls += 1
-                output = [missing_judge, newly_exposed_judge, covered_judge][self.coverage_calls - 1]
+            if output_model is FinalCoverageRepair:
+                self.coverage_repair_calls += 1
+                output = final_repair
             else:
-                self.repair_requests.append(request)
-                output = repaired_pages if len(self.repair_requests) == 1 else second_repaired_pages
+                raise AssertionError(output_model)
             return ProviderCallResult(
                 output=output,
                 prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
@@ -1129,7 +1429,7 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
                         "request_key": "",
                         "model": "deepseek-v4-flash",
                         "attempt": 0,
-                        "call_index": self.coverage_calls + len(self.repair_requests),
+                        "call_index": self.coverage_repair_calls,
                         "status": "success",
                         "finish_reason": "stop",
                         "duration_ms": 1.0,
@@ -1160,247 +1460,17 @@ def test_coverage_judge_repairs_missing_claim_by_retrying_target_final_page(tmp_
         "operation_id": "ING-test",
     }
 
-    output = _step_coverage_judge(tmp_path / "run", state)
+    output = _step_final_coverage_judge(tmp_path / "run", state)
 
-    assert output.counts["coverage_repair_count"] == 2
-    assert output.counts["coverage_repair_final_page_count"] == 2
+    assert output.counts["coverage_repair_count"] == 1
+    assert output.counts["coverage_repair_action_count"] == 2
+    assert output.counts["coverage_repair_final_page_count"] == 1
+    assert output.counts["final_verify_count"] == 0
     assert output.counts["raw_claim_coverage_percent"] == 100.0
-    assert registry.coverage_calls == 3
-    assert len(registry.repair_requests) == 2
-    assert registry.repair_requests[0].user_payload["coverage_repair_claims"][0]["claim"]["claim_id"] == "C-001"
-    assert registry.repair_requests[0].user_payload["coverage_repair_claims"][0]["status"] == "missing"
-    assert registry.repair_requests[1].user_payload["coverage_repair_claims"][0]["claim"]["claim_id"] == "C-002"
-    assert registry.repair_requests[1].user_payload["coverage_repair_claims"][0]["status"] == "partial"
+    assert registry.coverage_repair_calls == 1
     assert "自动写入 wiki" in state["final_pages"].pages[0].markdown
     assert "保留 raw 文件用于追溯原始信息" in state["final_pages"].pages[0].markdown
-    assert (tmp_path / "run" / "coverage_judge" / "coverage_repair_final_pages" / "repaired_final_pages.json").exists()
-    assert (tmp_path / "run" / "coverage_judge" / "coverage_repair_final_pages_round_2" / "repaired_final_pages.json").exists()
-
-
-def test_coverage_judge_repairs_claim_defect_without_touching_other_claims(tmp_path: Path) -> None:
-    vault = init_vault(tmp_path / "vault")
-    raw = vault / "raw" / "guardrails.md"
-    raw.write_text(
-        "# Guardrails\n\n"
-        "Guardrails 包括输入 guardrails、输出 guardrails 和工具 guardrails。"
-        "输入 guardrails 作用于初始用户输入，输出 guardrails 作用于最终输出，工具 guardrails 作用于自定义函数工具调用。\n",
-        encoding="utf-8",
-    )
-    ref = SourceRef(raw_path="raw/guardrails.md", raw_sha256=sha256_file(raw), locator="whole_file")
-    unchanged_claim = make_claim(ref, "C-001", "Guardrails 用于检查用户输入和智能体输出。")
-    wrong_claim = make_claim(ref, "C-002", "Guardrails 分为两种：输入 guardrails 和输出 guardrails。")
-    digest = SourceDigest(
-        source_raw_path=ref.raw_path,
-        raw_sha256=ref.raw_sha256,
-        summary="这份材料说明 Guardrails 的类型。",
-        key_takeaways=["Guardrails 包括输入、输出和工具三种类型。"],
-        claims=[unchanged_claim, wrong_claim],
-        content_units=[make_source_unit(ref, claim_ids=["C-001", "C-002"])],
-    )
-    final_pages = FinalPages(
-        pages=[
-            FinalPage(
-                final_page_id="FP-001",
-                target_path="concepts/Concept_Guardrails.md",
-                action="create",
-                title="Guardrails",
-                page_type="concept",
-                markdown="# Guardrails\n\n## 类型\n\nGuardrails 包括输入 guardrails、输出 guardrails 和工具 guardrails。\n",
-                source_refs=[ref],
-            )
-        ]
-    )
-    judge = CoverageJudge(
-        claim_results=[
-            ClaimCoverageItem(
-                claim_id="C-001",
-                status="covered",
-                covered_by=["concepts/Concept_Guardrails.md#类型"],
-                evidence="最终页面说明了 Guardrails 的检查作用。",
-                reason="正文覆盖了该 claim。",
-            ),
-            ClaimCoverageItem(
-                claim_id="C-002",
-                status="partial",
-                covered_by=["concepts/Concept_Guardrails.md#类型"],
-                evidence="最终页面写了三种 Guardrails，与 claim 的两种说法冲突。",
-                reason="最终页面与 claim 所述两种类型矛盾，raw 也包含工具 guardrails。",
-            ),
-        ]
-    )
-    repaired_claim = SourceClaim(
-        claim_id="C-002",
-        text="Guardrails 包括输入 guardrails、输出 guardrails 和工具 guardrails；三者分别作用于初始用户输入、最终输出和自定义函数工具调用。",
-        kind="fact",
-        importance=4,
-        concept_terms=["输入 guardrails", "输出 guardrails", "工具 guardrails"],
-        raw_locator="whole_file",
-        source_refs=[ref],
-    )
-    repair_result = ClaimRepairResult(
-        patches=[
-            {
-                "claim_id": "C-002",
-                "replacement_claim": repaired_claim,
-                "reason": "原 claim 把 raw 中明确出现的工具 guardrails 漏掉了。",
-            }
-        ]
-    )
-
-    class FakeRegistry:
-        def __init__(self) -> None:
-            self.spec = ProviderSpec(
-                spec="openai_compatible:deepseek-v4-flash",
-                endpoint="https://api.deepseek.com/v1/chat/completions",
-                api_key="test-key",
-            )
-            self.calls = []
-
-        def provider_for(self, step: str) -> ProviderSpec:
-            return self.spec
-
-        def call_structured(self, step: str, request, output_model):
-            self.calls.append((step, output_model, request))
-            if output_model is CoverageJudge:
-                output = judge
-            else:
-                assert output_model is ClaimRepairResult
-                assert request.user_payload["repair_claim_ids"] == ["C-002"]
-                output = repair_result
-            return ProviderCallResult(
-                output=output,
-                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
-                provider_result={"parsed": output.model_dump(mode="json")},
-                sanitized_context=self.spec.sanitized_context(),
-                api_calls=[
-                    {
-                        "step": step,
-                        "request_key": "",
-                        "model": "deepseek-v4-flash",
-                        "attempt": 0,
-                        "call_index": len(self.calls),
-                        "status": "success",
-                        "finish_reason": "stop",
-                        "duration_ms": 1.0,
-                        "response_status_code": 200,
-                        "error": "",
-                        "prompt_tokens": 10,
-                        "prompt_cache_hit_tokens": 0,
-                        "prompt_cache_miss_tokens": 10,
-                        "completion_tokens": 5,
-                        "reasoning_tokens": 0,
-                        "total_tokens": 15,
-                        "cache_hit_rate_percent": 0.0,
-                        "price_cny": 0.00002,
-                    }
-                ],
-            )
-
-    state = {
-        "raw_abs": raw,
-        "raw_rel": ref.raw_path,
-        "raw_binding": RawBinding(
-            raw_path=ref.raw_path,
-            raw_sha256=ref.raw_sha256,
-            size_bytes=raw.stat().st_size,
-            mtime_ns=raw.stat().st_mtime_ns,
-            bound_at="2026-06-24T00:00:00Z",
-        ),
-        "source_granularity_stats": _source_granularity_stats(raw.read_text(encoding="utf-8"), raw_size_bytes=raw.stat().st_size),
-        "source_digest": digest,
-        "final_pages": final_pages,
-        "provider_registry": FakeRegistry(),
-        "provider_contexts": {},
-    }
-
-    output = _step_coverage_judge(tmp_path / "run", state)
-
-    repaired_digest = state["source_digest"]
-    assert state["claim_repair_applied"] is True
-    assert output.counts["claim_repair_count"] == 1
-    assert output.counts["claim_repair_claim_count"] == 1
-    assert repaired_digest.claims[0] == unchanged_claim
-    assert repaired_digest.claims[1].text == repaired_claim.text
-    assert (tmp_path / "run" / "coverage_judge" / "claim_repair" / "repaired_source_digest.json").exists()
-
-
-def test_claim_repair_restart_archives_stale_artifacts(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    artifact_paths = [
-        "candidate_pages_warmup/candidate_pages_warmup.json",
-        "candidate_pages/candidate_pages.json",
-        "coverage_judge/coverage_judge_report.json",
-    ]
-    for path in artifact_paths:
-        target = run_dir / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(f"old:{path}", encoding="utf-8")
-
-    manifest = OperationManifest(
-        operation_id="ING-test",
-        status="running",
-        created_at="2026-06-29T00:00:00Z",
-        updated_at="2026-06-29T00:00:00Z",
-        vault=tmp_path.as_posix(),
-        raw_path="raw/a.md",
-        profile_name="default",
-        engine_version="test",
-        steps=[
-            StepRecord(name="raw_binding", status="completed"),
-            StepRecord(
-                name="candidate_pages_warmup",
-                status="completed",
-                artifacts=[
-                    ArtifactRef(
-                        path="candidate_pages_warmup/candidate_pages_warmup.json",
-                        sha256=sha256_file(run_dir / "candidate_pages_warmup/candidate_pages_warmup.json"),
-                        size_bytes=(run_dir / "candidate_pages_warmup/candidate_pages_warmup.json").stat().st_size,
-                    )
-                ],
-                model_calls=1,
-            ),
-            StepRecord(
-                name="candidate_pages",
-                status="completed",
-                artifacts=[
-                    ArtifactRef(
-                        path="candidate_pages/candidate_pages.json",
-                        sha256=sha256_file(run_dir / "candidate_pages/candidate_pages.json"),
-                        size_bytes=(run_dir / "candidate_pages/candidate_pages.json").stat().st_size,
-                    )
-                ],
-                model_calls=1,
-            ),
-            StepRecord(
-                name="coverage_judge",
-                status="completed",
-                artifacts=[
-                    ArtifactRef(
-                        path="coverage_judge/coverage_judge_report.json",
-                        sha256=sha256_file(run_dir / "coverage_judge/coverage_judge_report.json"),
-                        size_bytes=(run_dir / "coverage_judge/coverage_judge_report.json").stat().st_size,
-                    )
-                ],
-                model_calls=2,
-                repair_count=1,
-            ),
-        ],
-    )
-
-    archived_count = _archive_manifest_steps_for_restart(run_dir, manifest, "candidate_pages_warmup", "claim_repair_restart")
-
-    assert archived_count == 3
-    assert manifest.steps[0].artifacts == []
-    archived_refs = [artifact for step in manifest.steps[1:] for artifact in step.artifacts]
-    assert all(ref.path.startswith("restarts/claim_repair_restart_1/") for ref in archived_refs)
-    for path in artifact_paths:
-        (run_dir / path).write_text(f"new:{path}", encoding="utf-8")
-    for ref in archived_refs:
-        current_sha = sha256_file(run_dir / ref.path)
-        assert current_sha == ref.sha256
-    assert sum(step.model_calls for step in manifest.steps) == 4
-    assert sum(step.repair_count for step in manifest.steps) == 1
+    assert (tmp_path / "run" / "final_coverage_judge" / "repaired_final_pages.json").exists()
 
 
 def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:

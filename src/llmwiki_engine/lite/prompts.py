@@ -8,10 +8,12 @@ from .models import (
     CandidateContexts,
     CandidatePages,
     CandidatePagesWarmup,
-    ClaimRepairResult,
     CompositionItem,
     CompositionPlan,
     CoverageJudge,
+    DigestCoverageRepair,
+    DigestCoverageJudge,
+    FinalCoverageRepair,
     FinalPages,
     MergePlan,
     PageUpdatePlanItem,
@@ -433,7 +435,6 @@ def final_page_retry_prompt(
     previous_pages: FinalPages,
     validation_error: str,
     page_update_plan_item: PageUpdatePlanItem | None = None,
-    coverage_repair_claims: list[dict[str, object]] | None = None,
 ) -> PromptRequest:
     request = final_page_prompt(
         composition_item=composition_item,
@@ -444,17 +445,6 @@ def final_page_retry_prompt(
     )
     payload = dict(request.user_payload)
     instructions = list(payload.get("instructions") or [])
-    if coverage_repair_claims:
-        payload["coverage_repair_claims"] = coverage_repair_claims
-        instructions.extend(
-            [
-                "这是 coverage_judge 后的覆盖修复请求。",
-                "必须优先补齐 coverage_repair_claims 中 status/judge_status 为 partial、missing 或 contradicted 的知识点。",
-                "每条 coverage_repair_claims.claim.text 都必须在最终正文中有明确中文落点；不要只写泛化总结。",
-                "如果 claim 包含数字、限制条件、例子、机制或对象，修复后必须保留这些关键信息。",
-                "不要删除已经正确覆盖的内容；只做必要补充和局部改写。",
-            ]
-        )
     payload.update(
         {
             "previous_invalid_output": previous_pages.model_dump(mode="json"),
@@ -476,9 +466,136 @@ def final_page_retry_prompt(
     return request.model_copy(update={"user_payload": payload})
 
 
-def coverage_judge_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> PromptRequest:
+def digest_coverage_repair_prompt(
+    *,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    digest: SourceDigest,
+) -> PromptRequest:
     return _request(
-        step="coverage_judge",
+        step="digest_coverage_repair",
+        model=DigestCoverageRepair,
+        payload={
+            "raw_path": raw_path,
+            "raw_sha256": raw_sha256,
+            "raw_text": raw_text,
+            "source_digest": digest.model_dump(mode="json"),
+            "allowed_status": ["covered", "partial", "missing"],
+            "instructions": [
+                *CHINESE_OUTPUT_RULES,
+                "这是 raw -> source_digest 的覆盖校验与修复，必须独立阅读 raw_text，不要只复核 source_digest.claims。",
+                "先审查输入 source_digest 是否遗漏 raw_text 的有效信息，再直接输出 repaired_source_digest。",
+                "coverage_items 必须描述 repaired_source_digest 修复后的覆盖状态，而不是修复前状态。",
+                "从 raw_text 中识别所有值得进入知识库的有效信息项；每个信息项返回一个 coverage_items item。",
+                "如果 raw_text 确实是 404、不可访问、空页面、导航页、菜单页或没有有效知识，coverage_items 可以为空，但必须在 warnings 中用中文说明。",
+                "covered：source_digest.claims/content_units 已明确覆盖该 raw 信息项。",
+                "partial：source_digest 提到了主题，但遗漏关键限定、数字、例子、机制、对象或结论。",
+                "missing：source_digest 没有覆盖该 raw 信息项。",
+                "covered_by_claim_ids 只能引用 source_digest.claims 中真实存在的 claim_id；covered_by_content_unit_ids 只能引用真实存在的 content_unit_id。",
+                "status 是 covered 或 partial 时，至少填写一个 covered_by_claim_ids 或 covered_by_content_unit_ids；status 是 missing 时二者必须为空数组。",
+                "importance 取 1-5，5 表示 raw 主干核心信息，1 表示边缘但仍值得入库的信息。",
+                "raw_locator 必须指向 raw_text 中支撑该信息项的位置，例如 heading、paragraph 或 section。",
+                "evidence 必须引用 raw_text 的中文转述或必要专有名词；reason 必须中文说明 digest 覆盖是否充分。",
+                "不要把广告、导航、页脚、分享按钮、重复链接、版权声明等噪声列为有效信息项。",
+                "repaired_source_digest 必须返回完整修复后的 source_digest，source_raw_path/raw_sha256 必须与输入完全一致。",
+                "如果输入 source_digest 存在遗漏或部分覆盖，repaired_source_digest 必须补齐对应信息，不能只写入 summary、key_takeaways、concept_terms、content_scope 或 weak_or_noise_items；若它是有效知识，必须新增或修改具体 claim，并把 claim_id 分配到真实 content_unit。",
+                "新增或修改 claim 必须保留原文中的具体对象、数字、工具名、机制、例子和局限性；不要用上位概念吞掉具体信息。",
+                "repair_actions 记录你对输入 source_digest 做过的新增、修改、挂载或不改动动作；如果输入本来已经完整，可以为空或只写 no_change。",
+                "如果所有 coverage_items 都是 covered，repaired_source_digest 可以与 source_digest 等价，但仍必须返回完整对象。",
+            ],
+        },
+    )
+
+
+def digest_coverage_repair_retry_prompt(
+    *,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    digest: SourceDigest,
+    previous_repair: DigestCoverageRepair,
+    validation_error: str,
+) -> PromptRequest:
+    request = digest_coverage_repair_prompt(raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, digest=digest)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "previous_invalid_output": previous_repair.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 digest_coverage_judge 覆盖修复输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "coverage_items 的 item_id 必须唯一，格式使用 RI-001、RI-002。",
+                "所有 text、evidence、reason、warnings 等用户可读字段必须使用中文。",
+                "不要为了通过校验删除 missing/partial 项；如果 raw 有有效信息而 digest 没覆盖，必须保留 missing 或 partial 判断。",
+                "repaired_source_digest 必须是完整修复后的 source_digest，并且每个新增 claim 必须归属到真实 content_unit。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
+
+
+def digest_coverage_judge_prompt(
+    *,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    digest: SourceDigest,
+) -> PromptRequest:
+    request = digest_coverage_repair_prompt(raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, digest=digest)
+    payload = dict(request.user_payload)
+    instructions = [
+        *CHINESE_OUTPUT_RULES,
+        "这是 repaired_source_digest 的独立复判，只判断覆盖，不修改 digest。",
+        "必须独立阅读 raw_text，并从 raw_text 中识别所有值得进入知识库的有效信息项。",
+        "每个有效信息项返回一个 coverage_items item。",
+        "covered：source_digest.claims/content_units 已明确覆盖该 raw 信息项。",
+        "partial：source_digest 提到了主题，但遗漏关键限定、数字、例子、机制、对象或结论。",
+        "missing：source_digest 没有覆盖该 raw 信息项。",
+        "covered_by_claim_ids 只能引用 source_digest.claims 中真实存在的 claim_id；covered_by_content_unit_ids 只能引用真实存在的 content_unit_id。",
+        "status 是 covered 或 partial 时，至少填写一个 covered_by_claim_ids 或 covered_by_content_unit_ids；status 是 missing 时二者必须为空数组。",
+        "importance 取 1-5，5 表示 raw 主干核心信息，1 表示边缘但仍值得入库的信息。",
+        "raw_locator 必须指向 raw_text 中支撑该信息项的位置，例如 heading、paragraph 或 section。",
+        "evidence 必须引用 raw_text 的中文转述或必要专有名词；reason 必须中文说明 digest 覆盖是否充分。",
+        "不要把广告、导航、页脚、分享按钮、重复链接、版权声明等噪声列为有效信息项。",
+    ]
+    payload.update({"instructions": instructions})
+    return _request(step="digest_coverage_judge", model=DigestCoverageJudge, payload=payload)
+
+
+def digest_coverage_judge_retry_prompt(
+    *,
+    raw_path: str,
+    raw_sha256: str,
+    raw_text: str,
+    digest: SourceDigest,
+    previous_judge: DigestCoverageJudge,
+    validation_error: str,
+) -> PromptRequest:
+    request = digest_coverage_judge_prompt(raw_path=raw_path, raw_sha256=raw_sha256, raw_text=raw_text, digest=digest)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "previous_invalid_output": previous_judge.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 digest_coverage_judge 复判输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "coverage_items 的 item_id 必须唯一，格式使用 RI-001、RI-002。",
+                "所有 text、evidence、reason、warnings 等用户可读字段必须使用中文。",
+                "不要为了通过校验删除 missing/partial 项；如果 raw 有有效信息而 digest 没覆盖，必须保留 missing 或 partial 判断。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
+
+
+def final_coverage_judge_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> PromptRequest:
+    return _request(
+        step="final_coverage_judge",
         model=CoverageJudge,
         payload={
             "source_raw_path": digest.source_raw_path,
@@ -514,14 +631,89 @@ def coverage_judge_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> P
     )
 
 
-def coverage_judge_retry_prompt(
+def final_coverage_repair_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> PromptRequest:
+    return _request(
+        step="final_coverage_repair",
+        model=FinalCoverageRepair,
+        payload={
+            "source_raw_path": digest.source_raw_path,
+            "raw_sha256": digest.raw_sha256,
+            "claims": [claim.model_dump(mode="json") for claim in digest.claims],
+            "content_units": [unit.model_dump(mode="json") for unit in digest.content_units],
+            "final_pages": [
+                {
+                    "final_page_id": page.final_page_id,
+                    "target_path": page.target_path,
+                    "title": page.title,
+                    "action": page.action,
+                    "markdown": page.markdown,
+                    "source_refs": [ref.model_dump(mode="json") for ref in page.source_refs],
+                    "preimage_sha256": page.preimage_sha256,
+                    "preimage_coverage_report": [item.model_dump(mode="json") for item in page.preimage_coverage_report],
+                }
+                for page in final_pages.pages
+            ],
+            "allowed_status": ["covered", "partial", "missing", "contradicted"],
+            "instructions": [
+                *CHINESE_OUTPUT_RULES,
+                "这是 final_pages 的覆盖校验与修复，必须判断每条 claim 是否被最终页面正文明确覆盖。",
+                "先审查输入 final_pages 是否遗漏、部分覆盖或冲突，再直接输出 repaired_final_pages。",
+                "claim_results 必须描述 repaired_final_pages 修复后的覆盖状态，而不是修复前状态。",
+                "repaired_final_pages 必须返回完整最终页面集合，final_page_id、target_path、action 必须与输入 final_pages 对应页面保持一致。",
+                "covered：修复后的最终页面明确写入了 claim 的事实含义，允许中文改写。",
+                "partial：修复后的最终页面写到了主题但缺少 claim 的关键限定、数字、例子、机制或对象。",
+                "missing：修复后的最终页面没有覆盖该 claim。",
+                "contradicted：修复后的最终页面与 claim 含义冲突。",
+                "claim_results 必须且只能包含每个 claim_id 一条结果，不能遗漏、不能新增。",
+                "covered_by 写 target_path#中文小节；如果缺失或冲突可为空数组。",
+                "evidence 必须引用 repaired_final_pages 中的中文表达；reason 必须中文说明判断理由。",
+                "如果输入 final_pages 存在遗漏、部分覆盖或冲突，必须在 repaired_final_pages 中补写、改写或移动到合适页面，不要只泛化总结。",
+                "repair_actions 记录你对输入 final_pages 做过的新增、修改、移动或不改动动作；如果输入本来已经完整，可以为空或只写 no_change。",
+                "不要删除已经正确覆盖的内容；只做必要补充和局部改写。",
+                "不要写 Related 或 相关页面章节；引擎会统一生成。",
+                "正文 Obsidian wikilink 最多 2 条；也可以不写正文链接。",
+                "正文中不得包含 raw、sources、logs、index、Source_* 或 source page 的 wikilink、Markdown link、HTML href。",
+                "不要因为 source_refs 或 frontmatter 包含 raw 路径就判 covered；必须看正文内容。",
+            ],
+        },
+    )
+
+
+def final_coverage_repair_retry_prompt(
+    *,
+    digest: SourceDigest,
+    final_pages: FinalPages,
+    previous_repair: FinalCoverageRepair,
+    validation_error: str,
+) -> PromptRequest:
+    request = final_coverage_repair_prompt(digest=digest, final_pages=final_pages)
+    payload = dict(request.user_payload)
+    instructions = list(payload.get("instructions") or [])
+    payload.update(
+        {
+            "previous_invalid_output": previous_repair.model_dump(mode="json"),
+            "validation_error": validation_error,
+            "instructions": [
+                *instructions,
+                "上一轮 final_coverage_judge 覆盖修复输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "repaired_final_pages 必须是完整页面集合，不能只返回改动页。",
+                "claim_results 的 claim_id 集合必须与输入 claims 完全一致。",
+                "每条 claim_results 的 evidence 和 reason 都不能为空，且必须基于 repaired_final_pages 正文。",
+                "所有 evidence、reason、warnings 等用户可读字段必须使用中文。",
+            ],
+        }
+    )
+    return request.model_copy(update={"user_payload": payload})
+
+
+def final_coverage_judge_retry_prompt(
     *,
     digest: SourceDigest,
     final_pages: FinalPages,
     previous_judge: CoverageJudge,
     validation_error: str,
 ) -> PromptRequest:
-    request = coverage_judge_prompt(digest=digest, final_pages=final_pages)
+    request = final_coverage_judge_prompt(digest=digest, final_pages=final_pages)
     payload = dict(request.user_payload)
     instructions = list(payload.get("instructions") or [])
     payload.update(
@@ -530,7 +722,7 @@ def coverage_judge_retry_prompt(
             "validation_error": validation_error,
             "instructions": [
                 *instructions,
-                "上一轮 coverage_judge 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
+                "上一轮 final_coverage_judge 输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
                 "claim_results 的 claim_id 集合必须与输入 claims 完全一致。",
                 "每条 claim_results 的 evidence 和 reason 都不能为空。",
                 "所有 evidence、reason、warnings 等用户可读字段必须使用中文。",
@@ -538,41 +730,6 @@ def coverage_judge_retry_prompt(
         }
     )
     return request.model_copy(update={"user_payload": payload})
-
-
-def claim_repair_prompt(
-    *,
-    raw_path: str,
-    raw_sha256: str,
-    raw_text: str,
-    digest: SourceDigest,
-    coverage_report: dict[str, object],
-    repair_claim_ids: list[str],
-) -> PromptRequest:
-    return _request(
-        step="claim_repair",
-        model=ClaimRepairResult,
-        payload={
-            "raw_path": raw_path,
-            "raw_sha256": raw_sha256,
-            "raw_text": raw_text,
-            "source_digest": digest.model_dump(mode="json"),
-            "coverage_report": coverage_report,
-            "repair_claim_ids": repair_claim_ids,
-            "instructions": [
-                *CHINESE_OUTPUT_RULES,
-                "这是 coverage_judge 发现 source_digest claim 可能有事实错误后的局部修复请求。",
-                "只允许为 repair_claim_ids 中的 claim 返回 patches；不要返回未点名 claim 的 patch。",
-                "必须以 raw_text 为最高优先级证据判断原 claim 是否真的错误，不要盲目信任 final_pages 或 coverage_judge。",
-                "如果 raw_text 支持原 claim，只返回空 patches，并在 warnings 用中文说明应该修最终页而不是修 claim。",
-                "如果原 claim 把范围、数量、对象、机制、限制条件写错或写窄，则返回 replacement_claim。",
-                "replacement_claim.claim_id 必须与 patch.claim_id 完全一致；不要改 claim_id，不要拆分 claim，不要合并 claim。",
-                "replacement_claim.source_refs 只能引用当前 raw_path/raw_sha256，raw_locator 必须指向 raw_text 中支撑修正的段落、小节或片段。",
-                "replacement_claim.text、concept_terms、reason、warnings 等用户可读字段必须使用中文。",
-                "未出现在 repair_claim_ids 中的 claims 必须由引擎原样保留；你不要尝试重写它们。",
-            ],
-        },
-    )
 
 
 def preimage_coverage_requirements(entry: WikiKnowledgeEntry | None) -> list[dict[str, object]]:
@@ -786,7 +943,75 @@ def _json_example(step: str) -> dict[str, Any]:
             ],
             "warnings": [],
         },
-        "coverage_judge": {
+        "digest_coverage_judge": {
+            "coverage_items": [
+                {
+                    "item_id": "RI-001",
+                    "text": "示例原文说明了示例概念的定义和用途。",
+                    "importance": 4,
+                    "status": "covered",
+                    "covered_by_claim_ids": ["C-001"],
+                    "covered_by_content_unit_ids": ["CU-001"],
+                    "raw_locator": "whole_file",
+                    "evidence": "raw 中说明示例概念的定义和用途。",
+                    "reason": "source_digest 的 C-001 与 CU-001 已覆盖该信息。",
+                }
+            ],
+            "warnings": [],
+        },
+        "digest_coverage_repair": {
+            "coverage_items": [
+                {
+                    "item_id": "RI-001",
+                    "text": "示例原文说明了示例概念的定义和用途。",
+                    "importance": 4,
+                    "status": "covered",
+                    "covered_by_claim_ids": ["C-001"],
+                    "covered_by_content_unit_ids": ["CU-001"],
+                    "raw_locator": "whole_file",
+                    "evidence": "raw 中说明示例概念的定义和用途。",
+                    "reason": "修复后的 source_digest 已覆盖该信息。",
+                }
+            ],
+            "repaired_source_digest": {
+                "source_raw_path": "raw/example.md",
+                "raw_sha256": "sha256",
+                "summary": "这是一段来源材料的中文摘要。",
+                "key_takeaways": ["一条有来源支撑的中文收获。"],
+                "claims": [
+                    {
+                        "claim_id": "C-001",
+                        "text": "示例概念说明了一个有来源支撑的定义和用途。",
+                        "kind": "concept",
+                        "importance": 4,
+                        "concept_terms": ["示例概念"],
+                        "raw_locator": "whole_file",
+                        "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
+                    }
+                ],
+                "content_units": [
+                    {
+                        "content_unit_id": "CU-001",
+                        "title": "示例概念",
+                        "content_role": "主干",
+                        "absorption_decision": "独立成页",
+                        "anchor_unit_id": "CU-001",
+                        "section_hint": "核心概念",
+                        "page_type": "concept",
+                        "path_hint": "concepts/Concept_Example_Concept.md",
+                        "summary": "说明这个概念为什么值得写入 wiki。",
+                        "absorption_reason": "该内容是 raw 的主要知识对象。",
+                        "content_scope": "覆盖 raw 中关于示例概念的定义和用途。",
+                        "claim_ids": ["C-001"],
+                        "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
+                    }
+                ],
+                "weak_or_noise_items": [],
+            },
+            "repair_actions": [],
+            "warnings": [],
+        },
+        "final_coverage_judge": {
             "claim_results": [
                 {
                     "claim_id": "C-001",
@@ -798,22 +1023,34 @@ def _json_example(step: str) -> dict[str, Any]:
             ],
             "warnings": [],
         },
-        "claim_repair": {
-            "patches": [
+        "final_coverage_repair": {
+            "claim_results": [
                 {
                     "claim_id": "C-001",
-                    "replacement_claim": {
-                        "claim_id": "C-001",
-                        "text": "示例概念包含定义、用途和限制条件，需要按 raw 证据完整表述。",
-                        "kind": "concept",
-                        "importance": 4,
-                        "concept_terms": ["示例概念"],
-                        "raw_locator": "whole_file",
-                        "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
-                    },
-                    "reason": "原 claim 遗漏了 raw 中明确出现的限制条件。",
+                    "status": "covered",
+                    "covered_by": ["concepts/Concept_Example_Concept.md#摘要"],
+                    "evidence": "修复后的最终页面说明了示例概念的定义和用途。",
+                    "reason": "正文明确覆盖了 claim 的事实含义。",
                 }
             ],
+            "repaired_final_pages": {
+                "pages": [
+                    {
+                        "final_page_id": "FP-001",
+                        "target_path": "concepts/Concept_Example_Concept.md",
+                        "action": "create",
+                        "title": "示例概念",
+                        "page_type": "concept",
+                        "content_sha256": "",
+                        "markdown": "# 示例概念\n\n## 摘要\n\n示例概念说明了一个有来源支撑的定义和用途。\n",
+                        "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
+                        "preimage_sha256": None,
+                        "warnings": [],
+                    }
+                ],
+                "warnings": [],
+            },
+            "repair_actions": [],
             "warnings": [],
         },
     }

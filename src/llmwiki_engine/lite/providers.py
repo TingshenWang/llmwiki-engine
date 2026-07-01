@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from .token_usage import api_call_record
 
 
-MODEL_BACKED_STEPS = ["source_digest", "candidate_pages_warmup", "candidate_pages", "merge_plan", "composition_plan", "final_pages", "coverage_judge"]
+MODEL_BACKED_STEPS = [
+    "source_digest",
+    "digest_coverage_judge",
+    "candidate_pages_warmup",
+    "candidate_pages",
+    "merge_plan",
+    "composition_plan",
+    "final_pages",
+    "final_coverage_judge",
+]
 MAX_OUTPUT_TOKENS = 262144
 
 T = TypeVar("T", bound=BaseModel)
@@ -213,7 +224,7 @@ class ProviderRegistry:
             call_index = calls_made
             started = time.perf_counter()
             try:
-                response = client.post(spec.endpoint, headers=headers, json=payload)
+                response = _post_with_wall_timeout(client, spec.endpoint, headers, payload, spec.timeout_seconds)
             except Exception as exc:  # noqa: BLE001 - record provider failures before retrying.
                 duration_ms = (time.perf_counter() - started) * 1000
                 api_calls.append(
@@ -366,6 +377,29 @@ def load_provider_registry(vault: Path) -> ProviderRegistry:
             else:
                 raise ProviderConfigError(f"{path} 中的 provider {name} 必须是 mapping。")
     return ProviderRegistry({name: ProviderSpec.model_validate(value) for name, value in merged.items()})
+
+
+def _post_with_wall_timeout(client: httpx.Client, endpoint: str, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float) -> httpx.Response:
+    if timeout_seconds <= 0:
+        return client.post(endpoint, headers=headers, json=payload)
+
+    result_queue: queue.Queue[tuple[bool, httpx.Response | BaseException]] = queue.Queue(maxsize=1)
+
+    def run_post() -> None:
+        try:
+            result_queue.put((True, client.post(endpoint, headers=headers, json=payload)))
+        except BaseException as exc:  # noqa: BLE001 - preserve provider exception type for retry classification.
+            result_queue.put((False, exc))
+
+    thread = threading.Thread(target=run_post, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise httpx.TimeoutException(f"provider call exceeded timeout_seconds={timeout_seconds:g}")
+    ok, value = result_queue.get_nowait()
+    if ok:
+        return value  # type: ignore[return-value]
+    raise value
 
 
 def _real_provider_issue(spec: ProviderSpec) -> str | None:

@@ -11,6 +11,7 @@ MergeAction = Literal["create", "update", "noop"]
 RelatedSource = Literal["source_digest", "wiki_context"]
 ClaimKind = str
 CoverageStatus = Literal["covered", "partial", "missing", "contradicted"]
+DigestCoverageStatus = Literal["covered", "partial", "missing"]
 ContentRole = Literal["主干", "附属", "工具性"]
 AbsorptionDecision = Literal["独立成页", "并入主干", "降级为段落"]
 PageStateNodeKind = Literal["主干", "附属", "工具性"]
@@ -146,6 +147,66 @@ class CoverageJudge(StrictModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class DigestCoverageItem(StrictModel):
+    item_id: str
+    text: str
+    importance: int = Field(ge=1, le=5)
+    status: DigestCoverageStatus
+    covered_by_claim_ids: list[str] = Field(default_factory=list)
+    covered_by_content_unit_ids: list[str] = Field(default_factory=list)
+    raw_locator: str
+    evidence: str
+    reason: str
+
+    @field_validator("item_id", "text", "raw_locator", "evidence", "reason")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class DigestCoverageJudge(StrictModel):
+    coverage_items: list[DigestCoverageItem] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DigestCoverageRepairAction(StrictModel):
+    item_id: str
+    action: Literal["added_claim", "updated_claim", "attached_to_unit", "no_change"]
+    claim_ids: list[str] = Field(default_factory=list)
+    content_unit_ids: list[str] = Field(default_factory=list)
+    reason: str
+
+    @field_validator("item_id", "reason")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
+class DigestCoverageRepair(StrictModel):
+    coverage_items: list[DigestCoverageItem] = Field(default_factory=list)
+    repaired_source_digest: SourceDigest
+    repair_actions: list[DigestCoverageRepairAction] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FinalCoverageRepairAction(StrictModel):
+    claim_id: str
+    action: Literal["added_content", "updated_content", "moved_content", "no_change"]
+    final_page_ids: list[str] = Field(default_factory=list)
+    reason: str
+
+    @field_validator("claim_id", "reason")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
 class PageStateClaim(StrictModel):
     state_claim_id: str
     source_claim_id: str
@@ -233,24 +294,6 @@ class PageUpdatePlanItem(StrictModel):
 
 class PageUpdatePlan(StrictModel):
     items: list[PageUpdatePlanItem] = Field(default_factory=list)
-
-
-class ClaimRepairPatch(StrictModel):
-    claim_id: str
-    replacement_claim: SourceClaim
-    reason: str
-
-    @field_validator("claim_id", "reason")
-    @classmethod
-    def non_empty(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("不能为空。")
-        return value
-
-
-class ClaimRepairResult(StrictModel):
-    patches: list[ClaimRepairPatch] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
 
 
 class SourceGranularityStats(StrictModel):
@@ -462,6 +505,13 @@ class FinalPage(StrictModel):
 
 class FinalPages(StrictModel):
     pages: list[FinalPage]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FinalCoverageRepair(StrictModel):
+    claim_results: list[ClaimCoverageItem] = Field(default_factory=list)
+    repaired_final_pages: FinalPages
+    repair_actions: list[FinalCoverageRepairAction] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

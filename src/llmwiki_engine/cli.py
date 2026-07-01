@@ -37,12 +37,13 @@ def ingest_run(
     raw: Path,
     profile: Optional[str] = typer.Option(None, "--profile"),
     slug: Optional[str] = typer.Option(None, "--slug"),
+    verify_coverage: bool = typer.Option(False, "--verify-coverage", help="测试参数：coverage 修复后追加独立复判。"),
     json_output: bool = typer.Option(False, "--json", help="输出机器可读 JSON。"),
 ) -> None:
     """运行全自动 Lite ingest 并写入 wiki transaction。"""
     try:
         run_console = Console(file=io.StringIO()) if json_output else console
-        manifest = pipeline.run_ingest(vault, raw, profile_name=profile, slug=slug, console=run_console, emit_progress=not json_output)
+        manifest = pipeline.run_ingest(vault, raw, profile_name=profile, slug=slug, console=run_console, emit_progress=not json_output, verify_coverage=verify_coverage)
     except (ValueError, pipeline.PipelineError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
