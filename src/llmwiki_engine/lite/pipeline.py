@@ -53,7 +53,7 @@ from .models import (
     CoverageJudge,
     DigestCoverageRepair,
     DigestCoverageJudge,
-    FinalCoverageRepair,
+    FinalPageCoverageRepair,
     FinalPage,
     FinalPages,
     MergeDecision,
@@ -1346,22 +1346,89 @@ def _final_pages_from_outputs(
     return artifact
 
 
-def _normalize_repaired_final_pages(state: dict[str, object], pages: FinalPages) -> FinalPages:
+def _normalize_repaired_final_page(state: dict[str, object], page: FinalPage) -> FinalPage:
     composition: CompositionPlan = state["composition_plan"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     operation_id = str(state.get("operation_id", ""))
     page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
-    artifact = _hydrate_provider_final_pages(pages, composition, snapshot)
+    item = next((candidate for candidate in composition.items if candidate.final_page_id == page.final_page_id or candidate.target_path == page.target_path), None)
+    if item is None:
+        raise PipelineError(f"final_coverage_judge 修复页不在写作编排中：{page.final_page_id} {page.target_path}")
+    single_composition = CompositionPlan(items=[item])
+    single_update_plan = _single_page_update_plan(page_update_plan, item.final_page_id)
+    artifact = _hydrate_provider_final_pages(FinalPages(pages=[page]), single_composition, snapshot)
     artifact = _normalize_final_pages(
         artifact,
-        composition,
+        single_composition,
         snapshot=snapshot,
         operation_id=operation_id,
     )
-    _assert_final_pages_cover_composition(artifact, composition)
+    _assert_final_pages_cover_composition(artifact, single_composition)
     _assert_final_pages_chinese(artifact)
-    _assert_final_pages_preserve_preimage_coverage(artifact, composition, snapshot, page_update_plan=page_update_plan)
-    return artifact
+    _assert_final_pages_preserve_preimage_coverage(artifact, single_composition, snapshot, page_update_plan=single_update_plan)
+    return artifact.pages[0]
+
+
+def _assign_final_coverage_claims(state: dict[str, object], digest: SourceDigest, final_pages: FinalPages) -> tuple[dict[str, list[SourceClaim]], list[dict[str, object]]]:
+    page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
+    pages_by_id = {page.final_page_id: page for page in final_pages.pages}
+    candidates_by_claim: dict[str, list[str]] = {}
+    for item in page_update_plan.items:
+        if item.final_page_id not in pages_by_id:
+            continue
+        for claim in item.incoming_claims:
+            candidates_by_claim.setdefault(claim.claim_id, []).append(item.final_page_id)
+
+    assignments: dict[str, list[SourceClaim]] = {page.final_page_id: [] for page in final_pages.pages}
+    rows: list[dict[str, object]] = []
+    for claim in digest.claims:
+        page_ids = _dedupe_list([page_id for page_id in candidates_by_claim.get(claim.claim_id, []) if page_id in pages_by_id])
+        if not page_ids:
+            page_ids = list(pages_by_id)
+            reason = "page_update_plan 未给出归属，按文本相关度分配。"
+        elif len(page_ids) == 1:
+            reason = "page_update_plan 给出唯一归属。"
+        else:
+            reason = "page_update_plan 给出多个候选页，按文本相关度选择唯一修复页。"
+        selected_id = max(page_ids, key=lambda page_id: (_claim_page_assignment_score(claim, pages_by_id[page_id]), page_id)) if page_ids else ""
+        if not selected_id:
+            continue
+        assignments[selected_id].append(claim)
+        rows.append(
+            {
+                "claim_id": claim.claim_id,
+                "final_page_id": selected_id,
+                "target_path": pages_by_id[selected_id].target_path,
+                "candidate_final_page_ids": page_ids,
+                "score": round(_claim_page_assignment_score(claim, pages_by_id[selected_id]), 4),
+                "reason": reason,
+            }
+        )
+    return assignments, rows
+
+
+def _claim_page_assignment_score(claim: SourceClaim, page: FinalPage) -> float:
+    claim_text = " ".join([claim.text, *claim.concept_terms, claim.raw_locator])
+    page_text = " ".join([page.title, page.target_path, page.page_type, summarize(strip_frontmatter(page.markdown), max_sentences=20, max_chars=3000)])
+    claim_terms = _assignment_terms(claim_text)
+    page_terms = _assignment_terms(page_text)
+    if not claim_terms:
+        return 0.0
+    overlap = len(claim_terms & page_terms)
+    containment_bonus = sum(1 for term in claim.concept_terms if term and term in page_text) * 2
+    return (overlap + containment_bonus) / max(1, len(claim_terms))
+
+
+def _assignment_terms(text: str) -> set[str]:
+    normalized = text.lower()
+    terms = {item for item in re.findall(r"[a-z0-9][a-z0-9_./+-]{2,}", normalized) if len(item) >= 3}
+    cjk = re.findall(r"[\u4e00-\u9fff]{2,}", normalized)
+    for item in cjk:
+        if len(item) <= 8:
+            terms.add(item)
+            continue
+        terms.update(item[index : index + 4] for index in range(0, len(item) - 3))
+    return terms
 
 
 def _final_page_semantic_errors(
@@ -2860,27 +2927,34 @@ def _step_final_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepO
         state["final_coverage_report"] = report
         return StepOutput([report_path, md_path], _final_coverage_counts(report))
 
-    repair, repaired_final_pages, report, provider_artifacts, model_calls, api_calls, semantic_retry_count = _run_final_coverage_repair_once(
-        out_dir,
-        state,
-        digest,
-        final_pages,
-        artifact_stem="final_coverage_repair",
+    if not final_pages.pages:
+        raise PipelineError("final_coverage_judge 存在 claims 但没有 final_pages，无法做覆盖修复。")
+
+    repairs, repaired_final_pages, assignment_rows, provider_artifacts, model_calls, api_calls, semantic_retry_count = _run_final_coverage_repair_parallel(
+        out_dir, state, digest, final_pages
     )
     repaired_final_page_count = _changed_final_page_count(final_pages, repaired_final_pages)
     final_pages = repaired_final_pages
     state["final_pages"] = final_pages
+    repair_actions = [action for repair in repairs for action in repair.repair_actions]
+    repair_warnings = _dedupe_list([warning for repair in repairs for warning in repair.warnings])
     repair_actions_path = out_dir / "repair_actions.json"
+    repairs_path = out_dir / "final_page_coverage_repairs.json"
+    assignment_path = out_dir / "claim_assignments.json"
     repaired_path = out_dir / "repaired_final_pages.json"
     manifest_path = out_dir / "repaired_final_page_manifest.json"
-    write_json(repair_actions_path, [action.model_dump(mode="json") for action in repair.repair_actions])
+    write_json(repair_actions_path, [action.model_dump(mode="json") for action in repair_actions])
+    write_json(repairs_path, [repair.model_dump(mode="json") for repair in repairs])
+    write_json(assignment_path, assignment_rows)
     write_json(repaired_path, final_pages)
     write_json(manifest_path, [{"target_path": page.target_path, "sha256": page.content_sha256, "action": page.action} for page in final_pages.pages])
-    provider_artifacts.extend([repair_actions_path, repaired_path, manifest_path])
+    provider_artifacts.extend([repair_actions_path, repairs_path, assignment_path, repaired_path, manifest_path])
 
     verify_enabled = bool(state.get("verify_final_coverage"))
     verify_count = 0
-    judge = CoverageJudge(claim_results=repair.claim_results, warnings=repair.warnings)
+    judge = _aggregate_final_coverage_judge(digest, repairs, repair_warnings)
+    report = _final_coverage_report(judge, digest)
+    _assert_final_coverage_judge_thresholds(report)
     if verify_enabled:
         judge, report, second_artifacts, second_model_calls, second_api_calls, second_semantic_retry_count = _run_final_coverage_judge_once(
             out_dir,
@@ -2897,11 +2971,13 @@ def _step_final_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepO
         semantic_retry_count += second_semantic_retry_count
         _assert_final_coverage_judge_thresholds(report)
     report["repair"] = {
-        "attempted": bool(repair.repair_actions),
-        "rounds": 1 if repair.repair_actions else 0,
-        "mode": "combined_repair",
+        "attempted": bool(repair_actions),
+        "rounds": 1 if repair_actions else 0,
+        "mode": "parallel_page_repair",
         "verify_enabled": verify_enabled,
         "verify_rounds": verify_count,
+        "parallel_request_count": len(repairs),
+        "parallel_max_workers": _page_generation_parallelism(state, len(repairs)),
         "repaired_final_page_count": repaired_final_page_count,
     }
     report_path, md_path = _write_final_coverage_report(out_dir, "final_coverage_report", report)
@@ -2910,9 +2986,11 @@ def _step_final_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepO
     state["final_coverage_report"] = report
     counts = {
         **_final_coverage_counts(report),
-        "coverage_repair_count": 1 if repair.repair_actions else 0,
-        "coverage_repair_action_count": len(repair.repair_actions),
+        "coverage_repair_count": sum(1 for repair in repairs if repair.repair_actions),
+        "coverage_repair_action_count": len(repair_actions),
         **({"coverage_repair_final_page_count": repaired_final_page_count} if repaired_final_page_count else {}),
+        "parallel_request_count": len(repairs) if model_calls else 0,
+        "parallel_max_workers": _page_generation_parallelism(state, len(repairs)) if model_calls else 0,
         "final_verify_enabled": 1 if verify_enabled else 0,
         "final_verify_count": verify_count,
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
@@ -2926,67 +3004,156 @@ def _step_final_coverage_judge(run_dir: Path, state: dict[str, object]) -> StepO
     )
 
 
-def _run_final_coverage_repair_once(
+def _run_final_coverage_repair_parallel(
     out_dir: Path,
     state: dict[str, object],
     digest: SourceDigest,
     final_pages: FinalPages,
-    *,
-    artifact_stem: str,
-) -> tuple[FinalCoverageRepair, FinalPages, dict[str, object], list[Path], int, list[dict[str, object]], int]:
-    request = prompts.final_coverage_repair_prompt(digest=digest, final_pages=final_pages)
-    provider_artifacts: list[Path] = []
-    api_calls: list[dict[str, object]] = []
-    model_calls = 0
+) -> tuple[list[FinalPageCoverageRepair], FinalPages, list[dict[str, object]], list[Path], int, list[dict[str, object]], int]:
+    claims_by_page, assignment_rows = _assign_final_coverage_claims(state, digest, final_pages)
+    pages_by_id = {page.final_page_id: page for page in final_pages.pages}
+    initial_requests = [
+        (
+            page_id,
+            prompts.final_page_coverage_repair_prompt(digest=digest, final_page=pages_by_id[page_id], claims=claims),
+        )
+        for page_id, claims in claims_by_page.items()
+        if claims and page_id in pages_by_id
+    ]
+    outputs_by_id, provider_artifacts, model_calls, api_calls, provider_errors = _call_provider_artifacts_parallel_soft(
+        state,
+        out_dir,
+        "final_coverage_judge",
+        initial_requests,
+        FinalPageCoverageRepair,
+    )
     semantic_retry_count = 0
-    repair: FinalCoverageRepair | None = None
-    repaired_pages: FinalPages | None = None
-    last_semantic_error = ""
-    for attempt in range(FINAL_COVERAGE_REPAIR_MAX_ATTEMPTS):
-        current_artifact_stem = artifact_stem if attempt == 0 else f"{artifact_stem}_retry_{attempt}"
-        repair_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+    normalized_by_id, semantic_errors = _normalize_final_page_coverage_repairs(state, outputs_by_id, claims_by_page, provider_errors)
+    if semantic_errors:
+        api_calls = _mark_request_semantic_retry_failed(api_calls, semantic_errors)
+        retry_requests: list[tuple[str, BaseModel]] = []
+        for page_id, error in semantic_errors.items():
+            previous_output = outputs_by_id.get(page_id)
+            if not isinstance(previous_output, FinalPageCoverageRepair):
+                retry_requests.append(
+                    (
+                        page_id,
+                        prompts.final_page_coverage_repair_prompt(digest=digest, final_page=pages_by_id[page_id], claims=claims_by_page[page_id]),
+                    )
+                )
+                continue
+            retry_requests.append(
+                (
+                    page_id,
+                    prompts.final_coverage_repair_retry_prompt(
+                        digest=digest,
+                        final_page=pages_by_id[page_id],
+                        claims=claims_by_page[page_id],
+                        previous_repair=previous_output,
+                        validation_error=error,
+                    ),
+                )
+            )
+        semantic_retry_count = len(retry_requests)
+        retry_outputs, retry_artifacts, retry_model_calls, retry_api_calls, retry_provider_errors = _call_provider_artifacts_parallel_soft(
             state,
             out_dir,
             "final_coverage_judge",
-            request,
-            FinalCoverageRepair,
-            artifact_stem=current_artifact_stem,
+            retry_requests,
+            FinalPageCoverageRepair,
+            artifact_suffix="_retry_1",
+            api_calls_filename="token_usage_calls_retry_1.json",
         )
-        provider_artifacts.extend(attempt_artifacts)
-        model_calls += attempt_model_calls
-        if not isinstance(repair_result, FinalCoverageRepair):
-            raise PipelineError("final_coverage_judge 覆盖修复 provider 返回了无效 artifact。")
-        try:
-            normalized_pages = _normalize_repaired_final_pages(state, repair_result.repaired_final_pages)
-            normalized_repair = repair_result.model_copy(update={"repaired_final_pages": normalized_pages})
-            judge = CoverageJudge(claim_results=normalized_repair.claim_results, warnings=normalized_repair.warnings)
-            _assert_final_coverage_judge_chinese(judge)
-            _assert_final_coverage_judge_covers_claims(judge, digest)
-            _assert_final_coverage_judge_thresholds(_final_coverage_report(judge, digest))
-            _assert_final_coverage_repair_actions(normalized_repair)
-            repair = normalized_repair
-            repaired_pages = normalized_pages
-        except PipelineError as exc:
-            last_semantic_error = str(exc)
-            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
-            if attempt >= FINAL_COVERAGE_REPAIR_MAX_ATTEMPTS - 1:
-                break
-            semantic_retry_count += 1
-            request = prompts.final_coverage_repair_retry_prompt(
-                digest=digest,
-                final_pages=final_pages,
-                previous_repair=repair_result,
-                validation_error=last_semantic_error,
-            )
+        provider_artifacts.extend(retry_artifacts)
+        model_calls += retry_model_calls
+        retry_claims_by_page = {page_id: claims_by_page[page_id] for page_id, _ in retry_requests}
+        retry_normalized_by_id, retry_errors = _normalize_final_page_coverage_repairs(state, retry_outputs, retry_claims_by_page, retry_provider_errors)
+        if retry_errors:
+            api_calls.extend(_mark_request_semantic_retry_failed(retry_api_calls, retry_errors))
+            raise PipelineError(f"final_coverage_judge 单页覆盖修复重试后仍未通过系统校验：{'; '.join(retry_errors.values())}")
+        api_calls.extend(retry_api_calls)
+        outputs_by_id.update(retry_outputs)
+        normalized_by_id.update(retry_normalized_by_id)
+        combined_api_calls_path = out_dir / "token_usage_calls.json"
+        write_json(combined_api_calls_path, api_calls)
+        if combined_api_calls_path not in provider_artifacts:
+            provider_artifacts.append(combined_api_calls_path)
+
+    repairs = [normalized_by_id[page_id] for page_id, _ in initial_requests]
+    repaired_pages = []
+    for page in final_pages.pages:
+        repair = normalized_by_id.get(page.final_page_id)
+        repaired_pages.append(repair.repaired_final_page if repair else page)
+    return repairs, final_pages.model_copy(update={"pages": repaired_pages}), assignment_rows, provider_artifacts, model_calls, api_calls, semantic_retry_count
+
+
+def _normalize_final_page_coverage_repairs(
+    state: dict[str, object],
+    outputs_by_id: dict[str, BaseModel],
+    claims_by_page: dict[str, list[SourceClaim]],
+    provider_errors: dict[str, str],
+) -> tuple[dict[str, FinalPageCoverageRepair], dict[str, str]]:
+    normalized: dict[str, FinalPageCoverageRepair] = {}
+    errors = dict(provider_errors)
+    for page_id, claims in claims_by_page.items():
+        if not claims:
             continue
-        api_calls.extend(attempt_api_calls)
-        break
-    if repair is None or repaired_pages is None:
-        raise PipelineError(f"final_coverage_judge 覆盖修复重试后仍未通过系统语义校验：{last_semantic_error}")
-    report = _final_coverage_report(CoverageJudge(claim_results=repair.claim_results, warnings=repair.warnings), digest)
-    repair_path = out_dir / "final_coverage_repair.json"
-    write_json(repair_path, repair)
-    return repair, repaired_pages, report, [repair_path, *provider_artifacts], model_calls, api_calls, semantic_retry_count
+        if page_id in errors:
+            continue
+        output = outputs_by_id.get(page_id)
+        if output is None:
+            errors[page_id] = f"{page_id} 缺少 provider 输出。"
+            continue
+        if not isinstance(output, FinalPageCoverageRepair):
+            errors[page_id] = f"{page_id} 覆盖修复返回了无效 artifact。"
+            continue
+        try:
+            repaired_page = _normalize_repaired_final_page(state, output.repaired_final_page)
+            repair = output.model_copy(update={"repaired_final_page": repaired_page})
+            _assert_final_page_coverage_repair(repair, claims)
+        except PipelineError as exc:
+            errors[page_id] = str(exc)
+            continue
+        normalized[page_id] = repair
+    return normalized, errors
+
+
+def _assert_final_page_coverage_repair(repair: FinalPageCoverageRepair, claims: list[SourceClaim]) -> None:
+    judge = CoverageJudge(claim_results=repair.claim_results, warnings=repair.warnings)
+    digest = SourceDigest(
+        source_raw_path="final_coverage_page_scope",
+        raw_sha256="page-scope",
+        summary="单页覆盖修复范围。",
+        key_takeaways=[],
+        claims=claims,
+        content_units=[],
+        weak_or_noise_items=[],
+    )
+    _assert_final_coverage_judge_chinese(judge)
+    _assert_final_coverage_judge_covers_claims(judge, digest)
+    _assert_final_coverage_judge_thresholds(_final_coverage_report(judge, digest))
+    _assert_final_page_coverage_repair_actions(repair, claims)
+
+
+def _assert_final_page_coverage_repair_actions(repair: FinalPageCoverageRepair, claims: list[SourceClaim]) -> None:
+    valid_claim_ids = {claim.claim_id for claim in claims}
+    page_id = repair.repaired_final_page.final_page_id
+    for index, action in enumerate(repair.repair_actions, start=1):
+        if action.claim_id not in valid_claim_ids:
+            raise PipelineError(f"final_coverage_judge.repair_actions[{index}] 引用了未分配给当前页的 claim_id：{action.claim_id}")
+        unknown_pages = [item for item in action.final_page_ids if item != page_id]
+        if unknown_pages:
+            raise PipelineError(f"final_coverage_judge.repair_actions[{index}] 引用了当前页之外的 final_page_id：{', '.join(unknown_pages)}")
+        _require_chinese_text(f"final_coverage_judge.repair_actions[{index}].reason", action.reason)
+
+
+def _aggregate_final_coverage_judge(digest: SourceDigest, repairs: list[FinalPageCoverageRepair], warnings: list[str]) -> CoverageJudge:
+    by_claim_id = {item.claim_id: item for repair in repairs for item in repair.claim_results}
+    claim_results = [by_claim_id[claim.claim_id] for claim in digest.claims if claim.claim_id in by_claim_id]
+    judge = CoverageJudge(claim_results=claim_results, warnings=warnings)
+    _assert_final_coverage_judge_chinese(judge)
+    _assert_final_coverage_judge_covers_claims(judge, digest)
+    return judge
 
 
 def _run_final_coverage_judge_once(
@@ -3073,18 +3240,6 @@ def _assert_final_coverage_judge_covers_claims(judge: CoverageJudge, digest: Sou
     for item in judge.claim_results:
         if item.status in {"covered", "partial"} and not item.covered_by:
             raise PipelineError(f"final_coverage_judge {item.claim_id} 状态为 {item.status} 时必须填写 covered_by。")
-
-
-def _assert_final_coverage_repair_actions(repair: FinalCoverageRepair) -> None:
-    claim_ids = {item.claim_id for item in repair.claim_results}
-    final_page_ids = {page.final_page_id for page in repair.repaired_final_pages.pages}
-    for index, action in enumerate(repair.repair_actions, start=1):
-        if action.claim_id not in claim_ids:
-            raise PipelineError(f"final_coverage_judge.repair_actions[{index}] 引用了不存在的 claim_id：{action.claim_id}")
-        unknown_pages = sorted(set(action.final_page_ids) - final_page_ids)
-        if unknown_pages:
-            raise PipelineError(f"final_coverage_judge.repair_actions[{index}] 引用了不存在的 final_page_id：{', '.join(unknown_pages)}")
-        _require_chinese_text(f"final_coverage_judge.repair_actions[{index}].reason", action.reason)
 
 
 def _changed_final_page_count(before: FinalPages, after: FinalPages) -> int:
@@ -4559,7 +4714,7 @@ def _important_artifact_hashes(run_dir: Path) -> dict[str, str]:
         "page_update_plan": run_dir / "page_update_plan" / "page_update_plan.json",
         "final_pages": run_dir / "final_pages" / "final_pages.json",
         "final_coverage_judge": run_dir / "final_coverage_judge" / "final_coverage_report.json",
-        "coverage_repaired_final_pages": run_dir / "final_coverage_judge" / "coverage_repair_final_pages" / "repaired_final_pages.json",
+        "coverage_repaired_final_pages": run_dir / "final_coverage_judge" / "repaired_final_pages.json",
         "related_refresh": run_dir / "related_refresh" / "related_refresh_report.json",
         "related_final_pages": run_dir / "related_refresh" / "final_pages.json",
         "knowledge_write_set": run_dir / "knowledge_write" / "write_set.json",

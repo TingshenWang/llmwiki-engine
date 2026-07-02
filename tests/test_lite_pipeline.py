@@ -26,7 +26,7 @@ from llmwiki_engine.lite.models import (
     CoverageJudge,
     DigestCoverageRepair,
     DigestCoverageJudge,
-    FinalCoverageRepair,
+    FinalPageCoverageRepair,
     FinalPage,
     FinalPages,
     MergeDecision,
@@ -36,6 +36,7 @@ from llmwiki_engine.lite.models import (
     PageStateClaim,
     PageStateNode,
     PageUpdatePlan,
+    PageUpdatePlanItem,
     PreimageCoverageItem,
     RawBinding,
     SourceDigest,
@@ -964,7 +965,7 @@ def test_final_coverage_judge_writes_quantified_report(tmp_path: Path) -> None:
             )
         ]
     )
-    repair = FinalCoverageRepair(claim_results=judge.claim_results, repaired_final_pages=final_pages, repair_actions=[])
+    repair = FinalPageCoverageRepair(claim_results=judge.claim_results, repaired_final_page=final_pages.pages[0], repair_actions=[])
     composition = CompositionPlan(
         items=[
             CompositionItem(
@@ -1084,8 +1085,8 @@ def test_final_coverage_judge_retries_empty_evidence(tmp_path: Path) -> None:
             )
         ]
     )
-    invalid_repair = FinalCoverageRepair(claim_results=invalid_judge.claim_results, repaired_final_pages=final_pages, repair_actions=[])
-    valid_repair = FinalCoverageRepair(claim_results=valid_judge.claim_results, repaired_final_pages=final_pages, repair_actions=[])
+    invalid_repair = FinalPageCoverageRepair(claim_results=invalid_judge.claim_results, repaired_final_page=final_pages.pages[0], repair_actions=[])
+    valid_repair = FinalPageCoverageRepair(claim_results=valid_judge.claim_results, repaired_final_page=final_pages.pages[0], repair_actions=[])
     composition = CompositionPlan(
         items=[
             CompositionItem(
@@ -1246,7 +1247,7 @@ def test_final_coverage_judge_rejects_english_explanatory_evidence() -> None:
         _assert_final_coverage_judge_chinese(judge)
 
 
-def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Path) -> None:
+def test_final_coverage_judge_repairs_missing_claim_per_page(tmp_path: Path) -> None:
     vault = init_vault(tmp_path / "vault")
     ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
     digest = SourceDigest(
@@ -1302,41 +1303,6 @@ def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Pat
             )
         ]
     )
-    missing_judge = CoverageJudge(
-        claim_results=[
-            ClaimCoverageItem(
-                claim_id="C-001",
-                status="missing",
-                evidence="最终页面没有写出自动写入 wiki。",
-                reason="缺少覆盖校验通过后自动写入 wiki 的信息。",
-            ),
-            ClaimCoverageItem(
-                claim_id="C-002",
-                status="covered",
-                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
-                evidence="最终页面体现 raw 可用于追溯。",
-                reason="raw 追溯信息已覆盖。",
-            )
-        ]
-    )
-    newly_exposed_judge = CoverageJudge(
-        claim_results=[
-            ClaimCoverageItem(
-                claim_id="C-001",
-                status="covered",
-                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
-                evidence="最终页面写明覆盖校验通过后自动写入 wiki。",
-                reason="正文补齐了缺失的 claim。",
-            ),
-            ClaimCoverageItem(
-                claim_id="C-002",
-                status="partial",
-                covered_by=["concepts/Concept_Auto_Ingest.md#摘要"],
-                evidence="最终页面只泛化提到 raw，没有明确保留 raw 文件用于追溯原始信息。",
-                reason="raw 追溯信息不够具体。",
-            ),
-        ]
-    )
     covered_judge = CoverageJudge(
         claim_results=[
             ClaimCoverageItem(
@@ -1355,19 +1321,6 @@ def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Pat
             )
         ]
     )
-    repaired_pages = FinalPages(
-        pages=[
-            FinalPage(
-                final_page_id="FP-001",
-                target_path="concepts/Concept_Auto_Ingest.md",
-                action="create",
-                title="自动化入库",
-                page_type="concept",
-                markdown="# 自动化入库\n\n## 摘要\n\n自动化入库去掉人工审核，并在覆盖校验通过后自动写入 wiki。\n",
-                source_refs=[ref],
-            )
-        ]
-    )
     second_repaired_pages = FinalPages(
         pages=[
             FinalPage(
@@ -1381,9 +1334,9 @@ def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Pat
             )
         ]
     )
-    final_repair = FinalCoverageRepair(
+    final_repair = FinalPageCoverageRepair(
         claim_results=covered_judge.claim_results,
-        repaired_final_pages=second_repaired_pages,
+        repaired_final_page=second_repaired_pages.pages[0],
         repair_actions=[
             {
                 "claim_id": "C-001",
@@ -1413,7 +1366,7 @@ def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Pat
             return self.spec
 
         def call_structured(self, step: str, request, output_model):
-            if output_model is FinalCoverageRepair:
+            if output_model is FinalPageCoverageRepair:
                 self.coverage_repair_calls += 1
                 output = final_repair
             else:
@@ -1471,6 +1424,156 @@ def test_final_coverage_judge_repairs_missing_claim_in_single_call(tmp_path: Pat
     assert "自动写入 wiki" in state["final_pages"].pages[0].markdown
     assert "保留 raw 文件用于追溯原始信息" in state["final_pages"].pages[0].markdown
     assert (tmp_path / "run" / "final_coverage_judge" / "repaired_final_pages.json").exists()
+
+
+def test_final_coverage_judge_repairs_pages_in_parallel(tmp_path: Path) -> None:
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    claim_a = make_claim(ref, "C-001", "自动化入库会自动写入 wiki。")
+    claim_b = make_claim(ref, "C-002", "自动化入库会保留 raw 文件用于追溯。")
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="这份材料说明自动化入库流程。",
+        key_takeaways=["自动化入库包含写入和追溯。"],
+        claims=[claim_a, claim_b],
+        content_units=[
+            make_source_unit(ref, content_unit_id="CU-001", claim_ids=["C-001"]),
+            make_source_unit(ref, content_unit_id="CU-002", title="追溯机制", claim_ids=["C-002"]),
+        ],
+    )
+    final_pages = FinalPages(
+        pages=[
+            FinalPage(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Auto_Write.md",
+                action="create",
+                title="自动写入",
+                page_type="concept",
+                markdown="# 自动写入\n\n## 摘要\n\n自动化入库会自动写入 wiki。\n",
+                source_refs=[ref],
+            ),
+            FinalPage(
+                final_page_id="FP-002",
+                target_path="concepts/Concept_Raw_Trace.md",
+                action="create",
+                title="Raw 追溯",
+                page_type="concept",
+                markdown="# Raw 追溯\n\n## 摘要\n\n自动化入库会保留 raw 文件用于追溯。\n",
+                source_refs=[ref],
+            ),
+        ]
+    )
+    composition = CompositionPlan(
+        items=[
+            CompositionItem(
+                final_page_id="FP-001",
+                target_path="concepts/Concept_Auto_Write.md",
+                action="create",
+                merge_decision_ids=["MD-001"],
+                candidate_page_ids=["CP-001"],
+                section_order=["摘要"],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="生成可读的中文 wiki 笔记。",
+            ),
+            CompositionItem(
+                final_page_id="FP-002",
+                target_path="concepts/Concept_Raw_Trace.md",
+                action="create",
+                merge_decision_ids=["MD-002"],
+                candidate_page_ids=["CP-002"],
+                section_order=["摘要"],
+                source_ref_rules=["保留 raw 来源引用。"],
+                readability_goal="生成可读的中文 wiki 笔记。",
+            ),
+        ]
+    )
+    page_update_plan = PageUpdatePlan(
+        items=[
+            PageUpdatePlanItem(final_page_id="FP-001", target_path="concepts/Concept_Auto_Write.md", action="create", state_path=".llmwiki/page_state/a.json", state_exists=False, incoming_claims=[claim_a]),
+            PageUpdatePlanItem(final_page_id="FP-002", target_path="concepts/Concept_Raw_Trace.md", action="create", state_path=".llmwiki/page_state/b.json", state_exists=False, incoming_claims=[claim_b]),
+        ]
+    )
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.spec = ProviderSpec(
+                spec="openai_compatible:deepseek-v4-flash",
+                endpoint="https://api.deepseek.com/v1/chat/completions",
+                api_key="test-key",
+            )
+            self.requests = []
+
+        def provider_for(self, step: str) -> ProviderSpec:
+            return self.spec
+
+        def call_structured(self, step: str, request, output_model):
+            assert output_model is FinalPageCoverageRepair
+            self.requests.append(request)
+            page_payload = request.user_payload["final_page"]
+            claim_payload = request.user_payload["claims"][0]
+            page = next(page for page in final_pages.pages if page.final_page_id == page_payload["final_page_id"])
+            repair = FinalPageCoverageRepair(
+                claim_results=[
+                    ClaimCoverageItem(
+                        claim_id=claim_payload["claim_id"],
+                        status="covered",
+                        covered_by=[f"{page.target_path}#摘要"],
+                        evidence="最终页面正文已经覆盖该知识点。",
+                        reason="单页正文明确覆盖了分配到的 claim。",
+                    )
+                ],
+                repaired_final_page=page,
+                repair_actions=[],
+            )
+            return ProviderCallResult(
+                output=repair,
+                prompt_artifact={"step": step, "request": request.model_dump(mode="json")},
+                provider_result={"parsed": repair.model_dump(mode="json")},
+                sanitized_context=self.spec.sanitized_context(),
+                api_calls=[
+                    {
+                        "step": step,
+                        "request_key": "",
+                        "model": "deepseek-v4-flash",
+                        "attempt": 0,
+                        "call_index": len(self.requests),
+                        "status": "success",
+                        "finish_reason": "stop",
+                        "duration_ms": 1.0,
+                        "response_status_code": 200,
+                        "error": "",
+                        "prompt_tokens": 10,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10,
+                        "completion_tokens": 5,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 15,
+                        "cache_hit_rate_percent": 0.0,
+                        "price_cny": 0.00002,
+                    }
+                ],
+            )
+
+    registry = FakeRegistry()
+    state = {
+        "source_digest": digest,
+        "final_pages": final_pages,
+        "composition_plan": composition,
+        "page_update_plan": page_update_plan,
+        "wiki_snapshot": WikiSnapshot(wiki_root="wiki", pool_hash="empty", generated_at="2026-06-23T00:00:00Z", entries=[]),
+        "provider_registry": registry,
+        "provider_contexts": {},
+        "operation_id": "ING-test",
+    }
+
+    output = _step_final_coverage_judge(tmp_path / "run", state)
+
+    assert output.counts["parallel_request_count"] == 2
+    assert output.counts["parallel_max_workers"] == 2
+    assert len(registry.requests) == 2
+    assert sorted(len(request.user_payload["claims"]) for request in registry.requests) == [1, 1]
+    assignments = read_json(tmp_path / "run" / "final_coverage_judge" / "claim_assignments.json")
+    assert {item["claim_id"]: item["final_page_id"] for item in assignments} == {"C-001": "FP-001", "C-002": "FP-002"}
 
 
 def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:

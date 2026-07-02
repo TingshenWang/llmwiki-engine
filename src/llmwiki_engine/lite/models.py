@@ -508,9 +508,9 @@ class FinalPages(StrictModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-class FinalCoverageRepair(StrictModel):
+class FinalPageCoverageRepair(StrictModel):
     claim_results: list[ClaimCoverageItem] = Field(default_factory=list)
-    repaired_final_pages: FinalPages
+    repaired_final_page: FinalPage
     repair_actions: list[FinalCoverageRepairAction] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 

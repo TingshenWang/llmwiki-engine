@@ -13,11 +13,13 @@ from .models import (
     CoverageJudge,
     DigestCoverageRepair,
     DigestCoverageJudge,
-    FinalCoverageRepair,
+    FinalPage,
+    FinalPageCoverageRepair,
     FinalPages,
     MergePlan,
     PageUpdatePlanItem,
     SourceDigest,
+    SourceClaim,
     SourceGranularityStats,
     SourceContentUnit,
     WikiKnowledgeEntry,
@@ -631,44 +633,41 @@ def final_coverage_judge_prompt(*, digest: SourceDigest, final_pages: FinalPages
     )
 
 
-def final_coverage_repair_prompt(*, digest: SourceDigest, final_pages: FinalPages) -> PromptRequest:
+def final_page_coverage_repair_prompt(*, digest: SourceDigest, final_page: FinalPage, claims: list[SourceClaim]) -> PromptRequest:
     return _request(
         step="final_coverage_repair",
-        model=FinalCoverageRepair,
+        model=FinalPageCoverageRepair,
         payload={
             "source_raw_path": digest.source_raw_path,
             "raw_sha256": digest.raw_sha256,
-            "claims": [claim.model_dump(mode="json") for claim in digest.claims],
+            "claims": [claim.model_dump(mode="json") for claim in claims],
             "content_units": [unit.model_dump(mode="json") for unit in digest.content_units],
-            "final_pages": [
-                {
-                    "final_page_id": page.final_page_id,
-                    "target_path": page.target_path,
-                    "title": page.title,
-                    "action": page.action,
-                    "markdown": page.markdown,
-                    "source_refs": [ref.model_dump(mode="json") for ref in page.source_refs],
-                    "preimage_sha256": page.preimage_sha256,
-                    "preimage_coverage_report": [item.model_dump(mode="json") for item in page.preimage_coverage_report],
-                }
-                for page in final_pages.pages
-            ],
+            "final_page": {
+                "final_page_id": final_page.final_page_id,
+                "target_path": final_page.target_path,
+                "title": final_page.title,
+                "action": final_page.action,
+                "markdown": final_page.markdown,
+                "source_refs": [ref.model_dump(mode="json") for ref in final_page.source_refs],
+                "preimage_sha256": final_page.preimage_sha256,
+                "preimage_coverage_report": [item.model_dump(mode="json") for item in final_page.preimage_coverage_report],
+            },
             "allowed_status": ["covered", "partial", "missing", "contradicted"],
             "instructions": [
                 *CHINESE_OUTPUT_RULES,
-                "这是 final_pages 的覆盖校验与修复，必须判断每条 claim 是否被最终页面正文明确覆盖。",
-                "先审查输入 final_pages 是否遗漏、部分覆盖或冲突，再直接输出 repaired_final_pages。",
-                "claim_results 必须描述 repaired_final_pages 修复后的覆盖状态，而不是修复前状态。",
-                "repaired_final_pages 必须返回完整最终页面集合，final_page_id、target_path、action 必须与输入 final_pages 对应页面保持一致。",
-                "covered：修复后的最终页面明确写入了 claim 的事实含义，允许中文改写。",
-                "partial：修复后的最终页面写到了主题但缺少 claim 的关键限定、数字、例子、机制或对象。",
-                "missing：修复后的最终页面没有覆盖该 claim。",
-                "contradicted：修复后的最终页面与 claim 含义冲突。",
+                "这是单篇 final_page 的覆盖校验与修复；只判断输入 claims 是否被这一篇最终页面正文明确覆盖。",
+                "先审查输入 final_page 是否遗漏、部分覆盖或冲突，再直接输出 repaired_final_page。",
+                "claim_results 必须描述 repaired_final_page 修复后的覆盖状态，而不是修复前状态。",
+                "repaired_final_page 必须只返回这一篇完整最终页面，final_page_id、target_path、action 必须与输入 final_page 保持一致。",
+                "covered：修复后的这一篇最终页面明确写入了 claim 的事实含义，允许中文改写。",
+                "partial：修复后的这一篇最终页面写到了主题但缺少 claim 的关键限定、数字、例子、机制或对象。",
+                "missing：修复后的这一篇最终页面没有覆盖该 claim。",
+                "contradicted：修复后的这一篇最终页面与 claim 含义冲突。",
                 "claim_results 必须且只能包含每个 claim_id 一条结果，不能遗漏、不能新增。",
                 "covered_by 写 target_path#中文小节；如果缺失或冲突可为空数组。",
-                "evidence 必须引用 repaired_final_pages 中的中文表达；reason 必须中文说明判断理由。",
-                "如果输入 final_pages 存在遗漏、部分覆盖或冲突，必须在 repaired_final_pages 中补写、改写或移动到合适页面，不要只泛化总结。",
-                "repair_actions 记录你对输入 final_pages 做过的新增、修改、移动或不改动动作；如果输入本来已经完整，可以为空或只写 no_change。",
+                "evidence 必须引用 repaired_final_page 中的中文表达；reason 必须中文说明判断理由。",
+                "如果输入 final_page 存在遗漏、部分覆盖或冲突，必须在 repaired_final_page 中补写或局部改写，不要只泛化总结。",
+                "repair_actions 记录你对输入 final_page 做过的新增、修改、移动或不改动动作；如果输入本来已经完整，可以为空或只写 no_change。",
                 "不要删除已经正确覆盖的内容；只做必要补充和局部改写。",
                 "不要写 Related 或 相关页面章节；引擎会统一生成。",
                 "正文 Obsidian wikilink 最多 2 条；也可以不写正文链接。",
@@ -682,11 +681,12 @@ def final_coverage_repair_prompt(*, digest: SourceDigest, final_pages: FinalPage
 def final_coverage_repair_retry_prompt(
     *,
     digest: SourceDigest,
-    final_pages: FinalPages,
-    previous_repair: FinalCoverageRepair,
+    final_page: FinalPage,
+    claims: list[SourceClaim],
+    previous_repair: FinalPageCoverageRepair,
     validation_error: str,
 ) -> PromptRequest:
-    request = final_coverage_repair_prompt(digest=digest, final_pages=final_pages)
+    request = final_page_coverage_repair_prompt(digest=digest, final_page=final_page, claims=claims)
     payload = dict(request.user_payload)
     instructions = list(payload.get("instructions") or [])
     payload.update(
@@ -696,9 +696,9 @@ def final_coverage_repair_retry_prompt(
             "instructions": [
                 *instructions,
                 "上一轮 final_coverage_judge 覆盖修复输出没有通过系统校验；本轮必须返回修正后的完整 JSON，不要解释。",
-                "repaired_final_pages 必须是完整页面集合，不能只返回改动页。",
+                "repaired_final_page 必须是输入 final_page 对应的完整页面，不能只返回改动片段。",
                 "claim_results 的 claim_id 集合必须与输入 claims 完全一致。",
-                "每条 claim_results 的 evidence 和 reason 都不能为空，且必须基于 repaired_final_pages 正文。",
+                "每条 claim_results 的 evidence 和 reason 都不能为空，且必须基于 repaired_final_page 正文。",
                 "所有 evidence、reason、warnings 等用户可读字段必须使用中文。",
             ],
         }
@@ -1033,21 +1033,16 @@ def _json_example(step: str) -> dict[str, Any]:
                     "reason": "正文明确覆盖了 claim 的事实含义。",
                 }
             ],
-            "repaired_final_pages": {
-                "pages": [
-                    {
-                        "final_page_id": "FP-001",
-                        "target_path": "concepts/Concept_Example_Concept.md",
-                        "action": "create",
-                        "title": "示例概念",
-                        "page_type": "concept",
-                        "content_sha256": "",
-                        "markdown": "# 示例概念\n\n## 摘要\n\n示例概念说明了一个有来源支撑的定义和用途。\n",
-                        "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
-                        "preimage_sha256": None,
-                        "warnings": [],
-                    }
-                ],
+            "repaired_final_page": {
+                "final_page_id": "FP-001",
+                "target_path": "concepts/Concept_Example_Concept.md",
+                "action": "create",
+                "title": "示例概念",
+                "page_type": "concept",
+                "content_sha256": "",
+                "markdown": "# 示例概念\n\n## 摘要\n\n示例概念说明了一个有来源支撑的定义和用途。\n",
+                "source_refs": [{"raw_path": "raw/example.md", "raw_sha256": "sha256", "locator": "whole_file"}],
+                "preimage_sha256": None,
                 "warnings": [],
             },
             "repair_actions": [],
