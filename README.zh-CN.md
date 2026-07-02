@@ -105,7 +105,7 @@ llmwiki init ~/my-llmwiki-vault
 mkdir -p ~/my-llmwiki-vault/raw
 cp /path/to/example.md ~/my-llmwiki-vault/raw/
 
-llmwiki ingest run ~/my-llmwiki-vault raw/example.md
+llmwiki ingest run ~/my-llmwiki-vault example.md
 llmwiki ingest status ~/my-llmwiki-vault --verify
 llmwiki ingest raw-candidates ~/my-llmwiki-vault --all
 ```

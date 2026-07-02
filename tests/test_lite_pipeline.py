@@ -66,6 +66,7 @@ from llmwiki_engine.lite.pipeline import (
     _normalize_merge_plan,
     _page_generation_parallelism,
     _repair_merge_plan_candidate_content_locators,
+    _resolve_raw,
     _step_candidate_pages,
     _step_composition_plan,
     _step_digest_coverage_judge,
@@ -1590,6 +1591,24 @@ def test_cli_json_run(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code != 0
     assert "必须使用真实模型 provider" in result.output
+
+
+def test_resolve_raw_defaults_relative_paths_to_raw_dir(tmp_path: Path) -> None:
+    vault = init_vault(tmp_path / "vault")
+    raw = write_raw(vault, "project_note.md")
+    nested = write_raw(vault, "nested/project_note.md")
+
+    assert _resolve_raw(vault, Path("project_note.md")) == raw.resolve()
+    assert _resolve_raw(vault, raw) == raw.resolve()
+    assert _resolve_raw(vault, Path("nested/project_note.md")) == nested.resolve()
+
+    with pytest.raises(ValueError):
+        _resolve_raw(vault, Path("raw/project_note.md"))
+
+    outside = tmp_path / "project_note.md"
+    outside.write_text("# outside\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        _resolve_raw(vault, outside)
 
 
 def test_log_pages_are_date_sharded_without_global_log(tmp_path: Path) -> None:

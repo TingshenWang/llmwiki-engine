@@ -4909,8 +4909,9 @@ def _run_dir(vault: Path, operation_id: str) -> Path:
 
 def _resolve_raw(vault: Path, raw_file: Path) -> Path:
     raw = raw_file.expanduser()
-    raw_abs = raw.resolve() if raw.is_absolute() else (vault / raw).resolve()
-    ensure_under(raw_abs, vault / "raw", label="raw_file")
+    raw_root = (vault / "raw").resolve()
+    raw_abs = raw.resolve() if raw.is_absolute() else (raw_root / raw).resolve()
+    ensure_under(raw_abs, raw_root, label="raw_file")
     if not raw_abs.exists():
         raise ValueError(f"raw 文件不存在：{raw_abs}")
     if not raw_abs.is_file():

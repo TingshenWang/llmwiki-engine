@@ -117,7 +117,7 @@ providers:
 
 \`\`\`bash
 llmwiki init /path/to/vault
-llmwiki ingest run /path/to/vault raw/example.md
+llmwiki ingest run /path/to/vault example.md
 llmwiki ingest status /path/to/vault --verify
 \`\`\`
 EOF
