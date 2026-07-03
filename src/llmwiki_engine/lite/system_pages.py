@@ -9,7 +9,6 @@ from .models import WikiKnowledgeEntry
 
 
 SYSTEM_MARKER = "<!-- llmwiki:system-page:v3 -->"
-RELATED_LINK_LIMIT = 1
 GRAPH_EXCLUDED_ROOTS = {"raw", "sources", "logs"}
 SYSTEM_WIKI_FILES = {"index.md", "log.md"}
 
@@ -86,7 +85,7 @@ def render_index(
         if tension_rows
         else [["暂无未决问题记录", "", ""]]
     )
-    parts.extend(["## 矛盾与未决问题", "", markdown_table(["问题", "关联页面", "更新日期"], tension_table_rows)])
+    parts.extend(["## 矛盾与未解决问题", "", markdown_table(["问题", "关联页面", "更新日期"], tension_table_rows)])
     return "\n".join(parts).rstrip() + "\n"
 
 

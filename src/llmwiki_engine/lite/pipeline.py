@@ -46,6 +46,7 @@ from .models import (
     CandidateContexts,
     CandidatePage,
     CandidatePages,
+    CandidatePagesDraft,
     CandidatePagesWarmup,
     ClaimCoverageItem,
     CompositionItem,
@@ -84,6 +85,7 @@ from .models import (
     WriteSet,
     WriteSetItem,
 )
+from .page_plugin import PagePlugin, default_page_plugin, load_page_plugin, page_plugin_hash, write_page_plugin
 from .profile import Profile, load_profile, write_profile
 from .providers import MODEL_BACKED_STEPS, ProviderCallError, ProviderConfigError, ProviderRegistry, load_provider_registry
 from .text import (
@@ -121,8 +123,6 @@ class CandidateContentGroup:
     members: list[SourceContentUnit]
 
 
-RELATED_MIN_SIMILARITY = 0.72
-RELATED_REPLACEMENT_MARGIN = 0.04
 MERGE_PLAN_STRONG_OVERLAP_UPDATE_THRESHOLD = 0.80
 COVERAGE_MIN_RAW_CLAIM_PERCENT = 85.0
 COVERAGE_MIN_CORE_CLAIM_PERCENT = 95.0
@@ -139,6 +139,10 @@ def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
     (vault / "wiki" / "logs").mkdir(parents=True, exist_ok=True)
     profile = load_profile(vault, profile_name)
     write_profile(vault, profile)
+    plugin = default_page_plugin()
+    write_page_plugin(vault, plugin)
+    for spec in plugin.page_types.values():
+        (vault / "wiki" / spec.directory).mkdir(parents=True, exist_ok=True)
     config = {
         "version": "lite-1",
         "profile": profile.name,
@@ -187,6 +191,10 @@ def run_ingest(
     except ProviderConfigError as exc:
         raise PipelineError(str(exc)) from exc
     profile = load_profile(vault, profile_name or str(config.get("profile", "project_basic")))
+    try:
+        page_plugin = load_page_plugin(vault)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
     raw_abs = _resolve_raw(vault, raw_file)
     raw_rel = relative_posix(raw_abs, vault)
     _assert_llmwiki_not_tracked(vault)
@@ -213,6 +221,8 @@ def run_ingest(
         "raw_abs": raw_abs,
         "raw_rel": raw_rel,
         "profile": profile,
+        "page_plugin": page_plugin,
+        "page_plugin_hash": page_plugin_hash(page_plugin),
         "config": config,
         "embedding_config": load_embedding_config(config),
         "provider_registry": provider_registry,
@@ -341,7 +351,7 @@ def scan_raw_candidates(vault: Path, *, include_processed: bool = False, limit: 
     return {"vault": vault.as_posix(), "count": len(items), "items": items}
 
 
-def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[SourceDigest, StructuredRepairReport]:
+def normalize_source_digest(digest: SourceDigest) -> tuple[SourceDigest, StructuredRepairReport]:
     repairs: list[RepairItem] = []
 
     claims: list[SourceClaim] = []
@@ -371,12 +381,6 @@ def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[Sou
         if not title:
             title = f"未命名内容单元 {index}"
             repairs.append(RepairItem(path=f"content_units[{index - 1}].title", reason="title 为空，已使用默认标题补齐。", local_fix=True, model_called=False))
-        page_type = unit.page_type if unit.page_type in profile.page_types and unit.page_type != profile.source_page_type else profile.default_page_type
-        if page_type != unit.page_type:
-            repairs.append(RepairItem(path=f"content_units[{index - 1}].page_type", reason="page_type 不在 profile 中或指向 source 类型，已改为默认知识页类型。", local_fix=True, model_called=False))
-        path_hint = _normalize_path_hint(unit.path_hint, page_type, title, profile)
-        if path_hint != unit.path_hint:
-            repairs.append(RepairItem(path=f"content_units[{index - 1}].path_hint", reason="path_hint 越界或格式不正确，已按页面类型和标题重建。", local_fix=True, model_called=False))
         claim_ids = _dedupe_list([claim_id_map.get(item.strip(), item.strip()) for item in unit.claim_ids if item.strip()])
         normalized_id = content_unit_id_map[unit.content_unit_id]
         anchor_unit_id = content_unit_id_map.get(unit.anchor_unit_id.strip(), unit.anchor_unit_id.strip() or normalized_id)
@@ -392,8 +396,6 @@ def normalize_source_digest(digest: SourceDigest, profile: Profile) -> tuple[Sou
                     "summary": unit.summary.strip(),
                     "absorption_reason": unit.absorption_reason.strip(),
                     "content_scope": unit.content_scope.strip(),
-                    "page_type": page_type,
-                    "path_hint": path_hint,
                     "claim_ids": claim_ids,
                     "source_refs": _merge_source_refs(unit.source_refs),
                 }
@@ -530,9 +532,6 @@ def _assert_source_digest_claim_plan(digest: SourceDigest) -> None:
         if unknown:
             raise PipelineError(f"{unit.content_unit_id} 引用了不存在的 claim_ids：{', '.join(unknown)}")
         assigned.extend(unit.claim_ids)
-    duplicate_assignments = [claim_id for claim_id, count in Counter(assigned).items() if count > 1]
-    if duplicate_assignments:
-        raise PipelineError(f"source_digest 存在被多个 content_unit 重复消费的 claims：{', '.join(sorted(duplicate_assignments))}")
     unassigned = sorted(known - set(assigned))
     if unassigned:
         raise PipelineError(f"source_digest 存在未分配到 content_unit 的有效 claims：{', '.join(unassigned)}")
@@ -565,6 +564,29 @@ def _call_provider_artifact(
     output_model: type[BaseModel],
     artifact_stem: str | None = None,
 ) -> tuple[BaseModel, list[Path], int, list[dict[str, object]]]:
+    output, artifacts, model_calls, api_calls, error = _call_provider_artifact_soft(
+        state,
+        out_dir,
+        step,
+        request,
+        output_model,
+        artifact_stem=artifact_stem,
+    )
+    if error:
+        raise PipelineError(error)
+    if output is None:
+        raise PipelineError(f"{step} provider 返回了无效 artifact。")
+    return output, artifacts, model_calls, api_calls
+
+
+def _call_provider_artifact_soft(
+    state: dict[str, object],
+    out_dir: Path,
+    step: str,
+    request: BaseModel,
+    output_model: type[BaseModel],
+    artifact_stem: str | None = None,
+) -> tuple[BaseModel | None, list[Path], int, list[dict[str, object]], str | None]:
     registry: ProviderRegistry = state["provider_registry"]  # type: ignore[assignment]
     spec = registry.provider_for(step)
     provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
@@ -573,8 +595,9 @@ def _call_provider_artifact(
     try:
         result = registry.call_structured(step, request, output_model)
     except ProviderCallError as exc:
-        _write_provider_failure_artifacts(out_dir, stem, exc, step)
-        raise PipelineError(str(exc)) from exc
+        artifacts = _write_provider_failure_artifacts(out_dir, stem, exc, step)
+        provider_contexts[step] = exc.sanitized_context or spec.sanitized_context()
+        return None, artifacts, exc.model_calls, tag_api_calls(exc.api_calls, step), str(exc)
     except (ProviderConfigError, ValueError) as exc:
         raise PipelineError(str(exc)) from exc
     model_dir = out_dir / "model_calls"
@@ -586,7 +609,28 @@ def _call_provider_artifact(
     write_json(result_path, result.provider_result)
     write_json(api_calls_path, api_calls)
     provider_contexts[step] = result.sanitized_context
-    return result.output, [prompt_path, result_path, api_calls_path], result.model_calls, api_calls
+    return result.output, [prompt_path, result_path, api_calls_path], result.model_calls, api_calls, None
+
+
+def _is_retriable_provider_structure_error(error: str) -> bool:
+    lowered = error.lower()
+    return any(
+        marker in lowered
+        for marker in [
+            "validation error",
+            "json object",
+            "json",
+            "模型响应没有",
+            "field required",
+            "input should be",
+        ]
+    )
+
+
+def _provider_structure_validation_error(error: str) -> str:
+    if not _is_retriable_provider_structure_error(error):
+        raise PipelineError(error)
+    return f"provider 返回的 JSON/schema 无法通过解析：{error}"
 
 
 def _call_provider_artifacts_parallel(
@@ -866,6 +910,9 @@ def _assert_composition_plan_chinese(plan: CompositionPlan) -> None:
         for field_name in ["preserve_rules", "insert_rules", "delete_rules", "source_ref_rules", "warnings"]:
             for index, value in enumerate(getattr(item, field_name), start=1):
                 _require_chinese_text(f"{item.final_page_id}.{field_name}[{index}]", value)
+        for index, ref in enumerate(item.same_ingest_related_refs, start=1):
+            _require_chinese_title(f"{item.final_page_id}.same_ingest_related_refs[{index}].display_title", ref.display_title, ref.reason)
+            _require_chinese_text(f"{item.final_page_id}.same_ingest_related_refs[{index}].reason", ref.reason)
 
 
 def _assert_final_pages_chinese(artifact: FinalPages) -> None:
@@ -873,6 +920,9 @@ def _assert_final_pages_chinese(artifact: FinalPages) -> None:
         body = strip_frontmatter(page.markdown)
         _require_chinese_title(f"{page.final_page_id}.title", page.title, body)
         _require_chinese_text(f"{page.final_page_id}.markdown", body)
+        for index, section in enumerate(page.sections, start=1):
+            _require_chinese_text(f"{page.final_page_id}.sections[{index}].heading", section.heading)
+            _require_chinese_text(f"{page.final_page_id}.sections[{index}].body_markdown", section.body_markdown)
         for index, item in enumerate(page.preimage_coverage_report, start=1):
             _require_chinese_text(f"{page.final_page_id}.preimage_coverage_report[{index}].final_anchor", item.final_anchor)
             _require_chinese_text(f"{page.final_page_id}.preimage_coverage_report[{index}].evidence", item.evidence)
@@ -1057,26 +1107,13 @@ def _strip_locator_marker(text: str, marker: str | None = None) -> str:
     return stripped or text.strip()
 
 
-def _normalize_path_hint(path_hint: str, page_type: str, title: str, profile: Profile) -> str:
-    spec = profile.page_type(page_type)
-    cleaned = path_hint.strip().replace("\\", "/").lstrip("/")
-    if cleaned and not cleaned.endswith(".md"):
-        cleaned += ".md"
-    if cleaned.startswith(f"{spec.directory}/") and ".." not in Path(cleaned).parts:
-        return cleaned
-    filename = safe_filename(title) or "Untitled"
-    if not filename.startswith(spec.title_prefix):
-        filename = f"{spec.title_prefix}{filename}"
-    return f"{spec.directory}/{filename}.md"
-
-
 def _merge_parallel_candidate_pages(outputs: list[BaseModel], groups: list[CandidateContentGroup]) -> CandidatePages:
     if len(outputs) != len(groups):
         raise PipelineError(f"候选页并发请求组返回 {len(outputs)} 个结果，但主干内容组数量是 {len(groups)}。")
     pages: list[CandidatePage] = []
     skipped: list[str] = []
     for index, (output, group) in enumerate(zip(outputs, groups, strict=True), start=1):
-        if not isinstance(output, CandidatePages):
+        if not isinstance(output, CandidatePages | CandidatePagesDraft):
             raise PipelineError("候选页并发请求返回了无效 artifact。")
         skipped.extend(output.skipped_content_unit_ids)
         if len(output.pages) != 1:
@@ -1087,17 +1124,19 @@ def _merge_parallel_candidate_pages(outputs: list[BaseModel], groups: list[Candi
                 f"{group.anchor.content_unit_id} 的候选页 content_unit_id 不一致：{page.content_unit_id}"
             )
         group_source_refs = [ref for unit in group.members for ref in unit.source_refs]
-        pages.append(
-            page.model_copy(
-                update={
-                    "candidate_page_id": f"CP-{index:03d}",
-                    "content_unit_id": group.anchor.content_unit_id,
-                    "proposed_page_type": group.anchor.page_type,
-                    "proposed_path_hint": group.anchor.path_hint,
-                    "source_refs": _merge_source_refs([*group_source_refs, *page.source_refs]),
-                }
-            )
+        covered_content_unit_ids = [unit.content_unit_id for unit in group.members]
+        covered_claim_ids = _dedupe_list([claim_id for unit in group.members for claim_id in unit.claim_ids])
+        page_payload = page.model_dump()
+        page_payload.update(
+            {
+                "candidate_page_id": f"CP-{index:03d}",
+                "content_unit_id": group.anchor.content_unit_id,
+                "covered_content_unit_ids": covered_content_unit_ids,
+                "covered_claim_ids": covered_claim_ids,
+                "source_refs": _merge_source_refs([*group_source_refs, *page.source_refs]),
+            }
         )
+        pages.append(CandidatePage.model_validate(page_payload))
     return CandidatePages(pages=pages, skipped_content_unit_ids=_dedupe_list(skipped))
 
 
@@ -1144,6 +1183,8 @@ def _normalize_merge_plan(plan: MergePlan) -> MergePlan:
             decision.model_copy(
                 update={
                     "decision_id": decision_id,
+                    "page_type": decision.page_type.strip() if decision.action == "create" and isinstance(decision.page_type, str) else None,
+                    "target_path": decision.target_path.strip().replace("\\", "/").lstrip("/") if isinstance(decision.target_path, str) else None,
                     "candidate_content_locators": candidate_content_locators,
                 }
             )
@@ -1182,7 +1223,7 @@ def _repair_merge_plan_candidate_content_locators(plan: MergePlan, candidate_pag
     return plan.model_copy(update={"decisions": repaired_decisions})
 
 
-def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: CandidatePages, contexts: CandidateContexts) -> None:
+def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: CandidatePages, contexts: CandidateContexts, page_plugin: PagePlugin) -> None:
     expected = {page.candidate_page_id for page in candidate_pages.pages}
     actual = {decision.candidate_page_id for decision in plan.decisions}
     unknown = sorted(actual - expected)
@@ -1196,6 +1237,10 @@ def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: Can
     for decision in plan.decisions:
         if decision.action in {"create", "update"} and not decision.target_path:
             raise PipelineError(f"合并决策 {decision.candidate_page_id} 缺少 target_path。")
+        if decision.action == "create":
+            _assert_merge_create_target(decision, page_plugin)
+        elif decision.page_type:
+            raise PipelineError(f"合并决策 {decision.decision_id} 只有 create 可以填写 page_type。")
         if not decision.source_refs:
             raise PipelineError(f"合并决策 {decision.decision_id} 缺少 source_refs。")
         if not decision.content_scope.strip():
@@ -1209,6 +1254,25 @@ def _assert_merge_plan_consumes_candidates(plan: MergePlan, candidate_pages: Can
             if not decision.matched_existing_paths:
                 raise PipelineError(f"更新决策 {decision.decision_id} 缺少 matched_existing_paths。")
     _assert_merge_plan_handles_strong_overlap(plan, contexts)
+
+
+def _assert_merge_create_target(decision: MergeDecision, page_plugin: PagePlugin) -> None:
+    page_type = decision.page_type or ""
+    if page_type not in page_plugin.page_types:
+        raise PipelineError(f"新建决策 {decision.decision_id} 的 page_type 不在页面插件中：{page_type or '空'}")
+    if not decision.target_path:
+        raise PipelineError(f"新建决策 {decision.decision_id} 缺少 target_path。")
+    spec = page_plugin.page_type(page_type)
+    target_path = decision.target_path.replace("\\", "/").lstrip("/")
+    if ".." in Path(target_path).parts:
+        raise PipelineError(f"新建决策 {decision.decision_id} 的 target_path 不能包含上级目录。")
+    if not target_path.startswith(f"{spec.directory}/"):
+        raise PipelineError(f"新建决策 {decision.decision_id} 的 target_path 必须位于 {spec.directory}/。")
+    filename = Path(target_path).name
+    if not filename.endswith(".md"):
+        raise PipelineError(f"新建决策 {decision.decision_id} 的 target_path 必须以 .md 结尾。")
+    if not filename.startswith(spec.title_prefix):
+        raise PipelineError(f"新建决策 {decision.decision_id} 的文件名必须以 {spec.title_prefix} 开头。")
 
 
 def _assert_merge_plan_handles_strong_overlap(plan: MergePlan, contexts: CandidateContexts) -> None:
@@ -1251,6 +1315,12 @@ def _assert_composition_covers_writes(artifact: CompositionPlan, plan: MergePlan
             raise PipelineError(f"写作编排项 {item.final_page_id} 缺少 merge_decision_ids。")
         if not item.source_ref_rules:
             raise PipelineError(f"写作编排项 {item.final_page_id} 缺少 source_ref_rules。")
+        for ref in item.same_ingest_related_refs:
+            normalized = system_pages.normalize_related_path(ref.target_path)
+            if normalized not in expected or normalized == item.target_path:
+                raise PipelineError(f"写作编排项 {item.final_page_id} 的同批相关页必须来自本轮可写目标且不能自链接：{ref.target_path}")
+            if ref.source != "same_ingest":
+                raise PipelineError(f"写作编排项 {item.final_page_id} 的同批相关页 source 必须是 same_ingest。")
 
 
 def _normalize_composition_plan(plan: CompositionPlan) -> CompositionPlan:
@@ -1269,6 +1339,7 @@ def _normalize_composition_plan(plan: CompositionPlan) -> CompositionPlan:
                 "insert_rules": _dedupe_list([*existing.insert_rules, *item.insert_rules]),
                 "delete_rules": _dedupe_list([*existing.delete_rules, *item.delete_rules]),
                 "source_ref_rules": _dedupe_list([*existing.source_ref_rules, *item.source_ref_rules]),
+                "same_ingest_related_refs": _dedupe_related_refs([*existing.same_ingest_related_refs, *item.same_ingest_related_refs]),
                 "warnings": _dedupe_list([*existing.warnings, *item.warnings, "多个合并决策指向同一个目标页面，已合并写作规则。"]),
             }
         )
@@ -1278,6 +1349,7 @@ def _normalize_composition_plan(plan: CompositionPlan) -> CompositionPlan:
             item.model_copy(
                 update={
                     "final_page_id": f"FP-{index:03d}",
+                    "same_ingest_related_refs": _dedupe_related_refs(item.same_ingest_related_refs),
                 }
             )
         )
@@ -1331,6 +1403,7 @@ def _final_pages_from_outputs(
     snapshot: WikiSnapshot,
     *,
     operation_id: str,
+    page_plugin: PagePlugin,
     page_update_plan: PageUpdatePlan | None = None,
 ) -> FinalPages:
     artifact = _hydrate_provider_final_pages(_merge_parallel_final_pages(outputs, composition), composition, snapshot)
@@ -1339,6 +1412,7 @@ def _final_pages_from_outputs(
         composition,
         snapshot=snapshot,
         operation_id=operation_id,
+        page_plugin=page_plugin,
     )
     _assert_final_pages_cover_composition(artifact, composition)
     _assert_final_pages_chinese(artifact)
@@ -1350,6 +1424,7 @@ def _normalize_repaired_final_page(state: dict[str, object], page: FinalPage) ->
     composition: CompositionPlan = state["composition_plan"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     operation_id = str(state.get("operation_id", ""))
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
     item = next((candidate for candidate in composition.items if candidate.final_page_id == page.final_page_id or candidate.target_path == page.target_path), None)
     if item is None:
@@ -1362,6 +1437,7 @@ def _normalize_repaired_final_page(state: dict[str, object], page: FinalPage) ->
         single_composition,
         snapshot=snapshot,
         operation_id=operation_id,
+        page_plugin=page_plugin,
     )
     _assert_final_pages_cover_composition(artifact, single_composition)
     _assert_final_pages_chinese(artifact)
@@ -1437,6 +1513,7 @@ def _final_page_semantic_errors(
     snapshot: WikiSnapshot,
     *,
     operation_id: str,
+    page_plugin: PagePlugin,
     page_update_plan: PageUpdatePlan | None = None,
 ) -> dict[str, str]:
     errors: dict[str, str] = {}
@@ -1448,7 +1525,7 @@ def _final_page_semantic_errors(
         single_composition = CompositionPlan(items=[item])
         single_update_plan = _single_page_update_plan(page_update_plan, item.final_page_id)
         try:
-            _final_pages_from_outputs([output], single_composition, snapshot, operation_id=operation_id, page_update_plan=single_update_plan)
+            _final_pages_from_outputs([output], single_composition, snapshot, operation_id=operation_id, page_plugin=page_plugin, page_update_plan=single_update_plan)
         except PipelineError as exc:
             errors[item.final_page_id] = str(exc)
     return errors
@@ -1460,6 +1537,7 @@ def _normalize_final_pages(
     *,
     snapshot: WikiSnapshot | None = None,
     operation_id: str = "",
+    page_plugin: PagePlugin,
 ) -> FinalPages:
     items_by_id = {item.final_page_id: item for item in composition.items}
     items_by_target = {item.target_path: item for item in composition.items}
@@ -1474,18 +1552,66 @@ def _normalize_final_pages(
         existing_entry = entries_by_path.get(page.target_path)
         model_title = page.title
         final_title = existing_entry.title if existing_entry is not None and item is not None and item.action == "update" else page.title
+        page_type = existing_entry.page_type if existing_entry is not None else page_plugin.page_type_for_path(page.target_path)
         source_refs = _merge_source_refs(page.source_refs)
-        updated_page = page.model_copy(update={"title": final_title, "source_refs": source_refs})
+        updated_page = page.model_copy(update={"title": final_title, "page_type": page_type, "source_refs": source_refs})
+        provider_markdown = _render_final_page_provider_body(updated_page, page_plugin, page_type)
         markdown = _canonical_final_markdown(
-            updated_page,
+            updated_page.model_copy(update={"markdown": provider_markdown}),
             operation_id=operation_id,
             existing_entry=existing_entry,
             known_paths=known_paths,
             path_titles=path_titles,
             model_title=model_title,
         )
+        missing_sections = _missing_required_sections(markdown, page_plugin, updated_page.page_type)
+        if missing_sections:
+            raise PipelineError(f"最终页 {updated_page.target_path} 缺少页面插件要求章节：{', '.join(missing_sections)}")
         normalized.append(updated_page.model_copy(update={"markdown": markdown, "content_sha256": sha256_text(markdown)}))
     return pages.model_copy(update={"pages": normalized})
+
+
+def _render_final_page_provider_body(page: FinalPage, page_plugin: PagePlugin, page_type: str) -> str:
+    if not page.sections:
+        return page.markdown
+    _, spec = page_plugin.page_type_or_default(page_type)
+    headings = [section.heading.strip() for section in page.sections]
+    duplicates = [heading for heading, count in Counter(headings).items() if count > 1]
+    if duplicates:
+        raise PipelineError(f"最终页 {page.target_path} sections 存在重复章节：{', '.join(duplicates)}")
+    sections_by_heading = {section.heading.strip(): section for section in page.sections}
+    missing = [section for section in spec.sections if section not in sections_by_heading]
+    extra = [section.heading.strip() for section in page.sections if section.heading.strip() not in set(spec.sections)]
+    if missing:
+        raise PipelineError(f"最终页 {page.target_path} 缺少页面插件要求章节：{', '.join(missing)}")
+    if extra:
+        raise PipelineError(f"最终页 {page.target_path} 包含页面插件未定义的顶层章节：{', '.join(extra)}")
+    lines = [f"# {page.title}"]
+    for heading in spec.sections:
+        section = sections_by_heading[heading]
+        body = _sanitize_section_body_markdown(section.body_markdown)
+        lines.extend(["", f"## {heading}", "", body or _default_section_body(heading)])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _sanitize_section_body_markdown(markdown: str) -> str:
+    body = strip_frontmatter(markdown).strip()
+    body = _drop_sections(body, {"Related", "相关页面"}).strip()
+    sanitized: list[str] = []
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        if stripped.startswith("# "):
+            sanitized.append(f"{indent}### {stripped[2:].strip()}")
+        elif stripped.startswith("## "):
+            sanitized.append(f"{indent}### {stripped[3:].strip()}")
+        else:
+            sanitized.append(line)
+    return "\n".join(sanitized).strip()
+
+
+def _default_section_body(heading: str) -> str:
+    return "暂无明确未解决问题。" if "未解决问题" in heading else "待补充。"
 
 
 def _canonical_final_markdown(
@@ -1728,6 +1854,18 @@ def _dedupe_list(values: list[str]) -> list[str]:
     return result
 
 
+def _dedupe_related_refs(values: list[RelatedPageRef]) -> list[RelatedPageRef]:
+    seen: set[str] = set()
+    result: list[RelatedPageRef] = []
+    for ref in values:
+        normalized = system_pages.normalize_related_path(ref.target_path) or ref.target_path
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(ref.model_copy(update={"target_path": normalized}))
+    return result
+
+
 def _step_raw_binding(run_dir: Path, state: dict[str, object]) -> StepOutput:
     raw_abs = state["raw_abs"]  # type: ignore[assignment]
     raw_rel = state["raw_rel"]  # type: ignore[assignment]
@@ -1766,7 +1904,7 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
     last_semantic_error = ""
     for attempt in range(2):
         artifact_stem = "source_digest" if attempt == 0 else f"source_digest_retry_{attempt}"
-        digest_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+        digest_result, attempt_artifacts, attempt_model_calls, attempt_api_calls, provider_error = _call_provider_artifact_soft(
             state,
             out_dir,
             "source_digest",
@@ -1776,12 +1914,41 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
         )
         provider_artifacts.extend(attempt_artifacts)
         model_calls += attempt_model_calls
+        if provider_error:
+            last_semantic_error = _provider_structure_validation_error(provider_error)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.source_digest_retry_prompt(
+                raw_path=raw_rel,
+                raw_sha256=binding.raw_sha256,
+                raw_text=raw_text,
+                profile=profile,
+                previous_digest=None,
+                validation_error=last_semantic_error,
+                granularity_stats=granularity_stats,
+            )
+            continue
         if not isinstance(digest_result, SourceDigest):
-            raise PipelineError("source_digest provider 返回了无效 artifact。")
+            last_semantic_error = "source_digest provider 返回了无效 artifact。"
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.source_digest_retry_prompt(
+                raw_path=raw_rel,
+                raw_sha256=binding.raw_sha256,
+                raw_text=raw_text,
+                profile=profile,
+                previous_digest=None,
+                validation_error=last_semantic_error,
+                granularity_stats=granularity_stats,
+            )
+            continue
         try:
             candidate_digest, candidate_repair_report = _normalize_and_validate_source_digest(
                 digest_result,
-                profile,
                 raw_rel=raw_rel,
                 raw_sha256=binding.raw_sha256,
                 raw_text=raw_text,
@@ -1858,7 +2025,6 @@ def _step_source_digest(run_dir: Path, state: dict[str, object]) -> StepOutput:
 
 def _normalize_and_validate_source_digest(
     digest_result: SourceDigest,
-    profile: Profile,
     *,
     raw_rel: str,
     raw_sha256: str,
@@ -1866,7 +2032,7 @@ def _normalize_and_validate_source_digest(
     granularity_stats: SourceGranularityStats,
 ) -> tuple[SourceDigest, StructuredRepairReport]:
     _assert_source_digest_binding(digest_result, raw_rel, raw_sha256)
-    candidate_digest, repair_report = normalize_source_digest(digest_result, profile)
+    candidate_digest, repair_report = normalize_source_digest(digest_result)
     _assert_source_digest_chinese(candidate_digest)
     _assert_unique([unit.content_unit_id for unit in candidate_digest.content_units], "source digest content_unit_id")
     _assert_source_digest_source_only_boundary(candidate_digest, raw_text)
@@ -1965,7 +2131,6 @@ def _run_digest_coverage_repair_once(
     digest: SourceDigest,
     artifact_stem: str,
 ) -> tuple[DigestCoverageRepair, SourceDigest, dict[str, object], list[Path], int, list[dict[str, object]], int, StructuredRepairReport]:
-    profile: Profile = state["profile"]  # type: ignore[assignment]
     granularity_stats: SourceGranularityStats = state["source_granularity_stats"]  # type: ignore[assignment]
     request = prompts.digest_coverage_repair_prompt(raw_path=raw_rel, raw_sha256=raw_sha256, raw_text=raw_text, digest=digest)
     provider_artifacts: list[Path] = []
@@ -1978,7 +2143,7 @@ def _run_digest_coverage_repair_once(
     last_semantic_error = ""
     for attempt in range(DIGEST_COVERAGE_REPAIR_MAX_ATTEMPTS):
         current_artifact_stem = artifact_stem if attempt == 0 else f"{artifact_stem}_retry_{attempt}"
-        repair_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+        repair_result, attempt_artifacts, attempt_model_calls, attempt_api_calls, provider_error = _call_provider_artifact_soft(
             state,
             out_dir,
             "digest_coverage_judge",
@@ -1988,12 +2153,39 @@ def _run_digest_coverage_repair_once(
         )
         provider_artifacts.extend(attempt_artifacts)
         model_calls += attempt_model_calls
+        if provider_error:
+            last_semantic_error = _provider_structure_validation_error(provider_error)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= DIGEST_COVERAGE_REPAIR_MAX_ATTEMPTS - 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.digest_coverage_repair_retry_prompt(
+                raw_path=raw_rel,
+                raw_sha256=raw_sha256,
+                raw_text=raw_text,
+                digest=digest,
+                previous_repair=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         if not isinstance(repair_result, DigestCoverageRepair):
-            raise PipelineError("digest_coverage_judge 覆盖修复 provider 返回了无效 artifact。")
+            last_semantic_error = "digest_coverage_judge 覆盖修复 provider 返回了无效 artifact。"
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= DIGEST_COVERAGE_REPAIR_MAX_ATTEMPTS - 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.digest_coverage_repair_retry_prompt(
+                raw_path=raw_rel,
+                raw_sha256=raw_sha256,
+                raw_text=raw_text,
+                digest=digest,
+                previous_repair=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         try:
             normalized_digest, structured_repair_report = _normalize_and_validate_source_digest(
                 repair_result.repaired_source_digest,
-                profile,
                 raw_rel=raw_rel,
                 raw_sha256=raw_sha256,
                 raw_text=raw_text,
@@ -2051,7 +2243,7 @@ def _run_digest_coverage_judge_once(
     last_semantic_error = ""
     for attempt in range(2):
         current_artifact_stem = artifact_stem if attempt == 0 else f"{artifact_stem}_retry_{attempt}"
-        judge_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+        judge_result, attempt_artifacts, attempt_model_calls, attempt_api_calls, provider_error = _call_provider_artifact_soft(
             state,
             out_dir,
             "digest_coverage_judge",
@@ -2061,8 +2253,36 @@ def _run_digest_coverage_judge_once(
         )
         provider_artifacts.extend(attempt_artifacts)
         model_calls += attempt_model_calls
+        if provider_error:
+            last_semantic_error = _provider_structure_validation_error(provider_error)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.digest_coverage_judge_retry_prompt(
+                raw_path=raw_rel,
+                raw_sha256=raw_sha256,
+                raw_text=raw_text,
+                digest=digest,
+                previous_judge=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         if not isinstance(judge_result, DigestCoverageJudge):
-            raise PipelineError("digest_coverage_judge provider 返回了无效 artifact。")
+            last_semantic_error = "digest_coverage_judge provider 返回了无效 artifact。"
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.digest_coverage_judge_retry_prompt(
+                raw_path=raw_rel,
+                raw_sha256=raw_sha256,
+                raw_text=raw_text,
+                digest=digest,
+                previous_judge=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         judge_result = _normalize_digest_coverage_item_refs(judge_result, digest)
         try:
             _assert_digest_coverage_judge_valid(judge_result, digest, raw_text, state["source_granularity_stats"])  # type: ignore[arg-type]
@@ -2305,9 +2525,9 @@ def _step_candidate_pages_warmup(run_dir: Path, state: dict[str, object]) -> Ste
 
 
 def _step_wiki_snapshot(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
-    profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
-    entries = _scan_wiki_entries(vault, profile)
+    entries = _scan_wiki_entries(vault, page_plugin)
     page_records, embedding_metrics = sync_page_embedding_cache(vault, entries, embedding_config)
     snapshot = WikiSnapshot(
         wiki_root="wiki",
@@ -2358,7 +2578,12 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
             [json_path, md_path],
             {
                 "candidate_page_count": 0,
+                "source_content_unit_count": len(digest.content_units),
                 "covered_content_unit_count": 0,
+                "missing_content_unit_count": len(digest.content_units),
+                "source_claim_count": len(digest.claims),
+                "covered_claim_count": 0,
+                "missing_claim_count": len(digest.claims),
                 "parallel_request_count": 0,
                 "parallel_max_workers": 0,
             },
@@ -2383,7 +2608,7 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         out_dir,
         "candidate_pages",
         initial_requests,
-        CandidatePages,
+        CandidatePagesDraft,
     )
     parallel_request_count = len(candidate_groups)
     semantic_retry_count = 0
@@ -2395,7 +2620,7 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         for group in retry_groups:
             anchor_id = group.anchor.content_unit_id
             previous_output = outputs_by_content_unit_id.get(anchor_id)
-            previous_pages = previous_output if isinstance(previous_output, CandidatePages) else None
+            previous_pages = previous_output if isinstance(previous_output, CandidatePages | CandidatePagesDraft) else None
             retry_requests.append(
                 (
                     anchor_id,
@@ -2418,7 +2643,7 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
             out_dir,
             "candidate_pages",
             retry_requests,
-            CandidatePages,
+            CandidatePagesDraft,
             artifact_suffix="_retry_1",
             api_calls_filename="token_usage_calls_retry_1.json",
         )
@@ -2445,9 +2670,18 @@ def _step_candidate_pages(run_dir: Path, state: dict[str, object]) -> StepOutput
         page_path = out_dir / f"page_{safe_filename(page.candidate_page_id)}.md"
         write_text(page_path, page.body_markdown)
         artifacts.append(page_path)
+    expected_content_unit_ids = {unit.content_unit_id for unit in digest.content_units}
+    covered_content_unit_ids = {unit_id for page in artifact.pages for unit_id in page.covered_content_unit_ids}
+    expected_claim_ids = {claim.claim_id for claim in digest.claims}
+    covered_claim_ids = {claim_id for page in artifact.pages for claim_id in page.covered_claim_ids}
     counts = {
         "candidate_page_count": len(artifact.pages),
-        "covered_content_unit_count": len({page.content_unit_id for page in artifact.pages}),
+        "source_content_unit_count": len(expected_content_unit_ids),
+        "covered_content_unit_count": len(covered_content_unit_ids),
+        "missing_content_unit_count": len(expected_content_unit_ids - covered_content_unit_ids),
+        "source_claim_count": len(expected_claim_ids),
+        "covered_claim_count": len(covered_claim_ids),
+        "missing_claim_count": len(expected_claim_ids - covered_claim_ids),
         "parallel_request_count": parallel_request_count if model_calls else 0,
         "parallel_max_workers": _page_generation_parallelism(state, parallel_request_count) if model_calls else 0,
         **({"semantic_retry_count": semantic_retry_count} if semantic_retry_count else {}),
@@ -2483,6 +2717,7 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     contexts: CandidateContexts = state["candidate_contexts"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     out_dir = run_dir / "merge_plan"
     if not candidate_pages.pages:
         plan = MergePlan(decisions=[], action_counts={"create": 0, "update": 0, "noop": 0})
@@ -2495,7 +2730,7 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
             [json_path, md_path],
             {**{f"{key}_count": value for key, value in plan.action_counts.items()}, **_token_usage_counts([])},
         )
-    request = prompts.merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=contexts, profile=profile)
+    request = prompts.merge_plan_prompt(candidate_pages=candidate_pages, candidate_contexts=contexts, profile=profile, page_plugin=page_plugin)
     provider_artifacts: list[Path] = []
     api_calls: list[dict[str, object]] = []
     model_calls = 0
@@ -2504,7 +2739,7 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
     last_semantic_error = ""
     for attempt in range(2):
         artifact_stem = "merge_plan" if attempt == 0 else f"merge_plan_retry_{attempt}"
-        plan_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+        plan_result, attempt_artifacts, attempt_model_calls, attempt_api_calls, provider_error = _call_provider_artifact_soft(
             state,
             out_dir,
             "merge_plan",
@@ -2514,13 +2749,41 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
         )
         provider_artifacts.extend(attempt_artifacts)
         model_calls += attempt_model_calls
+        if provider_error:
+            last_semantic_error = _provider_structure_validation_error(provider_error)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.merge_plan_retry_prompt(
+                candidate_pages=candidate_pages,
+                candidate_contexts=contexts,
+                profile=profile,
+                page_plugin=page_plugin,
+                previous_plan=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         if not isinstance(plan_result, MergePlan):
-            raise PipelineError("merge_plan provider 返回了无效 artifact。")
+            last_semantic_error = "merge_plan provider 返回了无效 artifact。"
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.merge_plan_retry_prompt(
+                candidate_pages=candidate_pages,
+                candidate_contexts=contexts,
+                profile=profile,
+                page_plugin=page_plugin,
+                previous_plan=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         try:
             candidate_plan = _normalize_merge_plan(plan_result)
             candidate_plan = _repair_merge_plan_candidate_content_locators(candidate_plan, candidate_pages)
             _assert_merge_plan_chinese(candidate_plan)
-            _assert_merge_plan_consumes_candidates(candidate_plan, candidate_pages, contexts)
+            _assert_merge_plan_consumes_candidates(candidate_plan, candidate_pages, contexts, page_plugin)
         except PipelineError as exc:
             last_semantic_error = str(exc)
             api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
@@ -2531,6 +2794,7 @@ def _step_merge_plan(run_dir: Path, state: dict[str, object]) -> StepOutput:
                 candidate_pages=candidate_pages,
                 candidate_contexts=contexts,
                 profile=profile,
+                page_plugin=page_plugin,
                 previous_plan=plan_result,
                 validation_error=last_semantic_error,
             )
@@ -2562,6 +2826,7 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
     plan: MergePlan = state["merge_plan"]  # type: ignore[assignment]
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     out_dir = run_dir / "composition_plan"
     if not any(decision.action in {"create", "update"} for decision in plan.decisions):
         artifact = CompositionPlan(items=[])
@@ -2578,7 +2843,7 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
                 **_token_usage_counts([]),
             },
         )
-    request = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile)
+    request = prompts.composition_plan_prompt(merge_plan=plan, candidate_pages=candidate_pages, profile=profile, page_plugin=page_plugin)
     provider_artifacts: list[Path] = []
     api_calls: list[dict[str, object]] = []
     model_calls = 0
@@ -2587,7 +2852,7 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
     last_semantic_error = ""
     for attempt in range(2):
         artifact_stem = "composition_plan" if attempt == 0 else f"composition_plan_retry_{attempt}"
-        plan_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+        plan_result, attempt_artifacts, attempt_model_calls, attempt_api_calls, provider_error = _call_provider_artifact_soft(
             state,
             out_dir,
             "composition_plan",
@@ -2597,8 +2862,36 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
         )
         provider_artifacts.extend(attempt_artifacts)
         model_calls += attempt_model_calls
+        if provider_error:
+            last_semantic_error = _provider_structure_validation_error(provider_error)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.composition_plan_retry_prompt(
+                merge_plan=plan,
+                candidate_pages=candidate_pages,
+                profile=profile,
+                page_plugin=page_plugin,
+                previous_plan=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         if not isinstance(plan_result, CompositionPlan):
-            raise PipelineError("composition_plan provider 返回了无效 artifact。")
+            last_semantic_error = "composition_plan provider 返回了无效 artifact。"
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.composition_plan_retry_prompt(
+                merge_plan=plan,
+                candidate_pages=candidate_pages,
+                profile=profile,
+                page_plugin=page_plugin,
+                previous_plan=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         try:
             candidate_plan = _normalize_composition_plan(plan_result)
             _assert_composition_plan_chinese(candidate_plan)
@@ -2613,6 +2906,7 @@ def _step_composition_plan(run_dir: Path, state: dict[str, object]) -> StepOutpu
                 merge_plan=plan,
                 candidate_pages=candidate_pages,
                 profile=profile,
+                page_plugin=page_plugin,
                 previous_plan=plan_result,
                 validation_error=last_semantic_error,
             )
@@ -2785,6 +3079,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     candidate_pages: CandidatePages = state["candidate_pages"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     page_update_plan: PageUpdatePlan = state.get("page_update_plan", PageUpdatePlan())  # type: ignore[assignment]
     page_update_items_by_id = {item.final_page_id: item for item in page_update_plan.items}
     artifacts: list[Path] = []
@@ -2798,6 +3093,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
                 candidate_pages=candidate_pages,
                 snapshot=snapshot,
                 profile=profile,
+                page_plugin=page_plugin,
                 page_update_plan_item=page_update_items_by_id.get(item.final_page_id),
             ),
         )
@@ -2813,7 +3109,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
     parallel_request_count = len(composition.items)
     outputs_by_id = {item.final_page_id: output for item, output in zip(composition.items, outputs, strict=True)}
     semantic_retry_count = 0
-    semantic_errors = _final_page_semantic_errors(outputs_by_id, composition, snapshot, operation_id=operation_id, page_update_plan=page_update_plan)
+    semantic_errors = _final_page_semantic_errors(outputs_by_id, composition, snapshot, operation_id=operation_id, page_plugin=page_plugin, page_update_plan=page_update_plan)
     if semantic_errors:
         api_calls = _mark_request_semantic_retry_failed(api_calls, semantic_errors)
         semantic_retry_count = len(semantic_errors)
@@ -2831,6 +3127,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
                         candidate_pages=candidate_pages,
                         snapshot=snapshot,
                         profile=profile,
+                        page_plugin=page_plugin,
                         previous_pages=previous_output,
                         validation_error=semantic_errors[item.final_page_id],
                         page_update_plan_item=page_update_items_by_id.get(item.final_page_id),
@@ -2855,6 +3152,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
             CompositionPlan(items=retry_items),
             snapshot,
             operation_id=operation_id,
+            page_plugin=page_plugin,
             page_update_plan=PageUpdatePlan(items=[page_update_items_by_id[item.final_page_id] for item in retry_items if item.final_page_id in page_update_items_by_id]),
         )
         if retry_errors:
@@ -2870,6 +3168,7 @@ def _step_final_pages(vault: Path, run_dir: Path, state: dict[str, object]) -> S
         composition,
         snapshot,
         operation_id=operation_id,
+        page_plugin=page_plugin,
         page_update_plan=page_update_plan,
     )
     for final in artifact.pages:
@@ -3010,12 +3309,18 @@ def _run_final_coverage_repair_parallel(
     digest: SourceDigest,
     final_pages: FinalPages,
 ) -> tuple[list[FinalPageCoverageRepair], FinalPages, list[dict[str, object]], list[Path], int, list[dict[str, object]], int]:
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     claims_by_page, assignment_rows = _assign_final_coverage_claims(state, digest, final_pages)
     pages_by_id = {page.final_page_id: page for page in final_pages.pages}
     initial_requests = [
         (
             page_id,
-            prompts.final_page_coverage_repair_prompt(digest=digest, final_page=pages_by_id[page_id], claims=claims),
+            prompts.final_page_coverage_repair_prompt(
+                digest=_scope_digest_for_claims(digest, claims),
+                final_page=pages_by_id[page_id],
+                claims=claims,
+                page_plugin=page_plugin,
+            ),
         )
         for page_id, claims in claims_by_page.items()
         if claims and page_id in pages_by_id
@@ -3038,7 +3343,14 @@ def _run_final_coverage_repair_parallel(
                 retry_requests.append(
                     (
                         page_id,
-                        prompts.final_page_coverage_repair_prompt(digest=digest, final_page=pages_by_id[page_id], claims=claims_by_page[page_id]),
+                        prompts.final_coverage_repair_retry_prompt(
+                            digest=_scope_digest_for_claims(digest, claims_by_page[page_id]),
+                            final_page=pages_by_id[page_id],
+                            claims=claims_by_page[page_id],
+                            page_plugin=page_plugin,
+                            previous_repair=None,
+                            validation_error=error,
+                        ),
                     )
                 )
                 continue
@@ -3046,9 +3358,10 @@ def _run_final_coverage_repair_parallel(
                 (
                     page_id,
                     prompts.final_coverage_repair_retry_prompt(
-                        digest=digest,
+                        digest=_scope_digest_for_claims(digest, claims_by_page[page_id]),
                         final_page=pages_by_id[page_id],
                         claims=claims_by_page[page_id],
+                        page_plugin=page_plugin,
                         previous_repair=previous_output,
                         validation_error=error,
                     ),
@@ -3109,13 +3422,26 @@ def _normalize_final_page_coverage_repairs(
             continue
         try:
             repaired_page = _normalize_repaired_final_page(state, output.repaired_final_page)
-            repair = output.model_copy(update={"repaired_final_page": repaired_page})
+            repair = _scope_final_page_coverage_repair(output.model_copy(update={"repaired_final_page": repaired_page}), claims)
             _assert_final_page_coverage_repair(repair, claims)
         except PipelineError as exc:
             errors[page_id] = str(exc)
             continue
         normalized[page_id] = repair
     return normalized, errors
+
+
+def _scope_digest_for_claims(digest: SourceDigest, claims: list[SourceClaim]) -> SourceDigest:
+    claim_ids = {claim.claim_id for claim in claims}
+    content_units = [unit for unit in digest.content_units if claim_ids.intersection(unit.claim_ids)]
+    return digest.model_copy(update={"claims": claims, "content_units": content_units})
+
+
+def _scope_final_page_coverage_repair(repair: FinalPageCoverageRepair, claims: list[SourceClaim]) -> FinalPageCoverageRepair:
+    valid_claim_ids = {claim.claim_id for claim in claims}
+    claim_results = [item for item in repair.claim_results if item.claim_id in valid_claim_ids]
+    repair_actions = [item for item in repair.repair_actions if item.claim_id in valid_claim_ids]
+    return repair.model_copy(update={"claim_results": claim_results, "repair_actions": repair_actions})
 
 
 def _assert_final_page_coverage_repair(repair: FinalPageCoverageRepair, claims: list[SourceClaim]) -> None:
@@ -3174,7 +3500,7 @@ def _run_final_coverage_judge_once(
     last_semantic_error = ""
     for attempt in range(2):
         current_artifact_stem = artifact_stem if attempt == 0 else f"{artifact_stem}_retry_{attempt}"
-        judge_result, attempt_artifacts, attempt_model_calls, attempt_api_calls = _call_provider_artifact(
+        judge_result, attempt_artifacts, attempt_model_calls, attempt_api_calls, provider_error = _call_provider_artifact_soft(
             state,
             out_dir,
             "final_coverage_judge",
@@ -3184,8 +3510,32 @@ def _run_final_coverage_judge_once(
         )
         provider_artifacts.extend(attempt_artifacts)
         model_calls += attempt_model_calls
+        if provider_error:
+            last_semantic_error = _provider_structure_validation_error(provider_error)
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.final_coverage_judge_retry_prompt(
+                digest=digest,
+                final_pages=final_pages,
+                previous_judge=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         if not isinstance(judge_result, CoverageJudge):
-            raise PipelineError("final_coverage_judge provider 返回了无效 artifact。")
+            last_semantic_error = "final_coverage_judge provider 返回了无效 artifact。"
+            api_calls.extend(_mark_semantic_retry_failed(attempt_api_calls, last_semantic_error))
+            if attempt >= 1:
+                break
+            semantic_retry_count += 1
+            request = prompts.final_coverage_judge_retry_prompt(
+                digest=digest,
+                final_pages=final_pages,
+                previous_judge=None,
+                validation_error=last_semantic_error,
+            )
+            continue
         try:
             _assert_final_coverage_judge_chinese(judge_result)
             _assert_final_coverage_judge_covers_claims(judge_result, digest)
@@ -3414,13 +3764,18 @@ def _render_final_coverage_report_md(report: dict[str, object]) -> str:
 
 def _step_related_refresh(run_dir: Path, state: dict[str, object]) -> StepOutput:
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
+    composition: CompositionPlan = state["composition_plan"]  # type: ignore[assignment]
     snapshot: WikiSnapshot = state["wiki_snapshot"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     page_records: dict[str, dict[str, object]] = state.get("embedding_page_records", {})  # type: ignore[assignment]
     threshold = _related_similarity_threshold(state)
+    embedding_top_k = page_plugin.related.embedding_existing_top_k
+    same_ingest_limit = page_plugin.related.same_ingest_model_max
+    total_limit = same_ingest_limit + embedding_top_k
     report = related_logic.RelatedMergeReport()
     if not final_pages.pages:
-        return StepOutput([], {"related_link_count": 0, "related_threshold": threshold, "body_link_count": 0})
+        return StepOutput([], {"related_link_count": 0, "related_threshold": threshold, "body_link_count": 0, "related_embedding_top_k": embedding_top_k, "related_same_ingest_limit": same_ingest_limit})
 
     final_cards = [_final_page_embedding_card(page, embedding_config.max_page_chars) for page in final_pages.pages]
     final_vectors = embed_texts(final_cards, embedding_config, is_query=False)
@@ -3433,30 +3788,48 @@ def _step_related_refresh(run_dir: Path, state: dict[str, object]) -> StepOutput
     )
     known_paths = set(pool)
     path_titles = {path: str(item["title"]) for path, item in pool.items()}
+    final_targets = {page.target_path for page in final_pages.pages}
+    composition_by_id = {item.final_page_id: item for item in composition.items}
+    composition_by_target = {item.target_path: item for item in composition.items}
     refreshed_pages: list[FinalPage] = []
     related_link_count = 0
+    same_ingest_related_count = 0
+    embedding_related_count = 0
     body_link_count = 0
     for page in final_pages.pages:
         body_links = set(related_logic.body_wikilink_targets(page.markdown))
         body_link_count += len(body_links)
         vector = final_vector_by_path[page.target_path]
-        selected = _select_calculated_related(
+        item = composition_by_id.get(page.final_page_id) or composition_by_target.get(page.target_path)
+        same_ingest_refs = _same_ingest_related_refs(
+            page=page,
+            item=item,
+            final_targets=final_targets,
+            report=report,
+            limit=same_ingest_limit,
+        )
+        embedding_refs = _select_embedding_related(
             page=page,
             vector=vector,
             pool=pool,
             body_links=body_links,
             threshold=threshold,
+            limit=embedding_top_k,
             report=report,
         )
-        if selected:
-            related_link_count += 1
+        same_ingest_related_count += len(same_ingest_refs)
+        embedding_related_count += len(embedding_refs)
         markdown = _apply_calculated_related_section(
             page.markdown,
             current_path=page.target_path,
-            related_page=selected,
+            related_pages=[*same_ingest_refs, *embedding_refs],
             known_paths=known_paths,
             path_titles=path_titles,
+            limit=total_limit,
+            report=report,
+            owner_id=page.final_page_id,
         )
+        related_link_count += len(related_logic.related_section_targets(markdown))
         refreshed_pages.append(page.model_copy(update={"markdown": markdown, "content_sha256": sha256_text(markdown)}))
     artifact = final_pages.model_copy(update={"pages": refreshed_pages})
     state["final_pages"] = artifact
@@ -3477,44 +3850,30 @@ def _step_related_refresh(run_dir: Path, state: dict[str, object]) -> StepOutput
         [json_path, report_json, report_md, *page_artifacts],
         {
             "related_link_count": related_link_count,
+            "same_ingest_related_count": same_ingest_related_count,
+            "embedding_related_count": embedding_related_count,
             "related_kept_count": sum(1 for item in report.candidates if item.decision == "kept"),
             "related_filtered_count": sum(1 for item in report.candidates if item.decision != "kept"),
             "related_threshold": threshold,
+            "related_embedding_top_k": embedding_top_k,
+            "related_same_ingest_limit": same_ingest_limit,
             "body_link_count": body_link_count,
         },
     )
 
 
 def _related_similarity_threshold(state: dict[str, object]) -> float:
-    config = state.get("config")
-    if isinstance(config, dict):
-        related = config.get("related")
-        if isinstance(related, dict):
-            raw = related.get("min_similarity")
-            if raw is not None:
-                try:
-                    return max(0.0, min(1.0, float(raw)))
-                except (TypeError, ValueError):
-                    pass
-    return RELATED_MIN_SIMILARITY
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
+    return page_plugin.related.embedding_existing_min_similarity
 
 
 def _related_replacement_margin(state: dict[str, object]) -> float:
-    config = state.get("config")
-    if isinstance(config, dict):
-        related = config.get("related")
-        if isinstance(related, dict):
-            raw = related.get("replacement_margin")
-            if raw is not None:
-                try:
-                    return max(0.0, min(1.0, float(raw)))
-                except (TypeError, ValueError):
-                    pass
-    return RELATED_REPLACEMENT_MARGIN
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
+    return page_plugin.related.replacement_margin
 
 
 def _step_related_maintenance(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
-    profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
     page_records: dict[str, dict[str, object]] = state.get("embedding_page_records", {})  # type: ignore[assignment]
@@ -3541,7 +3900,7 @@ def _step_related_maintenance(vault: Path, run_dir: Path, state: dict[str, objec
 
     threshold = _related_similarity_threshold(state)
     margin = _related_replacement_margin(state)
-    entries = _scan_wiki_entries(vault, profile)
+    entries = _scan_wiki_entries(vault, page_plugin)
     pool = _related_pool_from_entries(entries=entries, page_records=page_records)
     path_titles = {path: str(item["title"]) for path, item in pool.items()}
     report = related_logic.RelatedMergeReport()
@@ -3615,9 +3974,12 @@ def _step_related_maintenance(vault: Path, run_dir: Path, state: dict[str, objec
             new_markdown = _apply_calculated_related_section(
                 markdown,
                 current_path=entry.path,
-                related_page=selected,
+                related_pages=[selected] if selected else [],
                 known_paths=set(pool),
                 path_titles=path_titles,
+                limit=page_plugin.related.embedding_existing_top_k,
+                report=report,
+                owner_id=f"MAINT-{len(checked_pages) + 1:03d}",
             )
             if new_markdown != markdown:
                 writes[entry.path] = new_markdown
@@ -3658,7 +4020,7 @@ def _step_related_maintenance(vault: Path, run_dir: Path, state: dict[str, objec
     if write_items:
         state["write_set_items"] = [*state.get("write_set_items", []), *write_items]  # type: ignore[list-item]
         state["written_targets"] = sorted({*state.get("written_targets", []), *writes.keys()})  # type: ignore[arg-type]
-        refreshed_entries = _scan_wiki_entries(vault, profile)
+        refreshed_entries = _scan_wiki_entries(vault, page_plugin)
         refreshed_records, cache_metrics = sync_page_embedding_cache(vault, refreshed_entries, embedding_config)
         state["embedding_page_records"] = refreshed_records
         embedding_metrics = dict(state.get("embedding_refresh_metrics", {}))
@@ -3775,7 +4137,7 @@ def _best_related_candidate(
                 )
             )
             continue
-        if score < threshold:
+        if score <= threshold:
             report.candidates.append(
                 RelatedCandidateReport(
                     owner_id=owner_id,
@@ -3835,6 +4197,149 @@ def _related_ref_from_candidate(path: str, item: dict[str, object], score: float
         source="wiki_context",
         reason=f"全文向量相似度={score:.4f}，是超过阈值的最相关非正文链接页面。",
     )
+
+
+def _same_ingest_related_refs(
+    *,
+    page: FinalPage,
+    item: CompositionItem | None,
+    final_targets: set[str],
+    report: related_logic.RelatedMergeReport,
+    limit: int,
+) -> list[RelatedPageRef]:
+    if item is None or limit <= 0:
+        return []
+    refs: list[RelatedPageRef] = []
+    seen: set[str] = set()
+    for ref in item.same_ingest_related_refs:
+        normalized = system_pages.normalize_related_path(ref.target_path)
+        if normalized is None or normalized not in final_targets:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=ref.target_path,
+                    display_title=ref.display_title,
+                    source="same_ingest",
+                    decision="filtered",
+                    reject_reason="not_same_ingest_target",
+                    reason=ref.reason,
+                )
+            )
+            continue
+        if normalized == page.target_path:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=normalized,
+                    display_title=ref.display_title,
+                    source="same_ingest",
+                    decision="filtered",
+                    reject_reason="self_link",
+                    reason=ref.reason,
+                )
+            )
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if len(refs) >= limit:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=normalized,
+                    display_title=ref.display_title,
+                    source="same_ingest",
+                    decision="cutoff",
+                    reject_reason="same_ingest_limit",
+                    reason=ref.reason,
+                )
+            )
+            continue
+        refs.append(ref.model_copy(update={"target_path": normalized, "source": "same_ingest"}))
+    return refs
+
+
+def _select_embedding_related(
+    *,
+    page: FinalPage,
+    vector: list[float],
+    pool: dict[str, dict[str, object]],
+    body_links: set[str],
+    threshold: float,
+    limit: int,
+    report: related_logic.RelatedMergeReport,
+) -> list[RelatedPageRef]:
+    if limit <= 0:
+        return []
+    ranked: list[tuple[float, str, dict[str, object]]] = []
+    for path, item in pool.items():
+        score = round(cosine(vector, item["vector"]), 4)  # type: ignore[arg-type]
+        reason = f"全文向量相似度={score:.4f}；阈值必须大于 {threshold:.2f}。"
+        if path == page.target_path:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="filtered",
+                    reject_reason="self_link",
+                    reason="候选目标是当前页面自身。",
+                )
+            )
+            continue
+        if path in body_links:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="filtered",
+                    reject_reason="already_body_link",
+                    reason=reason,
+                )
+            )
+            continue
+        if score <= threshold:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="filtered",
+                    reject_reason="below_similarity_threshold",
+                    reason=reason,
+                )
+            )
+            continue
+        ranked.append((score, path, item))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    refs: list[RelatedPageRef] = []
+    for index, (score, path, item) in enumerate(ranked):
+        if index >= limit:
+            report.candidates.append(
+                RelatedCandidateReport(
+                    owner_id=page.final_page_id,
+                    current_path=page.target_path,
+                    target_path=path,
+                    display_title=str(item["title"]),
+                    source="embedding_similarity",
+                    decision="cutoff",
+                    reject_reason="embedding_top_k_limit",
+                    reason=f"全文向量相似度={score:.4f}，但插件只保留 embedding top {limit}。",
+                )
+            )
+            continue
+        refs.append(_related_ref_from_candidate(path, item, score))
+    return refs
 
 
 def _render_related_maintenance_md(report: dict[str, object]) -> str:
@@ -3924,17 +4429,23 @@ def _apply_calculated_related_section(
     markdown: str,
     *,
     current_path: str,
-    related_page: RelatedPageRef | None,
+    related_pages: list[RelatedPageRef],
     known_paths: set[str],
     path_titles: dict[str, str],
+    limit: int,
+    report: related_logic.RelatedMergeReport,
+    owner_id: str,
 ) -> str:
-    if related_page is None:
+    if not related_pages or limit <= 0:
         return _drop_sections(markdown, {"Related", "相关页面"}).rstrip() + "\n"
     body = related_logic.render_related_section(
         current_path=current_path,
-        related_pages=[related_page],
+        related_pages=related_pages,
         known_paths=known_paths,
         path_titles=path_titles,
+        limit=limit,
+        report=report,
+        owner_id=owner_id,
     )
     if not body.strip():
         return _drop_sections(markdown, {"Related", "相关页面"}).rstrip() + "\n"
@@ -4199,11 +4710,11 @@ def _step_source_record_write(vault: Path, run_dir: Path, state: dict[str, objec
 def _step_index_log_write(vault: Path, run_dir: Path, state: dict[str, object], manifest: OperationManifest) -> StepOutput:
     binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
     merge_plan: MergePlan = state["merge_plan"]  # type: ignore[assignment]
-    profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     log_date = _operation_date(manifest.operation_id)
     daily_target = f"logs/{log_date}.md"
     writes = {
-        "index.md": _updated_index(vault, profile),
+        "index.md": _updated_index(vault, page_plugin),
         daily_target: _updated_daily_log(vault, log_date, manifest.operation_id, binding, merge_plan),
     }
     out_dir = run_dir / "index_log_write"
@@ -4235,9 +4746,9 @@ def _write_single_target(vault: Path, target: str, kind: Literal["source", "syst
 
 
 def _step_embedding_cache_refresh(vault: Path, run_dir: Path, state: dict[str, object]) -> StepOutput:
-    profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     embedding_config: EmbeddingConfig = state["embedding_config"]  # type: ignore[assignment]
-    entries = _scan_wiki_entries(vault, profile)
+    entries = _scan_wiki_entries(vault, page_plugin)
     records, metrics = sync_page_embedding_cache(vault, entries, embedding_config)
     state["embedding_page_records"] = records
     state["embedding_refresh_metrics"] = metrics
@@ -4413,19 +4924,18 @@ def _chinese_scaffold(text: str, label: str) -> str:
     return f"{label}：暂无可用内容。"
 
 
-def _scan_wiki_entries(vault: Path, profile: Profile) -> list[WikiKnowledgeEntry]:
+def _scan_wiki_entries(vault: Path, page_plugin: PagePlugin) -> list[WikiKnowledgeEntry]:
     wiki_root = vault / "wiki"
     entries = []
-    source_dir = profile.page_type(profile.source_page_type).directory
     for path in sorted(wiki_root.rglob("*.md")):
         rel = relative_posix(path, wiki_root)
-        if rel in {"index.md", "log.md"} or rel.startswith("logs/") or rel.startswith(f"{source_dir}/"):
+        if rel in {"index.md", "log.md"} or rel.startswith("logs/") or rel.startswith("sources/"):
             continue
         text = read_text(path)
         frontmatter = _frontmatter_data(text) or {}
         title = _title_from_existing_page(text, path.stem)
-        page_type = str(frontmatter.get("type") or frontmatter.get("llmwiki_type") or _page_type_from_path(profile, rel))
-        if page_type == profile.source_page_type:
+        page_type = str(frontmatter.get("llmwiki_type") or _page_type_from_path(page_plugin, rel))
+        if page_type not in page_plugin.page_types:
             continue
         summary = str(frontmatter.get("summary") or summarize(strip_frontmatter(text), max_sentences=2))
         source_raw_paths = _frontmatter_list(frontmatter, "source_raw_paths")
@@ -4455,7 +4965,7 @@ def _validate_before_write(vault: Path, state: dict[str, object]) -> ValidationR
     binding: RawBinding = state["raw_binding"]  # type: ignore[assignment]
     raw_abs: Path = state["raw_abs"]  # type: ignore[assignment]
     final_pages: FinalPages = state["final_pages"]  # type: ignore[assignment]
-    profile: Profile = state["profile"]  # type: ignore[assignment]
+    page_plugin: PagePlugin = state["page_plugin"]  # type: ignore[assignment]
     snapshot: WikiSnapshot | None = state.get("wiki_snapshot") if isinstance(state.get("wiki_snapshot"), WikiSnapshot) else None  # type: ignore[assignment]
     known_paths = {entry.path for entry in snapshot.entries} if snapshot else set()
     path_titles = {entry.path: entry.title for entry in snapshot.entries} if snapshot else {}
@@ -4472,8 +4982,11 @@ def _validate_before_write(vault: Path, state: dict[str, object]) -> ValidationR
             ensure_under(vault / "wiki" / page.target_path, vault / "wiki", label="final target")
         except ValueError as exc:
             issues.append(ValidationIssue(severity="error", code="target_escape", message=f"最终页面目标路径越界：{exc}", path=page.target_path))
-        if not _is_knowledge_target(profile, page):
+        if not _is_knowledge_target(page_plugin, page):
             issues.append(ValidationIssue(severity="error", code="invalid_knowledge_target", message="最终页面目标不在允许的知识页目录中。", path=page.target_path))
+        missing_sections = _missing_required_sections(page.markdown, page_plugin, page.page_type)
+        if missing_sections:
+            issues.append(ValidationIssue(severity="error", code="missing_required_sections", message=f"最终页面缺少页面插件要求章节：{', '.join(missing_sections)}", path=page.target_path))
         if sha256_text(page.markdown) != page.content_sha256:
             issues.append(ValidationIssue(severity="error", code="content_hash_mismatch", message="最终页面内容 hash 与 Markdown 不一致。", path=page.target_path))
         if not page.markdown.strip():
@@ -4516,13 +5029,14 @@ def _preflight_knowledge_write(vault: Path, final_pages: FinalPages) -> None:
             raise PipelineError(f"{page.target_path} 的写入 preimage 不一致。")
 
 
-def _is_knowledge_target(profile: Profile, page: FinalPage) -> bool:
+def _is_knowledge_target(page_plugin: PagePlugin, page: FinalPage) -> bool:
     if page.target_path in {"index.md", "log.md"} or page.target_path.startswith("logs/"):
         return False
-    source_dir = profile.page_type(profile.source_page_type).directory
-    if page.target_path.startswith(f"{source_dir}/"):
+    if page.target_path.startswith("sources/"):
         return False
-    spec = profile.page_type(page.page_type)
+    if page.page_type not in page_plugin.page_types:
+        return False
+    spec = page_plugin.page_type(page.page_type)
     return page.target_path.startswith(f"{spec.directory}/") and page.target_path.endswith(".md")
 
 
@@ -4548,6 +5062,17 @@ def _validate_final_markdown_frontmatter(page: FinalPage) -> list[ValidationIssu
     if not data.get("created") or not data.get("updated") or not data.get("last_ingest_operation"):
         issues.append(ValidationIssue(severity="error", code="frontmatter_missing_dates", message="frontmatter 必须包含 created、updated 和 last_ingest_operation。", path=page.target_path))
     return issues
+
+
+def _missing_required_sections(markdown: str, page_plugin: PagePlugin, page_type: str) -> list[str]:
+    _, spec = page_plugin.page_type_or_default(page_type)
+    body = strip_frontmatter(markdown)
+    headings = set()
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            headings.add(stripped[3:].strip())
+    return [section for section in spec.sections if section not in headings]
 
 
 def _frontmatter_data(markdown: str) -> dict[str, object] | None:
@@ -4636,12 +5161,12 @@ def _render_source_page(operation_id: str, digest: SourceDigest, final_pages: Fi
     )
 
 
-def _updated_index(vault: Path, profile: Profile) -> str:
-    entries = _scan_wiki_entries(vault, profile)
+def _updated_index(vault: Path, page_plugin: PagePlugin) -> str:
+    entries = _scan_wiki_entries(vault, page_plugin)
     return system_pages.render_index(
         entries=entries,
         tension_rows=_index_tension_rows(vault, entries),
-        page_type_order=profile.page_types.keys(),
+        page_type_order=page_plugin.page_types.keys(),
     )
 
 
@@ -4662,7 +5187,7 @@ def _index_tension_rows(vault: Path, entries: list[WikiKnowledgeEntry]) -> list[
         page_path = vault / "wiki" / entry.path
         if not page_path.exists():
             continue
-        body = _section_text(read_text(page_path), {"Tensions / Open Questions", "矛盾与未决问题"})
+        body = _section_text(read_text(page_path), {"Tensions / Open Questions", "矛盾与未解决问题", "矛盾与未决问题"})
         for question in _question_lines(body):
             rows.append({"question": question, "page": system_pages.obsidian_link(entry.path, entry.title), "updated": entry.updated})
     return rows
@@ -4688,7 +5213,7 @@ def _section_text(markdown: str, headings: set[str]) -> str:
 
 def _question_lines(text: str) -> list[str]:
     rows: list[str] = []
-    ignored = {"none captured yet.", "(no tensions or open questions raised by this source.)", "暂无矛盾与未决问题记录。"}
+    ignored = {"none captured yet.", "(no tensions or open questions raised by this source.)", "暂无矛盾与未解决问题。", "暂无明确未解决问题。", "暂无矛盾与未决问题记录。"}
     for line in text.splitlines():
         stripped = line.strip().lstrip("-*+ ").strip()
         if not stripped or stripped.lower() in ignored:
@@ -4744,8 +5269,6 @@ def _render_source_digest_md(digest: SourceDigest) -> str:
         lines.append(f"- 吸收决策：{unit.absorption_decision}")
         lines.append(f"- 主干锚点：{unit.anchor_unit_id}")
         lines.append(f"- 建议小节：{unit.section_hint}")
-        lines.append(f"- 类型：{unit.page_type}")
-        lines.append(f"- 路径提示：`{unit.path_hint}`")
         lines.append(f"- 内容范围：{unit.content_scope}")
         lines.append(f"- 吸收理由：{unit.absorption_reason}")
         lines.append(f"- 消费知识点：{', '.join(unit.claim_ids)}")
@@ -4775,9 +5298,11 @@ def _render_candidate_pages_md(artifact: CandidatePages) -> str:
     lines = ["# 候选知识页", ""]
     for page in artifact.pages:
         lines.append(f"## {page.candidate_page_id}: {page.title}")
-        lines.append(f"- 内容单元：`{page.content_unit_id}`")
-        lines.append(f"- 类型：{page.proposed_page_type}")
-        lines.append(f"- 路径提示：`{page.proposed_path_hint}`")
+        lines.append(f"- 主干内容单元：`{page.content_unit_id}`")
+        if page.covered_content_unit_ids:
+            lines.append(f"- 吸收内容单元：{', '.join(f'`{unit_id}`' for unit_id in page.covered_content_unit_ids)}")
+        if page.covered_claim_ids:
+            lines.append(f"- 覆盖知识点：{len(page.covered_claim_ids)} 个")
         lines.append("")
         lines.append(page.summary)
         lines.append("")
@@ -4794,7 +5319,8 @@ def _render_merge_plan_md(plan: MergePlan) -> str:
         lines.append(f"- 动作：{_action_label(decision.action)}")
         lines.append(f"- 目标：`{decision.target_path}`")
         lines.append(f"- 标题：{decision.title}")
-        lines.append(f"- 类型：{decision.page_type}")
+        if decision.page_type:
+            lines.append(f"- 类型：{decision.page_type}")
         lines.append(f"- 内容范围：{decision.content_scope}")
         if decision.candidate_content_locators:
             lines.append(f"- 候选内容定位：{', '.join(decision.candidate_content_locators)}")
@@ -4883,11 +5409,11 @@ def _frontmatter_list(data: dict[str, object], key: str) -> list[str]:
     return []
 
 
-def _page_type_from_path(profile: Profile, rel: str) -> str:
-    for page_type, spec in profile.page_types.items():
+def _page_type_from_path(page_plugin: PagePlugin, rel: str) -> str:
+    for page_type, spec in page_plugin.page_types.items():
         if rel.startswith(f"{spec.directory}/"):
             return page_type
-    return profile.default_page_type
+    return page_plugin.default_page_type
 
 
 def _artifact_ref(run_dir: Path, path: Path) -> ArtifactRef:

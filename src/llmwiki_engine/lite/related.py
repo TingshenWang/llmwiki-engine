@@ -15,7 +15,6 @@ from .text import strip_frontmatter
 
 
 BODY_WIKILINK_LIMIT = 2
-FINAL_RELATED_LIMIT = system_pages.RELATED_LINK_LIMIT
 
 
 def render_related_section(
@@ -24,16 +23,20 @@ def render_related_section(
     related_pages: Iterable[RelatedPageRef],
     known_paths: set[str],
     path_titles: dict[str, str] | None = None,
+    limit: int,
+    report: RelatedMergeReport | None = None,
+    owner_id: str = "render",
 ) -> str:
-    report = RelatedMergeReport()
+    active_report = report or RelatedMergeReport()
     titles = path_titles or {}
     selector = _RelatedSelector(
-        owner_id="render",
+        owner_id=owner_id,
         current_path=current_path,
         known_paths=known_paths,
         path_titles=titles,
         title_to_path=_title_to_path(titles),
-        report=report,
+        report=active_report,
+        limit=limit,
     )
     for ref in related_pages:
         selector.add(ref.target_path, ref.source, ref.reason, display_title=ref.display_title)
@@ -87,13 +90,25 @@ def canonicalize_body_wikilinks(markdown: str, *, known_paths: set[str], path_ti
         target, separator, alias = inner.partition("|")
         resolved = _resolve_target(target, known_paths=known_paths, title_to_path=title_to_path)
         if resolved is None:
-            return match.group(0)
+            return _plain_wikilink_text(target, alias if separator else "")
         display_target = resolved[:-3] if resolved.endswith(".md") else resolved
         if separator:
             return f"[[{display_target}|{alias.strip()}]]"
         return f"[[{display_target}]]"
 
     return re.sub(r"\[\[([^\]]+)\]\]", replace, markdown)
+
+
+def _plain_wikilink_text(target: str, alias: str = "") -> str:
+    if alias.strip():
+        return alias.strip()
+    text = _strip_wikilink(target)
+    text = Path(text.replace("\\", "/")).stem
+    for prefix in ["Concept_", "Overview_", "Design_", "Entity_", "Comparison_"]:
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    return text.replace("_", " ").strip() or target.strip()
 
 
 def precanonical_link_errors(*, markdown: str, target_path: str, title: str) -> list[str]:
@@ -166,7 +181,7 @@ class _RelatedSelector:
         path_titles: dict[str, str],
         title_to_path: dict[str, str],
         report: RelatedMergeReport,
-        limit: int = FINAL_RELATED_LIMIT,
+        limit: int,
     ) -> None:
         self.owner_id = owner_id
         self.current_path = system_pages.normalize_related_path(current_path) or current_path
@@ -307,7 +322,7 @@ def _contains_graph_excluded_link(markdown: str) -> bool:
 
 
 def _related_ref_source(source: str) -> str:
-    return "source_digest" if source == "source_digest" else "wiki_context"
+    return "same_ingest" if source == "same_ingest" else "wiki_context"
 
 
 def _strip_wikilink(value: str) -> str:

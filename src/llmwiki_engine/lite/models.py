@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 OperationStatus = Literal["created", "running", "failed", "written", "source_recorded"]
 StepStatus = Literal["running", "completed", "failed"]
 MergeAction = Literal["create", "update", "noop"]
-RelatedSource = Literal["source_digest", "wiki_context"]
+RelatedSource = Literal["same_ingest", "wiki_context"]
 ClaimKind = str
 CoverageStatus = Literal["covered", "partial", "missing", "contradicted"]
 DigestCoverageStatus = Literal["covered", "partial", "missing"]
@@ -79,15 +79,13 @@ class SourceContentUnit(StrictModel):
     absorption_decision: AbsorptionDecision
     anchor_unit_id: str
     section_hint: str
-    page_type: str
-    path_hint: str
     summary: str
     absorption_reason: str
     content_scope: str
     claim_ids: list[str]
     source_refs: list[SourceRef]
 
-    @field_validator("content_unit_id", "title", "anchor_unit_id", "section_hint", "page_type", "path_hint", "summary", "absorption_reason", "content_scope")
+    @field_validator("content_unit_id", "title", "anchor_unit_id", "section_hint", "summary", "absorption_reason", "content_scope")
     @classmethod
     def non_empty(cls, value: str) -> str:
         if not value.strip():
@@ -380,18 +378,26 @@ class WikiSnapshot(StrictModel):
     embedding_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
-class CandidatePage(StrictModel):
+class CandidatePageDraft(StrictModel):
     candidate_page_id: str
     content_unit_id: str
     title: str
-    proposed_page_type: str
-    proposed_path_hint: str
     summary: str
     body_markdown: str
     open_questions: list[str] = Field(default_factory=list)
     source_refs: list[SourceRef]
     evidence_notes: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
+
+
+class CandidatePage(CandidatePageDraft):
+    covered_content_unit_ids: list[str] = Field(default_factory=list)
+    covered_claim_ids: list[str] = Field(default_factory=list)
+
+
+class CandidatePagesDraft(StrictModel):
+    pages: list[CandidatePageDraft]
+    skipped_content_unit_ids: list[str] = Field(default_factory=list)
 
 
 class CandidatePages(StrictModel):
@@ -438,7 +444,7 @@ class MergeDecision(StrictModel):
     action: MergeAction
     target_path: str | None = None
     title: str
-    page_type: str
+    page_type: str | None = None
     content_scope: str
     candidate_content_locators: list[str] = Field(default_factory=list)
     matched_existing_paths: list[str] = Field(default_factory=list)
@@ -467,6 +473,7 @@ class CompositionItem(StrictModel):
     insert_rules: list[str] = Field(default_factory=list)
     delete_rules: list[str] = Field(default_factory=list)
     source_ref_rules: list[str]
+    same_ingest_related_refs: list[RelatedPageRef] = Field(default_factory=list)
     readability_goal: str
     warnings: list[str] = Field(default_factory=list)
 
@@ -489,6 +496,18 @@ class PreimageCoverageItem(StrictModel):
         return value
 
 
+class FinalPageSection(StrictModel):
+    heading: str
+    body_markdown: str
+
+    @field_validator("heading", "body_markdown")
+    @classmethod
+    def non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能为空。")
+        return value
+
+
 class FinalPage(StrictModel):
     final_page_id: str
     target_path: str
@@ -496,7 +515,8 @@ class FinalPage(StrictModel):
     title: str
     page_type: str
     content_sha256: str = ""
-    markdown: str
+    markdown: str = ""
+    sections: list[FinalPageSection] = Field(default_factory=list)
     source_refs: list[SourceRef]
     preimage_sha256: str | None = None
     preimage_coverage_report: list[PreimageCoverageItem] = Field(default_factory=list)

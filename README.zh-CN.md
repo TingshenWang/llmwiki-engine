@@ -49,21 +49,21 @@ Obsidian wikilink，且必须指向已有知识页。`related_refresh` 再根据
 从 GitHub Release 下载 macOS/Linux 通用包：
 
 ```bash
-curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.2/llmwiki-engine-0.2.2-macos-linux.tar.gz
-curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.2/llmwiki-engine-0.2.2-macos-linux.tar.gz.sha256
+curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.4/llmwiki-engine-0.2.4-macos-linux.tar.gz
+curl -L -O https://github.com/TingshenWang/llmwiki-engine/releases/download/v0.2.4/llmwiki-engine-0.2.4-macos-linux.tar.gz.sha256
 ```
 
 校验下载文件：
 
 ```bash
-shasum -a 256 -c llmwiki-engine-0.2.2-macos-linux.tar.gz.sha256
+shasum -a 256 -c llmwiki-engine-0.2.4-macos-linux.tar.gz.sha256
 ```
 
 解压并运行安装脚本：
 
 ```bash
-tar -xzf llmwiki-engine-0.2.2-macos-linux.tar.gz
-cd llmwiki-engine-0.2.2-macos-linux
+tar -xzf llmwiki-engine-0.2.4-macos-linux.tar.gz
+cd llmwiki-engine-0.2.4-macos-linux
 ./install.sh
 ```
 

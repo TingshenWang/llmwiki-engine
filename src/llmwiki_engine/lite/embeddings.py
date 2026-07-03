@@ -242,9 +242,7 @@ def page_card(entry: WikiKnowledgeEntry, vault: Path, max_chars: int) -> str:
 def candidate_query(page: CandidatePage, max_chars: int) -> str:
     values = [
         f"title: {page.title}",
-        f"type: {page.proposed_page_type}",
         f"summary: {page.summary}",
-        f"path_hint: {page.proposed_path_hint}",
         page.body_markdown,
         "\n".join(page.evidence_notes),
     ]
