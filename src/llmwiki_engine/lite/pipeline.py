@@ -9,6 +9,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Iterable, Literal
 
 import yaml
@@ -180,6 +181,7 @@ def run_ingest(
     console: Console | None = None,
     emit_progress: bool = True,
     verify_coverage: bool = False,
+    show_reasoning: bool = False,
 ) -> OperationManifest:
     vault = vault.expanduser().resolve()
     if not (vault / ".llmwiki").exists():
@@ -230,6 +232,8 @@ def run_ingest(
         "operation_id": operation_id,
         "verify_digest_coverage": verify_coverage,
         "verify_final_coverage": verify_coverage,
+        "show_reasoning": show_reasoning,
+        "console": progress_console,
     }
     steps: list[tuple[str, Callable[[], StepOutput]]] = [
         ("raw_binding", lambda: _step_raw_binding(run_dir, state)),
@@ -261,7 +265,7 @@ def run_ingest(
         index = 0
         while index < len(steps):
             name, fn = steps[index]
-            _run_step(run_dir, manifest, name, fn, progress_console, emit_progress=emit_progress)
+            _run_step(run_dir, manifest, name, fn, progress_console, emit_progress=emit_progress, show_reasoning=show_reasoning)
             index += 1
         manifest.status = "source_recorded"
         if any(item.kind == "knowledge" for item in state.get("write_set_items", [])):  # type: ignore[arg-type]
@@ -592,14 +596,29 @@ def _call_provider_artifact_soft(
     provider_contexts: dict[str, dict[str, object]] = state["provider_contexts"]  # type: ignore[assignment]
     provider_contexts[step] = spec.sanitized_context()
     stem = artifact_stem or step
+    show_reasoning = bool(state.get("show_reasoning"))
+    console_obj = state.get("console")
+    reasoning_callback: Callable[[str], None] | None = None
+    reasoning_started = [False]
+    if show_reasoning and console_obj is not None:
+        def reasoning_callback(chunk: str) -> None:  # type: ignore[no-redef]
+            if not reasoning_started[0]:
+                console_obj.print("[dim cyan]▌ 思维链[/]")  # type: ignore[union-attr]
+                reasoning_started[0] = True
+            console_obj.print(chunk, end="", highlight=False, style="dim")  # type: ignore[union-attr]
+    call_kwargs: dict[str, object] = {}
+    if reasoning_callback is not None:
+        call_kwargs["reasoning_callback"] = reasoning_callback
     try:
-        result = registry.call_structured(step, request, output_model)
+        result = registry.call_structured(step, request, output_model, **call_kwargs)
     except ProviderCallError as exc:
         artifacts = _write_provider_failure_artifacts(out_dir, stem, exc, step)
         provider_contexts[step] = exc.sanitized_context or spec.sanitized_context()
         return None, artifacts, exc.model_calls, tag_api_calls(exc.api_calls, step), str(exc)
     except (ProviderConfigError, ValueError) as exc:
         raise PipelineError(str(exc)) from exc
+    if reasoning_started[0] and console_obj is not None:
+        console_obj.print()  # type: ignore[union-attr]
     model_dir = out_dir / "model_calls"
     prompt_path = model_dir / f"{stem}.prompt.json"
     result_path = model_dir / f"{stem}.provider_result.json"
@@ -608,8 +627,13 @@ def _call_provider_artifact_soft(
     write_json(prompt_path, result.prompt_artifact)
     write_json(result_path, result.provider_result)
     write_json(api_calls_path, api_calls)
+    artifacts: list[Path] = [prompt_path, result_path, api_calls_path]
+    if result.reasoning_content:
+        reasoning_path = model_dir / f"{stem}.reasoning.md"
+        write_text(reasoning_path, result.reasoning_content)
+        artifacts.append(reasoning_path)
     provider_contexts[step] = result.sanitized_context
-    return result.output, [prompt_path, result_path, api_calls_path], result.model_calls, api_calls, None
+    return result.output, artifacts, result.model_calls, api_calls, None
 
 
 def _is_retriable_provider_structure_error(error: str) -> bool:
@@ -657,8 +681,11 @@ def _call_provider_artifacts_parallel(
     api_calls_by_key: dict[str, list[dict[str, object]]] = {}
     contexts = []
     model_dir = out_dir / "model_calls"
+    show_reasoning = bool(state.get("show_reasoning"))
+    console_obj = state.get("console")
+    print_lock = Lock()
 
-    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel, list[Path], dict[str, object], int, list[dict[str, object]]]:
+    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel, list[Path], dict[str, object], int, list[dict[str, object]], str | None]:
         artifact_stem = f"{step}_{safe_filename(key)}{artifact_suffix}"
         try:
             result = registry.call_structured(step, request, output_model)
@@ -671,17 +698,27 @@ def _call_provider_artifacts_parallel(
         result_path = model_dir / f"{artifact_stem}.provider_result.json"
         write_json(prompt_path, result.prompt_artifact)
         write_json(result_path, result.provider_result)
-        return key, result.output, [prompt_path, result_path], result.sanitized_context, result.model_calls, tag_api_calls(result.api_calls, key)
+        artifacts = [prompt_path, result_path]
+        reasoning_content = result.reasoning_content
+        if reasoning_content:
+            reasoning_path = model_dir / f"{artifact_stem}.reasoning.md"
+            write_text(reasoning_path, reasoning_content)
+            artifacts.append(reasoning_path)
+        return key, result.output, artifacts, result.sanitized_context, result.model_calls, tag_api_calls(result.api_calls, key), reasoning_content
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(call_one, key, request) for key, request in requests]
         for future in as_completed(futures):
-            key, output, artifacts, context, model_calls, api_calls = future.result()
+            key, output, artifacts, context, model_calls, api_calls, reasoning_content = future.result()
             results_by_key[key] = output
             artifacts_by_key[key] = artifacts
             model_calls_by_key[key] = model_calls
             api_calls_by_key[key] = api_calls
             contexts.append(context)
+            if show_reasoning and reasoning_content and console_obj is not None:
+                with print_lock:
+                    console_obj.print(f"[dim cyan]▌ {step} · {key}[/]")  # type: ignore[union-attr]
+                    console_obj.print(reasoning_content, style="dim", highlight=False)  # type: ignore[union-attr]
 
     provider_contexts[step] = {
         **spec.sanitized_context(),
@@ -723,27 +760,36 @@ def _call_provider_artifacts_parallel_soft(
     errors_by_key: dict[str, str] = {}
     contexts = []
     model_dir = out_dir / "model_calls"
+    show_reasoning = bool(state.get("show_reasoning"))
+    console_obj = state.get("console")
+    print_lock = Lock()
 
-    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel | None, list[Path], dict[str, object], int, list[dict[str, object]], str | None]:
+    def call_one(key: str, request: BaseModel) -> tuple[str, BaseModel | None, list[Path], dict[str, object], int, list[dict[str, object]], str | None, str | None]:
         artifact_stem = f"{step}_{safe_filename(key)}{artifact_suffix}"
         try:
             result = registry.call_structured(step, request, output_model)
         except ProviderCallError as exc:
             artifacts = _write_provider_failure_artifacts(out_dir, artifact_stem, exc, key)
             context = exc.sanitized_context or spec.sanitized_context()
-            return key, None, artifacts, context, exc.model_calls, tag_api_calls(exc.api_calls, key), str(exc)
+            return key, None, artifacts, context, exc.model_calls, tag_api_calls(exc.api_calls, key), str(exc), None
         except (ProviderConfigError, ValueError) as exc:
             raise PipelineError(str(exc)) from exc
         prompt_path = model_dir / f"{artifact_stem}.prompt.json"
         result_path = model_dir / f"{artifact_stem}.provider_result.json"
         write_json(prompt_path, result.prompt_artifact)
         write_json(result_path, result.provider_result)
-        return key, result.output, [prompt_path, result_path], result.sanitized_context, result.model_calls, tag_api_calls(result.api_calls, key), None
+        artifacts = [prompt_path, result_path]
+        reasoning_content = result.reasoning_content
+        if reasoning_content:
+            reasoning_path = model_dir / f"{artifact_stem}.reasoning.md"
+            write_text(reasoning_path, reasoning_content)
+            artifacts.append(reasoning_path)
+        return key, result.output, artifacts, result.sanitized_context, result.model_calls, tag_api_calls(result.api_calls, key), None, reasoning_content
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(call_one, key, request) for key, request in requests]
         for future in as_completed(futures):
-            key, output, artifacts, context, model_calls, api_calls, error = future.result()
+            key, output, artifacts, context, model_calls, api_calls, error, reasoning_content = future.result()
             if output is not None:
                 results_by_key[key] = output
             if error:
@@ -752,6 +798,10 @@ def _call_provider_artifacts_parallel_soft(
             model_calls_by_key[key] = model_calls
             api_calls_by_key[key] = api_calls
             contexts.append(context)
+            if show_reasoning and reasoning_content and console_obj is not None:
+                with print_lock:
+                    console_obj.print(f"[dim cyan]▌ {step} · {key}[/]")  # type: ignore[union-attr]
+                    console_obj.print(reasoning_content, style="dim", highlight=False)  # type: ignore[union-attr]
 
     provider_contexts[step] = {
         **spec.sanitized_context(),
@@ -4808,8 +4858,9 @@ def _run_step(
     console: Console,
     *,
     emit_progress: bool,
+    show_reasoning: bool = False,
 ) -> None:
-    use_live_status = emit_progress and console.is_terminal and name in MODEL_BACKED_STEPS
+    use_live_status = emit_progress and console.is_terminal and name in MODEL_BACKED_STEPS and not show_reasoning
     if emit_progress and not use_live_status:
         console.print(f"[cyan]开始[/] {step_label(name)}")
     started = now_utc()

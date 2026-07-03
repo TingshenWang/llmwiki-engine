@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -74,6 +74,7 @@ class ProviderSpec(BaseModel):
     max_tokens: int | None = MAX_OUTPUT_TOKENS
     json_mode: Literal["json_schema", "json_object"] = "json_schema"
     json_schema_strict: bool = False
+    stream_reasoning: bool = False
 
     @property
     def kind(self) -> str:
@@ -109,6 +110,7 @@ class ProviderSpec(BaseModel):
             "json_mode": self.json_mode,
             "effective_json_mode": self.effective_json_mode(),
             "json_schema_strict": self.json_schema_strict,
+            "stream_reasoning": self.stream_reasoning,
             "has_api_key": bool(self.resolved_api_key()),
         }
         return context
@@ -134,6 +136,7 @@ class ProviderCallResult:
     sanitized_context: dict[str, Any]
     api_calls: list[dict[str, Any]]
     model_calls: int = 1
+    reasoning_content: str | None = None
 
 
 class ProviderRegistry:
@@ -147,12 +150,12 @@ class ProviderRegistry:
         step_names = steps or MODEL_BACKED_STEPS
         return {step: self.provider_for(step).sanitized_context() for step in step_names}
 
-    def call_structured(self, step: str, request: PromptRequest, output_model: type[T]) -> ProviderCallResult:
+    def call_structured(self, step: str, request: PromptRequest, output_model: type[T], *, reasoning_callback: Callable[[str], None] | None = None) -> ProviderCallResult:
         spec = self.provider_for(step)
         if _is_non_model_provider(spec):
             raise ProviderConfigError(f"步骤 {step} 没有配置真实模型 provider，不能发起模型请求。")
         if spec.is_openai_compatible:
-            return self._call_openai_compatible(step, request, output_model, spec)
+            return self._call_openai_compatible(step, request, output_model, spec, reasoning_callback=reasoning_callback)
         raise ProviderConfigError(f"步骤 {step} 使用了不支持的 provider spec：{spec.spec}")
 
     def check(self, *, live: bool = False) -> list[dict[str, Any]]:
@@ -199,7 +202,7 @@ class ProviderRegistry:
                 + "；".join(issues)
             )
 
-    def _call_openai_compatible(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec) -> ProviderCallResult:
+    def _call_openai_compatible(self, step: str, request: PromptRequest, output_model: type[T], spec: ProviderSpec, *, reasoning_callback: Callable[[str], None] | None = None) -> ProviderCallResult:
         if not spec.endpoint:
             raise ProviderConfigError(f"{step} 的 openai_compatible provider 缺少 endpoint。")
         if not _is_chat_completions_endpoint(spec.endpoint):
@@ -217,6 +220,7 @@ class ProviderRegistry:
         api_calls: list[dict[str, Any]] = []
         retry_reason: str | None = None
         last_attempt_spec = spec
+        use_streaming = reasoning_callback is not None or spec.stream_reasoning
 
         def post_once(client: httpx.Client, payload: dict[str, Any], attempt: int) -> tuple[httpx.Response, dict[str, Any], float]:
             nonlocal calls_made
@@ -252,23 +256,141 @@ class ProviderRegistry:
             api_calls.append(response_record)
             return response, response_record, duration_ms
 
+        def stream_once(client: httpx.Client, payload: dict[str, Any], attempt: int) -> tuple[dict[str, Any] | None, dict[str, Any], float, int, str]:
+            nonlocal calls_made
+            calls_made += 1
+            call_index = calls_made
+            started = time.perf_counter()
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            finish_reason: str | None = None
+            usage: dict[str, Any] | None = None
+            status_code = 200
+            error_text = ""
+            try:
+                with client.stream("POST", spec.endpoint or "", headers=headers, json=payload) as response:  # type: ignore[arg-type]
+                    status_code = response.status_code
+                    if status_code != 200:
+                        error_text = response.read().decode("utf-8", errors="replace")
+                        duration_ms = (time.perf_counter() - started) * 1000
+                        record = api_call_record(
+                            step=step,
+                            model=model,
+                            attempt=attempt,
+                            call_index=call_index,
+                            status="paused",
+                            duration_ms=duration_ms,
+                            response_status_code=status_code,
+                        )
+                        api_calls.append(record)
+                        return None, record, duration_ms, status_code, error_text
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if choices and isinstance(choices[0], dict):
+                            delta = choices[0].get("delta") or {}
+                            rc = delta.get("reasoning_content")
+                            if rc:
+                                reasoning_parts.append(rc)
+                                if reasoning_callback:
+                                    reasoning_callback(rc)
+                            ct = delta.get("content")
+                            if ct:
+                                content_parts.append(ct)
+                            fr = choices[0].get("finish_reason")
+                            if fr:
+                                finish_reason = fr
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+            except Exception as exc:  # noqa: BLE001 - record provider failures before retrying.
+                duration_ms = (time.perf_counter() - started) * 1000
+                api_calls.append(
+                    api_call_record(
+                        step=step,
+                        model=model,
+                        attempt=attempt,
+                        call_index=call_index,
+                        status="paused",
+                        duration_ms=duration_ms,
+                        error=_provider_exception_message(exc),
+                    )
+                )
+                raise
+            duration_ms = (time.perf_counter() - started) * 1000
+            raw_response: dict[str, Any] = {
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": finish_reason or "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "".join(content_parts),
+                        },
+                    }
+                ],
+                "usage": usage or {},
+            }
+            reasoning_text = "".join(reasoning_parts)
+            if reasoning_text:
+                raw_response["choices"][0]["message"]["reasoning_content"] = reasoning_text
+            record = api_call_record(
+                step=step,
+                model=model,
+                attempt=attempt,
+                call_index=call_index,
+                status="paused",
+                duration_ms=duration_ms,
+                response_status_code=status_code,
+            )
+            api_calls.append(record)
+            return raw_response, record, duration_ms, status_code, error_text
+
         for attempt in range(spec.max_retries + 1):
             attempt_spec = _spec_for_retry_attempt(spec, attempt, retry_reason)
             last_attempt_spec = attempt_spec
-            payload = build_chat_payload(attempt_spec, request)
+            payload = build_chat_payload(attempt_spec, request, stream=use_streaming)
             current_retry_reason: str | None = None
             try:
                 with httpx.Client(timeout=spec.timeout_seconds) as client:
-                    response, response_record, duration_ms = post_once(client, payload, attempt)
                     fallback_used = False
-                    if _should_fallback_to_json_object(response, attempt_spec):
-                        response_record["error"] = "json_schema_response_format_fallback"
-                        fallback_spec = attempt_spec.model_copy(update={"json_mode": "json_object"})
-                        fallback_payload = build_chat_payload(fallback_spec, request)
-                        response, response_record, duration_ms = post_once(client, fallback_payload, attempt)
-                        fallback_used = True
-                response.raise_for_status()
-                raw_response = response.json()
+                    if use_streaming:
+                        stream_raw, response_record, duration_ms, status_code, error_text = stream_once(client, payload, attempt)
+                        raw_response: dict[str, Any] | None = stream_raw
+                        if status_code == 400 and _is_json_schema_unavailable_text(error_text, attempt_spec):
+                            response_record["error"] = "json_schema_response_format_fallback"
+                            fallback_spec = attempt_spec.model_copy(update={"json_mode": "json_object"})
+                            fallback_payload = build_chat_payload(fallback_spec, request)
+                            response, response_record, duration_ms = post_once(client, fallback_payload, attempt)
+                            fallback_used = True
+                            response.raise_for_status()
+                            raw_response = response.json()
+                            status_code = response.status_code
+                        elif raw_response is None:
+                            raise httpx.HTTPStatusError(
+                                f"streaming 请求失败：{status_code}",
+                                request=httpx.Request("POST", spec.endpoint or ""),
+                                response=httpx.Response(status_code, text=error_text),
+                            )
+                    else:
+                        response, response_record, duration_ms = post_once(client, payload, attempt)
+                        status_code = response.status_code
+                        if _should_fallback_to_json_object(response, attempt_spec):
+                            response_record["error"] = "json_schema_response_format_fallback"
+                            fallback_spec = attempt_spec.model_copy(update={"json_mode": "json_object"})
+                            fallback_payload = build_chat_payload(fallback_spec, request)
+                            response, response_record, duration_ms = post_once(client, fallback_payload, attempt)
+                            fallback_used = True
+                            status_code = response.status_code
+                        response.raise_for_status()
+                        raw_response = response.json()
                 response_record.update(
                     api_call_record(
                         step=step,
@@ -278,7 +400,7 @@ class ProviderRegistry:
                         status="paused",
                         duration_ms=duration_ms,
                         raw_response=raw_response,
-                        response_status_code=response.status_code,
+                        response_status_code=status_code,
                     )
                 )
                 if _response_was_truncated(raw_response):
@@ -293,6 +415,7 @@ class ProviderRegistry:
                     provider_context["retry_reason"] = retry_reason
                 if fallback_used:
                     provider_context = {**provider_context, "response_format_fallback": "json_object"}
+                reasoning_content = _extract_reasoning_content(raw_response)
                 return ProviderCallResult(
                     output=output,
                     prompt_artifact=_prompt_artifact(request, attempt_spec),
@@ -301,10 +424,12 @@ class ProviderRegistry:
                         "raw_response": _compact_response(raw_response),
                         "api_calls": api_calls,
                         "parsed": output.model_dump(mode="json"),
+                        "reasoning_content": reasoning_content,
                     },
                     sanitized_context=provider_context,
                     api_calls=api_calls,
                     model_calls=calls_made,
+                    reasoning_content=reasoning_content,
                 )
             except Exception as exc:  # noqa: BLE001 - retry surface should preserve provider failure text.
                 if api_calls and api_calls[-1].get("status") != "success" and not api_calls[-1].get("error"):
@@ -433,7 +558,7 @@ def _is_chat_completions_endpoint(endpoint: str) -> bool:
     return path.endswith("/chat/completions")
 
 
-def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, Any]:
+def build_chat_payload(spec: ProviderSpec, request: PromptRequest, *, stream: bool = False) -> dict[str, Any]:
     messages = [{"role": "system", "content": request.system_prompt}]
     suffix_content = json.dumps(
         {
@@ -467,6 +592,9 @@ def build_chat_payload(spec: ProviderSpec, request: PromptRequest) -> dict[str, 
         }
     else:
         payload["response_format"] = {"type": "json_object"}
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
     return payload
 
 
@@ -571,9 +699,30 @@ def _compact_response(raw_response: dict[str, Any]) -> dict[str, Any]:
             {
                 "index": choice.get("index"),
                 "finish_reason": choice.get("finish_reason"),
-                "message": {"role": choice.get("message", {}).get("role"), "content": choice.get("message", {}).get("content")},
+                "message": {
+                    "role": choice.get("message", {}).get("role"),
+                    "content": choice.get("message", {}).get("content"),
+                    "reasoning_content": choice.get("message", {}).get("reasoning_content"),
+                },
             }
             for choice in compact.get("choices", [])
             if isinstance(choice, dict)
         ]
     return compact
+
+
+def _extract_reasoning_content(raw_response: dict[str, Any]) -> str | None:
+    try:
+        rc = raw_response["choices"][0]["message"]["reasoning_content"]
+        if isinstance(rc, str) and rc:
+            return rc
+    except (KeyError, IndexError, TypeError):
+        pass
+    return None
+
+
+def _is_json_schema_unavailable_text(text: str, spec: ProviderSpec) -> bool:
+    if spec.json_mode != "json_schema":
+        return False
+    lowered = text.lower()
+    return "response_format" in lowered and ("unavailable" in lowered or "not support" in lowered or "unsupported" in lowered)
