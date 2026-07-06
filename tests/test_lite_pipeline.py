@@ -28,6 +28,7 @@ from llmwiki_engine.lite.models import (
     CoverageJudge,
     DigestCoverageRepair,
     DigestCoverageJudge,
+    DigestCoverageItem,
     FinalPageCoverageRepair,
     FinalPage,
     FinalPageSection,
@@ -966,6 +967,73 @@ def test_digest_coverage_complete_rejects_low_importance_gap() -> None:
     assert report["digest_raw_coverage_percent"] == 90.91
     with pytest.raises(PipelineError, match="修复后仍存在未完整覆盖"):
         _assert_digest_coverage_complete(report)
+
+
+def test_digest_coverage_allows_low_importance_partial() -> None:
+    """importance ≤ 2 的 partial 不触发重试。"""
+    ref = SourceRef(raw_path="raw/note.md", raw_sha256="abc", locator="whole_file")
+    digest = SourceDigest(
+        source_raw_path=ref.raw_path,
+        raw_sha256=ref.raw_sha256,
+        summary="覆盖了核心内容。",
+        key_takeaways=["核心要点。"],
+        claims=[
+            SourceClaim(
+                claim_id="C-001",
+                text="核心知识点。",
+                kind="concept",
+                importance=5,
+                concept_terms=["核心"],
+                raw_locator=ref.locator,
+                source_refs=[ref],
+            ),
+        ],
+        content_units=[
+            SourceContentUnit(
+                content_unit_id="CU-001",
+                title="核心概念",
+                content_role="主干",
+                absorption_decision="独立成页",
+                anchor_unit_id="CU-001",
+                section_hint="核心",
+                summary="核心概念。",
+                absorption_reason="主干。",
+                content_scope="核心。",
+                claim_ids=["C-001"],
+                source_refs=[ref],
+            ),
+        ],
+    )
+    judge = DigestCoverageJudge(
+        coverage_items=[
+            DigestCoverageItem(
+                item_id="RI-001",
+                text="核心信息。",
+                importance=5,
+                status="covered",
+                covered_by_claim_ids=["C-001"],
+                covered_by_content_unit_ids=["CU-001"],
+                raw_locator="whole_file",
+                evidence="已覆盖。",
+                reason="核心已覆盖。",
+            ),
+            DigestCoverageItem(
+                item_id="RI-002",
+                text="边缘举例信息。",
+                importance=2,
+                status="partial",
+                covered_by_claim_ids=["C-001"],
+                covered_by_content_unit_ids=[],
+                raw_locator="whole_file",
+                evidence="部分覆盖。",
+                reason="边缘信息部分覆盖可接受。",
+            ),
+        ],
+    )
+
+    report = _digest_coverage_report(judge, digest)
+    # 不应抛出异常：importance=2 的 partial 被允许
+    _assert_digest_coverage_complete(report)
 
 
 def test_digest_coverage_allows_raw_english_evidence() -> None:

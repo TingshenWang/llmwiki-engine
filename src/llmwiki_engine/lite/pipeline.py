@@ -15,7 +15,10 @@ from typing import Callable, Iterable, Literal
 import yaml
 from pydantic import BaseModel
 from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from llmwiki_engine import __version__
 
@@ -129,6 +132,8 @@ COVERAGE_MIN_RAW_CLAIM_PERCENT = 85.0
 COVERAGE_MIN_CORE_CLAIM_PERCENT = 95.0
 COVERAGE_MIN_CONCEPT_PERCENT = 95.0
 DIGEST_COVERAGE_REPAIR_MAX_ATTEMPTS = 3
+DIGEST_COVERAGE_LOW_IMPORTANCE_THRESHOLD = 2
+DIGEST_COVERAGE_MIN_RAW_PERCENT = 99.0
 FINAL_COVERAGE_REPAIR_MAX_ATTEMPTS = 3
 
 
@@ -600,25 +605,37 @@ def _call_provider_artifact_soft(
     console_obj = state.get("console")
     reasoning_callback: Callable[[str], None] | None = None
     reasoning_started = [False]
+    reasoning_live: list[Live | None] = [None]
+    reasoning_parts: list[str] = []
     if show_reasoning and console_obj is not None:
         def reasoning_callback(chunk: str) -> None:  # type: ignore[no-redef]
             if not reasoning_started[0]:
-                console_obj.print("[dim cyan]▌ 思维链[/]")  # type: ignore[union-attr]
                 reasoning_started[0] = True
-            console_obj.print(chunk, end="", highlight=False, style="dim")  # type: ignore[union-attr]
+                panel = Panel(Text("", style="dim"), title="深度思考", title_align="left", border_style="cyan", padding=(0, 1))
+                live = Live(panel, console=console_obj, refresh_per_second=10, transient=False)  # type: ignore[arg-type]
+                live.start()
+                reasoning_live[0] = live
+            reasoning_parts.append(chunk)
+            if reasoning_live[0] is not None:
+                panel = Panel(Text("".join(reasoning_parts), style="dim"), title="深度思考", title_align="left", border_style="cyan", padding=(0, 1))
+                reasoning_live[0].update(panel)
     call_kwargs: dict[str, object] = {}
     if reasoning_callback is not None:
         call_kwargs["reasoning_callback"] = reasoning_callback
     try:
         result = registry.call_structured(step, request, output_model, **call_kwargs)
     except ProviderCallError as exc:
+        if reasoning_live[0] is not None:
+            reasoning_live[0].stop()
         artifacts = _write_provider_failure_artifacts(out_dir, stem, exc, step)
         provider_contexts[step] = exc.sanitized_context or spec.sanitized_context()
         return None, artifacts, exc.model_calls, tag_api_calls(exc.api_calls, step), str(exc)
     except (ProviderConfigError, ValueError) as exc:
+        if reasoning_live[0] is not None:
+            reasoning_live[0].stop()
         raise PipelineError(str(exc)) from exc
-    if reasoning_started[0] and console_obj is not None:
-        console_obj.print()  # type: ignore[union-attr]
+    if reasoning_live[0] is not None:
+        reasoning_live[0].stop()
     model_dir = out_dir / "model_calls"
     prompt_path = model_dir / f"{stem}.prompt.json"
     result_path = model_dir / f"{stem}.provider_result.json"
@@ -717,8 +734,13 @@ def _call_provider_artifacts_parallel(
             contexts.append(context)
             if show_reasoning and reasoning_content and console_obj is not None:
                 with print_lock:
-                    console_obj.print(f"[dim cyan]▌ {step} · {key}[/]")  # type: ignore[union-attr]
-                    console_obj.print(reasoning_content, style="dim", highlight=False)  # type: ignore[union-attr]
+                    console_obj.print(Panel(  # type: ignore[union-attr]
+                        Text(reasoning_content, style="dim"),
+                        title=f"深度思考 · {step} · {key}",
+                        title_align="left",
+                        border_style="cyan",
+                        padding=(0, 1),
+                    ))
 
     provider_contexts[step] = {
         **spec.sanitized_context(),
@@ -800,8 +822,13 @@ def _call_provider_artifacts_parallel_soft(
             contexts.append(context)
             if show_reasoning and reasoning_content and console_obj is not None:
                 with print_lock:
-                    console_obj.print(f"[dim cyan]▌ {step} · {key}[/]")  # type: ignore[union-attr]
-                    console_obj.print(reasoning_content, style="dim", highlight=False)  # type: ignore[union-attr]
+                    console_obj.print(Panel(  # type: ignore[union-attr]
+                        Text(reasoning_content, style="dim"),
+                        title=f"深度思考 · {step} · {key}",
+                        title_align="left",
+                        border_style="cyan",
+                        padding=(0, 1),
+                    ))
 
     provider_contexts[step] = {
         **spec.sanitized_context(),
@@ -2487,11 +2514,16 @@ def _assert_digest_coverage_complete(report: dict[str, object]) -> None:
     items = report.get("coverage_items")
     if not isinstance(items, list):
         raise PipelineError("digest_coverage_judge 覆盖报告缺少 coverage_items。")
-    gaps = [str(item.get("item_id")) for item in items if isinstance(item, dict) and item.get("status") in {"missing", "partial"}]
+    # 允许 importance ≤ 2 的 partial 不触发重试（低重要性边缘信息的部分覆盖可接受）
+    gaps = [
+        str(item.get("item_id"))
+        for item in items
+        if isinstance(item, dict)
+        and item.get("status") in {"missing", "partial"}
+        and not (item.get("status") == "partial" and int(item.get("importance") or 0) <= DIGEST_COVERAGE_LOW_IMPORTANCE_THRESHOLD)
+    ]
     if gaps:
         raise PipelineError(f"digest_coverage_judge 修复后仍存在未完整覆盖 raw 信息项：{', '.join(gaps)}")
-    if float(report.get("digest_raw_coverage_percent") or 0.0) < 100.0:
-        raise PipelineError(f"digest_coverage_judge 修复后覆盖率不是 100%：{report.get('digest_raw_coverage_percent')}%")
 
 
 def _assert_digest_coverage_repair_actions(repair: DigestCoverageRepair) -> None:

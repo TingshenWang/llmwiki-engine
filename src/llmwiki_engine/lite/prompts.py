@@ -600,7 +600,7 @@ def digest_coverage_repair_prompt(
                 "新增或修改 content_unit 不得输出 page_type、target_path 或 path_hint；页面类型和路径由后续 merge_plan 决定。",
                 "如果输入 source_digest 存在遗漏或部分覆盖，repaired_source_digest 必须补齐对应信息，不能只写入 summary、key_takeaways、concept_terms、content_scope 或 weak_or_noise_items；若它是有效知识，必须新增或修改具体 claim，并把 claim_id 分配到真实 content_unit。",
                 "新增或修改 claim 必须保留原文中的具体对象、数字、工具名、机制、例子和局限性；不要用上位概念吞掉具体信息。",
-                "repair_actions 记录你对输入 source_digest 做过的新增、修改、挂载或不改动动作；如果输入本来已经完整，可以为空或只写 no_change。",
+                "repair_actions 只记录对 repaired_source_digest 的实际修改（新增 claim、修改 claim 文本、挂载 claim 到 content_unit）。如果某个 coverage item 的状态从 missing/partial 改为 covered 但 source_digest 的 claim 和 content_unit 没有实际修改（只是重新评估了覆盖状态），该 item 不需要在 repair_actions 中记录。如果输入本来已经完整，repair_actions 可以为空。",
                 "如果所有 coverage_items 都是 covered，repaired_source_digest 可以与 source_digest 等价，但仍必须返回完整对象。",
             ],
         },
@@ -631,6 +631,7 @@ def digest_coverage_repair_retry_prompt(
                 "所有 text、evidence、reason、warnings 等用户可读字段必须使用中文。",
                 "不要为了通过校验删除 missing/partial 项；如果 raw 有有效信息而 digest 没覆盖，必须保留 missing 或 partial 判断。",
                 "repaired_source_digest 必须是完整修复后的 source_digest，并且每个新增 claim 必须归属到真实 content_unit。",
+                "注意：repair_actions 只记录对 source_digest 的修改，不记录 coverage_items 的状态变化。",
             ],
         }
     )
@@ -773,7 +774,7 @@ def final_page_coverage_repair_prompt(*, digest: SourceDigest, final_page: Final
                 "covered_by 写 target_path#中文小节；如果缺失或冲突可为空数组。",
                 "evidence 必须引用 repaired_final_page 中的中文表达；reason 必须中文说明判断理由。",
                 "如果输入 final_page 存在遗漏、部分覆盖或冲突，必须在 repaired_final_page 中补写或局部改写，不要只泛化总结。",
-                "repair_actions 记录你对输入 final_page 做过的新增、修改、移动或不改动动作；如果输入本来已经完整，可以为空或只写 no_change。",
+                "repair_actions 只记录对 repaired_final_page 的实际修改（新增、修改、移动 section 或正文段落）。如果某个 claim 的覆盖状态从 missing/partial 改为 covered 但 final_page 正文没有实际修改（只是重新评估了覆盖状态），该 claim 不需要在 repair_actions 中记录。如果输入本来已经完整，repair_actions 可以为空。",
                 "不要删除已经正确覆盖的内容；只做必要补充和局部改写。",
                 "不要写 Related 或 相关页面章节；引擎会统一生成。",
                 "正文 Obsidian wikilink 最多 2 条；也可以不写正文链接。",
@@ -809,6 +810,7 @@ def final_coverage_repair_retry_prompt(
                 "repaired_final_page.markdown 必须返回空字符串；不要手写整篇 Markdown。",
                 "claim_results 的 claim_id 集合必须与输入 claims 完全一致。",
                 "每条 claim_results 的 evidence 和 reason 都不能为空，且必须基于 repaired_final_page 正文。",
+                "注意：repair_actions 只记录对 final_page 正文的修改，不记录 claim_results 的覆盖状态变化。",
                 "所有 evidence、reason、warnings 等用户可读字段必须使用中文。",
             ],
         }

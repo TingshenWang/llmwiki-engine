@@ -507,7 +507,7 @@ def test_parallel_reasoning_displayed_on_completion(tmp_path: Path) -> None:
     _call_provider_artifacts_parallel_soft(state, out_dir, "final_pages", requests, SimpleOutput)
 
     text = output_buf.getvalue()
-    assert "▌" in text
+    assert "深度思考" in text
     assert "keyA" in text
     assert "keyB" in text
     assert "并行推理展示文本。" in text
