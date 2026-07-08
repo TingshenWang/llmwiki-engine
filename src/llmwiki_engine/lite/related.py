@@ -52,6 +52,7 @@ def final_markdown_link_issues(
     title: str,
     known_paths: set[str] | None = None,
     path_titles: dict[str, str] | None = None,
+    body_wikilink_limit: int = BODY_WIKILINK_LIMIT,
 ) -> list[ValidationIssue]:
     body = strip_frontmatter(markdown)
     body_without_official = _remove_sections(body, {"相关页面"})
@@ -61,8 +62,8 @@ def final_markdown_link_issues(
     if _has_section(body_without_official, {"Related"}):
         issues.append(ValidationIssue(severity="error", code="model_related_section", message="最终 Markdown 包含模型自己写的 Related 章节。", path=target_path))
     body_targets = _wikilink_targets(body_without_official)
-    if len(body_targets) > BODY_WIKILINK_LIMIT:
-        issues.append(ValidationIssue(severity="error", code="body_wikilink_too_many", message=f"最终 Markdown 正文 wikilink 超过 {BODY_WIKILINK_LIMIT} 条。", path=target_path))
+    if len(body_targets) > body_wikilink_limit:
+        issues.append(ValidationIssue(severity="error", code="body_wikilink_too_many", message=f"最终 Markdown 正文 wikilink 超过 {body_wikilink_limit} 条。", path=target_path))
     for target in body_targets:
         if _is_self_link(target, target_path=target_path, title=title):
             issues.append(ValidationIssue(severity="error", code="self_wikilink", message="最终 Markdown 在系统相关页面章节外包含自链接。", path=target_path))
@@ -111,13 +112,13 @@ def _plain_wikilink_text(target: str, alias: str = "") -> str:
     return text.replace("_", " ").strip() or target.strip()
 
 
-def precanonical_link_errors(*, markdown: str, target_path: str, title: str) -> list[str]:
+def precanonical_link_errors(*, markdown: str, target_path: str, title: str, body_wikilink_limit: int = BODY_WIKILINK_LIMIT) -> list[str]:
     body = strip_frontmatter(markdown)
     errors: list[str] = []
     if _has_section(body, {"Related", "相关页面"}):
         errors.append("模型输出不能包含 Related/相关页面；引擎会统一渲染")
-    if len(_wikilink_targets(body)) > BODY_WIKILINK_LIMIT:
-        errors.append(f"正文 wikilink 最多 {BODY_WIKILINK_LIMIT} 条")
+    if len(_wikilink_targets(body)) > body_wikilink_limit:
+        errors.append(f"正文 wikilink 最多 {body_wikilink_limit} 条")
     if any(_is_self_link(target, target_path=target_path, title=title) for target in _wikilink_targets(body)):
         errors.append("模型输出不能包含自链接")
     if _contains_graph_excluded_link(body):

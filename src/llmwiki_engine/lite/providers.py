@@ -74,7 +74,7 @@ class ProviderSpec(BaseModel):
     max_tokens: int | None = MAX_OUTPUT_TOKENS
     json_mode: Literal["json_schema", "json_object"] = "json_schema"
     json_schema_strict: bool = False
-    stream_reasoning: bool = False
+    stream_reasoning: bool = False  # deprecated: 流式显示仅由 --reasoning flag 控制，此字段不再影响 streaming 决策
 
     @property
     def kind(self) -> str:
@@ -220,7 +220,10 @@ class ProviderRegistry:
         api_calls: list[dict[str, Any]] = []
         retry_reason: str | None = None
         last_attempt_spec = spec
-        use_streaming = reasoning_callback is not None or spec.stream_reasoning
+        # 流式仅由 --reasoning flag（经 reasoning_callback）控制。
+        # 不开 --reasoning 时始终走非流式，保持 DeepSeek prompt cache 命中率；
+        # reasoning_content 仍从非流式响应体中提取并保存到 artifact。
+        use_streaming = reasoning_callback is not None
 
         def post_once(client: httpx.Client, payload: dict[str, Any], attempt: int) -> tuple[httpx.Response, dict[str, Any], float]:
             nonlocal calls_made

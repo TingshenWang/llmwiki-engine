@@ -379,6 +379,31 @@ def test_call_structured_passes_reasoning_callback(tmp_path: Path, monkeypatch) 
     assert "stream" not in client.post_payloads[0]
 
 
+def test_stream_reasoning_spec_does_not_force_streaming(tmp_path: Path, monkeypatch) -> None:
+    """spec.stream_reasoning=True 时，不传 reasoning_callback 仍走非流式（保持缓存命中）。"""
+    spec = _make_spec(stream_reasoning=True)
+    request = _make_request()
+    response = _DummyResponse({
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps({"ok": True}),
+                "reasoning_content": "非流式也能拿到 reasoning。",
+            },
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    })
+    client = _DummyClient(timeout=180.0, response=response)
+    monkeypatch.setattr("llmwiki_engine.lite.providers.httpx.Client", lambda **kw: client)
+
+    result = ProviderRegistry({"test_step": spec}).call_structured("test_step", request, SimpleOutput)
+
+    assert len(client.posted_payloads) == 1
+    assert "stream" not in client.posted_payloads[0]
+    assert result.reasoning_content == "非流式也能拿到 reasoning。"
+
+
 # ---------------------------------------------------------------------------
 # pipeline.py tests
 # ---------------------------------------------------------------------------

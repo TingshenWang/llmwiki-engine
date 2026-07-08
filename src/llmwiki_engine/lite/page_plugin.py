@@ -49,6 +49,7 @@ class PagePlugin(BaseModel):
     default_page_type: str
     page_types: dict[str, PageTypeSpec]
     related: RelatedPolicy = Field(default_factory=RelatedPolicy)
+    body_wikilink_limit: int = Field(default=2, ge=0)
 
     @field_validator("name", "version", "description", "default_page_type")
     @classmethod
@@ -90,6 +91,7 @@ DEFAULT_PAGE_PLUGIN = {
     "version": "1",
     "description": "llmwiki Lite 默认页面插件，面向 100 页以内的轻量中文知识库。",
     "default_page_type": "concept",
+    "body_wikilink_limit": 2,
     "related": {
         "same_ingest_model_max": 5,
         "embedding_existing_top_k": 3,
@@ -244,6 +246,7 @@ def page_plugin_writing_card(plugin: PagePlugin, page_type: str) -> str:
         f"目标目录：`{spec.directory}/`",
         f"文件名前缀：`{spec.title_prefix}`",
         "固定章节顺序：" + " -> ".join(spec.sections),
+        f"正文 wikilink 上限：{plugin.body_wikilink_limit} 条",
     ]
     if spec.writing_rules:
         lines.append("写作规则：")

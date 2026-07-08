@@ -83,6 +83,7 @@ from llmwiki_engine.lite.pipeline import (
     _step_related_refresh,
     _step_source_digest,
     _source_granularity_stats,
+    _strip_raw_path_references,
     _validate_before_write,
     init_vault,
     PipelineError,
@@ -3945,3 +3946,127 @@ def test_composition_and_final_page_prompt_runtime_contracts(tmp_path: Path) -> 
 
     assert final_prompt.schema_name == "llmwiki_lite_final_pages"
     assert normalized.pages[0].content_sha256 == sha256_text(normalized.pages[0].markdown)
+
+
+def test_strip_raw_path_references_removes_inline_source_paths() -> None:
+    """_strip_raw_path_references 删除 [来源：raw/xxx.md] 等内联路径引用。"""
+    body = (
+        "MCP 是连接 AI 应用到外部系统的标准协议 [来源：raw/009-introducing-the-model-context-protocol.md]。"
+        "它类似于 USB-C 端口 [来源：raw/011-what-is-the-model-context-protocol-mcp-model-context-protocol.md]。"
+    )
+    cleaned = _strip_raw_path_references(body)
+    assert "raw/" not in cleaned
+    assert "来源" not in cleaned
+    assert "MCP 是连接 AI 应用到外部系统的标准协议" in cleaned
+    assert "它类似于 USB-C 端口" in cleaned
+
+
+def test_strip_raw_path_references_removes_markdown_links_to_raw() -> None:
+    """_strip_raw_path_references 删除指向 raw/sources/logs 的 Markdown link。"""
+    body = "参见 [详情](raw/009-intro.md) 和 [日志](logs/2026-07-07.md) 了解更多。"
+    cleaned = _strip_raw_path_references(body)
+    assert "raw/" not in cleaned
+    assert "logs/" not in cleaned
+    assert "了解更多" in cleaned
+
+
+def test_strip_raw_path_references_removes_bare_paths() -> None:
+    """_strip_raw_path_references 删除裸路径 raw/xxx.md。"""
+    body = "来源文件 raw/009-introducing-the-model-context-protocol.md 描述了 MCP。"
+    cleaned = _strip_raw_path_references(body)
+    assert "raw/" not in cleaned
+    assert "描述了 MCP" in cleaned
+
+
+def test_strip_raw_path_references_preserves_normal_text() -> None:
+    """_strip_raw_path_references 不影响正常中文正文。"""
+    body = "MCP 是 Anthropic 于 2024 年 11 月 25 日宣布开源的标准协议。"
+    cleaned = _strip_raw_path_references(body)
+    assert cleaned == body
+
+
+def test_normalize_final_pages_strips_raw_paths_from_sections(tmp_path: Path) -> None:
+    """_normalize_final_pages 清理 sections.body_markdown 中的 raw 路径引用。"""
+    vault = init_vault(tmp_path / "vault")
+    page_plugin = load_page_plugin(vault)
+    ref = SourceRef(raw_path="raw/project_note.md", raw_sha256="abc", locator="whole_file")
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_Test.md",
+        action="create",
+        title="测试概念",
+        page_type="concept",
+        markdown="",
+        sections=[
+            FinalPageSection(
+                heading="摘要",
+                body_markdown="这是一个测试概念 [来源：raw/project_note.md]，用于验证清理逻辑。",
+            ),
+            FinalPageSection(heading="核心内容", body_markdown="核心内容描述。"),
+            FinalPageSection(heading="矛盾与未解决问题", body_markdown="暂无。"),
+        ],
+        content_sha256="",
+        source_refs=[ref],
+    )
+    item = CompositionItem(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_Test.md",
+        action="create",
+        merge_decision_ids=["MD-001"],
+        candidate_page_ids=["CP-001"],
+        section_order=["摘要", "核心内容", "矛盾与未解决问题"],
+        source_ref_rules=["保留来源。"],
+        readability_goal="生成可读中文页。",
+    )
+    normalized = _normalize_final_pages(
+        FinalPages(pages=[page]),
+        CompositionPlan(items=[item]),
+        page_plugin=page_plugin,
+    )
+    body = normalized.pages[0].sections[0].body_markdown
+    assert "raw/" not in body
+    assert "来源" not in body
+    assert "这是一个测试概念" in body
+    assert "用于验证清理逻辑" in body
+
+
+def test_body_wikilink_limit_from_plugin(tmp_path: Path) -> None:
+    """插件 body_wikilink_limit 控制 prompt 和校验中的 wikilink 数量上限。"""
+    from llmwiki_engine.lite.page_plugin import PagePlugin, PageTypeSpec, RelatedPolicy
+
+    plugin = PagePlugin(
+        name="test",
+        version="1",
+        description="test",
+        default_page_type="concept",
+        body_wikilink_limit=5,
+        page_types={
+            "concept": PageTypeSpec(
+                directory="concepts",
+                title_prefix="Concept_",
+                label="概念",
+                sections=["摘要", "核心内容", "矛盾与未解决问题"],
+            )
+        },
+    )
+
+    # 验证 writing_card 包含插件设置的 limit
+    from llmwiki_engine.lite.page_plugin import page_plugin_writing_card
+    card = page_plugin_writing_card(plugin, "concept")
+    assert "5" in card
+
+    # 验证校验使用插件的 limit（5 条 wikilink 不报错，超过 5 才报错）
+    from llmwiki_engine.lite.related import precanonical_link_errors
+    body = "正文 " + " ".join(f"[[Concept_{i}]]" for i in range(5))
+    errors = precanonical_link_errors(markdown=body, target_path="concepts/Concept_Test.md", title="测试", body_wikilink_limit=plugin.body_wikilink_limit)
+    assert not any("wikilink 最多" in e for e in errors)  # 5 条不超限
+
+    body_6 = "正文 " + " ".join(f"[[Concept_{i}]]" for i in range(6))
+    errors_6 = precanonical_link_errors(markdown=body_6, target_path="concepts/Concept_Test.md", title="测试", body_wikilink_limit=plugin.body_wikilink_limit)
+    assert any("最多 5 条" in e for e in errors_6)  # 6 条超限
+
+
+def test_default_plugin_body_wikilink_limit_is_2() -> None:
+    """默认插件 body_wikilink_limit 为 2，保持向后兼容。"""
+    plugin = default_page_plugin()
+    assert plugin.body_wikilink_limit == 2

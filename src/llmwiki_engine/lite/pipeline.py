@@ -1631,7 +1631,11 @@ def _normalize_final_pages(
         final_title = existing_entry.title if existing_entry is not None and item is not None and item.action == "update" else page.title
         page_type = existing_entry.page_type if existing_entry is not None else page_plugin.page_type_for_path(page.target_path)
         source_refs = _merge_source_refs(page.source_refs)
-        updated_page = page.model_copy(update={"title": final_title, "page_type": page_type, "source_refs": source_refs})
+        cleaned_sections = [
+            section.model_copy(update={"body_markdown": _strip_raw_path_references(section.body_markdown)})
+            for section in page.sections
+        ]
+        updated_page = page.model_copy(update={"title": final_title, "page_type": page_type, "source_refs": source_refs, "sections": cleaned_sections})
         provider_markdown = _render_final_page_provider_body(updated_page, page_plugin, page_type)
         markdown = _canonical_final_markdown(
             updated_page.model_copy(update={"markdown": provider_markdown}),
@@ -1640,6 +1644,7 @@ def _normalize_final_pages(
             known_paths=known_paths,
             path_titles=path_titles,
             model_title=model_title,
+            body_wikilink_limit=page_plugin.body_wikilink_limit,
         )
         missing_sections = _missing_required_sections(markdown, page_plugin, updated_page.page_type)
         if missing_sections:
@@ -1671,9 +1676,26 @@ def _render_final_page_provider_body(page: FinalPage, page_plugin: PagePlugin, p
     return "\n".join(lines).rstrip() + "\n"
 
 
+_RAW_PATH_PATTERN = re.compile(
+    r"\s*\[来源：[^\]]*\]"  # [来源：raw/xxx.md]
+    r"|\s*\[(?:raw|sources|logs)/[^\]]*\]"  # [raw/xxx.md]
+    r"|\[[^\]]*\]\((?:raw|sources|logs)/[^)]*\)"  # [text](raw/xxx.md)
+    r"|(?:raw|sources|logs)/[\w./-]+\.md"  # bare raw/xxx.md
+)
+
+
+def _strip_raw_path_references(text: str) -> str:
+    """删除正文中对 raw/sources/logs 路径的内联引用，清理残留空白。"""
+    cleaned = _RAW_PATH_PATTERN.sub("", text)
+    cleaned = re.sub(r"  +", " ", cleaned)  # 多余空格
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)  # 多余空行
+    return cleaned.strip()
+
+
 def _sanitize_section_body_markdown(markdown: str) -> str:
     body = strip_frontmatter(markdown).strip()
     body = _drop_sections(body, {"Related", "相关页面"}).strip()
+    body = _strip_raw_path_references(body)
     sanitized: list[str] = []
     for line in body.splitlines():
         stripped = line.lstrip()
@@ -1699,10 +1721,11 @@ def _canonical_final_markdown(
     known_paths: set[str] | None = None,
     path_titles: dict[str, str] | None = None,
     model_title: str = "",
+    body_wikilink_limit: int = 2,
 ) -> str:
     body = strip_frontmatter(page.markdown).strip()
     body = _drop_sections(body, {"Related", "相关页面"}).strip()
-    link_errors = related_logic.precanonical_link_errors(markdown=body, target_path=page.target_path, title=page.title)
+    link_errors = related_logic.precanonical_link_errors(markdown=body, target_path=page.target_path, title=page.title, body_wikilink_limit=body_wikilink_limit)
     if link_errors:
         raise PipelineError(f"最终页 {page.target_path} 不符合链接契约：{'; '.join(link_errors)}")
     body = related_logic.canonicalize_body_wikilinks(body, known_paths=known_paths or set(), path_titles=path_titles or {})
@@ -1712,6 +1735,7 @@ def _canonical_final_markdown(
         title=model_title or page.title,
         known_paths=known_paths,
         path_titles=path_titles,
+        body_wikilink_limit=body_wikilink_limit,
     )
     if link_issues:
         raise PipelineError(f"最终页 {page.target_path} 不符合链接契约：{'; '.join(issue.message for issue in link_issues)}")

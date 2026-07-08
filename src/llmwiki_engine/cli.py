@@ -39,7 +39,7 @@ def ingest_run(
     slug: Optional[str] = typer.Option(None, "--slug"),
     verify_coverage: bool = typer.Option(False, "--verify-coverage", help="测试参数：coverage 修复后追加独立复判。"),
     json_output: bool = typer.Option(False, "--json", help="输出机器可读 JSON。"),
-    reasoning: bool = typer.Option(False, "--reasoning", help="实时显示模型思维链。"),
+    reasoning: bool = typer.Option(False, "--reasoning", help="实时流式显示模型思维链（会降低缓存命中率）。不加此选项时 reasoning 仍会保存到日志。"),
 ) -> None:
     """运行全自动 Lite ingest 并写入 wiki transaction。"""
     try:
