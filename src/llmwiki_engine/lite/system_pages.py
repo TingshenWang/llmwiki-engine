@@ -20,8 +20,8 @@ class DailyLogCounts:
     noop: int = 0
 
 
-def initial_index_text() -> str:
-    return render_index(entries=[], tension_rows=[], page_type_order=[])
+def initial_index_text(*, okf_compatible: bool = True) -> str:
+    return render_index(entries=[], tension_rows=[], page_type_order=[], okf_compatible=okf_compatible)
 
 
 def markdown_table(headers: list[str], rows: list[list[object]]) -> str:
@@ -40,7 +40,9 @@ def render_index(
     entries: list[WikiKnowledgeEntry],
     tension_rows: list[dict[str, str]],
     page_type_order: Iterable[str],
+    okf_compatible: bool = True,
 ) -> str:
+    okf_header = "---\nokf_version: \"0.1\"\n---\n\n" if okf_compatible else ""
     ordered_types = list(page_type_order)
     by_type = {page_type: [] for page_type in ordered_types}
     extra_rows: list[WikiKnowledgeEntry] = []
@@ -86,7 +88,7 @@ def render_index(
         else [["暂无未决问题记录", "", ""]]
     )
     parts.extend(["## 矛盾与未解决问题", "", markdown_table(["问题", "关联页面", "更新日期"], tension_table_rows)])
-    return "\n".join(parts).rstrip() + "\n"
+    return okf_header + "\n".join(parts).rstrip() + "\n"
 
 
 def render_daily_log(

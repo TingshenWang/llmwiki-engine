@@ -514,6 +514,7 @@ class FinalPage(StrictModel):
     action: MergeAction
     title: str
     page_type: str
+    okf_type: str = ""
     content_sha256: str = ""
     markdown: str = ""
     sections: list[FinalPageSection] = Field(default_factory=list)

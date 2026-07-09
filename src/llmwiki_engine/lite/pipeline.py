@@ -173,7 +173,7 @@ def init_vault(vault: Path, profile_name: str = "project_basic") -> Path:
     applied.touch(exist_ok=True)
     _ensure_gitignore(vault)
     if not (vault / "wiki" / "index.md").exists():
-        write_text(vault / "wiki" / "index.md", system_pages.initial_index_text())
+        write_text(vault / "wiki" / "index.md", system_pages.initial_index_text(okf_compatible=True))
     return vault
 
 
@@ -1645,6 +1645,7 @@ def _normalize_final_pages(
             path_titles=path_titles,
             model_title=model_title,
             body_wikilink_limit=page_plugin.body_wikilink_limit,
+            okf_compatible=page_plugin.okf_compatible,
         )
         missing_sections = _missing_required_sections(markdown, page_plugin, updated_page.page_type)
         if missing_sections:
@@ -1722,6 +1723,7 @@ def _canonical_final_markdown(
     path_titles: dict[str, str] | None = None,
     model_title: str = "",
     body_wikilink_limit: int = 2,
+    okf_compatible: bool = True,
 ) -> str:
     body = strip_frontmatter(page.markdown).strip()
     body = _drop_sections(body, {"Related", "相关页面"}).strip()
@@ -1752,8 +1754,15 @@ def _canonical_final_markdown(
     source_prepared_hashes = _dedupe_list([*(existing_entry.source_prepared_hashes if existing_entry else []), *(ref.raw_sha256 for ref in source_refs)])
     source_operation_ids = _dedupe_list([*(existing_entry.source_operation_ids if existing_entry else []), *([operation_id] if operation_id else [])])
     summary = summarize(body, max_sentences=2, max_chars=260)
+    okf_type = (page.okf_type.strip() or page.page_type) if okf_compatible else ""
+    okf_fields = (
+        f"type: {okf_type}\n"
+        f"description: {_yaml_scalar(summary)}\n"
+        f"timestamp: {log_date}\n"
+    ) if okf_compatible else ""
     frontmatter = (
         "---\n"
+        f"{okf_fields}"
         f"llmwiki_type: {page.page_type}\n"
         f"title: {_yaml_scalar(page.title)}\n"
         f"{_yaml_list('aliases', aliases)}"
@@ -3527,7 +3536,15 @@ def _normalize_final_page_coverage_repairs(
             errors[page_id] = f"{page_id} 覆盖修复返回了无效 artifact。"
             continue
         try:
-            repaired_page = _normalize_repaired_final_page(state, output.repaired_final_page)
+            repaired_input = output.repaired_final_page
+            # okf_type 是 final_pages 步骤的领域种类判断，覆盖修复不应改变它；
+            # 若修复页未携带 okf_type，继承原 final_pages 中对应页面的值。
+            original_pages = state.get("final_pages")
+            if isinstance(original_pages, FinalPages) and not repaired_input.okf_type.strip():
+                original_page = next((p for p in original_pages.pages if p.final_page_id == page_id or p.target_path == repaired_input.target_path), None)
+                if original_page is not None:
+                    repaired_input = repaired_input.model_copy(update={"okf_type": original_page.okf_type})
+            repaired_page = _normalize_repaired_final_page(state, repaired_input)
             repair = _scope_final_page_coverage_repair(output.model_copy(update={"repaired_final_page": repaired_page}), claims)
             _assert_final_page_coverage_repair(repair, claims)
         except PipelineError as exc:
@@ -5102,7 +5119,7 @@ def _validate_before_write(vault: Path, state: dict[str, object]) -> ValidationR
             issues.append(ValidationIssue(severity="error", code="missing_source_refs", message="最终页面缺少 source refs。", path=page.target_path))
         elif not any(ref.raw_path == binding.raw_path and ref.raw_sha256 == binding.raw_sha256 for ref in page.source_refs):
             issues.append(ValidationIssue(severity="error", code="source_ref_mismatch", message="最终页面没有包含本次绑定的 raw source ref。", path=page.target_path))
-        frontmatter_issues = _validate_final_markdown_frontmatter(page)
+        frontmatter_issues = _validate_final_markdown_frontmatter(page, page_plugin)
         issues.extend(frontmatter_issues)
         issues.extend(
             related_logic.final_markdown_link_issues(
@@ -5147,7 +5164,7 @@ def _is_knowledge_target(page_plugin: PagePlugin, page: FinalPage) -> bool:
     return page.target_path.startswith(f"{spec.directory}/") and page.target_path.endswith(".md")
 
 
-def _validate_final_markdown_frontmatter(page: FinalPage) -> list[ValidationIssue]:
+def _validate_final_markdown_frontmatter(page: FinalPage, page_plugin: PagePlugin) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     data = _frontmatter_data(page.markdown)
     if data is None:
@@ -5156,9 +5173,18 @@ def _validate_final_markdown_frontmatter(page: FinalPage) -> list[ValidationIssu
         issues.append(ValidationIssue(severity="error", code="frontmatter_title_mismatch", message="frontmatter title 与最终页面标题不一致。", path=page.target_path))
     if data.get("llmwiki_type") != page.page_type:
         issues.append(ValidationIssue(severity="error", code="frontmatter_type_mismatch", message="frontmatter llmwiki_type 与最终页面类型不一致。", path=page.target_path))
-    for forbidden in ["type", "source_refs", "llmwiki"]:
-        if forbidden in data:
-            issues.append(ValidationIssue(severity="error", code="frontmatter_legacy_lite_field", message=f"frontmatter 不能包含 Lite-only 字段 {forbidden}。", path=page.target_path))
+    # OKF 兼容时 type 是必填字段，描述概念本身所属的领域种类（由模型在生成时判断），
+    # 允许与 llmwiki_type（页面结构角色）不同，也允许相等；非兼容时 type 仍为 Lite-only 保留字段。
+    if page_plugin.okf_compatible:
+        okf_type_value = data.get("type")
+        if not okf_type_value or not str(okf_type_value).strip():
+            issues.append(ValidationIssue(severity="error", code="frontmatter_okf_type_missing", message="OKF 兼容模式下 frontmatter type 不能为空。", path=page.target_path))
+        forbidden = ["source_refs", "llmwiki"]
+    else:
+        forbidden = ["type", "source_refs", "llmwiki"]
+    for forbidden_field in forbidden:
+        if forbidden_field in data:
+            issues.append(ValidationIssue(severity="error", code="frontmatter_legacy_lite_field", message=f"frontmatter 不能包含 Lite-only 字段 {forbidden_field}。", path=page.target_path))
     aliases = data.get("aliases")
     if not isinstance(aliases, list):
         issues.append(ValidationIssue(severity="error", code="frontmatter_missing_aliases", message="frontmatter aliases 必须是列表。", path=page.target_path))
@@ -5274,6 +5300,7 @@ def _updated_index(vault: Path, page_plugin: PagePlugin) -> str:
         entries=entries,
         tension_rows=_index_tension_rows(vault, entries),
         page_type_order=page_plugin.page_types.keys(),
+        okf_compatible=page_plugin.okf_compatible,
     )
 
 

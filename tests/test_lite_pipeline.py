@@ -4070,3 +4070,133 @@ def test_default_plugin_body_wikilink_limit_is_2() -> None:
     """默认插件 body_wikilink_limit 为 2，保持向后兼容。"""
     plugin = default_page_plugin()
     assert plugin.body_wikilink_limit == 2
+
+
+def test_default_plugin_okf_compatible_is_true() -> None:
+    """默认插件 okf_compatible 为 True，新 vault 开箱 OKF 合规。"""
+    plugin = default_page_plugin()
+    assert plugin.okf_compatible is True
+
+
+def test_okf_frontmatter_fields_present_when_compatible() -> None:
+    """okf_compatible=True 时 frontmatter 包含 type/description/timestamp。"""
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_OKF.md",
+        action="create",
+        title="OKF 测试概念",
+        page_type="concept",
+        markdown="# OKF 测试概念\n\n这是正文内容。",
+        content_sha256="",
+        source_refs=[ref],
+    )
+    markdown = _canonical_final_markdown(page, operation_id="OP-OKF-001", okf_compatible=True)
+    frontmatter = markdown.split("---", 2)[1]
+    assert "type: concept" in frontmatter
+    assert "description:" in frontmatter
+    assert "timestamp:" in frontmatter
+    # 原有字段保留
+    assert "llmwiki_type: concept" in frontmatter
+    assert "summary:" in frontmatter
+
+
+def test_okf_frontmatter_fields_absent_when_not_compatible() -> None:
+    """okf_compatible=False 时不输出 OKF 字段，回退到纯 llmwiki 格式。"""
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_NoOKF.md",
+        action="create",
+        title="无 OKF 测试",
+        page_type="concept",
+        markdown="# 无 OKF 测试\n\n正文。",
+        content_sha256="",
+        source_refs=[ref],
+    )
+    markdown = _canonical_final_markdown(page, operation_id="OP-NOOKF-001", okf_compatible=False)
+    frontmatter = markdown.split("---", 2)[1]
+    # OKF 字段不存在（检查行首，排除 llmwiki_type 的子串匹配）
+    fm_lines = [line.strip() for line in frontmatter.splitlines()]
+    assert not any(line.startswith("type: ") for line in fm_lines)
+    assert not any(line.startswith("description:") for line in fm_lines)
+    assert not any(line.startswith("timestamp:") for line in fm_lines)
+    # 原有字段仍在
+    assert "llmwiki_type: concept" in frontmatter
+
+
+def test_okf_type_uses_concept_kind_when_provided() -> None:
+    """okf_type 提供时 frontmatter type 用领域种类，与 llmwiki_type（结构角色）区分。"""
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_MCP.md",
+        action="create",
+        title="模型上下文协议 MCP",
+        page_type="concept",
+        okf_type="Protocol",
+        markdown="# 模型上下文协议 MCP\n\n正文。",
+        content_sha256="",
+        source_refs=[ref],
+    )
+    markdown = _canonical_final_markdown(page, operation_id="OP-OKF-TYPE-001", okf_compatible=True)
+    frontmatter = markdown.split("---", 2)[1]
+    fm_lines = [line.strip() for line in frontmatter.splitlines()]
+    # type 是领域种类 Protocol，与 llmwiki_type=concept 不同
+    assert any(line == "type: Protocol" for line in fm_lines)
+    assert any(line == "llmwiki_type: concept" for line in fm_lines)
+
+
+def test_okf_type_falls_back_to_page_type_when_empty() -> None:
+    """okf_type 为空时 frontmatter type 回退到 page_type（允许两者相等）。"""
+    ref = SourceRef(raw_path="raw/a.md", raw_sha256="abc", locator="whole_file")
+    page = FinalPage(
+        final_page_id="FP-001",
+        target_path="concepts/Concept_X.md",
+        action="create",
+        title="测试概念",
+        page_type="concept",
+        okf_type="",
+        markdown="# 测试概念\n\n正文。",
+        content_sha256="",
+        source_refs=[ref],
+    )
+    markdown = _canonical_final_markdown(page, operation_id="OP-OKF-TYPE-002", okf_compatible=True)
+    frontmatter = markdown.split("---", 2)[1]
+    fm_lines = [line.strip() for line in frontmatter.splitlines()]
+    # 回退：type == page_type == concept
+    assert any(line == "type: concept" for line in fm_lines)
+    assert any(line == "llmwiki_type: concept" for line in fm_lines)
+
+
+def test_render_index_includes_okf_version_when_compatible() -> None:
+    """okf_compatible=True 时根 index.md 包含 okf_version frontmatter。"""
+    from llmwiki_engine.lite.system_pages import render_index
+    text = render_index(entries=[], tension_rows=[], page_type_order=["concept"], okf_compatible=True)
+    assert text.startswith("---\n")
+    assert 'okf_version: "0.1"' in text
+    # SYSTEM_MARKER 仍在
+    assert "<!-- llmwiki:system-page:v3 -->" in text
+
+
+def test_render_index_excludes_okf_version_when_not_compatible() -> None:
+    """okf_compatible=False 时根 index.md 不含 okf_version frontmatter。"""
+    from llmwiki_engine.lite.system_pages import render_index
+    text = render_index(entries=[], tension_rows=[], page_type_order=["concept"], okf_compatible=False)
+    assert not text.startswith("---\n")
+    assert "okf_version" not in text
+    assert "<!-- llmwiki:system-page:v3 -->" in text
+
+
+def test_initial_index_text_includes_okf_version() -> None:
+    """initial_index_text 默认包含 okf_version。"""
+    from llmwiki_engine.lite.system_pages import initial_index_text
+    text = initial_index_text()
+    assert 'okf_version: "0.1"' in text
+
+
+def test_init_vault_writes_okf_compatible_index(tmp_path: Path) -> None:
+    """init_vault 写入的 index.md 包含 okf_version。"""
+    vault = init_vault(tmp_path / "vault")
+    index_text = (vault / "wiki" / "index.md").read_text(encoding="utf-8")
+    assert 'okf_version: "0.1"' in index_text

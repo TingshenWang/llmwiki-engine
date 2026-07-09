@@ -50,6 +50,7 @@ class PagePlugin(BaseModel):
     page_types: dict[str, PageTypeSpec]
     related: RelatedPolicy = Field(default_factory=RelatedPolicy)
     body_wikilink_limit: int = Field(default=2, ge=0)
+    okf_compatible: bool = Field(default=True)
 
     @field_validator("name", "version", "description", "default_page_type")
     @classmethod
@@ -92,6 +93,7 @@ DEFAULT_PAGE_PLUGIN = {
     "description": "llmwiki Lite 默认页面插件，面向 100 页以内的轻量中文知识库。",
     "default_page_type": "concept",
     "body_wikilink_limit": 2,
+    "okf_compatible": True,
     "related": {
         "same_ingest_model_max": 5,
         "embedding_existing_top_k": 3,
